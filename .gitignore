@@ -1,0 +1,13 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+
+# Node / UI
+ui/node_modules
+ui/dist
+
+# macOS
+.DS_Store
+
+# Heap snapshots
+*.heapsnapshot
