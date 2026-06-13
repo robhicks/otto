@@ -1,15 +1,19 @@
 //! Engine wiring: assemble the default agent registry and run a turn end-to-end.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use otto_agents::{EchoCoder, StubContextFinder, StubPlanner, StubVerifier};
-use otto_engine_core::tool::{DenyAsk, ToolRegistry};
+use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolRegistry};
 use otto_engine_core::traits::{Provider, Workspace};
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_protocol::{Event, EventKind, Role, SessionId};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
 use otto_router::{BrainBlendRouter, SingleProviderRouter};
-use otto_tools::{DefaultPermissionGate, FsListTool, FsReadTool, FsWriteTool};
+use otto_tools::{
+    BashTool, DefaultPermissionGate, FsListTool, FsReadTool, FsWriteTool, SandboxPolicy,
+    os_sandbox_available,
+};
 
 /// Build the registry of built-in walking-skeleton agents.
 pub fn build_default_registry() -> AgentRegistry {
@@ -54,13 +58,33 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     }
 }
 
-/// Build the default tool registry: the sensitive-path-floor gate, a deny-by-default `Ask`
-/// resolver (headless), and the in-process fs tools bound to `workspace`.
-pub fn build_tool_registry(workspace: Arc<dyn Workspace>) -> ToolRegistry {
-    let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
+/// Build the default tool registry. Always includes the sensitive-path-floor gate and the
+/// in-process fs tools. A sandboxed `bash` tool is registered ONLY when an OS sandbox backend
+/// (bwrap/sandbox-exec) is available; in that case the `Ask` verdict the gate gives `bash` is
+/// resolved by an allow-list resolver (safe because the registered bash is OS-confined — and
+/// the no-orphans-on-timeout guarantee holds because we only ever wire the `Os` policy, never
+/// `None`). With no sandbox backend, `bash` is absent and the resolver denies all `Ask`
+/// (fail-closed).
+pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
+    let sandboxed = os_sandbox_available();
+    let ask: Arc<dyn AskResolver> = if sandboxed {
+        Arc::new(AllowListAskResolver::new(vec!["bash".to_string()]))
+    } else {
+        Arc::new(DenyAsk)
+    };
+
+    let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), ask);
     registry.register(Arc::new(FsReadTool::new(Arc::clone(&workspace))));
     registry.register(Arc::new(FsWriteTool::new(Arc::clone(&workspace))));
     registry.register(Arc::new(FsListTool::new(workspace)));
+
+    if sandboxed {
+        registry.register(Arc::new(BashTool::new(
+            root,
+            SandboxPolicy::Os { allow_net: false },
+        )));
+    }
+
     registry
 }
 

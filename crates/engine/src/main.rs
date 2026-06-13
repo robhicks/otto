@@ -36,8 +36,8 @@ async fn main() -> anyhow::Result<()> {
 
     let router = build_router();
     let workspace = LocalWorkspace::new(root.clone());
-    let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root));
-    let tools = build_tool_registry(tools_workspace);
+    let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    let tools = build_tool_registry(tools_workspace, root);
 
     let (events, outcome) = run_goal(&goal, router.as_ref(), &workspace, &tools).await?;
     for event in &events {

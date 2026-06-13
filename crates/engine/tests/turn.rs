@@ -19,7 +19,7 @@ async fn full_turn_writes_output_file_and_completes_ok() {
 
     let tools_workspace: std::sync::Arc<dyn Workspace> =
         std::sync::Arc::new(LocalWorkspace::new(dir.path()));
-    let tools = build_tool_registry(tools_workspace);
+    let tools = build_tool_registry(tools_workspace, dir.path().to_path_buf());
 
     let (events, outcome) = run_goal("add a greeting", &router, &workspace, &tools)
         .await
