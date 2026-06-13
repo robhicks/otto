@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use crate::router::Router;
+use crate::tool::ToolRegistry;
 use crate::types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit};
 
 /// An LLM provider (local Ollama, remote Claude, etc.). In-process by default.
@@ -38,11 +39,20 @@ pub trait Agent: Send + Sync {
 pub struct AgentCtx<'a> {
     router: &'a dyn Router,
     workspace: &'a dyn Workspace,
+    tools: &'a ToolRegistry,
 }
 
 impl<'a> AgentCtx<'a> {
-    pub fn new(router: &'a dyn Router, workspace: &'a dyn Workspace) -> Self {
-        Self { router, workspace }
+    pub fn new(
+        router: &'a dyn Router,
+        workspace: &'a dyn Workspace,
+        tools: &'a ToolRegistry,
+    ) -> Self {
+        Self {
+            router,
+            workspace,
+            tools,
+        }
     }
 
     /// The router agents call to run completions (local-vs-remote selection happens inside).
@@ -53,5 +63,10 @@ impl<'a> AgentCtx<'a> {
     /// The workspace agents read from / write edits to.
     pub fn workspace(&self) -> &dyn Workspace {
         self.workspace
+    }
+
+    /// The tool registry; calls made through it are gated by the permission gate before dispatch.
+    pub fn tools(&self) -> &ToolRegistry {
+        self.tools
     }
 }

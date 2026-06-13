@@ -675,7 +675,9 @@ dependencies = [
  "otto-engine-core",
  "otto-providers",
  "otto-router",
+ "otto-tools",
  "otto-workspace",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -690,6 +692,7 @@ dependencies = [
  "otto-protocol",
  "otto-providers",
  "otto-router",
+ "otto-tools",
  "otto-workspace",
  "tempfile",
  "tokio",
@@ -702,6 +705,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "otto-protocol",
+ "serde_json",
  "tokio",
 ]
 
@@ -735,6 +739,19 @@ dependencies = [
  "anyhow",
  "async-trait",
  "otto-engine-core",
+ "tokio",
+]
+
+[[package]]
+name = "otto-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "otto-workspace",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

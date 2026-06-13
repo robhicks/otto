@@ -3,11 +3,13 @@
 pub mod orchestrator;
 pub mod registry;
 pub mod router;
+pub mod tool;
 pub mod traits;
 pub mod types;
 
 pub use orchestrator::{Emitter, Orchestrator, TurnOutcome};
 pub use registry::AgentRegistry;
 pub use router::{RouteHints, Router, TaskKind};
+pub use tool::{AskResolver, Decision, DenyAsk, PermissionGate, Tool, ToolRegistry};
 pub use traits::{Agent, AgentCtx, Provider, Workspace};
 pub use types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, Milestone};

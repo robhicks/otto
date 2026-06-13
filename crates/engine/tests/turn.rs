@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use otto_engine::run_goal;
+use otto_engine::{build_tool_registry, run_goal};
 use otto_engine_core::traits::Workspace;
 use otto_protocol::EventKind;
 use otto_providers::LocalProvider;
@@ -17,7 +17,11 @@ async fn full_turn_writes_output_file_and_completes_ok() {
     let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
     let workspace = LocalWorkspace::new(dir.path());
 
-    let (events, outcome) = run_goal("add a greeting", &router, &workspace)
+    let tools_workspace: std::sync::Arc<dyn Workspace> =
+        std::sync::Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = build_tool_registry(tools_workspace);
+
+    let (events, outcome) = run_goal("add a greeting", &router, &workspace, &tools)
         .await
         .unwrap();
 

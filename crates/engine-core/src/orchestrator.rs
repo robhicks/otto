@@ -5,6 +5,7 @@ use otto_protocol::{EventKind, Role, SessionId};
 
 use crate::registry::AgentRegistry;
 use crate::router::Router;
+use crate::tool::ToolRegistry;
 use crate::traits::{AgentCtx, Workspace};
 use crate::types::{AgentOutput, AgentRequest};
 
@@ -30,6 +31,7 @@ pub struct Orchestrator<'a> {
     pub registry: &'a AgentRegistry,
     pub router: &'a dyn Router,
     pub workspace: &'a dyn Workspace,
+    pub tools: &'a ToolRegistry,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -42,7 +44,7 @@ impl<'a> Orchestrator<'a> {
         goal: &str,
         emit: &dyn Emitter,
     ) -> anyhow::Result<TurnOutcome> {
-        let ctx = AgentCtx::new(self.router, self.workspace);
+        let ctx = AgentCtx::new(self.router, self.workspace, self.tools);
 
         // --- Plan ---
         emit.emit(EventKind::AgentStarted {
@@ -140,11 +142,23 @@ impl<'a> Orchestrator<'a> {
 mod tests {
     use super::*;
     use crate::router::{RouteHints, Router};
+    use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
     use crate::traits::{Agent, Workspace};
     use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone};
     use async_trait::async_trait;
+    use serde_json::Value;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    struct TestAllowGate;
+    impl PermissionGate for TestAllowGate {
+        fn evaluate(&self, _tool: &str, _args: &Value) -> Decision {
+            Decision::Allow
+        }
+    }
+    fn empty_tools() -> ToolRegistry {
+        ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(DenyAsk))
+    }
 
     struct FakeRouter;
     #[async_trait]
@@ -233,10 +247,12 @@ mod tests {
         let reg = registry();
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
             workspace: &workspace,
+            tools: &tools,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -297,10 +313,12 @@ mod tests {
         reg.register(Role::Planner, Arc::new(FixedPlanner));
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
             workspace: &workspace,
+            tools: &tools,
         };
 
         let err = orch
