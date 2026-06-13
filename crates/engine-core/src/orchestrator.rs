@@ -5,7 +5,7 @@ use otto_protocol::{EventKind, Role, SessionId};
 
 use crate::registry::AgentRegistry;
 use crate::router::Router;
-use crate::tool::ToolRegistry;
+use crate::tool::{Decision, ToolRegistry};
 use crate::traits::{AgentCtx, Workspace};
 use crate::types::{AgentOutput, AgentRequest};
 
@@ -107,6 +107,16 @@ impl<'a> Orchestrator<'a> {
             anyhow::bail!("coder returned unexpected output");
         };
         for edit in &edits {
+            let check_args = serde_json::json!({ "path": edit.path.to_string_lossy() });
+            if self.tools.check("fs.write", &check_args) == Decision::Deny {
+                emit.emit(EventKind::Log {
+                    message: format!(
+                        "edit to {} denied by permission gate; skipped",
+                        edit.path.display()
+                    ),
+                });
+                continue;
+            }
             let bytes_written = self.workspace.apply_edit(edit).await?;
             emit.emit(EventKind::FileEdit {
                 path: edit.path.clone(),
@@ -158,6 +168,20 @@ mod tests {
     }
     fn empty_tools() -> ToolRegistry {
         ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(DenyAsk))
+    }
+
+    struct TestDenyWriteGate;
+    impl PermissionGate for TestDenyWriteGate {
+        fn evaluate(&self, tool: &str, _args: &Value) -> Decision {
+            if tool == "fs.write" {
+                Decision::Deny
+            } else {
+                Decision::Allow
+            }
+        }
+    }
+    fn deny_write_tools() -> ToolRegistry {
+        ToolRegistry::new(Arc::new(TestDenyWriteGate), Arc::new(DenyAsk))
     }
 
     struct FakeRouter;
@@ -326,5 +350,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no agent registered"));
+    }
+
+    #[tokio::test]
+    async fn denied_edit_is_skipped_and_logged() {
+        let reg = registry(); // OneEditCoder produces an edit to out.txt
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = deny_write_tools();
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+        };
+
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+
+        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+
+        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(workspace.edits.lock().unwrap().len(), 0);
+
+        let recorded = events.lock().unwrap().clone();
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            EventKind::Log { message } if message.contains("denied by permission gate")
+        )));
+        assert!(
+            !recorded
+                .iter()
+                .any(|e| matches!(e, EventKind::FileEdit { .. }))
+        );
     }
 }
