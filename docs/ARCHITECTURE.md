@@ -119,6 +119,20 @@ Every call passes a deterministic `PermissionGate` (otto's guardrail) before dis
 an inviolable, case-insensitive floor. An `Ask` verdict is resolved by an `AskResolver` —
 `DenyAsk` in headless mode; the interactive UI supplies a prompting resolver later.
 
+The `bash` tool (`BashTool`) runs shell commands confined by a `SandboxPolicy`: on Linux,
+`bwrap` mounts the whole filesystem read-only, re-binds only the workspace root writable, and
+isolates the network/pid/ipc/session namespaces (`--unshare-net/-pid/-ipc`, `--new-session`);
+on macOS, `sandbox-exec` applies an equivalent write-confined, network-denied profile. The
+spawned command runs with a cleared, minimal environment (`PATH`/`HOME`/`TERM` only) so host
+credentials in env are never exposed. The gate classifies `bash` as `Ask` (shell can't be
+statically path-vetted), and the engine registers `bash` ONLY when an OS sandbox backend
+exists — pairing it with an `AllowListAskResolver` that permits the now-confined `bash`. With
+no backend, `bash` is absent and `Ask` stays denied (fail-closed). Output is
+`{stdout, stderr, exit_code}`; a timeout kills the whole sandbox process tree via
+`kill_on_drop` (the pid-namespace ensures no orphans). Known deferrals: unbounded
+stdout/stderr buffering (no output cap yet), and toolchain env pass-through (e.g. CARGO_HOME)
+for when the real Verifier runs builds.
+
 ### `RemoteTarget` — the engine-axis seam
 
 ```rust
