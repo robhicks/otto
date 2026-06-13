@@ -142,7 +142,7 @@ impl<'a> Orchestrator<'a> {
 mod tests {
     use super::*;
     use crate::router::{RouteHints, Router};
-    use crate::tool::{AskResolver, Decision, PermissionGate, ToolRegistry};
+    use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
     use crate::traits::{Agent, Workspace};
     use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone};
     use async_trait::async_trait;
@@ -156,14 +156,8 @@ mod tests {
             Decision::Allow
         }
     }
-    struct TestDenyAsk;
-    impl AskResolver for TestDenyAsk {
-        fn resolve(&self, _tool: &str, _args: &Value) -> bool {
-            false
-        }
-    }
     fn empty_tools() -> ToolRegistry {
-        ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(TestDenyAsk))
+        ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(DenyAsk))
     }
 
     struct FakeRouter;

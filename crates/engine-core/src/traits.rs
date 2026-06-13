@@ -65,7 +65,7 @@ impl<'a> AgentCtx<'a> {
         self.workspace
     }
 
-    /// The tool registry; every call is gated by the permission gate before dispatch.
+    /// The tool registry; calls made through it are gated by the permission gate before dispatch.
     pub fn tools(&self) -> &ToolRegistry {
         self.tools
     }
