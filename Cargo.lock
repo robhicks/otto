@@ -197,6 +197,15 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "otto-agents"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "otto-providers",
+ "otto-workspace",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "otto-engine"
@@ -211,6 +220,7 @@ dependencies = [
  "otto-protocol",
  "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -225,6 +235,12 @@ dependencies = [
 [[package]]
 name = "otto-providers"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "tokio",
+]
 
 [[package]]
 name = "otto-workspace"

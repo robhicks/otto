@@ -23,7 +23,7 @@ impl Default for SessionId {
 }
 
 /// The role an atomic agent plays in the orchestrator spine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     Planner,
     ContextFinder,
