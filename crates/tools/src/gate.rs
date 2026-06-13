@@ -5,9 +5,13 @@ use otto_engine_core::tool::{Decision, PermissionGate};
 use serde_json::Value;
 
 /// Substrings (lowercase) that mark a path as sensitive. A tool-call argument naming such a
-/// path is denied. Matching is case-insensitive (see `is_sensitive`). Symlink-to-secret
-/// escapes are owned by `LocalWorkspace` path containment, not this string gate.
-const SENSITIVE_MARKERS: &[&str] = &[".env", ".ssh/", ".ssh", ".git/", "id_rsa", ".aws/", ".aws"];
+/// path is denied. Matching is case-insensitive (see `is_sensitive`). NOTE: symlink-to-secret
+/// escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
+/// symlinks; they are addressed by the sandboxed mcp-fs/mcp-bash layer in a later plan, not this
+/// string gate.
+const SENSITIVE_MARKERS: &[&str] = &[
+    ".env", ".ssh/", ".ssh", ".git/", ".git", "id_rsa", ".aws/", ".aws",
+];
 
 pub struct DefaultPermissionGate;
 
@@ -35,6 +39,9 @@ impl DefaultPermissionGate {
                     out.push(p.to_string());
                 }
             }
+        }
+        if let Some(g) = args.get("glob").and_then(Value::as_str) {
+            out.push(g.to_string());
         }
         out
     }
@@ -103,6 +110,28 @@ mod tests {
         let gate = DefaultPermissionGate::new();
         let args = json!({"paths": ["src/a.rs", ".ssh/known_hosts"]});
         assert_eq!(gate.evaluate("fs.search", &args), Decision::Deny);
+    }
+
+    #[test]
+    fn denies_bare_git_path() {
+        let gate = DefaultPermissionGate::new();
+        assert_eq!(
+            gate.evaluate("fs.read", &json!({"path": ".git"})),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn denies_sensitive_glob() {
+        let gate = DefaultPermissionGate::new();
+        assert_eq!(
+            gate.evaluate("fs.list", &json!({"glob": ".ssh/**"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            gate.evaluate("fs.list", &json!({"glob": "src/**/*.rs"})),
+            Decision::Allow
+        );
     }
 
     #[test]
