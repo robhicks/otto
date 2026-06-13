@@ -1,5 +1,6 @@
-//! The four seams that keep otto's axes decoupled. Only `Provider`, `Workspace`,
-//! and `Agent` are exercised in the walking skeleton; `RemoteTarget` arrives later.
+//! The trait seams that keep otto's axes decoupled. `Router` (agent-facing via `AgentCtx`),
+//! `Workspace`, and `Agent` are the live seams; `Provider` is the internal LLM-backend trait
+//! that routers select among. `RemoteTarget` arrives in a later plan.
 
 use std::path::{Path, PathBuf};
 
