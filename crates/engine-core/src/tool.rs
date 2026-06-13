@@ -178,4 +178,11 @@ mod tests {
         assert!(r.resolve("bash", &json!({})));
         assert!(!r.resolve("fs.write", &json!({})));
     }
+
+    #[test]
+    fn allow_list_resolver_denies_all_when_empty() {
+        let r = AllowListAskResolver::new(vec![]);
+        assert!(!r.resolve("bash", &json!({})));
+        assert!(!r.resolve("fs.write", &json!({})));
+    }
 }
