@@ -2,6 +2,8 @@
 
 pub mod fs;
 pub mod gate;
+pub mod sandbox;
 
 pub use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub use gate::DefaultPermissionGate;
+pub use sandbox::{SandboxPolicy, build_argv, os_sandbox_available};
