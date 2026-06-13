@@ -202,6 +202,7 @@ dependencies = [
  "async-trait",
  "otto-engine-core",
  "otto-providers",
+ "otto-router",
  "otto-workspace",
  "tempfile",
  "tokio",
@@ -216,6 +217,7 @@ dependencies = [
  "otto-engine-core",
  "otto-protocol",
  "otto-providers",
+ "otto-router",
  "otto-workspace",
  "tempfile",
  "tokio",
@@ -242,6 +244,16 @@ dependencies = [
 
 [[package]]
 name = "otto-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "tokio",
+]
+
+[[package]]
+name = "otto-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
