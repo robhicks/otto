@@ -99,7 +99,9 @@ mod tests {
     #[tokio::test]
     async fn default_build_router_is_offline_and_deterministic() {
         // Ensure the env that would select real backends is absent for this test.
-        // SAFETY: single-threaded test; we only remove vars we don't rely on elsewhere.
+        // SAFETY: this is the only test in this lib's test binary, so no other test
+        // races on these process-global env vars. Do not add a test here that reads
+        // OTTO_OLLAMA / ANTHROPIC_API_KEY without revisiting this.
         unsafe {
             std::env::remove_var("OTTO_OLLAMA");
             std::env::remove_var("ANTHROPIC_API_KEY");
