@@ -1,4 +1,6 @@
 //! `BashTool`: runs a shell command confined by a `SandboxPolicy`, with a timeout.
+//! The spawned command runs with a CLEARED, minimal environment (PATH/HOME/TERM only)
+//! so host credentials in env are not exposed.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -46,6 +48,13 @@ impl Tool for BashTool {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(argv)
             .current_dir(&self.root)
+            .env_clear()
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
+            .env("HOME", &self.root)
+            .env("TERM", "dumb")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -107,6 +116,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn clears_host_environment() {
+        // `cargo test` sets CARGO_MANIFEST_DIR in the host env; it must NOT leak into the
+        // sandboxed command after env_clear().
+        let tool = unsandboxed();
+        let out = tool
+            .call(json!({"command": "echo \"manifest=${CARGO_MANIFEST_DIR:-CLEARED}\""}))
+            .await
+            .unwrap();
+        assert!(out["stdout"].as_str().unwrap().contains("manifest=CLEARED"));
     }
 
     #[tokio::test]
