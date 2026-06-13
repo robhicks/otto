@@ -108,7 +108,7 @@ impl<'a> Orchestrator<'a> {
         };
         for edit in &edits {
             let check_args = serde_json::json!({ "path": edit.path.to_string_lossy() });
-            if self.tools.check("fs.write", &check_args) == Decision::Deny {
+            if self.tools.check("fs.write", &check_args) != Decision::Allow {
                 emit.emit(EventKind::Log {
                     message: format!(
                         "edit to {} denied by permission gate; skipped",
@@ -182,6 +182,17 @@ mod tests {
     }
     fn deny_write_tools() -> ToolRegistry {
         ToolRegistry::new(Arc::new(TestDenyWriteGate), Arc::new(DenyAsk))
+    }
+
+    struct TestAskWriteGate;
+    impl PermissionGate for TestAskWriteGate {
+        fn evaluate(&self, tool: &str, _args: &Value) -> Decision {
+            if tool == "fs.write" {
+                Decision::Ask
+            } else {
+                Decision::Allow
+            }
+        }
     }
 
     struct FakeRouter;
@@ -386,5 +397,28 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, EventKind::FileEdit { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn ask_verdict_also_skips_edit_fail_closed() {
+        let reg = registry(); // OneEditCoder produces an edit to out.txt
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+        };
+
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &(|_k: EventKind| {}))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, TurnOutcome { ok: true });
+        // An Ask verdict (not Allow) must NOT apply the edit — fail-closed.
+        assert_eq!(workspace.edits.lock().unwrap().len(), 0);
     }
 }
