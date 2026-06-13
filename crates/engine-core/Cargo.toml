@@ -9,8 +9,6 @@ license.workspace = true
 otto-protocol = { path = "../protocol" }
 async-trait.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

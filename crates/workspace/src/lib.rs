@@ -116,6 +116,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_edit_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+
+        let edit = Edit {
+            path: PathBuf::from("/etc/passwd"),
+            new_contents: "nope".to_string(),
+        };
+        let err = ws.apply_edit(&edit).await.unwrap_err();
+        assert!(err.to_string().contains("absolute paths are not allowed"));
+    }
+
+    #[tokio::test]
     async fn list_returns_relative_entries() {
         let dir = tempfile::tempdir().unwrap();
         let ws = LocalWorkspace::new(dir.path());
