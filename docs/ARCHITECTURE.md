@@ -24,6 +24,7 @@ otto-next/
 │   ├── engine-core      # Orchestrator state machine, Agent/Workspace/Provider/RemoteTarget traits, registry.
 │   ├── agents           # Built-in atomic agents: planner, context-finder, coder, verifier.
 │   ├── providers        # LLM provider libs (in-process): anthropic, gemini, openai, local(ollama).
+│   ├── router           # SingleProviderRouter + BrainBlendRouter (privacy/complexity routing) over the Provider pool.
 │   ├── mcp-fs           # MCP stdio server: file read/write/search, path-contained.
 │   ├── mcp-git          # MCP stdio server: clone/branch/stage/commit/push/PR.
 │   ├── mcp-grep         # MCP stdio server: ripgrep-style search.
@@ -97,6 +98,15 @@ trait Provider {
 
 In-process by default; an optional HTTP shim wraps the same impl for out-of-process
 debugging. The Brain-Blend router holds a pool of providers and selects one per task.
+
+### `Router` — the agent-facing completion seam
+
+Agents call a `Router` (via `AgentCtx::router()`), not a single `Provider`. `engine-core`
+owns the trait: `async fn complete(&self, CompleteRequest, RouteHints) -> Result<CompleteResponse>`.
+`otto-router` provides `SingleProviderRouter` (pass-through) and `BrainBlendRouter`
+(privacy-forced-local + complexity-scored selection over a local/remote provider pool, with
+cross-provider fallback that never crosses the privacy boundary). This keeps Brain-Blend behind
+a stable seam: adding providers or changing routing never touches `engine-core` or the agents.
 
 ### `RemoteTarget` — the engine-axis seam
 
