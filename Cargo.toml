@@ -6,6 +6,7 @@ members = [
     "crates/workspace",
     "crates/providers",
     "crates/router",
+    "crates/tools",
     "crates/agents",
     "crates/engine",
 ]

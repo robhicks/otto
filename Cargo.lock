@@ -740,6 +740,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "otto-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "otto-workspace",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "otto-workspace"
 version = "0.1.0"
 dependencies = [
