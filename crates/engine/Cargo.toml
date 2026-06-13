@@ -4,3 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[[bin]]
+name = "otto"
+path = "src/main.rs"
+
+[dependencies]
+otto-protocol = { path = "../protocol" }
+otto-engine-core = { path = "../engine-core" }
+otto-workspace = { path = "../workspace" }
+otto-providers = { path = "../providers" }
+otto-agents = { path = "../agents" }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
