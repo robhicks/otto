@@ -133,6 +133,13 @@ no backend, `bash` is absent and `Ask` stays denied (fail-closed). Output is
 stdout/stderr buffering (no output cap yet), and toolchain env pass-through (e.g. CARGO_HOME)
 for when the real Verifier runs builds.
 
+The orchestrator also runs every Coder edit through `ToolRegistry::check("fs.write", {path})`
+(the same gate, without dispatch) before applying it via the workspace — and only an explicit
+`Allow` proceeds (a `Deny` or `Ask` is logged and the edit skipped, fail-closed). So a Coder
+cannot write a sensitive path. The `ctx.workspace()` accessor remains a trusted, direct handle
+for built-in agents (the real Coder returns edits rather than writing directly); a read-only
+workspace view for untrusted agents is a later refinement.
+
 ### `RemoteTarget` — the engine-axis seam
 
 ```rust

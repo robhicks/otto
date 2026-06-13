@@ -82,6 +82,13 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Return the gate's `Decision` for a proposed call WITHOUT dispatching. Lets the
+    /// orchestrator gate edits it applies directly (via the workspace) through the same
+    /// policy that governs tool calls.
+    pub fn check(&self, name: &str, args: &Value) -> Decision {
+        self.gate.evaluate(name, args)
+    }
+
     /// Gate then dispatch. Denied (or ask-denied) calls error before the tool runs.
     pub async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
         match self.gate.evaluate(name, &args) {
@@ -184,5 +191,20 @@ mod tests {
         let r = AllowListAskResolver::new(vec![]);
         assert!(!r.resolve("bash", &json!({})));
         assert!(!r.resolve("fs.write", &json!({})));
+    }
+
+    #[test]
+    fn check_returns_gate_decision_without_dispatch() {
+        let allow = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        assert_eq!(
+            allow.check("fs.write", &json!({"path": "a.txt"})),
+            Decision::Allow
+        );
+
+        let deny = ToolRegistry::new(Arc::new(DenyAll), Arc::new(DenyAsk));
+        assert_eq!(
+            deny.check("fs.write", &json!({"path": "a.txt"})),
+            Decision::Deny
+        );
     }
 }
