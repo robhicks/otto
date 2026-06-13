@@ -25,6 +25,7 @@ otto-next/
 │   ├── agents           # Built-in atomic agents: planner, context-finder, coder, verifier.
 │   ├── providers        # LLM provider libs (in-process): anthropic, gemini, openai, local(ollama).
 │   ├── router           # SingleProviderRouter + BrainBlendRouter (privacy/complexity routing) over the Provider pool.
+│   ├── tools            # In-process Tool impls (fs.read/write/list) + DefaultPermissionGate (sensitive-path floor).
 │   ├── mcp-fs           # MCP stdio server: file read/write/search, path-contained.
 │   ├── mcp-git          # MCP stdio server: clone/branch/stage/commit/push/PR.
 │   ├── mcp-grep         # MCP stdio server: ripgrep-style search.
@@ -107,6 +108,16 @@ owns the trait: `async fn complete(&self, CompleteRequest, RouteHints) -> Result
 (privacy-forced-local + complexity-scored selection over a local/remote provider pool, with
 cross-provider fallback that never crosses the privacy boundary). This keeps Brain-Blend behind
 a stable seam: adding providers or changing routing never touches `engine-core` or the agents.
+
+### `Tool` — the tool-call seam (+ the permission gate)
+
+Agents call tools via `AgentCtx::tools()` → `ToolRegistry::call(name, json_args)`. Tools are
+MCP-shaped (`fn name()`, `async fn call(Value) -> Result<Value>`), so an MCP-stdio tool
+(rmcp client to external/Claude Code servers) registers behind the same `Tool` trait later.
+Every call passes a deterministic `PermissionGate` (otto's guardrail) before dispatch:
+`DefaultPermissionGate` denies sensitive paths (`.env`, `.ssh/`, `.git/`, `.aws/`, ssh keys) as
+an inviolable, case-insensitive floor. An `Ask` verdict is resolved by an `AskResolver` —
+`DenyAsk` in headless mode; the interactive UI supplies a prompting resolver later.
 
 ### `RemoteTarget` — the engine-axis seam
 
