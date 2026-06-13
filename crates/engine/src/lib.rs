@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use otto_agents::{EchoCoder, StubContextFinder, StubPlanner, StubVerifier};
-use otto_engine_core::traits::{Provider, Workspace};
-use otto_engine_core::{AgentRegistry, Orchestrator, TurnOutcome};
+use otto_engine_core::traits::Workspace;
+use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_protocol::{Event, EventKind, Role, SessionId};
 
 /// Build the registry of built-in walking-skeleton agents.
@@ -22,7 +22,7 @@ pub fn build_default_registry() -> AgentRegistry {
 /// monotonic `seq` to each event here (the orchestrator emits bare `EventKind`s).
 pub async fn run_goal(
     goal: &str,
-    provider: &dyn Provider,
+    router: &dyn Router,
     workspace: &dyn Workspace,
 ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
     let registry = build_default_registry();
@@ -46,7 +46,7 @@ pub async fn run_goal(
 
     let orchestrator = Orchestrator {
         registry: &registry,
-        provider,
+        router,
         workspace,
     };
     let outcome = orchestrator.run_turn(session, goal, &sink).await?;

@@ -1,9 +1,11 @@
 //! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use otto_engine::run_goal;
 use otto_providers::LocalProvider;
+use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
 
 #[tokio::main]
@@ -33,10 +35,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let provider = LocalProvider::new();
+    let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
     let workspace = LocalWorkspace::new(root);
 
-    let (events, outcome) = run_goal(&goal, &provider, &workspace).await?;
+    let (events, outcome) = run_goal(&goal, &router, &workspace).await?;
     for event in &events {
         println!("[{:>3}] {:?}", event.seq, event.kind);
     }
