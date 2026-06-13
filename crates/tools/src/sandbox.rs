@@ -1,8 +1,10 @@
 //! Confinement for shell commands. `build_argv` wraps a `sh -c "<command>"` invocation in an
 //! OS sandbox (bwrap on Linux, sandbox-exec on macOS) that limits filesystem writes to the
 //! workspace root and disables network unless allowed. The argv this produces IS the security
-//! boundary — `bwrap --ro-bind / /` mounts the whole filesystem read-only, then `--bind root
-//! root` re-mounts only the workspace writable; `--unshare-net` removes network access.
+//! boundary — `bwrap --ro-bind / /` mounts the ENTIRE filesystem read-only (so `/tmp`, `$HOME`,
+//! etc. are not writable), then `--bind root root` re-mounts only the workspace writable;
+//! `--unshare-net` removes network access and `--unshare-pid/--ipc/--new-session` isolate
+//! process, IPC, and session namespaces.
 
 use std::path::Path;
 
@@ -71,6 +73,9 @@ pub fn build_argv(
                     "--chdir".to_string(),
                     root_str,
                     "--die-with-parent".to_string(),
+                    "--unshare-pid".to_string(),
+                    "--unshare-ipc".to_string(),
+                    "--new-session".to_string(),
                 ];
                 if !allow_net {
                     args.push("--unshare-net".to_string());
@@ -88,9 +93,10 @@ pub fn build_argv(
                 } else {
                     "(deny network*)"
                 };
+                let root_escaped = root_str.replace('\\', "\\\\").replace('"', "\\\"");
                 let profile = format!(
                     "(version 1)(allow default)(deny file-write*)\
-                     (allow file-write* (subpath \"{root_str}\"))\
+                     (allow file-write* (subpath \"{root_escaped}\"))\
                      (allow file-write* (subpath \"/dev\"))\
                      (allow file-write* (subpath \"/tmp\")){net}"
                 );
@@ -141,6 +147,9 @@ mod tests {
         assert!(args.windows(3).any(|w| w == ["--bind", "/work", "/work"]));
         assert!(args.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
         assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(args.contains(&"--unshare-pid".to_string()));
+        assert!(args.contains(&"--unshare-ipc".to_string()));
+        assert!(args.contains(&"--new-session".to_string()));
         assert_eq!(
             &args[args.len() - 3..],
             &["sh".to_string(), "-c".to_string(), "ls".to_string()]
