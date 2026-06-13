@@ -4,8 +4,10 @@
 use otto_engine_core::tool::{Decision, PermissionGate};
 use serde_json::Value;
 
-/// Substrings that mark a path as sensitive. A tool-call argument naming such a path is denied.
-const SENSITIVE_MARKERS: &[&str] = &[".env", ".ssh/", ".ssh", ".git/", "id_rsa", ".aws/"];
+/// Substrings (lowercase) that mark a path as sensitive. A tool-call argument naming such a
+/// path is denied. Matching is case-insensitive (see `is_sensitive`). Symlink-to-secret
+/// escapes are owned by `LocalWorkspace` path containment, not this string gate.
+const SENSITIVE_MARKERS: &[&str] = &[".env", ".ssh/", ".ssh", ".git/", "id_rsa", ".aws/", ".aws"];
 
 pub struct DefaultPermissionGate;
 
@@ -14,9 +16,11 @@ impl DefaultPermissionGate {
         Self
     }
 
-    /// True if `s` names a sensitive path.
+    /// True if `s` names a sensitive path. Case-insensitive so `.ENV` / `.AWS/...` can't
+    /// slip past on case-insensitive filesystems (macOS/Windows).
     fn is_sensitive(s: &str) -> bool {
-        SENSITIVE_MARKERS.iter().any(|m| s.contains(m))
+        let lower = s.to_ascii_lowercase();
+        SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
     }
 
     /// Collect candidate path strings from common arg shapes: `path`, `paths[]`.
@@ -99,5 +103,26 @@ mod tests {
         let gate = DefaultPermissionGate::new();
         let args = json!({"paths": ["src/a.rs", ".ssh/known_hosts"]});
         assert_eq!(gate.evaluate("fs.search", &args), Decision::Deny);
+    }
+
+    #[test]
+    fn denies_case_variant_sensitive_paths() {
+        let gate = DefaultPermissionGate::new();
+        assert_eq!(
+            gate.evaluate("fs.read", &json!({"path": ".ENV"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            gate.evaluate("fs.read", &json!({"path": ".SSH/config"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            gate.evaluate("fs.read", &json!({"path": ".AWS/credentials"})),
+            Decision::Deny
+        );
+        assert_eq!(
+            gate.evaluate("fs.read", &json!({"path": "Id_Rsa"})),
+            Decision::Deny
+        );
     }
 }
