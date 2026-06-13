@@ -44,6 +44,24 @@ impl AskResolver for DenyAsk {
     }
 }
 
+/// Resolves `Ask` to allow only for an explicit allow-list of tool names. Used by the engine
+/// to permit a tool that is `Ask`-gated but otherwise confined (e.g. a sandboxed `bash`).
+pub struct AllowListAskResolver {
+    allowed: Vec<String>,
+}
+
+impl AllowListAskResolver {
+    pub fn new(allowed: Vec<String>) -> Self {
+        Self { allowed }
+    }
+}
+
+impl AskResolver for AllowListAskResolver {
+    fn resolve(&self, tool: &str, _args: &Value) -> bool {
+        self.allowed.iter().any(|t| t == tool)
+    }
+}
+
 /// Holds the available tools plus the gate/resolver. Every `call` is gated before dispatch.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -152,5 +170,12 @@ mod tests {
         let r = registry(Arc::new(AllowAll), Arc::new(DenyAsk));
         let err = r.call("nope", json!({})).await.unwrap_err();
         assert!(err.to_string().contains("no tool registered"));
+    }
+
+    #[test]
+    fn allow_list_resolver_allows_listed_tool_only() {
+        let r = AllowListAskResolver::new(vec!["bash".to_string()]);
+        assert!(r.resolve("bash", &json!({})));
+        assert!(!r.resolve("fs.write", &json!({})));
     }
 }

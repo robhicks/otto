@@ -54,7 +54,11 @@ impl Default for DefaultPermissionGate {
 }
 
 impl PermissionGate for DefaultPermissionGate {
-    fn evaluate(&self, _tool: &str, args: &Value) -> Decision {
+    fn evaluate(&self, tool: &str, args: &Value) -> Decision {
+        // Shell exec can't be statically vetted by path — it always requires explicit approval.
+        if tool == "bash" {
+            return Decision::Ask;
+        }
         for p in Self::candidate_paths(args) {
             if Self::is_sensitive(&p) {
                 return Decision::Deny;
@@ -131,6 +135,15 @@ mod tests {
         assert_eq!(
             gate.evaluate("fs.list", &json!({"glob": "src/**/*.rs"})),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn bash_requires_ask() {
+        let gate = DefaultPermissionGate::new();
+        assert_eq!(
+            gate.evaluate("bash", &json!({"command": "ls"})),
+            Decision::Ask
         );
     }
 
