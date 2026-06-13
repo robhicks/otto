@@ -3,9 +3,11 @@
 use std::sync::{Arc, Mutex};
 
 use otto_agents::{EchoCoder, StubContextFinder, StubPlanner, StubVerifier};
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Provider, Workspace};
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_protocol::{Event, EventKind, Role, SessionId};
+use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
+use otto_router::{BrainBlendRouter, SingleProviderRouter};
 
 /// Build the registry of built-in walking-skeleton agents.
 pub fn build_default_registry() -> AgentRegistry {
@@ -17,7 +19,40 @@ pub fn build_default_registry() -> AgentRegistry {
     registry
 }
 
-/// Run one turn for `goal` against `workspace` using `provider`, returning the
+/// Build a router from environment configuration.
+///
+/// - Local slot: `OllamaProvider` if `OTTO_OLLAMA=1` (model from `OTTO_OLLAMA_MODEL`,
+///   default `llama3.2`), otherwise the deterministic `LocalProvider`.
+/// - Remote slot: `AnthropicProvider` if `ANTHROPIC_API_KEY` is set (model from
+///   `OTTO_ANTHROPIC_MODEL`, default `claude-haiku-4-5`), otherwise the local slot is
+///   reused so routing still works with one real backend.
+///
+/// With no env vars set, both slots are the deterministic `LocalProvider`, so the engine
+/// runs fully offline and deterministically — the default for tests and first-run.
+pub fn build_router() -> Box<dyn otto_engine_core::Router> {
+    let local: Arc<dyn Provider> = if std::env::var("OTTO_OLLAMA").as_deref() == Ok("1") {
+        let model = std::env::var("OTTO_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+        Arc::new(OllamaProvider::local_default(model))
+    } else {
+        Arc::new(LocalProvider::new())
+    };
+
+    match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            let model = std::env::var("OTTO_ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+            let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
+                AnthropicProvider::api_base_default(),
+                key,
+                model,
+            ));
+            Box::new(BrainBlendRouter::new(local, remote))
+        }
+        _ => Box::new(SingleProviderRouter::new(local)),
+    }
+}
+
+/// Run one turn for `goal` against `workspace` using `router`, returning the
 /// sequenced events emitted and the final outcome. The engine assigns the per-session
 /// monotonic `seq` to each event here (the orchestrator emits bare `EventKind`s).
 pub async fn run_goal(
@@ -53,4 +88,42 @@ pub async fn run_goal(
 
     let events = collected.lock().unwrap().clone();
     Ok((events, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otto_engine_core::RouteHints;
+    use otto_engine_core::types::CompleteRequest;
+
+    #[tokio::test]
+    async fn default_build_router_is_offline_and_deterministic() {
+        // Ensure the env that would select real backends is absent for this test.
+        // SAFETY: single-threaded test; we only remove vars we don't rely on elsewhere.
+        unsafe {
+            std::env::remove_var("OTTO_OLLAMA");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        let router = build_router();
+        let a = router
+            .complete(
+                CompleteRequest {
+                    prompt: "ping".into(),
+                },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        let b = router
+            .complete(
+                CompleteRequest {
+                    prompt: "ping".into(),
+                },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        assert!(a.text.contains("ping"));
+    }
 }
