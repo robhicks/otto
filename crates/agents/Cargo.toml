@@ -1,0 +1,17 @@
+[package]
+name = "otto-agents"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+otto-engine-core = { path = "../engine-core" }
+async-trait.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+otto-providers = { path = "../providers" }
+otto-workspace = { path = "../workspace" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+tempfile.workspace = true
