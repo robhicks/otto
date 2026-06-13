@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
 use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit, Milestone};
 
@@ -46,8 +47,14 @@ impl Agent for EchoCoder {
             anyhow::bail!("EchoCoder received a non-Code request");
         };
         let completion = ctx
-            .provider
-            .complete(CompleteRequest { prompt: goal })
+            .router()
+            .complete(
+                CompleteRequest { prompt: goal },
+                RouteHints {
+                    task_kind: TaskKind::Edit,
+                    ..RouteHints::default()
+                },
+            )
             .await?;
         Ok(AgentOutput::Code {
             edits: vec![Edit {
@@ -78,18 +85,17 @@ impl Agent for StubVerifier {
 mod tests {
     use super::*;
     use otto_providers::LocalProvider;
+    use otto_router::SingleProviderRouter;
     use otto_workspace::LocalWorkspace;
+    use std::sync::Arc;
 
-    fn ctx<'a>(provider: &'a LocalProvider, workspace: &'a LocalWorkspace) -> AgentCtx<'a> {
-        AgentCtx {
-            provider,
-            workspace,
-        }
+    fn ctx<'a>(router: &'a SingleProviderRouter, workspace: &'a LocalWorkspace) -> AgentCtx<'a> {
+        AgentCtx::new(router, workspace)
     }
 
     #[tokio::test]
     async fn planner_produces_one_milestone_from_goal() {
-        let provider = LocalProvider::new();
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
         let dir = tempfile::tempdir().unwrap();
         let ws = LocalWorkspace::new(dir.path());
         let out = StubPlanner
@@ -97,7 +103,7 @@ mod tests {
                 AgentRequest::Plan {
                     goal: "add a greeting".to_string(),
                 },
-                &ctx(&provider, &ws),
+                &ctx(&router, &ws),
             )
             .await
             .unwrap();
@@ -112,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn coder_turns_completion_into_an_edit() {
-        let provider = LocalProvider::new();
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
         let dir = tempfile::tempdir().unwrap();
         let ws = LocalWorkspace::new(dir.path());
         let out = EchoCoder
@@ -121,7 +127,7 @@ mod tests {
                     goal: "add a greeting".to_string(),
                     context: Vec::new(),
                 },
-                &ctx(&provider, &ws),
+                &ctx(&router, &ws),
             )
             .await
             .unwrap();

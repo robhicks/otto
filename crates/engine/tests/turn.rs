@@ -2,20 +2,22 @@
 //! sequenced event stream ending in a successful TurnComplete.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use otto_engine::run_goal;
 use otto_engine_core::traits::Workspace;
 use otto_protocol::EventKind;
 use otto_providers::LocalProvider;
+use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
 
 #[tokio::test]
 async fn full_turn_writes_output_file_and_completes_ok() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = LocalProvider::new();
+    let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
     let workspace = LocalWorkspace::new(dir.path());
 
-    let (events, outcome) = run_goal("add a greeting", &provider, &workspace)
+    let (events, outcome) = run_goal("add a greeting", &router, &workspace)
         .await
         .unwrap();
 

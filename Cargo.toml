@@ -5,6 +5,7 @@ members = [
     "crates/engine-core",
     "crates/workspace",
     "crates/providers",
+    "crates/router",
     "crates/agents",
     "crates/engine",
 ]

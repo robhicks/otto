@@ -2,8 +2,7 @@
 
 use std::path::PathBuf;
 
-use otto_engine::run_goal;
-use otto_providers::LocalProvider;
+use otto_engine::{build_router, run_goal};
 use otto_workspace::LocalWorkspace;
 
 #[tokio::main]
@@ -33,10 +32,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let provider = LocalProvider::new();
+    let router = build_router();
     let workspace = LocalWorkspace::new(root);
 
-    let (events, outcome) = run_goal(&goal, &provider, &workspace).await?;
+    let (events, outcome) = run_goal(&goal, router.as_ref(), &workspace).await?;
     for event in &events {
         println!("[{:>3}] {:?}", event.seq, event.kind);
     }

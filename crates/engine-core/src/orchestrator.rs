@@ -4,7 +4,8 @@
 use otto_protocol::{EventKind, Role, SessionId};
 
 use crate::registry::AgentRegistry;
-use crate::traits::{AgentCtx, Provider, Workspace};
+use crate::router::Router;
+use crate::traits::{AgentCtx, Workspace};
 use crate::types::{AgentOutput, AgentRequest};
 
 /// Sink for engine -> frontend events. The engine supplies a real implementation;
@@ -27,7 +28,7 @@ pub struct TurnOutcome {
 
 pub struct Orchestrator<'a> {
     pub registry: &'a AgentRegistry,
-    pub provider: &'a dyn Provider,
+    pub router: &'a dyn Router,
     pub workspace: &'a dyn Workspace,
 }
 
@@ -41,10 +42,7 @@ impl<'a> Orchestrator<'a> {
         goal: &str,
         emit: &dyn Emitter,
     ) -> anyhow::Result<TurnOutcome> {
-        let ctx = AgentCtx {
-            provider: self.provider,
-            workspace: self.workspace,
-        };
+        let ctx = AgentCtx::new(self.router, self.workspace);
 
         // --- Plan ---
         emit.emit(EventKind::AgentStarted {
@@ -141,19 +139,21 @@ impl<'a> Orchestrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traits::{Agent, Provider, Workspace};
+    use crate::router::{RouteHints, Router};
+    use crate::traits::{Agent, Workspace};
     use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone};
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
-    struct FakeProvider;
+    struct FakeRouter;
     #[async_trait]
-    impl Provider for FakeProvider {
-        fn id(&self) -> &str {
-            "fake"
-        }
-        async fn complete(&self, _req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
+    impl Router for FakeRouter {
+        async fn complete(
+            &self,
+            _req: CompleteRequest,
+            _hints: RouteHints,
+        ) -> anyhow::Result<CompleteResponse> {
             Ok(CompleteResponse {
                 text: "fake".to_string(),
             })
@@ -231,11 +231,11 @@ mod tests {
     #[tokio::test]
     async fn run_turn_drives_full_spine_and_emits_ordered_events() {
         let reg = registry();
-        let provider = FakeProvider;
+        let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let orch = Orchestrator {
             registry: &reg,
-            provider: &provider,
+            router: &router,
             workspace: &workspace,
         };
 
@@ -295,11 +295,11 @@ mod tests {
     async fn run_turn_errors_when_a_role_is_missing() {
         let mut reg = AgentRegistry::new();
         reg.register(Role::Planner, Arc::new(FixedPlanner));
-        let provider = FakeProvider;
+        let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let orch = Orchestrator {
             registry: &reg,
-            provider: &provider,
+            router: &router,
             workspace: &workspace,
         };
 
