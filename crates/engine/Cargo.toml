@@ -16,6 +16,7 @@ otto-workspace = { path = "../workspace" }
 otto-providers = { path = "../providers" }
 otto-router = { path = "../router" }
 otto-agents = { path = "../agents" }
+otto-tools = { path = "../tools" }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 

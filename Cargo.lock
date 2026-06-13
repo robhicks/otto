@@ -692,6 +692,7 @@ dependencies = [
  "otto-protocol",
  "otto-providers",
  "otto-router",
+ "otto-tools",
  "otto-workspace",
  "tempfile",
  "tokio",

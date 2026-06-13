@@ -3,11 +3,13 @@
 use std::sync::{Arc, Mutex};
 
 use otto_agents::{EchoCoder, StubContextFinder, StubPlanner, StubVerifier};
+use otto_engine_core::tool::{DenyAsk, ToolRegistry};
 use otto_engine_core::traits::{Provider, Workspace};
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_protocol::{Event, EventKind, Role, SessionId};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
 use otto_router::{BrainBlendRouter, SingleProviderRouter};
+use otto_tools::{DefaultPermissionGate, FsListTool, FsReadTool, FsWriteTool};
 
 /// Build the registry of built-in walking-skeleton agents.
 pub fn build_default_registry() -> AgentRegistry {
@@ -52,6 +54,16 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     }
 }
 
+/// Build the default tool registry: the sensitive-path-floor gate, a deny-by-default `Ask`
+/// resolver (headless), and the in-process fs tools bound to `workspace`.
+pub fn build_tool_registry(workspace: Arc<dyn Workspace>) -> ToolRegistry {
+    let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
+    registry.register(Arc::new(FsReadTool::new(Arc::clone(&workspace))));
+    registry.register(Arc::new(FsWriteTool::new(Arc::clone(&workspace))));
+    registry.register(Arc::new(FsListTool::new(workspace)));
+    registry
+}
+
 /// Run one turn for `goal` against `workspace` using `router`, returning the
 /// sequenced events emitted and the final outcome. The engine assigns the per-session
 /// monotonic `seq` to each event here (the orchestrator emits bare `EventKind`s).
@@ -59,6 +71,7 @@ pub async fn run_goal(
     goal: &str,
     router: &dyn Router,
     workspace: &dyn Workspace,
+    tools: &ToolRegistry,
 ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
     let registry = build_default_registry();
     let session = SessionId::new();
@@ -83,6 +96,7 @@ pub async fn run_goal(
         registry: &registry,
         router,
         workspace,
+        tools,
     };
     let outcome = orchestrator.run_turn(session, goal, &sink).await?;
 
