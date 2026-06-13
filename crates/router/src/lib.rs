@@ -104,7 +104,12 @@ impl Router for BrainBlendRouter {
         match self.provider(&primary).complete(req.clone()).await {
             Ok(resp) => Ok(resp),
             Err(primary_err) => {
-                // Fall back to the other provider once; if it also fails, surface both.
+                // Never fall back across the privacy boundary: a privacy-sensitive request
+                // must stay on its (local) provider — re-sending it to the other (remote)
+                // provider on failure would leak sensitive data. Surface the error instead.
+                if hints.privacy_sensitive {
+                    return Err(primary_err);
+                }
                 let fallback = Self::other(&primary);
                 self.provider(&fallback)
                     .complete(req)
@@ -236,5 +241,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "remote");
+    }
+
+    #[tokio::test]
+    async fn privacy_sensitive_never_falls_back_to_remote() {
+        // Privacy-sensitive → primary is local. If local fails, the request MUST NOT be
+        // re-sent to the remote provider; it must surface the local error.
+        let router = BrainBlendRouter::new(Arc::new(FailProvider), Arc::new(TagProvider("remote")));
+        let hints = RouteHints {
+            privacy_sensitive: true,
+            ..RouteHints::default()
+        };
+        let err = router
+            .complete(
+                CompleteRequest {
+                    prompt: "secret".into(),
+                },
+                hints,
+            )
+            .await
+            .unwrap_err();
+        // It returned the local failure, NOT the remote provider's "remote" text.
+        assert!(
+            err.to_string().contains("boom"),
+            "expected local error, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("remote"),
+            "must not have reached remote: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_providers_fail_surfaces_both_errors() {
+        let router = BrainBlendRouter::new(Arc::new(FailProvider), Arc::new(FailProvider));
+        let err = router
+            .complete(
+                CompleteRequest { prompt: "x".into() },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("primary"), "primary label missing: {msg}");
+        assert!(msg.contains("fallback"), "fallback label missing: {msg}");
+        assert!(msg.contains("boom"), "original error text missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn remote_primary_falls_back_to_local() {
+        // Architecture → primary is remote. If remote fails (non-privacy), fall back to local.
+        let router = BrainBlendRouter::new(Arc::new(TagProvider("local")), Arc::new(FailProvider));
+        let hints = RouteHints {
+            task_kind: TaskKind::Architecture,
+            ..RouteHints::default()
+        };
+        let out = router
+            .complete(CompleteRequest { prompt: "x".into() }, hints)
+            .await
+            .unwrap();
+        assert_eq!(out.text, "local");
     }
 }
