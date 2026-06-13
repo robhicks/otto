@@ -33,6 +33,7 @@ otto-next/
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
 │   ├── remote           # RemoteTarget impls: vps (v1-ready), microvm (v2).
+│   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
 └── ui/                  # Tauri 2 + Leptos frontend (separate build).
@@ -177,6 +178,34 @@ UI: PromoteToRemote
               RemoteWorkspace from patch bundle / scratch branch
         └─► returns WSS endpoint ──► UI reconnects, replays events from Last-Event-ID
 ```
+
+## Claude Code compatibility
+
+otto's native extension format is Claude Code's `.claude/` convention. The `extensions`
+crate discovers `.claude/` (project) and `~/.claude/` (user-global) at session start and
+registers each artifact into an existing otto primitive — there is no parallel otto-only
+format:
+
+- `agents/*.md` → `AgentRegistry` as `Role::Custom(name)` (honors per-agent tool allowlist + model).
+- `commands/*.md` → command registry (prompt templates for the palette).
+- `skills` (`SKILL.md` + resources) → loadable skills exposed via a built-in `Skill` tool.
+- `settings.json` hooks → `HookRegistry`, fired at the same lifecycle points.
+- `settings.json` permissions → composed into the Layer-2 permission gate.
+- plugins (`.claude-plugin/plugin.json`) → manifest parsed; each bundled component registered
+  via the rows above; **bundled MCP servers route straight into otto's MCP client unmodified.**
+
+`extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
+gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
+the single registration seam (Plan 1) is what makes this additive rather than invasive.
+
+## Editor interop (frontend)
+
+CodeMirror 6 (JS) is mounted into a Leptos-owned DOM node, not reimplemented in Rust. A
+bundled JS glue ES-module exposes `mountEditor(element, opts)`, `getDoc()`, `setDoc(text)`,
+and an `onChange` callback; Rust imports it via `#[wasm_bindgen(module = "...")]`. A Leptos
+component owns the mount element through a `node_ref`, instantiates the editor in a creation
+effect, tears it down on unmount, and bridges changes into Leptos signals via `onChange`. The
+same module is used unchanged in the Tauri desktop and Tauri 2 mobile webviews.
 
 ## Capability negotiation
 

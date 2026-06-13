@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-13
 **Status:** Draft for review
-**Working name:** otto (greenfield successor to `ai-coder`/savvagent, `otto-old`, and `otto`)
+**Name:** otto (final — greenfield successor to `ai-coder`/savvagent, `otto-old`, and the prior `otto`)
 
 ## Summary
 
@@ -21,6 +21,7 @@ otto decouples all four axes behind **one stable UI↔Engine protocol**. There i
 - The orchestrator is a deterministic, debuggable control loop; capabilities are composed from swappable atomic agents.
 - The app detects the limitations of its environment and adjusts how and where it runs.
 - Runs on desktop now; the same frontend codebase targets mobile later.
+- **Developers' existing Claude Code investment carries over unchanged**: their `.claude/` agents, slash commands, skills, hooks, and plugins work in otto without modification.
 
 ## Non-Goals (v1)
 
@@ -47,7 +48,8 @@ otto decouples all four axes behind **one stable UI↔Engine protocol**. There i
 3. **Pluggable remote target.** Promote-to-remote ships against a `RemoteTarget` trait: a long-lived VPS/server impl first, ephemeral microVM impl later.
 4. **Native agents now, WASM-pluggable later.** Agents are native Rust behind an `Agent` trait; safety is MCP path-containment + OS sandboxing. The trait is the seam where a `wasm32-wasip2` agent backend slots in later.
 5. **Orchestrator model = Approach C.** A deterministic spine drives atomic agents as swappable units; user-defined markdown agents register as additional roles/sub-steps.
-6. **Editor = CodeMirror 6** (lighter than Monaco, fits minimalist + future mobile).
+6. **Editor = CodeMirror 6** (lighter than Monaco, fits minimalist + future mobile), mounted into a Leptos-owned DOM node via a thin `wasm-bindgen` JS-interop shim — see Frontend below.
+7. **Claude Code's `.claude/` conventions are otto's native, primary extension format.** Rather than inventing an otto-specific format with a Claude-compat layer bolted on, otto reads `.claude/` agents, commands, skills, hooks (`settings.json`), and plugins directly. This is viable because otto already shares Claude Code's core primitives (MCP tools, subagents, slash commands, hooks). Existing developer investment carries over with zero porting.
 
 ## Architecture
 
@@ -149,6 +151,8 @@ Minimalist, terminal-like, *not* VSCode-shaped but VSCode-*capable*. Surfaces:
 - **Conversation / command pane** — the Claude-Code-like core: prompt, streaming agent output, inline tool calls + diffs.
 - **Rich prompt editor** — CodeMirror 6 for multi-line prompt composition with file-mentions, slash commands, syntax.
 - **File peek / edit** — light viewer + diff + occasional edit for a couple of files (CodeMirror). Not a project-wide tree.
+
+**Editor integration approach (decided):** CodeMirror 6 is a JS library; Leptos renders to the real DOM via Rust→WASM. otto does **not** reimplement an editor in Rust. Instead, a small JS glue ES-module (bundled with the UI) exposes `mountEditor(element, opts)`, `getDoc()`, `setDoc(text)`, and an `onChange` callback. Rust imports it via `#[wasm_bindgen(module = "...")]`. A Leptos component owns the mount `<div>` through a `node_ref`, instantiates CodeMirror in a creation effect, tears it down on unmount, and bridges document changes into Leptos signals through the `onChange` callback. The same module works in the Tauri desktop webview and the Tauri 2 mobile webview unchanged.
 - **Status strip** — agent state, Brain-Blend mode (local/remote LLM), token/cost meter, git + verify status.
 
 Desktop now; iOS/Android later from the same Leptos + Tauri 2 codebase.
@@ -162,6 +166,28 @@ On startup the engine emits a **capabilities manifest**: Ollama present? sandbox
 - Local engine + no sandbox → verify falls back to host runner with a warning.
 
 This is the concrete answer to "recognizes limitations of the environment and adjusts how and where it runs."
+
+### Claude Code compatibility (native extension format)
+
+otto's extension format **is** Claude Code's `.claude/` convention — not a separate format with a compatibility shim. A developer who already uses Claude Code drops otto into their repo and their existing tooling works. An `extensions` crate discovers and loads `.claude/` (and `~/.claude/` for user-global) at session start and registers each artifact into the matching otto primitive:
+
+| Claude Code artifact | On disk | Maps to otto primitive |
+|---|---|---|
+| **Agents** | `.claude/agents/*.md` (frontmatter: name, description, tools, model) | A user-defined `Agent` registered in the `AgentRegistry` as `Role::Custom(name)`; the Coder can delegate to it. Honors the per-agent tool allowlist and model override. |
+| **Slash commands** | `.claude/commands/*.md` | An entry in otto's command registry; the markdown body is a prompt template the UI's command palette can invoke. |
+| **Skills** | `SKILL.md` (+ bundled scripts/resources) under `.claude/skills/` or plugins | A loadable skill exposed to the orchestrator via a built-in `Skill` tool; the model invokes it by name, otto injects the skill body and makes its scripts available through `mcp-bash`. |
+| **Hooks** | `.claude/settings.json` hook entries (PreToolUse, PostToolUse, Stop, …) | Registered in otto's `HookRegistry`; the engine fires them at the same lifecycle points around tool calls and turns, executing the configured shell command and honoring its verdict. |
+| **Permissions** | `.claude/settings.json` `permissions` (allow/ask/deny) | Fed into otto's Layer-2 permission gate (see Security), composed with otto's own rules and the inviolable sensitive-path floor. |
+| **Plugins** | `.claude-plugin/plugin.json` manifest bundling the above + MCP servers | The manifest is parsed and each component is registered through the rows above; bundled **MCP servers route straight into otto's existing MCP client** with no adaptation, since otto already speaks MCP. |
+
+**What carries over cleanly:** agents, commands, hooks, permissions, and plugin-bundled MCP servers map one-to-one because otto's primitives are the same shapes Claude Code uses.
+
+**Known limits (documented, not hidden):**
+- Skills/agents authored assuming Claude-specific model behavior may behave differently when otto's Brain-Blend router sends a task to a *local* model. The artifact still loads and runs; only model quality varies. otto surfaces which model handled each step in the status strip.
+- Hooks are shell commands; they require a shell-capable environment (always true for a local engine; on a remote engine they run in the remote workspace).
+- otto's built-in tool names are kept aligned with Claude Code's where an artifact's tool allowlist references them; any otto-only tool is additive.
+
+This makes Claude Code compatibility a *first-class, native* capability rather than a feature. It is cross-cutting: the loader depends on the agent registry (Plan 1), the MCP client + permission gate (Plan 3), and the real LLM-backed agents (Plan 4), so it lands as its own dedicated plan once those seams exist (see v1 scope).
 
 ### Security
 
@@ -196,8 +222,15 @@ Verification runs in Podman containers when available, with a host runner fallba
 
 **Deferred to v2+ but designed-for now** (traits defined remote-ready in v1): remote engine target + promote-to-remote, mobile build, vector/hybrid retrieval, WASM agents, microVM `RemoteTarget`, mcp-lsp, jira.
 
+**Claude Code compatibility** ships as its own plan once its prerequisite seams exist (agent registry from Plan 1, MCP client + permission gate from Plan 3, real LLM agents from Plan 4): the `extensions` crate that loads `.claude/` agents, commands, skills, hooks, permissions, and plugins. It is native, not deferred-as-optional — it is sequenced after the seams it builds on.
+
+## Resolved questions
+
+- **Project name:** `otto` (final). The prior `/home/robhicks/dev/otto` repo is superseded; this greenfield repo lives at `/home/robhicks/dev/otto-next`.
+- **Editor integration:** CodeMirror 6 mounted into a Leptos-owned DOM node via a `wasm-bindgen` JS-interop shim (see Frontend). No Rust-native editor.
+- **User-defined agents / extensions:** otto adopts Claude Code's `.claude/` conventions as its **native, primary** extension format covering agents, commands, skills, hooks, permissions, and plugins (see Claude Code compatibility).
+
 ## Open questions
 
-- Final project name (working name "otto" collides with the prior repo).
-- Exact Leptos editor integration approach for CodeMirror 6 inside the Tauri webview.
-- Whether user-defined agents reuse `.claude/agents/` markdown for compatibility (savvagent did).
+- Exact set of otto built-in tool names to keep aligned with Claude Code's, so imported tool allowlists resolve. Finalize when the MCP fleet lands (Plan 3).
+- Skill execution model details (how bundled skill scripts are sandboxed when invoked) — finalize against the Security layering in the Claude Code compatibility plan.
