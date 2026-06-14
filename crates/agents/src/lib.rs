@@ -1,6 +1,8 @@
 //! Walking-skeleton atomic agents. These return canned/structured output so the
 //! orchestrator spine can be proven before real LLM-backed agents arrive.
 
+pub mod parse;
+
 use std::path::PathBuf;
 
 use async_trait::async_trait;
