@@ -1,5 +1,6 @@
-//! Walking-skeleton atomic agents. These return canned/structured output so the
-//! orchestrator spine can be proven before real LLM-backed agents arrive.
+//! otto's atomic agents. `Planner` and `Coder` are real LLM-backed agents — each prompts the
+//! router for structured JSON and parses it, falling back safely when no JSON is returned.
+//! `StubContextFinder` and `StubVerifier` remain stubs until their real versions land.
 
 pub mod coder;
 pub mod parse;
