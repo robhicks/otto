@@ -1,28 +1,18 @@
-//! Walking-skeleton atomic agents. These return canned/structured output so the
-//! orchestrator spine can be proven before real LLM-backed agents arrive.
+//! otto's atomic agents. `Planner` and `Coder` are real LLM-backed agents — each prompts the
+//! router for structured JSON and parses it, falling back safely when no JSON is returned.
+//! `StubContextFinder` and `StubVerifier` remain stubs until their real versions land.
 
-use std::path::PathBuf;
+pub mod coder;
+pub mod parse;
+pub mod planner;
+
+pub use coder::Coder;
+pub use planner::Planner;
 
 use async_trait::async_trait;
-use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
-use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit, Milestone};
+use otto_engine_core::types::{AgentOutput, AgentRequest};
 use serde_json::Value;
-
-/// Turns a goal into a single milestone.
-pub struct StubPlanner;
-
-#[async_trait]
-impl Agent for StubPlanner {
-    async fn run(&self, req: AgentRequest, _ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
-        let AgentRequest::Plan { goal } = req else {
-            anyhow::bail!("StubPlanner received a non-Plan request");
-        };
-        Ok(AgentOutput::Plan {
-            milestones: vec![Milestone { description: goal }],
-        })
-    }
-}
 
 /// Lists the workspace's top-level files via the `fs.list` tool and returns them as context.
 /// Falls back to an empty set if the tool is unavailable or errors (skeleton-friendly).
@@ -47,35 +37,6 @@ impl Agent for StubContextFinder {
             _ => Vec::new(),
         };
         Ok(AgentOutput::Context { files })
-    }
-}
-
-/// Calls the provider with the goal and writes the completion to `otto_output.txt`.
-/// This is the agent that exercises the Provider seam end-to-end.
-pub struct EchoCoder;
-
-#[async_trait]
-impl Agent for EchoCoder {
-    async fn run(&self, req: AgentRequest, ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
-        let AgentRequest::Code { goal, .. } = req else {
-            anyhow::bail!("EchoCoder received a non-Code request");
-        };
-        let completion = ctx
-            .router()
-            .complete(
-                CompleteRequest { prompt: goal },
-                RouteHints {
-                    task_kind: TaskKind::Edit,
-                    ..RouteHints::default()
-                },
-            )
-            .await?;
-        Ok(AgentOutput::Code {
-            edits: vec![Edit {
-                path: PathBuf::from("otto_output.txt"),
-                new_contents: completion.text,
-            }],
-        })
     }
 }
 
@@ -111,56 +72,6 @@ mod tests {
         tools: &'a ToolRegistry,
     ) -> AgentCtx<'a> {
         AgentCtx::new(router, workspace, tools)
-    }
-
-    #[tokio::test]
-    async fn planner_produces_one_milestone_from_goal() {
-        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
-        let dir = tempfile::tempdir().unwrap();
-        let ws = LocalWorkspace::new(dir.path());
-        let tools = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
-        let out = StubPlanner
-            .run(
-                AgentRequest::Plan {
-                    goal: "add a greeting".to_string(),
-                },
-                &ctx(&router, &ws, &tools),
-            )
-            .await
-            .unwrap();
-        match out {
-            AgentOutput::Plan { milestones } => {
-                assert_eq!(milestones.len(), 1);
-                assert_eq!(milestones[0].description, "add a greeting");
-            }
-            other => panic!("expected Plan output, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn coder_turns_completion_into_an_edit() {
-        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
-        let dir = tempfile::tempdir().unwrap();
-        let ws = LocalWorkspace::new(dir.path());
-        let tools = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
-        let out = EchoCoder
-            .run(
-                AgentRequest::Code {
-                    goal: "add a greeting".to_string(),
-                    context: Vec::new(),
-                },
-                &ctx(&router, &ws, &tools),
-            )
-            .await
-            .unwrap();
-        match out {
-            AgentOutput::Code { edits } => {
-                assert_eq!(edits.len(), 1);
-                assert_eq!(edits[0].path, PathBuf::from("otto_output.txt"));
-                assert!(edits[0].new_contents.contains("add a greeting"));
-            }
-            other => panic!("expected Code output, got {other:?}"),
-        }
     }
 
     #[tokio::test]

@@ -71,6 +71,17 @@ live in `agents`; a `wasm32-wasip2` impl can register against the same trait lat
 orchestrator only knows roles and endpoints — it never knows whether an agent is native,
 wasm, or a user-defined markdown SubHost.
 
+The built-in `Planner` and `Coder` are real LLM agents: each builds an instruction prompt
+asking the router for a specific JSON shape (milestones / file edits), calls
+`ctx.router().complete(...)`, and parses the response with `extract_json` (tolerant of fenced
+code blocks + surrounding prose). Prompts describe the JSON schema in PROSE rather than a
+literal example, so an offline echo provider yields no parseable JSON and the agents degrade
+safely — the Planner treats the whole goal as one milestone, the Coder produces no edits — so
+an offline run (no LLM configured) completes a turn but writes nothing. Tests drive a
+`ScriptedProvider` (deterministic prompt-keyed mock LLM) to exercise the real parse path. The
+Coder's edits still pass the orchestrator's fail-closed permission gate before being written.
+`ContextFinder` and `Verifier` remain stubs (real versions land next).
+
 ### `Workspace` — the workspace-axis seam
 
 ```rust

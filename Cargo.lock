@@ -677,6 +677,7 @@ dependencies = [
  "otto-router",
  "otto-tools",
  "otto-workspace",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
