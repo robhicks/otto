@@ -2,29 +2,17 @@
 //! orchestrator spine can be proven before real LLM-backed agents arrive.
 
 pub mod parse;
+pub mod planner;
+
+pub use planner::Planner;
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
-use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit, Milestone};
+use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit};
 use serde_json::Value;
-
-/// Turns a goal into a single milestone.
-pub struct StubPlanner;
-
-#[async_trait]
-impl Agent for StubPlanner {
-    async fn run(&self, req: AgentRequest, _ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
-        let AgentRequest::Plan { goal } = req else {
-            anyhow::bail!("StubPlanner received a non-Plan request");
-        };
-        Ok(AgentOutput::Plan {
-            milestones: vec![Milestone { description: goal }],
-        })
-    }
-}
 
 /// Lists the workspace's top-level files via the `fs.list` tool and returns them as context.
 /// Falls back to an empty set if the tool is unavailable or errors (skeleton-friendly).
@@ -113,30 +101,6 @@ mod tests {
         tools: &'a ToolRegistry,
     ) -> AgentCtx<'a> {
         AgentCtx::new(router, workspace, tools)
-    }
-
-    #[tokio::test]
-    async fn planner_produces_one_milestone_from_goal() {
-        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
-        let dir = tempfile::tempdir().unwrap();
-        let ws = LocalWorkspace::new(dir.path());
-        let tools = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
-        let out = StubPlanner
-            .run(
-                AgentRequest::Plan {
-                    goal: "add a greeting".to_string(),
-                },
-                &ctx(&router, &ws, &tools),
-            )
-            .await
-            .unwrap();
-        match out {
-            AgentOutput::Plan { milestones } => {
-                assert_eq!(milestones.len(), 1);
-                assert_eq!(milestones[0].description, "add a greeting");
-            }
-            other => panic!("expected Plan output, got {other:?}"),
-        }
     }
 
     #[tokio::test]
