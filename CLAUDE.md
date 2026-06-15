@@ -65,7 +65,7 @@ impl crate.
 ### The orchestrator spine
 
 `Orchestrator::run_turn` (`crates/engine-core/src/orchestrator.rs`) is the deterministic
-control flow: **Plan → Execute (ContextFinder → Coder → apply edits) → Verify → Done**. It
+control flow: **Plan → Execute (ContextFinder → Coder → apply gated edits → Verify, looping to Repair on failure) → Done**. It
 owns control flow and event emission only; all capability lives in the agents. Agents
 receive an `AgentCtx` granting scoped access to `router()`, `workspace()`, and `tools()` —
 add a capability by extending `AgentCtx` (private fields + accessors), never by widening a

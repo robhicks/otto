@@ -31,9 +31,20 @@ pub struct Milestone {
 /// The uniform request passed to any atomic agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentRequest {
-    Plan { goal: String },
-    FindContext { goal: String },
-    Code { goal: String, context: Vec<PathBuf> },
+    Plan {
+        goal: String,
+    },
+    FindContext {
+        goal: String,
+    },
+    Code {
+        goal: String,
+        context: Vec<PathBuf>,
+        /// The previous verify failure detail, if this is a repair attempt.
+        feedback: Option<String>,
+        /// How many times this turn has already failed verification (drives routing escalation).
+        prior_failures: u32,
+    },
     Verify,
 }
 
