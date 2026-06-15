@@ -1,13 +1,15 @@
 //! otto's atomic agents. `Planner` and `Coder` are real LLM-backed agents — each prompts the
 //! router for structured JSON and parses it, falling back safely when no JSON is returned.
-//! `StubContextFinder` and `StubVerifier` remain stubs until their real versions land.
+//! `StubContextFinder` remains a stub until its real version lands.
 
 pub mod coder;
 pub mod parse;
 pub mod planner;
+pub mod verifier;
 
 pub use coder::Coder;
 pub use planner::Planner;
+pub use verifier::Verifier;
 
 use async_trait::async_trait;
 use otto_engine_core::traits::{Agent, AgentCtx};
@@ -37,22 +39,6 @@ impl Agent for StubContextFinder {
             _ => Vec::new(),
         };
         Ok(AgentOutput::Context { files })
-    }
-}
-
-/// Always reports success in the skeleton.
-pub struct StubVerifier;
-
-#[async_trait]
-impl Agent for StubVerifier {
-    async fn run(&self, req: AgentRequest, _ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
-        let AgentRequest::Verify = req else {
-            anyhow::bail!("StubVerifier received a non-Verify request");
-        };
-        Ok(AgentOutput::Verify {
-            ok: true,
-            detail: "skeleton verifier: no checks run".to_string(),
-        })
     }
 }
 
