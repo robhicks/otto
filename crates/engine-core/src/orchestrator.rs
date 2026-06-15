@@ -99,6 +99,8 @@ impl<'a> Orchestrator<'a> {
                 AgentRequest::Code {
                     goal: goal.to_string(),
                     context: files,
+                    feedback: None,
+                    prior_failures: 0,
                 },
                 &ctx,
             )
