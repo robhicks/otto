@@ -1,6 +1,9 @@
 //! `BashTool`: runs a shell command confined by a `SandboxPolicy`, with a timeout.
-//! The spawned command runs with a CLEARED, minimal environment (PATH/HOME/TERM only)
-//! so host credentials in env are not exposed.
+//! The spawned command runs with a CLEARED environment, then a curated minimal env that
+//! also makes the Rust toolchain usable (`PATH` includes the host's `~/.cargo/bin`;
+//! `CARGO_HOME`/`RUSTUP_HOME` point at the host toolchain) — non-secret locations only, so
+//! it grants no new read access beyond the already-read-only host FS. `HOME` is set last to
+//! the workspace root so host credentials in env are not exposed.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,6 +15,27 @@ use serde_json::{Value, json};
 use crate::sandbox::{SandboxPolicy, build_argv};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// The curated environment for a sandboxed command. The host environment is cleared (no
+/// credential leakage), then a minimal env is set that also makes the Rust toolchain usable:
+/// `PATH` includes the host's `~/.cargo/bin`, and `CARGO_HOME`/`RUSTUP_HOME` point at the host
+/// toolchain. These are non-secret locations; the host filesystem is already read-only-readable
+/// inside the sandbox, so this grants no new read access — it only makes `cargo`/`rustc` runnable.
+/// `HOME` is set separately to the workspace root by the caller.
+fn curated_env() -> Vec<(String, String)> {
+    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{host_home}/.cargo"));
+    let rustup_home =
+        std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{host_home}/.rustup"));
+    let path =
+        format!("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{cargo_home}/bin");
+    vec![
+        ("PATH".to_string(), path),
+        ("TERM".to_string(), "dumb".to_string()),
+        ("CARGO_HOME".to_string(), cargo_home),
+        ("RUSTUP_HOME".to_string(), rustup_home),
+    ]
+}
 
 /// `bash` — args `{ "command": "<sh>", "timeout_ms": <n>? }` →
 /// `{ "stdout": "...", "stderr": "...", "exit_code": <i32|null> }`.
@@ -46,15 +70,11 @@ impl Tool for BashTool {
         let (program, argv) = build_argv(&self.policy, &self.root, command)?;
 
         let mut cmd = tokio::process::Command::new(program);
-        cmd.args(argv)
-            .current_dir(&self.root)
-            .env_clear()
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
-            .env("HOME", &self.root)
-            .env("TERM", "dumb")
+        cmd.args(argv).current_dir(&self.root).env_clear();
+        for (key, val) in curated_env() {
+            cmd.env(key, val);
+        }
+        cmd.env("HOME", &self.root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -128,6 +148,33 @@ mod tests {
             .await
             .unwrap();
         assert!(out["stdout"].as_str().unwrap().contains("manifest=CLEARED"));
+    }
+
+    #[test]
+    fn curated_env_exposes_the_rust_toolchain() {
+        let env: std::collections::HashMap<String, String> = curated_env().into_iter().collect();
+        let path = env.get("PATH").expect("PATH set");
+        assert!(
+            path.contains("/.cargo/bin"),
+            "PATH must include the cargo bin dir: {path}"
+        );
+        assert!(
+            path.contains("/usr/bin"),
+            "PATH must keep system dirs: {path}"
+        );
+        assert!(
+            env.get("CARGO_HOME")
+                .expect("CARGO_HOME set")
+                .ends_with(".cargo")
+        );
+        assert!(
+            env.get("RUSTUP_HOME")
+                .expect("RUSTUP_HOME set")
+                .ends_with(".rustup")
+        );
+        assert_eq!(env.get("TERM").map(String::as_str), Some("dumb"));
+        // HOME is intentionally NOT in curated_env (the caller sets it to the workspace root).
+        assert!(!env.contains_key("HOME"));
     }
 
     #[tokio::test]
