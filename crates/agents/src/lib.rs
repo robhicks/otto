@@ -1,5 +1,6 @@
 //! otto's atomic agents. `Planner` and `Coder` are real LLM-backed agents — each prompts the
 //! router for structured JSON and parses it, falling back safely when no JSON is returned.
+//! `Verifier` is real too: it runs `cargo check` via the sandboxed `bash` tool. Only
 //! `StubContextFinder` remains a stub until its real version lands.
 
 pub mod coder;

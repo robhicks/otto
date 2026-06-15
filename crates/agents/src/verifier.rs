@@ -2,6 +2,12 @@
 //! `cargo check --offline` inside the sandboxed `bash` tool and reports pass/fail. It degrades
 //! gracefully: no recognized project -> "nothing to verify"; `bash` unavailable (no OS sandbox)
 //! -> "verification skipped". A failure here drives the orchestrator's Repair loop.
+//!
+//! Precondition: the check runs `--offline` because the sandbox has no network
+//! (`--unshare-net`). A project's dependencies must therefore already be present in the host
+//! `CARGO_HOME` cache; if they are not, `cargo` cannot fetch them and the check fails for a
+//! reason unrelated to the edits under test. The common case — re-verifying an
+//! already-built project — has a warm cache, so this holds.
 
 use async_trait::async_trait;
 use otto_engine_core::traits::{Agent, AgentCtx};

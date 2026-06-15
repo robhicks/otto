@@ -2,8 +2,13 @@
 //! The spawned command runs with a CLEARED environment, then a curated minimal env that
 //! also makes the Rust toolchain usable (`PATH` includes the host's `~/.cargo/bin`;
 //! `CARGO_HOME`/`RUSTUP_HOME` point at the host toolchain) — non-secret locations only, so
-//! it grants no new read access beyond the already-read-only host FS. `HOME` is set last to
-//! the workspace root so host credentials in env are not exposed.
+//! it grants no new read access beyond the already-read-only host FS. `HOME` and `TMPDIR` are
+//! set last to the workspace root: `HOME` so host credentials in env are not exposed, and
+//! `TMPDIR` because the OS sandbox mounts the whole host FS read-only except the workspace, so
+//! the default `/tmp` is not writable. Tools that create temp files there (notably `cc`/`lld`
+//! when `cargo` builds a registry dependency, whose source dir — the linker's cwd — is on the
+//! read-only mount) must be pointed at the writable workspace root, or they fail with
+//! "Read-only file system".
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -74,7 +79,11 @@ impl Tool for BashTool {
         for (key, val) in curated_env() {
             cmd.env(key, val);
         }
+        // HOME and TMPDIR are set last so they always point at the writable workspace root and
+        // cannot be overridden by curated_env. TMPDIR is required because the sandbox's default
+        // /tmp is read-only (see the module doc).
         cmd.env("HOME", &self.root)
+            .env("TMPDIR", &self.root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -193,5 +202,52 @@ mod tests {
             .unwrap();
         assert!(out["stdout"].as_str().unwrap().contains("sandboxed"));
         assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn tmpdir_points_at_the_workspace_root() {
+        // The command's TMPDIR must be the workspace root so toolchain temp files land in the
+        // one writable location (the sandbox mounts everything else read-only).
+        let tool = unsandboxed();
+        let out = tool
+            .call(json!({"command": "echo \"tmp=$TMPDIR\""}))
+            .await
+            .unwrap();
+        let stdout = out["stdout"].as_str().unwrap();
+        let root = tool.root.to_string_lossy();
+        assert!(
+            stdout.contains(&format!("tmp={root}")),
+            "TMPDIR must be the workspace root ({root}): {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_tmpdir_is_writable() {
+        // Regression guard for the read-only-/tmp bug: inside the sandbox the whole host FS is
+        // read-only except the workspace, so a writable TMPDIR is what lets `cargo`'s linker
+        // create its temp files. Without the TMPDIR fix this write fails ("Read-only file
+        // system") and the real Verifier's `cargo check` spuriously fails on any project with a
+        // registry dependency.
+        if !crate::sandbox::os_sandbox_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(
+            dir.path().to_path_buf(),
+            SandboxPolicy::Os { allow_net: false },
+        );
+        let out = tool
+            .call(json!({
+                "command": "test -n \"$TMPDIR\" && echo probe > \"$TMPDIR/otto-probe\" && echo WROTE"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["exit_code"].as_i64().unwrap(),
+            0,
+            "writing into $TMPDIR inside the sandbox must succeed; stderr={}",
+            out["stderr"].as_str().unwrap_or("")
+        );
+        assert!(out["stdout"].as_str().unwrap().contains("WROTE"));
     }
 }

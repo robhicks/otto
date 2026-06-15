@@ -146,7 +146,9 @@ on macOS, `sandbox-exec` applies an equivalent write-confined, network-denied pr
 spawned command runs with a cleared, minimal environment (`PATH`/`HOME`/`TERM`, plus the
 non-secret Rust toolchain location — `~/.cargo/bin` on `PATH` and `CARGO_HOME`/`RUSTUP_HOME`
 pointing at the host toolchain so the Verifier can run `cargo`) so host credentials in env are
-never exposed. The gate classifies `bash` as `Ask` (shell can't be
+never exposed. `HOME` and `TMPDIR` are both pinned to the workspace root — the latter because
+the default `/tmp` is on the read-only mount, so toolchain temp files (e.g. `cargo`'s linker
+building a registry dependency) must land in the one writable location. The gate classifies `bash` as `Ask` (shell can't be
 statically path-vetted), and the engine registers `bash` ONLY when an OS sandbox backend
 exists — pairing it with an `AllowListAskResolver` that permits the now-confined `bash`. With
 no backend, `bash` is absent and `Ask` stays denied (fail-closed). Output is
