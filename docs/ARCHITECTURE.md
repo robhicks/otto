@@ -80,7 +80,16 @@ safely — the Planner treats the whole goal as one milestone, the Coder produce
 an offline run (no LLM configured) completes a turn but writes nothing. Tests drive a
 `ScriptedProvider` (deterministic prompt-keyed mock LLM) to exercise the real parse path. The
 Coder's edits still pass the orchestrator's fail-closed permission gate before being written.
-`ContextFinder` and `Verifier` remain stubs (real versions land next).
+
+The `Verifier` is real: it detects the project (via `fs.list`) and, for a Cargo project, runs
+`cargo check --offline` inside the sandboxed `bash` tool, reporting pass/fail (a non-zero exit
+becomes `Verify { ok: false }` with the truncated build output as detail, which drives the
+orchestrator's Repair loop). It degrades safely — no recognized project → "nothing to verify";
+`bash` unavailable (no OS sandbox) → "verification skipped". To run `cargo` inside the
+cleared-env sandbox, `BashTool` passes through the non-secret Rust toolchain location (`PATH`
+includes `~/.cargo/bin`; `CARGO_HOME`/`RUSTUP_HOME` point at the host toolchain); this grants
+no new read access (the host FS is already read-only-readable in the sandbox) and network stays
+off, so the read-but-no-exfil posture is unchanged. `ContextFinder` remains a stub.
 
 ### `Workspace` — the workspace-axis seam
 
@@ -134,15 +143,16 @@ The `bash` tool (`BashTool`) runs shell commands confined by a `SandboxPolicy`: 
 `bwrap` mounts the whole filesystem read-only, re-binds only the workspace root writable, and
 isolates the network/pid/ipc/session namespaces (`--unshare-net/-pid/-ipc`, `--new-session`);
 on macOS, `sandbox-exec` applies an equivalent write-confined, network-denied profile. The
-spawned command runs with a cleared, minimal environment (`PATH`/`HOME`/`TERM` only) so host
-credentials in env are never exposed. The gate classifies `bash` as `Ask` (shell can't be
+spawned command runs with a cleared, minimal environment (`PATH`/`HOME`/`TERM`, plus the
+non-secret Rust toolchain location — `~/.cargo/bin` on `PATH` and `CARGO_HOME`/`RUSTUP_HOME`
+pointing at the host toolchain so the Verifier can run `cargo`) so host credentials in env are
+never exposed. The gate classifies `bash` as `Ask` (shell can't be
 statically path-vetted), and the engine registers `bash` ONLY when an OS sandbox backend
 exists — pairing it with an `AllowListAskResolver` that permits the now-confined `bash`. With
 no backend, `bash` is absent and `Ask` stays denied (fail-closed). Output is
 `{stdout, stderr, exit_code}`; a timeout kills the whole sandbox process tree via
-`kill_on_drop` (the pid-namespace ensures no orphans). Known deferrals: unbounded
-stdout/stderr buffering (no output cap yet), and toolchain env pass-through (e.g. CARGO_HOME)
-for when the real Verifier runs builds.
+`kill_on_drop` (the pid-namespace ensures no orphans). Known deferral: unbounded
+stdout/stderr buffering (no output cap yet).
 
 The orchestrator also runs every Coder edit through `ToolRegistry::check("fs.write", {path})`
 (the same gate, without dispatch) before applying it via the workspace — and only an explicit
@@ -227,8 +237,9 @@ emits a "repairing" log, and re-runs the Coder + Verifier — up to `MAX_REPAIRS
 (3 total attempts). `prior_failures` flows into the Coder's `RouteHints`, so Brain-Blend
 escalates local→remote on repeated failure. The turn's outcome is the last Verify result, and
 the happy path (Verifier passes first try) runs the loop exactly once — so its event sequence
-is unchanged. (`StubVerifier` always passes, so the loop stays dormant until the real
-bash-backed Verifier lands.)
+is unchanged. The real bash-backed Verifier (`cargo check --offline` in the sandbox) now
+drives this loop; when no project is recognized or `bash` is unavailable it reports success,
+so the loop stays dormant in those cases.
 
 ### Promote-to-remote
 
