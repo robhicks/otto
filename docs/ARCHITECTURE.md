@@ -221,6 +221,15 @@ UI: SendPrompt
                             └─ repeated identical error hash ──► deadlock, surface to UI
 ```
 
+**Repair.** The `Code → apply (gated) → Verify` step is a bounded loop. On a verify failure the
+orchestrator increments `prior_failures`, sets the Coder's `feedback` to the failure detail,
+emits a "repairing" log, and re-runs the Coder + Verifier — up to `MAX_REPAIRS` (2) repairs
+(3 total attempts). `prior_failures` flows into the Coder's `RouteHints`, so Brain-Blend
+escalates local→remote on repeated failure. The turn's outcome is the last Verify result, and
+the happy path (Verifier passes first try) runs the loop exactly once — so its event sequence
+is unchanged. (`StubVerifier` always passes, so the loop stays dormant until the real
+bash-backed Verifier lands.)
+
 ### Promote-to-remote
 
 ```
