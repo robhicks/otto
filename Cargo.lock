@@ -892,11 +892,13 @@ dependencies = [
  "anyhow",
  "otto-agents",
  "otto-engine-core",
+ "otto-persistence",
  "otto-protocol",
  "otto-providers",
  "otto-router",
  "otto-tools",
  "otto-workspace",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
