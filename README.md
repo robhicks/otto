@@ -6,10 +6,13 @@ calls across local and remote providers behind a stable set of trait seams. The 
 (future) never branches on "local vs remote": it speaks one protocol to an engine that may
 be embedded in-process or served over the network.
 
-> **Status: walking skeleton.** The orchestrator spine, trait seams, providers, router,
-> tools, and permission gate are implemented and tested. Several agents are still stubs;
-> real LLM-backed agents are landing incrementally (see `docs/superpowers/plans/`). The
-> full intended design — including crates not yet built — lives in `docs/ARCHITECTURE.md`.
+> **Status: the single-machine spine is real.** The orchestrator, all four agents
+> (Planner, ContextFinder, Coder, Verifier), trait seams, providers, router, tools, sandbox,
+> and permission gate are implemented and tested — no stubs remain. The agents are LLM-backed
+> with a deterministic offline fallback, so the test suite runs without keys or network. Still
+> ahead: the remote/distribution axis (`serve` mode, `RemoteWorkspace`), MCP tool servers,
+> retrieval, persistence, extensions, and the UI. The full intended design lives in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`.
 
 ## Quick start
 
@@ -46,17 +49,19 @@ depends on nothing, `engine-core` defines the trait seams, the impl crates depen
 ```
 protocol        wire types (Command/Event/Role/SessionId) — no I/O
 engine-core     orchestrator state machine + the trait seams + AgentRegistry
-  ├─ agents     Agent impls (Planner / ContextFinder / Coder / Verifier)
+  ├─ agents     Agent impls (Planner / ContextFinder / Coder / Verifier) — all LLM-backed
   ├─ providers  Provider impls: Local, Scripted, Ollama, Anthropic
   ├─ router     SingleProviderRouter, BrainBlendRouter (privacy/complexity routing)
   ├─ tools      fs.* + bash tools, permission gate, OS sandbox
-  └─ workspace  LocalWorkspace (edits a real folder in place)
+  └─ workspace  LocalWorkspace (edits a real folder in place; agents see a read-only view)
 engine          the `otto` binary + wiring (build_router, build_tool_registry, run_goal)
 ```
 
-**A turn** (`Orchestrator::run_turn`) is deterministic control flow: Plan → Execute
-(find context → code → apply edits) → Verify → Done. Agents hold no global state; they
-receive an `AgentCtx` granting scoped access to the router, workspace, and tool registry.
+**A turn** (`Orchestrator::run_turn`) is deterministic control flow: Plan → Execute (find
+context → code → apply gated edits → Verify, looping to Repair on failure) → Done. The
+Verifier detects the project's ecosystem (Rust / Go / Node / Python / Make) and runs its
+test command in the sandbox. Agents hold no global state; they receive an `AgentCtx`
+granting scoped access to the router, a **read-only** workspace view, and the tool registry.
 
 **Every tool call and every Coder edit passes a permission gate** before it touches disk.
 A sensitive-path floor (`.env*`, `.ssh/`, `.git/`, `.aws/`, ssh keys) is always denied, and
@@ -64,10 +69,10 @@ edits apply only on an explicit `Allow` (an `Ask` or `Deny` is skipped — fail-
 `bash` tool is registered only when an OS sandbox backend (`bwrap`/`sandbox-exec`) is
 present, and runs network-isolated with the workspace root as the only writable path.
 
-The four trait seams — `Agent`, `Workspace`, `Provider`/`Router`, `Tool` — are the
-extension points. They are `Send + Sync` async traits, and the orchestrator only ever holds
-trait objects, so new agents, providers, routing policies, or tools slot in without touching
-the spine.
+The trait seams — `Agent`, `WorkspaceRead`/`Workspace`, `Provider`/`Router`, `Tool` — are
+the extension points. They are `Send + Sync` async traits, and the orchestrator only ever
+holds trait objects, so new agents, providers, routing policies, or tools slot in without
+touching the spine.
 
 ## Developing
 
