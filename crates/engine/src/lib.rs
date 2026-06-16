@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use otto_agents::{Coder, Planner, StubContextFinder, Verifier};
+use otto_agents::{Coder, ContextFinder, Planner, Verifier};
 use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolRegistry};
 use otto_engine_core::traits::{Provider, Workspace};
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
@@ -15,12 +15,12 @@ use otto_tools::{
     os_sandbox_available,
 };
 
-/// Build the registry of built-in agents: real LLM-backed Planner + Coder + a real Verifier
-/// (cargo check via sandboxed bash); ContextFinder remains a stub.
+/// Build the registry of built-in agents: the whole spine is real: LLM-backed Planner +
+/// ContextFinder + Coder and a cargo-check Verifier. No stubs remain.
 pub fn build_default_registry() -> AgentRegistry {
     let mut registry = AgentRegistry::new();
     registry.register(Role::Planner, Arc::new(Planner));
-    registry.register(Role::ContextFinder, Arc::new(StubContextFinder));
+    registry.register(Role::ContextFinder, Arc::new(ContextFinder));
     registry.register(Role::Coder, Arc::new(Coder));
     registry.register(Role::Verifier, Arc::new(Verifier));
     registry
