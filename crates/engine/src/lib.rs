@@ -16,11 +16,11 @@ use otto_tools::{
     os_sandbox_available,
 };
 
-mod service;
 mod serve;
+mod service;
 
-pub use service::{CollectingSink, EngineService, EventSink};
 pub use serve::app as serve_app;
+pub use service::{CollectingSink, EngineService, EventSink};
 
 /// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by
 /// both `build_router` (selection) and `session_config` (recording the effective model).

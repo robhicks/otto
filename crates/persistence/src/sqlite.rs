@@ -576,11 +576,20 @@ mod tests {
     #[tokio::test]
     async fn cursors_advance_with_events_and_turns() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(store.next_seq(id).await.unwrap(), 0);
         assert_eq!(store.next_turn(id).await.unwrap(), 0);
-        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
-        store.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
         assert_eq!(store.next_seq(id).await.unwrap(), 2);
         assert_eq!(store.next_turn(id).await.unwrap(), 1);

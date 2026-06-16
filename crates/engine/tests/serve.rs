@@ -30,9 +30,18 @@ async fn start_server() -> (u16, tempfile::TempDir) {
     let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
-    let store: Arc<dyn otto_persistence::SessionStore> =
-        Arc::new(otto_persistence::SqliteStore::open(dir.path().join("s.db")).await.unwrap());
-    let service = EngineService::new(store, Arc::new(build_default_registry()), router, workspace, tools);
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
 
     let app = serve_app(service, TOKEN.to_string());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -43,7 +52,10 @@ async fn start_server() -> (u16, tempfile::TempDir) {
     (port, dir)
 }
 
-fn authed_request(port: u16, query: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+fn authed_request(
+    port: u16,
+    query: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let url = format!("ws://127.0.0.1:{port}/ws{query}");
     let mut req = url.into_client_request().unwrap();
     req.headers_mut()
@@ -67,7 +79,7 @@ async fn streams_a_turn_then_reconnects_with_replay() {
 
     // Send a prompt for that session.
     let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
-    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap().into()))
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
         .await
         .unwrap();
 
@@ -90,10 +102,12 @@ async fn streams_a_turn_then_reconnects_with_replay() {
     drop(ws);
 
     // Reconnect with last_seq = 0: expect the gap (events with seq > 0) replayed.
-    let (mut ws2, _) =
-        tokio_tungstenite::connect_async(authed_request(port, &format!("?session={session}&last_seq=0")))
-            .await
-            .expect("reconnect");
+    let (mut ws2, _) = tokio_tungstenite::connect_async(authed_request(
+        port,
+        &format!("?session={session}&last_seq=0"),
+    ))
+    .await
+    .expect("reconnect");
     let ready2: Value = next_json(&mut ws2).await;
     assert_eq!(ready2["type"], "ready");
     assert_eq!(ready2["session"].as_str().unwrap(), session);
@@ -119,16 +133,23 @@ async fn rejects_missing_token() {
     let url = format!("ws://127.0.0.1:{port}/ws");
     // No Authorization header → upgrade rejected (401), connect_async errors.
     let result = tokio_tungstenite::connect_async(url).await;
-    assert!(result.is_err(), "unauthenticated connection must be rejected");
+    assert!(
+        result.is_err(),
+        "unauthenticated connection must be rejected"
+    );
 }
 
 /// Receive the next text frame as JSON (panics on close/non-text or stream end).
-async fn next_json(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Value {
+async fn next_json(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Value {
     next_json_opt(ws).await.expect("expected a frame")
 }
 
 /// Receive the next text frame as JSON, or None if the stream ended / a non-text frame arrived.
-async fn next_json_opt(ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin)) -> Option<Value> {
+async fn next_json_opt(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Option<Value> {
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(t))) => return Some(serde_json::from_str(t.as_str()).unwrap()),

@@ -111,11 +111,7 @@ impl EngineService {
             tokio::spawn(async move {
                 let sink_fn = move |kind: EventKind| {
                     let seq = counter.fetch_add(1, Ordering::SeqCst);
-                    let _ = tx.send(Event {
-                        seq,
-                        session,
-                        kind,
-                    });
+                    let _ = tx.send(Event { seq, session, kind });
                 };
                 let orchestrator = Orchestrator {
                     registry: &registry,
@@ -203,7 +199,13 @@ mod tests {
             tools_ws,
             dir.path().to_path_buf(),
         ));
-        EngineService::new(store, Arc::new(registry), scripted_router(), workspace, tools)
+        EngineService::new(
+            store,
+            Arc::new(registry),
+            scripted_router(),
+            workspace,
+            tools,
+        )
     }
 
     #[tokio::test]
@@ -244,7 +246,10 @@ mod tests {
             .await
             .unwrap();
         let mut sink = CollectingSink::default();
-        let outcome = service.run_prompt(id, "add a greeting", &mut sink).await.unwrap();
+        let outcome = service
+            .run_prompt(id, "add a greeting", &mut sink)
+            .await
+            .unwrap();
 
         assert!(outcome.ok);
         assert_eq!(
@@ -264,7 +269,10 @@ mod tests {
     async fn second_prompt_continues_seq() {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
-        let id = service.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
 
         let mut s1 = CollectingSink::default();
         service.run_prompt(id, "g", &mut s1).await.unwrap();
@@ -286,7 +294,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Empty registry: the orchestrator can't find the Planner, so run_turn errors.
         let service = service_in(&dir, AgentRegistry::new()).await;
-        let id = service.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         let mut sink = CollectingSink::default();
         let result = service.run_prompt(id, "g", &mut sink).await;
         assert!(result.is_err());

@@ -32,9 +32,15 @@ async fn full_turn_writes_parsed_edit_and_completes_ok() {
         Arc::new(SingleProviderRouter::new(Arc::new(provider)));
     let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
-    let tools = Arc::new(build_tool_registry(tools_workspace, dir.path().to_path_buf()));
-    let store: Arc<dyn otto_persistence::SessionStore> =
-        Arc::new(otto_persistence::SqliteStore::open(dir.path().join("sessions.db")).await.unwrap());
+    let tools = Arc::new(build_tool_registry(
+        tools_workspace,
+        dir.path().to_path_buf(),
+    ));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
+            .await
+            .unwrap(),
+    );
 
     let (events, outcome) = run_goal("add a greeting", store, router, workspace.clone(), tools)
         .await

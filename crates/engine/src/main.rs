@@ -18,7 +18,9 @@ async fn main() -> anyhow::Result<()> {
         "run" => cmd_run(rest).await,
         "serve" => cmd_serve(rest).await,
         _ => {
-            eprintln!("usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>]");
+            eprintln!(
+                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>]"
+            );
             std::process::exit(2);
         }
     }
@@ -75,7 +77,10 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
 
 async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let (root, positional) = parse_root(&args);
-    let mut port: u16 = std::env::var("OTTO_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(7878);
+    let mut port: u16 = std::env::var("OTTO_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7878);
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         if a == "--port" {

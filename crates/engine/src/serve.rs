@@ -40,7 +40,9 @@ struct ServeState {
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
 pub fn app(service: EngineService, token: String) -> AxumRouter {
     let state = Arc::new(ServeState { service, token });
-    AxumRouter::new().route("/ws", get(ws_handler)).with_state(state)
+    AxumRouter::new()
+        .route("/ws", get(ws_handler))
+        .with_state(state)
 }
 
 async fn ws_handler(
@@ -74,7 +76,13 @@ struct WsSink<'a> {
 #[async_trait::async_trait]
 impl EventSink for WsSink<'_> {
     async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
-        send_msg(self.socket, &ServerMessage::Event { event: event.clone() }).await
+        send_msg(
+            self.socket,
+            &ServerMessage::Event {
+                event: event.clone(),
+            },
+        )
+        .await
     }
 }
 
@@ -83,27 +91,50 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
     let session = match resolve_session(&params, &state).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = send_msg(&mut socket, &ServerMessage::Error { message: e.to_string() }).await;
+            let _ = send_msg(
+                &mut socket,
+                &ServerMessage::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
             return;
         }
     };
 
-    if send_msg(&mut socket, &ServerMessage::Ready { session }).await.is_err() {
+    if send_msg(&mut socket, &ServerMessage::Ready { session })
+        .await
+        .is_err()
+    {
         return;
     }
 
     // Reconnect: replay the gap after `last_seq`.
     if let Some(after) = params.last_seq {
-        match state.service.store().replay_since(session, Some(after)).await {
+        match state
+            .service
+            .store()
+            .replay_since(session, Some(after))
+            .await
+        {
             Ok(events) => {
                 for event in events {
-                    if send_msg(&mut socket, &ServerMessage::Event { event }).await.is_err() {
+                    if send_msg(&mut socket, &ServerMessage::Event { event })
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
             }
             Err(e) => {
-                let _ = send_msg(&mut socket, &ServerMessage::Error { message: e.to_string() }).await;
+                let _ = send_msg(
+                    &mut socket,
+                    &ServerMessage::Error {
+                        message: e.to_string(),
+                    },
+                )
+                .await;
                 return;
             }
         }
@@ -119,15 +150,29 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         let command: Command = match serde_json::from_str(text.as_str()) {
             Ok(c) => c,
             Err(e) => {
-                let _ = send_msg(&mut socket, &ServerMessage::Error { message: format!("bad command: {e}") }).await;
+                let _ = send_msg(
+                    &mut socket,
+                    &ServerMessage::Error {
+                        message: format!("bad command: {e}"),
+                    },
+                )
+                .await;
                 continue;
             }
         };
         match command {
             Command::SendPrompt { text, .. } => {
-                let mut sink = WsSink { socket: &mut socket };
+                let mut sink = WsSink {
+                    socket: &mut socket,
+                };
                 if let Err(e) = state.service.run_prompt(session, &text, &mut sink).await {
-                    let _ = send_msg(&mut socket, &ServerMessage::Error { message: e.to_string() }).await;
+                    let _ = send_msg(
+                        &mut socket,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                 }
             }
             Command::Abort { .. } => {
@@ -141,15 +186,17 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
     }
 }
 
-async fn resolve_session(
-    params: &ConnectParams,
-    state: &ServeState,
-) -> anyhow::Result<SessionId> {
+async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::Result<SessionId> {
     match &params.session {
         Some(s) => {
             let uuid = uuid::Uuid::parse_str(s)?;
             Ok(SessionId(uuid))
         }
-        None => state.service.create_session("", &serde_json::json!({})).await,
+        None => {
+            state
+                .service
+                .create_session("", &serde_json::json!({}))
+                .await
+        }
     }
 }
