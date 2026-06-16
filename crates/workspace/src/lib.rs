@@ -73,8 +73,18 @@ impl Workspace for LocalWorkspace {
             let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
                 continue; // skip directories we cannot read rather than failing the whole walk
             };
-            while let Some(entry) = entries.next_entry().await? {
-                let file_type = entry.file_type().await?;
+            loop {
+                // A transient per-entry error (e.g. a file vanishing mid-walk) skips that entry
+                // or ends this directory rather than failing the whole walk — retrieval should
+                // degrade, not blank out, on a flaky filesystem.
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(_) => break,
+                };
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
                 if file_type.is_symlink() {
                     continue;
                 }
