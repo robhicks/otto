@@ -108,10 +108,17 @@ impl crate::SessionStore for SqliteStore {
 
     async fn append_event(
         &self,
-        _session: otto_protocol::SessionId,
-        _event: &otto_protocol::Event,
+        session: otto_protocol::SessionId,
+        event: &otto_protocol::Event,
     ) -> anyhow::Result<()> {
-        unimplemented!("append_event lands in Task 5")
+        let kind = serde_json::to_string(&event.kind)?;
+        sqlx::query("INSERT INTO events (session_id, seq, kind) VALUES (?1, ?2, ?3)")
+            .bind(session.0.to_string())
+            .bind(event.seq as i64)
+            .bind(kind)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn record_turn(
@@ -132,10 +139,30 @@ impl crate::SessionStore for SqliteStore {
 
     async fn replay_since(
         &self,
-        _session: otto_protocol::SessionId,
-        _after_seq: u64,
+        session: otto_protocol::SessionId,
+        after_seq: u64,
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
-        unimplemented!("replay_since lands in Task 5")
+        // Bind -1 when after_seq == 0 so that `seq > -1` returns all events
+        // (including seq = 0). For after_seq > 0 the predicate is `seq > after_seq`.
+        let bound = if after_seq == 0 { -1i64 } else { after_seq as i64 };
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT seq, kind FROM events
+             WHERE session_id = ?1 AND seq > ?2
+             ORDER BY seq ASC",
+        )
+        .bind(session.0.to_string())
+        .bind(bound)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for (seq, kind) in rows {
+            events.push(otto_protocol::Event {
+                seq: seq as u64,
+                session,
+                kind: serde_json::from_str(&kind)?,
+            });
+        }
+        Ok(events)
     }
 }
 
@@ -151,6 +178,7 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
     use crate::{SessionStatus, SessionStore};
+    use otto_protocol::{Event, EventKind};
 
     /// Opens a fresh store in a temp dir. The returned `TempDir` must be kept alive for
     /// the duration of the test so the database file is not deleted.
@@ -183,5 +211,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Active);
+    }
+
+    fn log_event(session: otto_protocol::SessionId, seq: u64, msg: &str) -> Event {
+        Event {
+            seq,
+            session,
+            kind: EventKind::Log { message: msg.to_string() },
+        }
+    }
+
+    #[tokio::test]
+    async fn append_then_replay_returns_events_in_order() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
+            store.append_event(id, &log_event(id, seq, msg)).await.unwrap();
+        }
+        let replayed = store.replay_since(id, 0).await.unwrap();
+        assert_eq!(replayed, vec![
+            log_event(id, 0, "a"),
+            log_event(id, 1, "b"),
+            log_event(id, 2, "c"),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn replay_since_returns_only_the_gap() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
+            store.append_event(id, &log_event(id, seq, msg)).await.unwrap();
+        }
+        let gap = store.replay_since(id, 1).await.unwrap();
+        assert_eq!(gap, vec![log_event(id, 2, "c")]);
+    }
+
+    #[tokio::test]
+    async fn append_duplicate_seq_is_error() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
+        assert!(store.append_event(id, &log_event(id, 0, "dup")).await.is_err());
     }
 }
