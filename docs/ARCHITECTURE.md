@@ -81,13 +81,20 @@ an offline run (no LLM configured) completes a turn but writes nothing. Tests dr
 `ScriptedProvider` (deterministic prompt-keyed mock LLM) to exercise the real parse path. The
 Coder's edits still pass the orchestrator's fail-closed permission gate before being written.
 
-The `Verifier` is real: it detects the project (via `fs.list`) and, for a Cargo project, runs
-`cargo check --offline` inside the sandboxed `bash` tool, reporting pass/fail (a non-zero exit
-becomes `Verify { ok: false }` with the truncated build output as detail, which drives the
-orchestrator's Repair loop). It degrades safely — no recognized project → "nothing to verify";
-`bash` unavailable (no OS sandbox) → "verification skipped". To run `cargo` inside the
-cleared-env sandbox, `BashTool` passes through the non-secret Rust toolchain location (`PATH`
-includes `~/.cargo/bin`; `CARGO_HOME`/`RUSTUP_HOME` point at the host toolchain); this grants
+The `Verifier` is real and multi-ecosystem: it detects the project type from the workspace root
+(`Cargo.toml`, `go.mod`, `package.json`, `pyproject.toml`/`setup.py`, or `Makefile`) via an
+ordered recipe table — first match wins, language-native build systems before the generic
+`Makefile` — and runs that ecosystem's test command (`cargo test --offline`, `go test ./...`,
+`npm test`, `pytest -q`, `make test`) inside the sandboxed `bash` tool. A non-zero exit becomes
+`Verify { ok: false }` with the truncated output as detail, which drives the orchestrator's
+Repair loop. It degrades safely: no recognized project → "nothing to verify"; `bash` unavailable
+(no OS sandbox) → "verification skipped"; the toolchain not on the sandbox PATH (exit 127) →
+"verification skipped: <tool> tooling not found". Commands run offline (the sandbox has no
+network), so dependencies must already be installed/cached — the accepted v1 posture.
+
+To run `cargo` inside the cleared-env sandbox, `BashTool` passes through the non-secret Rust
+toolchain location (`PATH` includes `~/.cargo/bin`; `CARGO_HOME`/`RUSTUP_HOME` point at the
+host toolchain); this grants
 no new read access (the host FS is already read-only-readable in the sandbox) and network stays
 off, so the read-but-no-exfil posture is unchanged.
 
