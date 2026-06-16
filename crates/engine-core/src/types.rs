@@ -39,6 +39,8 @@ pub enum AgentRequest {
     },
     Code {
         goal: String,
+        /// The planned milestones (from the Planner), giving the Coder the intended steps.
+        milestones: Vec<Milestone>,
         context: Vec<PathBuf>,
         /// The previous verify failure detail, if this is a repair attempt.
         feedback: Option<String>,

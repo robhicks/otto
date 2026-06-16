@@ -107,6 +107,7 @@ impl<'a> Orchestrator<'a> {
                 .run(
                     AgentRequest::Code {
                         goal: goal.to_string(),
+                        milestones: milestones.clone(),
                         context: files.clone(),
                         feedback: feedback.clone(),
                         prior_failures,
