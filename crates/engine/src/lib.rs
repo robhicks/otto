@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use otto_agents::{Coder, ContextFinder, Planner, Verifier};
 use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolRegistry};
-use otto_engine_core::traits::{Provider, Workspace};
+use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_protocol::{Event, EventKind, Role, SessionId};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
@@ -75,9 +75,11 @@ pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> Tool
     };
 
     let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), ask);
-    registry.register(Arc::new(FsReadTool::new(Arc::clone(&workspace))));
+    // fs.read / fs.list need only the read-only view; fs.write holds the full workspace.
+    let read_workspace: Arc<dyn WorkspaceRead> = workspace.clone();
+    registry.register(Arc::new(FsReadTool::new(read_workspace.clone())));
     registry.register(Arc::new(FsWriteTool::new(Arc::clone(&workspace))));
-    registry.register(Arc::new(FsListTool::new(workspace)));
+    registry.register(Arc::new(FsListTool::new(read_workspace)));
 
     if sandboxed {
         registry.register(Arc::new(BashTool::new(

@@ -1,21 +1,22 @@
-//! In-process filesystem tools over a path-contained `Workspace`.
+//! In-process filesystem tools over a path-contained workspace. The read tools (`fs.read`,
+//! `fs.list`) need only the read-only `WorkspaceRead` view; `fs.write` holds the full `Workspace`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use otto_engine_core::tool::Tool;
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_engine_core::types::Edit;
 use serde_json::{Value, json};
 
 /// `fs.read` — args `{ "path": "<rel>" }` → `{ "content": "<utf8>" }`.
 pub struct FsReadTool {
-    workspace: Arc<dyn Workspace>,
+    workspace: Arc<dyn WorkspaceRead>,
 }
 
 impl FsReadTool {
-    pub fn new(workspace: Arc<dyn Workspace>) -> Self {
+    pub fn new(workspace: Arc<dyn WorkspaceRead>) -> Self {
         Self { workspace }
     }
 }
@@ -74,11 +75,11 @@ impl Tool for FsWriteTool {
 
 /// `fs.list` — args `{ "glob": "<pat>" }` (optional, defaults "*") → `{ "paths": ["<rel>", ...] }`.
 pub struct FsListTool {
-    workspace: Arc<dyn Workspace>,
+    workspace: Arc<dyn WorkspaceRead>,
 }
 
 impl FsListTool {
-    pub fn new(workspace: Arc<dyn Workspace>) -> Self {
+    pub fn new(workspace: Arc<dyn WorkspaceRead>) -> Self {
         Self { workspace }
     }
 }
@@ -118,7 +119,8 @@ mod tests {
             .unwrap();
         assert_eq!(out, json!({ "bytes_written": 5 }));
 
-        let read = FsReadTool::new(Arc::clone(&ws));
+        let read_ws: Arc<dyn WorkspaceRead> = ws.clone();
+        let read = FsReadTool::new(read_ws);
         let out = read.call(json!({"path": "a.txt"})).await.unwrap();
         assert_eq!(out, json!({ "content": "hello" }));
     }
@@ -130,10 +132,8 @@ mod tests {
             .call(json!({"path": "a.txt", "contents": "x"}))
             .await
             .unwrap();
-        let out = FsListTool::new(Arc::clone(&ws))
-            .call(json!({}))
-            .await
-            .unwrap();
+        let list_ws: Arc<dyn WorkspaceRead> = ws.clone();
+        let out = FsListTool::new(list_ws).call(json!({})).await.unwrap();
         assert_eq!(out, json!({ "paths": ["a.txt"] }));
     }
 
