@@ -13,5 +13,5 @@ pub use router::{RouteHints, Router, TaskKind};
 pub use tool::{
     AllowListAskResolver, AskResolver, Decision, DenyAsk, PermissionGate, Tool, ToolRegistry,
 };
-pub use traits::{Agent, AgentCtx, Provider, Workspace};
+pub use traits::{Agent, AgentCtx, Provider, Workspace, WorkspaceRead};
 pub use types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, Milestone};

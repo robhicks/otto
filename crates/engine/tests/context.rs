@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use otto_engine::{build_tool_registry, run_goal};
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_engine_core::types::Edit;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;

@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use crate::router::{RouteHints, Router};
     use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
-    use crate::traits::{Agent, Workspace};
+    use crate::traits::{Agent, Workspace, WorkspaceRead};
     use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone};
     use async_trait::async_trait;
     use serde_json::Value;
@@ -243,13 +243,16 @@ mod tests {
         edits: Mutex<Vec<Edit>>,
     }
     #[async_trait]
-    impl Workspace for RecordingWorkspace {
+    impl WorkspaceRead for RecordingWorkspace {
         async fn read(&self, _path: &Path) -> anyhow::Result<Vec<u8>> {
             Ok(Vec::new())
         }
         async fn list(&self, _glob: &str) -> anyhow::Result<Vec<PathBuf>> {
             Ok(Vec::new())
         }
+    }
+    #[async_trait]
+    impl Workspace for RecordingWorkspace {
         async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64> {
             self.edits.lock().unwrap().push(edit.clone());
             Ok(edit.new_contents.len() as u64)

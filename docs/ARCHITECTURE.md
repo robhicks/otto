@@ -66,7 +66,12 @@ trait Agent {
 }
 ```
 
-`AgentCtx` grants scoped access to the LLM router and the MCP tool registry. Native impls
+`AgentCtx` grants scoped access to the LLM router, the MCP tool registry, and a read-only
+view of the workspace. The workspace seam is split into `WorkspaceRead` (`read`, `list`) and
+`Workspace: WorkspaceRead` (adds `apply_edit`). `AgentCtx::workspace()` exposes only the
+read-only `WorkspaceRead` view, so an agent cannot mutate the workspace directly — writes flow
+exclusively through the gated `fs.write` tool and the orchestrator's permission-gated apply. The
+orchestrator and the `fs.*` tools hold the full `Workspace`. Native impls
 live in `agents`; a `wasm32-wasip2` impl can register against the same trait later. The
 orchestrator only knows roles and endpoints — it never knows whether an agent is native,
 wasm, or a user-defined markdown SubHost.
@@ -117,13 +122,22 @@ real, with no stubs remaining.
 
 ```rust
 #[async_trait]
-trait Workspace {
+trait WorkspaceRead {                                        // the agent-facing read-only view
     async fn read(&self, path: &Path) -> Result<Bytes>;
-    async fn apply_patch(&self, diff: &UnifiedDiff) -> Result<()>;
     async fn list(&self, glob: &str) -> Result<Vec<PathBuf>>;
+}
+
+#[async_trait]
+trait Workspace: WorkspaceRead {                             // orchestrator + `fs.*` tools only
+    async fn apply_edit(&self, edit: &Edit) -> Result<u64>;
     async fn snapshot(&self) -> Result<WorkspaceSnapshot>;   // uncommitted diffs, for handover
 }
 ```
+
+The seam is split so agents cannot mutate the workspace directly: `AgentCtx::workspace()`
+exposes only the read-only `WorkspaceRead` view, while the orchestrator and the `fs.*` tools
+hold the full `Workspace`. Writes therefore flow exclusively through the gated `fs.write` tool
+and the orchestrator's permission-gated apply.
 
 `LocalWorkspace` edits a real on-disk path in place (no clone). `RemoteWorkspace` operates
 on a checkout living on the remote engine. The orchestrator only ever holds
@@ -181,9 +195,10 @@ stdout/stderr buffering (no output cap yet).
 The orchestrator also runs every Coder edit through `ToolRegistry::check("fs.write", {path})`
 (the same gate, without dispatch) before applying it via the workspace — and only an explicit
 `Allow` proceeds (a `Deny` or `Ask` is logged and the edit skipped, fail-closed). So a Coder
-cannot write a sensitive path. The `ctx.workspace()` accessor remains a trusted, direct handle
-for built-in agents (the real Coder returns edits rather than writing directly); a read-only
-workspace view for untrusted agents is a later refinement.
+cannot write a sensitive path. The `ctx.workspace()` accessor exposes only the read-only
+`WorkspaceRead` view, so an agent cannot mutate the workspace directly (the real Coder returns
+edits rather than writing them); all writes flow through the gated `fs.write` tool and the
+orchestrator's permission-gated apply, which hold the full `Workspace`.
 
 ### `RemoteTarget` — the engine-axis seam
 
