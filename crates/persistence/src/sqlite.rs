@@ -123,10 +123,21 @@ impl crate::SessionStore for SqliteStore {
 
     async fn record_turn(
         &self,
-        _session: otto_protocol::SessionId,
-        _turn: &crate::TurnRecord,
+        session: otto_protocol::SessionId,
+        turn: &crate::TurnRecord,
     ) -> anyhow::Result<()> {
-        unimplemented!("record_turn lands in Task 7")
+        sqlx::query(
+            "INSERT INTO turns (session_id, turn_index, goal, outcome, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(session.0.to_string())
+        .bind(turn.turn_index as i64)
+        .bind(&turn.goal)
+        .bind(serde_json::to_string(&turn.outcome)?)
+        .bind(now_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn set_status(
@@ -188,7 +199,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionStatus, SessionStore};
+    use crate::{SessionStatus, SessionStore, TurnRecord};
     use otto_protocol::{Event, EventKind};
 
     /// Opens a fresh store in a temp dir. The returned `TempDir` must be kept alive for
@@ -279,5 +290,28 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
         assert!(store.set_status(missing, SessionStatus::Aborted).await.is_err());
+    }
+
+    fn turn(idx: u32, ok: bool) -> TurnRecord {
+        TurnRecord {
+            turn_index: idx,
+            goal: "g".to_string(),
+            outcome: serde_json::json!({ "ok": ok }),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_turn_succeeds() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_turn_rejects_duplicate_index() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+        assert!(store.record_turn(id, &turn(0, false)).await.is_err());
     }
 }
