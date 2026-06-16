@@ -66,7 +66,7 @@ impl crate.
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
 | `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). In-process today; the MCP-server form (`mcp-fs` etc.) is the destination. |
 | `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace`; agents see only the read-only `WorkspaceRead` view. |
-| `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq. A leaf crate depending only on `protocol`. |
+| `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq; `snapshot`/`restore` capture a session as a serializable `SessionState` and atomically re-create it in a fresh store (the promote-to-remote primitive). A leaf crate depending only on `protocol`. |
 | `engine` | Binary `otto` + wiring library (`build_router`, `build_tool_registry`, `run_goal`). Holds the `SessionStore` and runs turns through a `Session` (`create`/`run_prompt`/`abort`) that persists each turn fail-closed. |
 
 ### The orchestrator spine
