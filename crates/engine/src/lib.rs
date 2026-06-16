@@ -108,8 +108,12 @@ pub fn session_config() -> serde_json::Value {
     serde_json::json!({
         "ollama": ollama,
         "anthropic": anthropic,
-        "ollama_model": std::env::var("OTTO_OLLAMA_MODEL").ok(),
-        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL").ok(),
+        // Record the EFFECTIVE model (the build_router default when the env var is unset),
+        // so a restored session's config reflects the routing it actually used.
+        "ollama_model": std::env::var("OTTO_OLLAMA_MODEL")
+            .unwrap_or_else(|_| "llama3.2".to_string()),
+        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-haiku-4-5".to_string()),
     })
 }
 
