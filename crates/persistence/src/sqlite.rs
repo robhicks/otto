@@ -225,6 +225,36 @@ impl crate::SessionStore for SqliteStore {
             turns,
         })
     }
+
+    async fn restore(
+        &self,
+        state: &crate::SessionState,
+    ) -> anyhow::Result<otto_protocol::SessionId> {
+        // Insert the session row preserving id/status/config/goal (timestamps regenerated).
+        let now = now_millis();
+        sqlx::query(
+            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(state.id.0.to_string())
+        .bind(&state.goal)
+        .bind(state.status.as_db_str())
+        .bind(now)
+        .bind(now)
+        .bind(serde_json::to_string(&state.config)?)
+        .execute(&self.pool)
+        .await?;
+
+        // Replay events (preserving seqs) and turns through the existing inserts.
+        for event in &state.events {
+            self.append_event(state.id, event).await?;
+        }
+        for turn in &state.turns {
+            self.record_turn(state.id, turn).await?;
+        }
+
+        Ok(state.id)
+    }
 }
 
 /// Milliseconds since the Unix epoch, for `created_at`/`updated_at`/`started_at`.
@@ -432,6 +462,41 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
         assert!(store.snapshot(missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_into_a_fresh_store() {
+        let (source, _d1) = temp_store().await;
+        let id = source
+            .create_session("g", &serde_json::json!({ "m": "x" }))
+            .await
+            .unwrap();
+        source.append_event(id, &log_event(id, 0, "a")).await.unwrap();
+        source.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        source.record_turn(id, &turn(0, true)).await.unwrap();
+        source.set_status(id, SessionStatus::Done).await.unwrap();
+        let snap = source.snapshot(id).await.unwrap();
+
+        let (target, _d2) = temp_store().await;
+        let restored_id = target.restore(&snap).await.unwrap();
+        assert_eq!(restored_id, id);
+
+        // Re-snapshotting the target yields an identical SessionState (preserved id/seqs).
+        assert_eq!(target.snapshot(id).await.unwrap(), snap);
+        assert_eq!(target.replay_since(id, None).await.unwrap(), snap.events);
+        assert_eq!(target.session_status(id).await.unwrap(), SessionStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn restore_into_existing_session_is_error() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let snap = store.snapshot(id).await.unwrap();
+        // Restoring into the same store collides on the sessions primary key.
+        assert!(store.restore(&snap).await.is_err());
     }
 
     #[tokio::test]

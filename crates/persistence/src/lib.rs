@@ -47,4 +47,9 @@ pub trait SessionStore: Send + Sync {
     /// turn history — as a serializable `SessionState`. Errors if the session does not
     /// exist. (The workspace patch-bundle is deferred until `RemoteWorkspace`.)
     async fn snapshot(&self, session: SessionId) -> anyhow::Result<SessionState>;
+
+    /// Write a previously captured `SessionState` into this store, preserving its id, seqs,
+    /// status, config, and turn history. Intended for a fresh store (e.g. a remote engine);
+    /// errors if the session id already exists. Returns the (preserved) session id.
+    async fn restore(&self, state: &SessionState) -> anyhow::Result<SessionId>;
 }
