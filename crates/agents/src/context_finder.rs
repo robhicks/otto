@@ -23,6 +23,9 @@ const CANDIDATE_LIMIT: usize = 20;
 const SELECT_LIMIT: usize = 8;
 /// Per-file content scanned for lexical scoring (chars).
 const CONTENT_SCAN_CHARS: usize = 65_536;
+/// Maximum files whose contents are read per turn; the rest are scored on their path only. This
+/// bounds per-turn read cost on large repos — small repos (fewer text files than this) read all.
+const READ_BUDGET: usize = 200;
 
 pub struct ContextFinder;
 
@@ -47,6 +50,38 @@ fn keywords(goal: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether a path is a binary/non-text file to skip before reading — by extension or by a known
+/// lockfile name. Keeps the read budget for source files. Extensionless files (e.g. `Makefile`,
+/// scripts) are kept.
+fn is_skippable(path: &str) -> bool {
+    const SKIP_EXTS: &[&str] = &[
+        // images / media
+        "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tiff", "mp3", "mp4", "mov", "avi",
+        "wav", "ogg", "flac", "webm", // archives
+        "zip", "gz", "tgz", "tar", "xz", "zst", "bz2", "7z", "rar",
+        // binaries / objects
+        "exe", "dll", "so", "dylib", "o", "a", "bin", "wasm", "class", "pyc", "pyo", "obj",
+        // docs / fonts
+        "pdf", "ttf", "otf", "woff", "woff2",
+    ];
+    const SKIP_NAMES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "Pipfile.lock",
+    ];
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if SKIP_NAMES.contains(&name) {
+        return true;
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => SKIP_EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
 }
 
 /// Lexical relevance score: 5x per path/filename hit + 1x per content hit, summed over keywords.
@@ -104,18 +139,41 @@ impl Agent for ContextFinder {
 
         let kws = keywords(&goal);
 
-        // Lexical scoring. Read each file via fs.read; a non-UTF8/unreadable file scores on its
-        // path only.
+        // Path-only score every non-binary file (free, no read), dropping binary/non-text files
+        // so they neither consume read budget nor appear as context.
+        let mut by_path: Vec<(String, u64)> = files
+            .into_iter()
+            .filter(|p| !is_skippable(p))
+            .map(|p| {
+                let path_score = score_file(&p, None, &kws);
+                (p, path_score)
+            })
+            .collect();
+        // Read content only for the most path-relevant files, bounding per-turn read cost. Sort
+        // by path score desc, path asc (deterministic) and take the top READ_BUDGET to read.
+        by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let read_set: HashSet<String> = by_path
+            .iter()
+            .take(READ_BUDGET)
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        // Final scoring: read content for the budgeted set (full 5·path + 1·content score),
+        // path-only for the rest.
         let mut scored: Vec<(String, u64)> = Vec::new();
-        for path in &files {
-            let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
-                Ok(Value::Object(map)) => map
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                _ => None,
+        for (path, path_score) in &by_path {
+            let score = if read_set.contains(path) {
+                let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
+                    Ok(Value::Object(map)) => map
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                };
+                score_file(path, content.as_deref(), &kws)
+            } else {
+                *path_score
             };
-            let score = score_file(path, content.as_deref(), &kws);
             if score > 0 {
                 scored.push((path.clone(), score));
             }
@@ -289,5 +347,67 @@ mod tests {
         let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
         let files = find(&router, dir.path(), "do something").await;
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn is_skippable_filters_binaries_and_lockfiles() {
+        assert!(is_skippable("assets/logo.png"));
+        assert!(is_skippable("Cargo.lock"));
+        assert!(is_skippable("dir/package-lock.json"));
+        assert!(!is_skippable("src/main.rs"));
+        assert!(!is_skippable("Makefile")); // extensionless is kept
+        assert!(!is_skippable("README.md"));
+    }
+
+    #[tokio::test]
+    async fn extension_filter_skips_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed(&ws, "login.png", "login login login").await;
+        seed(&ws, "login.rs", "fn x() {}").await;
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        let files = find(&router, dir.path(), "login").await;
+        assert!(files.contains(&PathBuf::from("login.rs")));
+        assert!(
+            !files.contains(&PathBuf::from("login.png")),
+            "binary files are filtered out before reading: {files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_only_match_within_budget_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed(&ws, "helper.rs", "fn do_login() {}").await; // 'login' in content only
+        seed(&ws, "unrelated.rs", "fn nothing() {}").await;
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        let files = find(&router, dir.path(), "login").await;
+        assert!(
+            files.contains(&PathBuf::from("helper.rs")),
+            "content-only match is found in a small repo: {files:?}"
+        );
+        assert!(!files.contains(&PathBuf::from("unrelated.rs")));
+    }
+
+    #[tokio::test]
+    async fn content_only_match_beyond_read_budget_is_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        for i in 0..READ_BUDGET {
+            seed(&ws, &format!("noise/f{i:04}.txt"), "nothing relevant here").await;
+        }
+        seed(&ws, "zzz_only.txt", "login logic lives here").await; // content-only, sorts last
+        seed(&ws, "login_handler.rs", "nothing relevant here").await; // path hit
+
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        let files = find(&router, dir.path(), "login").await;
+        assert!(
+            files.contains(&PathBuf::from("login_handler.rs")),
+            "a path-hit file is found regardless of budget: {files:?}"
+        );
+        assert!(
+            !files.contains(&PathBuf::from("zzz_only.txt")),
+            "a content-only match beyond the read budget is missed: {files:?}"
+        );
     }
 }
