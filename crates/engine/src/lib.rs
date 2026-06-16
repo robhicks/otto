@@ -15,6 +15,10 @@ use otto_tools::{
     os_sandbox_available,
 };
 
+mod session;
+
+pub use session::Session;
+
 /// Build the registry of built-in agents: the whole spine is real: LLM-backed Planner +
 /// ContextFinder + Coder and a cargo-check Verifier. No stubs remain.
 pub fn build_default_registry() -> AgentRegistry {
