@@ -234,7 +234,7 @@ impl Agent for ContextFinder {
 mod tests {
     use super::*;
     use otto_engine_core::tool::{DenyAsk, Tool, ToolRegistry};
-    use otto_engine_core::traits::Workspace;
+    use otto_engine_core::traits::{Workspace, WorkspaceRead};
     use otto_engine_core::types::Edit;
     use otto_providers::{LocalProvider, ScriptedProvider};
     use otto_router::SingleProviderRouter;
@@ -254,7 +254,7 @@ mod tests {
     /// A registry with fs.list + fs.read over `ws_path` (both Allow for non-sensitive paths).
     fn registry(ws_path: &std::path::Path) -> ToolRegistry {
         let mut reg = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_path));
+        let ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(ws_path));
         reg.register(Arc::new(FsListTool::new(Arc::clone(&ws))) as Arc<dyn Tool>);
         reg.register(Arc::new(FsReadTool::new(ws)) as Arc<dyn Tool>);
         reg
