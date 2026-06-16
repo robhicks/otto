@@ -12,12 +12,17 @@ remain), the Coder's edits are gated, and the Verifier runs the project's test c
 sandbox and drives the Repair loop. Agents fall back to a deterministic offline path when no
 model answers, so the default test suite needs no network or keys.
 
+The **distribution axis has started**: a `persistence` crate now persists sessions and their
+seq-ordered event log to sqlite, and the engine runs turns through a `Session` lifecycle that
+records each turn (foundation for a future `serve` mode + `Last-Event-ID` replay).
+
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
-not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `persistence`,
-`remote`, `extensions`, `cli`, `ui`, etc.) and the remote/distribution axis (`serve` mode,
-`RemoteWorkspace`). Treat it as the destination, not the current state. The per-plan specs
-in `docs/superpowers/plans/` and the design spec in `docs/superpowers/specs/` record what
-was built and why; check the latest plan to see where the build currently stands.
+not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `remote`,
+`extensions`, `cli`, `ui`, etc.) and the rest of the remote/distribution axis (`serve` mode,
+`RemoteWorkspace`, session snapshot/restore). Treat it as the destination, not the current
+state. The per-plan specs in `docs/superpowers/plans/` and the design spec in
+`docs/superpowers/specs/` record what was built and why; check the latest plan to see where
+the build currently stands.
 
 ## Commands
 
@@ -61,7 +66,8 @@ impl crate.
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
 | `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). In-process today; the MCP-server form (`mcp-fs` etc.) is the destination. |
 | `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace`; agents see only the read-only `WorkspaceRead` view. |
-| `engine` | Binary `otto` + wiring library (`build_router`, `build_tool_registry`, `run_goal`). |
+| `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq. A leaf crate depending only on `protocol`. |
+| `engine` | Binary `otto` + wiring library (`build_router`, `build_tool_registry`, `run_goal`). Holds the `SessionStore` and runs turns through a `Session` (`create`/`run_prompt`/`abort`) that persists each turn fail-closed. |
 
 ### The orchestrator spine
 
@@ -72,8 +78,9 @@ receive an `AgentCtx` granting scoped access to `router()`, `workspace()` (the r
 `WorkspaceRead` view — agents never get the writable `Workspace`), and `tools()` — add a
 capability by extending `AgentCtx` (private fields + accessors), never by widening a
 struct's public surface. The only path to disk writes is the gated `fs.write` tool. Events
-are emitted as bare `EventKind`s; the engine layer (`run_goal`) assigns the monotonic
-per-session `seq`.
+are emitted as bare `EventKind`s; the engine layer (`Session::run_prompt`, which `run_goal`
+wraps) assigns the monotonic per-session `seq` and persists each turn's events through the
+`SessionStore` (fail-closed) after the turn — the `seq` counter continues across turns.
 
 ### Permission gate (security spine — get this right)
 
