@@ -149,7 +149,7 @@ impl crate::SessionStore for SqliteStore {
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
         let bound = match after_seq {
             None => -1i64,
-            Some(n) => n as i64,
+            Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
         };
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT seq, kind FROM events
@@ -472,6 +472,26 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
         assert!(store.replay_since(missing, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_since_huge_after_seq_returns_nothing() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
+        // A u64 larger than i64::MAX must not wrap to -1 and dump the whole log.
+        let gap = store.replay_since(id, Some(u64::MAX)).await.unwrap();
+        assert!(gap.is_empty());
     }
 
     #[tokio::test]

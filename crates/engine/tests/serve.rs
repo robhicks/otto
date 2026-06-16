@@ -139,6 +139,17 @@ async fn rejects_missing_token() {
     );
 }
 
+#[tokio::test]
+async fn rejects_wrong_token() {
+    let (port, _dir) = start_server().await;
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", "Bearer wrong-token".parse().unwrap());
+    let result = tokio_tungstenite::connect_async(req).await;
+    assert!(result.is_err(), "a wrong token must be rejected");
+}
+
 /// Receive the next text frame as JSON (panics on close/non-text or stream end).
 async fn next_json(
     ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),

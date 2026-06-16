@@ -39,6 +39,7 @@ struct ServeState {
 
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
 pub fn app(service: EngineService, token: String) -> AxumRouter {
+    assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState { service, token });
     AxumRouter::new()
         .route("/ws", get(ws_handler))
@@ -140,7 +141,8 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         }
     }
 
-    // Command loop. One command at a time; a turn runs to completion before the next.
+    // The loop ends on a clean close, a transport error, or an Abort. A disconnect with no
+    // in-flight turn intentionally leaves the session Active so the client can reconnect.
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
             Message::Text(t) => t,
@@ -195,7 +197,7 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
         None => {
             state
                 .service
-                .create_session("", &serde_json::json!({}))
+                .create_session("(serve/ws)", &serde_json::json!({}))
                 .await
         }
     }
