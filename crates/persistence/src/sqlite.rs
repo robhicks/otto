@@ -443,8 +443,14 @@ mod tests {
             .create_session("the goal", &serde_json::json!({ "k": 1 }))
             .await
             .unwrap();
-        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
-        store.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
         store.set_status(id, SessionStatus::Done).await.unwrap();
 
@@ -453,7 +459,10 @@ mod tests {
         assert_eq!(snap.goal, "the goal");
         assert_eq!(snap.status, SessionStatus::Done);
         assert_eq!(snap.config, serde_json::json!({ "k": 1 }));
-        assert_eq!(snap.events, vec![log_event(id, 0, "a"), log_event(id, 1, "b")]);
+        assert_eq!(
+            snap.events,
+            vec![log_event(id, 0, "a"), log_event(id, 1, "b")]
+        );
         assert_eq!(snap.turns, vec![turn(0, true)]);
     }
 
@@ -471,8 +480,14 @@ mod tests {
             .create_session("g", &serde_json::json!({ "m": "x" }))
             .await
             .unwrap();
-        source.append_event(id, &log_event(id, 0, "a")).await.unwrap();
-        source.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        source
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        source
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
         source.record_turn(id, &turn(0, true)).await.unwrap();
         source.set_status(id, SessionStatus::Done).await.unwrap();
         let snap = source.snapshot(id).await.unwrap();
@@ -484,7 +499,10 @@ mod tests {
         // Re-snapshotting the target yields an identical SessionState (preserved id/seqs).
         assert_eq!(target.snapshot(id).await.unwrap(), snap);
         assert_eq!(target.replay_since(id, None).await.unwrap(), snap.events);
-        assert_eq!(target.session_status(id).await.unwrap(), SessionStatus::Done);
+        assert_eq!(
+            target.session_status(id).await.unwrap(),
+            SessionStatus::Done
+        );
     }
 
     #[tokio::test]
