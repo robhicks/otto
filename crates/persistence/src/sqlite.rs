@@ -131,10 +131,21 @@ impl crate::SessionStore for SqliteStore {
 
     async fn set_status(
         &self,
-        _session: otto_protocol::SessionId,
-        _status: crate::SessionStatus,
+        session: otto_protocol::SessionId,
+        status: crate::SessionStatus,
     ) -> anyhow::Result<()> {
-        unimplemented!("set_status lands in Task 6")
+        let result = sqlx::query(
+            "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        )
+        .bind(status.as_db_str())
+        .bind(now_millis())
+        .bind(session.0.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("set_status: no session {}", session.0);
+        }
+        Ok(())
     }
 
     async fn replay_since(
@@ -253,5 +264,20 @@ mod tests {
         let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
         store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
         assert!(store.append_event(id, &log_event(id, 0, "dup")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_status_updates_existing_session() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        store.set_status(id, SessionStatus::Done).await.unwrap();
+        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn set_status_on_missing_session_is_error() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert!(store.set_status(missing, SessionStatus::Aborted).await.is_err());
     }
 }
