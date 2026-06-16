@@ -103,6 +103,11 @@ which skips `.git`/`target`/`node_modules`/dotfiles and does not follow symlinks
 lexically against goal keywords (path matches weighted above content matches), keeps the top
 candidates, and asks the model to pick the most relevant subset — falling back to the lexical
 top-N when the model does not answer in schema, so the default offline path stays deterministic.
+To stay bounded on large repositories, the lexical phase path-scores every file for free, drops
+non-text files by extension, and reads file contents only for the top ~200 files by path score
+(the rest are scored on their path alone) — so a small repo still reads everything, while a
+huge one reads a bounded subset. A file relevant only by content and ranked beyond that budget
+may be missed; path-named relevance (weighted higher) is always read.
 The `Coder` then reads those files via the gated `fs.read` tool and embeds their contents
 (budgeted: at most 8 files, ~8 KB each, ~32 KB total) in its prompt, so edits are grounded in
 real file contents. With this, the whole spine — Planner → ContextFinder → Coder → Verifier — is
