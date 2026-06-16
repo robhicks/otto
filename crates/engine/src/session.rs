@@ -111,6 +111,11 @@ impl<'a> Session<'a> {
 
         Ok((events, outcome))
     }
+
+    /// Mark the session aborted. (≙ `Command::Abort`.)
+    pub async fn abort(&self) -> anyhow::Result<()> {
+        self.store.set_status(self.id, SessionStatus::Aborted).await
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +187,65 @@ mod tests {
         for (i, event) in events.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn second_prompt_continues_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir).await;
+        let provider = ScriptedProvider::new("{}")
+            .on(
+                "edits",
+                r#"{"edits": [{"path": "out.txt", "contents": "hi g"}]}"#,
+            )
+            .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let workspace = LocalWorkspace::new(dir.path());
+        let tools_ws: Arc<dyn otto_engine_core::traits::Workspace> =
+            Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = crate::build_tool_registry(tools_ws, dir.path().to_path_buf());
+        let registry = crate::build_default_registry();
+
+        let mut session = Session::create(&store, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let id = session.id();
+        let (turn1, _) = session
+            .run_prompt(&registry, &router, &workspace, &tools, "g")
+            .await
+            .unwrap();
+        let (turn2, _) = session
+            .run_prompt(&registry, &router, &workspace, &tools, "g")
+            .await
+            .unwrap();
+
+        let last1 = turn1.last().unwrap().seq;
+        // Turn 2's first event continues right after turn 1's last.
+        assert_eq!(turn2.first().unwrap().seq, last1 + 1);
+
+        // The full replayed log is contiguous from 0 and covers both turns.
+        let all = store.replay_since(id, None).await.unwrap();
+        assert_eq!(all.len(), turn1.len() + turn2.len());
+        for (i, event) in all.iter().enumerate() {
+            assert_eq!(event.seq, i as u64);
+        }
+
+        // Replaying after turn 1's last seq yields exactly turn 2.
+        let gap = store.replay_since(id, Some(last1)).await.unwrap();
+        assert_eq!(gap, turn2);
+    }
+
+    #[tokio::test]
+    async fn abort_sets_status_aborted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir).await;
+        let session = Session::create(&store, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        session.abort().await.unwrap();
+        assert_eq!(
+            store.session_status(session.id()).await.unwrap(),
+            SessionStatus::Aborted
+        );
     }
 }
