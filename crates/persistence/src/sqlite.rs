@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 /// A session store backed by a single sqlite database file.
 pub struct SqliteStore {
@@ -19,7 +19,9 @@ impl SqliteStore {
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // WAL lets one writer proceed concurrently with readers.
+            .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let store = Self { pool };
         store.init_schema().await?;
@@ -62,22 +64,6 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-}
-
-impl SqliteStore {
-    /// Read a session's current status. Errors if the session does not exist.
-    pub async fn session_status(
-        &self,
-        session: otto_protocol::SessionId,
-    ) -> anyhow::Result<crate::SessionStatus> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM sessions WHERE id = ?1")
-            .bind(session.0.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
-        let (status,) =
-            row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
-        crate::SessionStatus::from_db_str(&status)
     }
 }
 
@@ -159,14 +145,11 @@ impl crate::SessionStore for SqliteStore {
     async fn replay_since(
         &self,
         session: otto_protocol::SessionId,
-        after_seq: u64,
+        after_seq: Option<u64>,
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
-        // Bind -1 when after_seq == 0 so that `seq > -1` returns all events
-        // (including seq = 0). For after_seq > 0 the predicate is `seq > after_seq`.
-        let bound = if after_seq == 0 {
-            -1i64
-        } else {
-            after_seq as i64
+        let bound = match after_seq {
+            None => -1i64,
+            Some(n) => n as i64,
         };
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT seq, kind FROM events
@@ -186,6 +169,19 @@ impl crate::SessionStore for SqliteStore {
             });
         }
         Ok(events)
+    }
+
+    async fn session_status(
+        &self,
+        session: otto_protocol::SessionId,
+    ) -> anyhow::Result<crate::SessionStatus> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM sessions WHERE id = ?1")
+            .bind(session.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        let (status,) =
+            row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
+        crate::SessionStatus::from_db_str(&status)
     }
 }
 
@@ -262,7 +258,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let replayed = store.replay_since(id, 0).await.unwrap();
+        let replayed = store.replay_since(id, None).await.unwrap();
         assert_eq!(
             replayed,
             vec![
@@ -286,7 +282,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let gap = store.replay_since(id, 1).await.unwrap();
+        let gap = store.replay_since(id, Some(1)).await.unwrap();
         assert_eq!(gap, vec![log_event(id, 2, "c")]);
     }
 
@@ -362,6 +358,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_since_unknown_session_is_empty() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert!(store.replay_since(missing, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn replay_is_isolated_per_session() {
         let (store, _dir) = temp_store().await;
         let a = store
@@ -381,11 +384,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.replay_since(a, 0).await.unwrap(),
+            store.replay_since(a, None).await.unwrap(),
             vec![log_event(a, 0, "for-a")]
         );
         assert_eq!(
-            store.replay_since(b, 0).await.unwrap(),
+            store.replay_since(b, None).await.unwrap(),
             vec![log_event(b, 0, "for-b")]
         );
     }

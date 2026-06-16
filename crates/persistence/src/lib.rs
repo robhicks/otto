@@ -30,7 +30,16 @@ pub trait SessionStore: Send + Sync {
     /// Update a session's lifecycle status. Errors if the session does not exist.
     async fn set_status(&self, session: SessionId, status: SessionStatus) -> anyhow::Result<()>;
 
-    /// Replay the session's events with `seq > after_seq`, in ascending seq order.
-    /// Pass `0` to get the full log (seqs are 0-based, so this returns everything).
-    async fn replay_since(&self, session: SessionId, after_seq: u64) -> anyhow::Result<Vec<Event>>;
+    /// Replay events for `session` in ascending seq order. `None` returns the full
+    /// log; `Some(n)` returns only events with `seq > n` (strictly after n) — a
+    /// client that has seen up through seq n passes `Some(n)` to get the gap.
+    /// Returns an empty Vec for an unknown session.
+    async fn replay_since(
+        &self,
+        session: SessionId,
+        after_seq: Option<u64>,
+    ) -> anyhow::Result<Vec<Event>>;
+
+    /// Read a session's current status. Errors if the session does not exist.
+    async fn session_status(&self, session: SessionId) -> anyhow::Result<SessionStatus>;
 }
