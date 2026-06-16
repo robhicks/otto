@@ -80,7 +80,15 @@ impl<'a> Session<'a> {
             workspace,
             tools,
         };
-        let outcome = orchestrator.run_turn(id, goal, &sink).await?;
+        let outcome = match orchestrator.run_turn(id, goal, &sink).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Orchestrator failure: mark the session Failed (best-effort) before
+                // propagating, so a crashed turn doesn't leave the session stuck Active.
+                let _ = store.set_status(id, SessionStatus::Failed).await;
+                return Err(e);
+            }
+        };
         let events = collected.lock().unwrap().clone();
 
         // Persist this turn's events. Fail-closed: a store error fails the turn rather than
@@ -247,5 +255,29 @@ mod tests {
             store.session_status(session.id()).await.unwrap(),
             SessionStatus::Aborted
         );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_error_marks_session_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir).await;
+        // An empty registry: the orchestrator can't find the Planner, so run_turn errors.
+        let registry = otto_engine_core::AgentRegistry::new();
+        let provider = ScriptedProvider::new("{}");
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let workspace = LocalWorkspace::new(dir.path());
+        let tools_ws: Arc<dyn otto_engine_core::traits::Workspace> =
+            Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = crate::build_tool_registry(tools_ws, dir.path().to_path_buf());
+
+        let mut session = Session::create(&store, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let id = session.id();
+        let result = session
+            .run_prompt(&registry, &router, &workspace, &tools, "g")
+            .await;
+        assert!(result.is_err());
+        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Failed);
     }
 }
