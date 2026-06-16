@@ -40,9 +40,15 @@ async fn context_flows_from_finder_to_coder() {
     let store = otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
         .await
         .unwrap();
-    let (_events, outcome) = run_goal("update the thing function", &store, &router, &workspace, &tools)
-        .await
-        .unwrap();
+    let (_events, outcome) = run_goal(
+        "update the thing function",
+        &store,
+        &router,
+        &workspace,
+        &tools,
+    )
+    .await
+    .unwrap();
 
     assert!(outcome.ok);
     let written = workspace.read(Path::new("result.txt")).await.unwrap();
