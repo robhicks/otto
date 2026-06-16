@@ -183,6 +183,97 @@ impl crate::SessionStore for SqliteStore {
             row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
         crate::SessionStatus::from_db_str(&status)
     }
+
+    async fn snapshot(
+        &self,
+        session: otto_protocol::SessionId,
+    ) -> anyhow::Result<crate::SessionState> {
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT goal, status, config FROM sessions WHERE id = ?1")
+                .bind(session.0.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (goal, status, config) =
+            row.ok_or_else(|| anyhow::anyhow!("snapshot: no session {}", session.0))?;
+        let status = crate::SessionStatus::from_db_str(&status)?;
+        let config: serde_json::Value = serde_json::from_str(&config)?;
+
+        let events = self.replay_since(session, None).await?;
+
+        let turn_rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT turn_index, goal, outcome FROM turns
+             WHERE session_id = ?1 ORDER BY turn_index ASC",
+        )
+        .bind(session.0.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut turns = Vec::with_capacity(turn_rows.len());
+        for (turn_index, turn_goal, outcome) in turn_rows {
+            turns.push(crate::TurnRecord {
+                turn_index: turn_index as u32,
+                goal: turn_goal,
+                outcome: serde_json::from_str(&outcome)?,
+            });
+        }
+
+        Ok(crate::SessionState {
+            id: session,
+            goal,
+            status,
+            config,
+            events,
+            turns,
+        })
+    }
+
+    async fn restore(
+        &self,
+        state: &crate::SessionState,
+    ) -> anyhow::Result<otto_protocol::SessionId> {
+        // Atomic: either the whole session (row + events + turns) lands, or nothing does.
+        // Timestamps are regenerated; ids and seqs are preserved.
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(state.id.0.to_string())
+        .bind(&state.goal)
+        .bind(state.status.as_db_str())
+        .bind(now)
+        .bind(now)
+        .bind(serde_json::to_string(&state.config)?)
+        .execute(&mut *tx)
+        .await?;
+
+        for event in &state.events {
+            sqlx::query("INSERT INTO events (session_id, seq, kind) VALUES (?1, ?2, ?3)")
+                .bind(state.id.0.to_string())
+                .bind(event.seq as i64)
+                .bind(serde_json::to_string(&event.kind)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for turn in &state.turns {
+            sqlx::query(
+                "INSERT INTO turns (session_id, turn_index, goal, outcome, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(state.id.0.to_string())
+            .bind(turn.turn_index as i64)
+            .bind(&turn.goal)
+            .bind(serde_json::to_string(&turn.outcome)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(state.id)
+    }
 }
 
 /// Milliseconds since the Unix epoch, for `created_at`/`updated_at`/`started_at`.
@@ -196,7 +287,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionStatus, SessionStore, TurnRecord};
+    use crate::{SessionState, SessionStatus, SessionStore, TurnRecord};
     use otto_protocol::{Event, EventKind};
 
     /// Opens a fresh store in a temp dir. The returned `TempDir` must be kept alive for
@@ -362,6 +453,105 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
         assert!(store.replay_since(missing, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_metadata_events_and_turns() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("the goal", &serde_json::json!({ "k": 1 }))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+        store.set_status(id, SessionStatus::Done).await.unwrap();
+
+        let snap = store.snapshot(id).await.unwrap();
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.goal, "the goal");
+        assert_eq!(snap.status, SessionStatus::Done);
+        assert_eq!(snap.config, serde_json::json!({ "k": 1 }));
+        assert_eq!(
+            snap.events,
+            vec![log_event(id, 0, "a"), log_event(id, 1, "b")]
+        );
+        assert_eq!(snap.turns, vec![turn(0, true)]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_unknown_session_is_error() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert!(store.snapshot(missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_into_a_fresh_store() {
+        let (source, _d1) = temp_store().await;
+        let id = source
+            .create_session("g", &serde_json::json!({ "m": "x" }))
+            .await
+            .unwrap();
+        source
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        source
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
+        source.record_turn(id, &turn(0, true)).await.unwrap();
+        source.set_status(id, SessionStatus::Done).await.unwrap();
+        let snap = source.snapshot(id).await.unwrap();
+
+        let (target, _d2) = temp_store().await;
+        let restored_id = target.restore(&snap).await.unwrap();
+        assert_eq!(restored_id, id);
+
+        // Re-snapshotting the target yields an identical SessionState (preserved id/seqs).
+        assert_eq!(target.snapshot(id).await.unwrap(), snap);
+        assert_eq!(target.replay_since(id, None).await.unwrap(), snap.events);
+        assert_eq!(
+            target.session_status(id).await.unwrap(),
+            SessionStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_is_atomic_on_inconsistent_state() {
+        let (store, _dir) = temp_store().await;
+        let id = otto_protocol::SessionId::new();
+        // A SessionState with a duplicate seq in its event log is internally inconsistent.
+        let state = SessionState {
+            id,
+            goal: "g".to_string(),
+            status: SessionStatus::Done,
+            config: serde_json::json!({}),
+            events: vec![log_event(id, 0, "a"), log_event(id, 0, "dup")],
+            turns: vec![],
+        };
+        assert!(store.restore(&state).await.is_err());
+        // The transaction rolled back: no stranded session row.
+        assert!(store.session_status(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_into_existing_session_is_error() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let snap = store.snapshot(id).await.unwrap();
+        // Restoring into the same store collides on the sessions primary key.
+        assert!(store.restore(&snap).await.is_err());
     }
 
     #[tokio::test]

@@ -20,6 +20,11 @@ mod session;
 
 pub use session::Session;
 
+/// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by
+/// both `build_router` (selection) and `session_config` (recording the effective model).
+const DEFAULT_OLLAMA_MODEL: &str = "llama3.2";
+const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
+
 /// Build the registry of built-in agents: the whole spine is real: LLM-backed Planner +
 /// ContextFinder + Coder and a cargo-check Verifier. No stubs remain.
 pub fn build_default_registry() -> AgentRegistry {
@@ -43,7 +48,8 @@ pub fn build_default_registry() -> AgentRegistry {
 /// runs fully offline and deterministically — the default for tests and first-run.
 pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     let local: Arc<dyn Provider> = if std::env::var("OTTO_OLLAMA").as_deref() == Ok("1") {
-        let model = std::env::var("OTTO_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+        let model =
+            std::env::var("OTTO_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
         Arc::new(OllamaProvider::local_default(model))
     } else {
         Arc::new(LocalProvider::new())
@@ -52,7 +58,7 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     match std::env::var("ANTHROPIC_API_KEY") {
         Ok(key) if !key.is_empty() => {
             let model = std::env::var("OTTO_ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-haiku-4-5".to_string());
+                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string());
             let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
                 AnthropicProvider::api_base_default(),
                 key,
@@ -108,8 +114,12 @@ pub fn session_config() -> serde_json::Value {
     serde_json::json!({
         "ollama": ollama,
         "anthropic": anthropic,
-        "ollama_model": std::env::var("OTTO_OLLAMA_MODEL").ok(),
-        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL").ok(),
+        // Record the EFFECTIVE model (the build_router default when the env var is unset),
+        // so a restored session's config reflects the routing it actually used.
+        "ollama_model": std::env::var("OTTO_OLLAMA_MODEL")
+            .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string()),
+        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string()),
     })
 }
 

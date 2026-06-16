@@ -278,6 +278,9 @@ mod tests {
             .run_prompt(&registry, &router, &workspace, &tools, "g")
             .await;
         assert!(result.is_err());
-        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Failed);
+        assert_eq!(
+            store.session_status(id).await.unwrap(),
+            SessionStatus::Failed
+        );
     }
 }
