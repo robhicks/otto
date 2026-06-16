@@ -3,7 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_engine_core::types::Edit;
 
 /// A workspace rooted at a real directory on disk. All paths are resolved relative
@@ -39,7 +39,7 @@ impl LocalWorkspace {
 }
 
 #[async_trait]
-impl Workspace for LocalWorkspace {
+impl WorkspaceRead for LocalWorkspace {
     async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
         let full = self.contain(path)?;
         Ok(tokio::fs::read(full).await?)
@@ -110,7 +110,10 @@ impl Workspace for LocalWorkspace {
         out.sort();
         Ok(out)
     }
+}
 
+#[async_trait]
+impl Workspace for LocalWorkspace {
     async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64> {
         let full = self.contain(&edit.path)?;
         if let Some(parent) = full.parent() {

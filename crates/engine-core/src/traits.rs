@@ -17,12 +17,19 @@ pub trait Provider: Send + Sync {
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse>;
 }
 
-/// The repository the engine operates on. `LocalWorkspace` edits a real folder in
-/// place (no clone); `RemoteWorkspace` operates on a remote checkout (later plan).
+/// Read access to the repository the engine operates on. This is the agent-facing view
+/// (`AgentCtx::workspace()`) — agents may read, but cannot mutate, the workspace.
 #[async_trait]
-pub trait Workspace: Send + Sync {
+pub trait WorkspaceRead: Send + Sync {
     async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>>;
     async fn list(&self, glob: &str) -> anyhow::Result<Vec<PathBuf>>;
+}
+
+/// The writable repository. `LocalWorkspace` edits a real folder in place (no clone);
+/// `RemoteWorkspace` operates on a remote checkout (later plan). Only the orchestrator and the
+/// gated `fs.write` tool hold this; agents get the read-only `WorkspaceRead` view.
+#[async_trait]
+pub trait Workspace: WorkspaceRead {
     /// Apply a full-file edit, returning the number of bytes written.
     async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64>;
 }
@@ -38,14 +45,14 @@ pub trait Agent: Send + Sync {
 /// `new` and read via accessors so capabilities can be added without breaking callers.
 pub struct AgentCtx<'a> {
     router: &'a dyn Router,
-    workspace: &'a dyn Workspace,
+    workspace: &'a dyn WorkspaceRead,
     tools: &'a ToolRegistry,
 }
 
 impl<'a> AgentCtx<'a> {
     pub fn new(
         router: &'a dyn Router,
-        workspace: &'a dyn Workspace,
+        workspace: &'a dyn WorkspaceRead,
         tools: &'a ToolRegistry,
     ) -> Self {
         Self {
@@ -60,8 +67,9 @@ impl<'a> AgentCtx<'a> {
         self.router
     }
 
-    /// The workspace agents read from / write edits to.
-    pub fn workspace(&self) -> &dyn Workspace {
+    /// The read-only workspace view agents may read from. Writes are NOT available here — they
+    /// go through the gated `fs.write` tool or the orchestrator's gated apply.
+    pub fn workspace(&self) -> &dyn WorkspaceRead {
         self.workspace
     }
 
