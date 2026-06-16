@@ -149,7 +149,7 @@ impl crate::SessionStore for SqliteStore {
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
         let bound = match after_seq {
             None => -1i64,
-            Some(n) => n as i64,
+            Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
         };
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT seq, kind FROM events
@@ -224,6 +224,25 @@ impl crate::SessionStore for SqliteStore {
             events,
             turns,
         })
+    }
+
+    async fn next_seq(&self, session: otto_protocol::SessionId) -> anyhow::Result<u64> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(seq) + 1, 0) FROM events WHERE session_id = ?1")
+                .bind(session.0.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 as u64)
+    }
+
+    async fn next_turn(&self, session: otto_protocol::SessionId) -> anyhow::Result<u32> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(turn_index) + 1, 0) FROM turns WHERE session_id = ?1",
+        )
+        .bind(session.0.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 as u32)
     }
 
     async fn restore(
@@ -456,6 +475,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_since_huge_after_seq_returns_nothing() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
+        // A u64 larger than i64::MAX must not wrap to -1 and dump the whole log.
+        let gap = store.replay_since(id, Some(u64::MAX)).await.unwrap();
+        assert!(gap.is_empty());
+    }
+
+    #[tokio::test]
     async fn snapshot_captures_metadata_events_and_turns() {
         let (store, _dir) = temp_store().await;
         let id = store
@@ -552,6 +591,36 @@ mod tests {
         let snap = store.snapshot(id).await.unwrap();
         // Restoring into the same store collides on the sessions primary key.
         assert!(store.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cursors_advance_with_events_and_turns() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(store.next_seq(id).await.unwrap(), 0);
+        assert_eq!(store.next_turn(id).await.unwrap(), 0);
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 1, "b"))
+            .await
+            .unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+        assert_eq!(store.next_seq(id).await.unwrap(), 2);
+        assert_eq!(store.next_turn(id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cursors_are_zero_for_unknown_session() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert_eq!(store.next_seq(missing).await.unwrap(), 0);
+        assert_eq!(store.next_turn(missing).await.unwrap(), 0);
     }
 
     #[tokio::test]

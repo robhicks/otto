@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use otto_engine::{build_tool_registry, run_goal};
-use otto_engine_core::traits::{Workspace, WorkspaceRead};
+use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
@@ -31,21 +31,26 @@ async fn context_flows_from_finder_to_coder() {
         "CTX_MARKER_77",
         r#"{"edits": [{"path": "result.txt", "contents": "used context"}]}"#,
     );
-    let router = SingleProviderRouter::new(Arc::new(provider));
-    let workspace = LocalWorkspace::new(dir.path());
-
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
-    let tools = build_tool_registry(tools_workspace, dir.path().to_path_buf());
+    let tools = Arc::new(build_tool_registry(
+        tools_workspace,
+        dir.path().to_path_buf(),
+    ));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
+            .await
+            .unwrap(),
+    );
 
-    let store = otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
-        .await
-        .unwrap();
     let (_events, outcome) = run_goal(
         "update the thing function",
-        &store,
-        &router,
-        &workspace,
-        &tools,
+        store,
+        router,
+        workspace.clone(),
+        tools,
     )
     .await
     .unwrap();

@@ -16,9 +16,11 @@ use otto_tools::{
     os_sandbox_available,
 };
 
-mod session;
+mod serve;
+mod service;
 
-pub use session::Session;
+pub use serve::app as serve_app;
+pub use service::{CollectingSink, EngineService, EventSink};
 
 /// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by
 /// both `build_router` (selection) and `session_config` (recording the effective model).
@@ -123,21 +125,27 @@ pub fn session_config() -> serde_json::Value {
     })
 }
 
-/// Run one turn for `goal` against `workspace` using `router`, persisting the session and
-/// its events through `store`. Returns the sequenced events emitted and the final outcome.
-/// A thin wrapper over `Session`: create the session, then run one prompt.
+/// Run one turn for `goal` through an `EngineService` backed by `store`, returning the
+/// sequenced events and the outcome. A thin wrapper: build the service, create a session,
+/// run one prompt with a collecting sink.
 pub async fn run_goal(
     goal: &str,
-    store: &dyn SessionStore,
-    router: &dyn Router,
-    workspace: &dyn Workspace,
-    tools: &ToolRegistry,
+    store: Arc<dyn SessionStore>,
+    router: Arc<dyn Router>,
+    workspace: Arc<dyn Workspace>,
+    tools: Arc<ToolRegistry>,
 ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
-    let registry = build_default_registry();
-    let mut session = Session::create(store, goal, &session_config()).await?;
-    session
-        .run_prompt(&registry, router, workspace, tools, goal)
-        .await
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
+    let session = service.create_session(goal, &session_config()).await?;
+    let mut sink = CollectingSink::default();
+    let outcome = service.run_prompt(session, goal, &mut sink).await?;
+    Ok((sink.events, outcome))
 }
 
 #[cfg(test)]
