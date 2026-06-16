@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
-use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit};
+use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit, Milestone};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -71,7 +71,22 @@ async fn read_context(ctx: &AgentCtx<'_>, context: &[PathBuf]) -> Vec<(PathBuf, 
     out
 }
 
-fn code_prompt(goal: &str, files: &[(PathBuf, String)], feedback: Option<&str>) -> String {
+fn code_prompt(
+    goal: &str,
+    milestones: &[Milestone],
+    files: &[(PathBuf, String)],
+    feedback: Option<&str>,
+) -> String {
+    let plan_block = if milestones.is_empty() {
+        "(none)".to_string()
+    } else {
+        milestones
+            .iter()
+            .enumerate()
+            .map(|(i, m)| format!("{}. {}", i + 1, m.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let context_block = if files.is_empty() {
         "(none)".to_string()
     } else {
@@ -84,6 +99,7 @@ fn code_prompt(goal: &str, files: &[(PathBuf, String)], feedback: Option<&str>) 
     let mut prompt = format!(
         "You are otto's coder. Produce the complete file edits that accomplish the goal.\n\
          Goal: {goal}\n\
+         Plan (milestones to accomplish):\n{plan_block}\n\
          Relevant files (each shown as a path then its current contents):\n{context_block}\n\
          Respond ONLY with valid JSON matching this schema:\n\
          edits: array of objects, each with a string field named path (a relative path) and \
@@ -102,6 +118,7 @@ impl Agent for Coder {
     async fn run(&self, req: AgentRequest, ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
         let AgentRequest::Code {
             goal,
+            milestones,
             context,
             feedback,
             prior_failures,
@@ -114,7 +131,7 @@ impl Agent for Coder {
             .router()
             .complete(
                 CompleteRequest {
-                    prompt: code_prompt(&goal, &files, feedback.as_deref()),
+                    prompt: code_prompt(&goal, &milestones, &files, feedback.as_deref()),
                 },
                 RouteHints {
                     task_kind: TaskKind::Edit,
@@ -158,6 +175,7 @@ mod tests {
             .run(
                 AgentRequest::Code {
                     goal: "add a greeting".to_string(),
+                    milestones: Vec::new(),
                     context: Vec::new(),
                     feedback,
                     prior_failures: 0,
@@ -225,7 +243,42 @@ mod tests {
             .run(
                 AgentRequest::Code {
                     goal: "update".to_string(),
+                    milestones: Vec::new(),
                     context: vec![PathBuf::from("src/lib.rs")],
+                    feedback: None,
+                    prior_failures: 0,
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        match out {
+            AgentOutput::Code { edits } => assert_eq!(edits.len(), 1),
+            other => panic!("expected Code, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn includes_milestones_in_prompt() {
+        use otto_engine_core::types::Milestone;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        let tools = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
+        // The scripted rule fires ONLY if the milestone description reached the prompt.
+        let provider = ScriptedProvider::new("{}").on(
+            "MILESTONE_MARKER_7",
+            r#"{"edits": [{"path": "out.txt", "contents": "ok"}]}"#,
+        );
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let ctx = AgentCtx::new(&router, &ws, &tools);
+        let out = Coder
+            .run(
+                AgentRequest::Code {
+                    goal: "build it".to_string(),
+                    milestones: vec![Milestone {
+                        description: "implement MILESTONE_MARKER_7".to_string(),
+                    }],
+                    context: Vec::new(),
                     feedback: None,
                     prior_failures: 0,
                 },
