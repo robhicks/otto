@@ -45,14 +45,56 @@ impl Workspace for LocalWorkspace {
         Ok(tokio::fs::read(full).await?)
     }
 
-    async fn list(&self, _glob: &str) -> anyhow::Result<Vec<PathBuf>> {
-        // Skeleton: shallow listing of the root, relative paths. Globbing arrives
-        // with the retrieval/ContextFinder work in a later plan.
-        let mut entries = tokio::fs::read_dir(&self.root).await?;
+    async fn list(&self, glob: &str) -> anyhow::Result<Vec<PathBuf>> {
+        // Shallow mode (the default `*`): list the root's immediate entries, unchanged.
+        if !glob.contains("**") {
+            let mut entries = tokio::fs::read_dir(&self.root).await?;
+            let mut out = Vec::new();
+            while let Some(entry) = entries.next_entry().await? {
+                if let Ok(rel) = entry.path().strip_prefix(&self.root) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+            out.sort();
+            return Ok(out);
+        }
+
+        // Recursive mode (`**`): walk the subtree, returning files only. Skips a fixed set of
+        // ignored directories (build/VCS/dependency dirs and any dotfile/dotdir, which also
+        // covers the gate's sensitive-path floor), does not follow symlinks, and caps the
+        // number of files to bound cost. Output is sorted for determinism.
+        const MAX_ENTRIES: usize = 5000;
+        fn ignored(name: &str) -> bool {
+            name == ".git" || name == "target" || name == "node_modules" || name.starts_with('.')
+        }
         let mut out = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if let Ok(rel) = entry.path().strip_prefix(&self.root) {
-                out.push(rel.to_path_buf());
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+                continue; // skip directories we cannot read rather than failing the whole walk
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if ignored(&name) {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    stack.push(path);
+                } else if file_type.is_file() {
+                    if let Ok(rel) = path.strip_prefix(&self.root) {
+                        out.push(rel.to_path_buf());
+                        if out.len() >= MAX_ENTRIES {
+                            out.sort();
+                            return Ok(out);
+                        }
+                    }
+                }
             }
         }
         out.sort();
@@ -141,5 +183,57 @@ mod tests {
 
         let listing = ws.list("*").await.unwrap();
         assert_eq!(listing, vec![PathBuf::from("a.txt")]);
+    }
+
+    #[tokio::test]
+    async fn recursive_list_walks_subdirs_and_skips_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        for (p, c) in [
+            ("src/lib.rs", "a"),
+            ("src/inner/mod.rs", "b"),
+            ("target/debug/junk.rs", "c"),
+            (".git/config", "d"),
+            ("node_modules/x/index.js", "e"),
+        ] {
+            ws.apply_edit(&Edit {
+                path: PathBuf::from(p),
+                new_contents: c.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+        let listing = ws.list("**").await.unwrap();
+        assert!(listing.contains(&PathBuf::from("src/lib.rs")));
+        assert!(listing.contains(&PathBuf::from("src/inner/mod.rs")));
+        assert!(!listing.iter().any(|p| p.starts_with("target")));
+        assert!(!listing.iter().any(|p| p.starts_with(".git")));
+        assert!(!listing.iter().any(|p| p.starts_with("node_modules")));
+        assert!(!listing.contains(&PathBuf::from("src")));
+        let mut sorted = listing.clone();
+        sorted.sort();
+        assert_eq!(listing, sorted);
+    }
+
+    #[tokio::test]
+    async fn shallow_list_unchanged_for_star_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        ws.apply_edit(&Edit {
+            path: PathBuf::from("a.txt"),
+            new_contents: "a".to_string(),
+        })
+        .await
+        .unwrap();
+        ws.apply_edit(&Edit {
+            path: PathBuf::from("sub/b.txt"),
+            new_contents: "b".to_string(),
+        })
+        .await
+        .unwrap();
+        let listing = ws.list("*").await.unwrap();
+        assert!(listing.contains(&PathBuf::from("a.txt")));
+        assert!(listing.contains(&PathBuf::from("sub")));
+        assert!(!listing.contains(&PathBuf::from("sub/b.txt")));
     }
 }
