@@ -89,7 +89,17 @@ orchestrator's Repair loop). It degrades safely — no recognized project → "n
 cleared-env sandbox, `BashTool` passes through the non-secret Rust toolchain location (`PATH`
 includes `~/.cargo/bin`; `CARGO_HOME`/`RUSTUP_HOME` point at the host toolchain); this grants
 no new read access (the host FS is already read-only-readable in the sandbox) and network stays
-off, so the read-but-no-exfil posture is unchanged. `ContextFinder` remains a stub.
+off, so the read-but-no-exfil posture is unchanged.
+
+The `ContextFinder` is real: it enumerates the workspace recursively (the `fs.list` `**` glob,
+which skips `.git`/`target`/`node_modules`/dotfiles and does not follow symlinks), scores files
+lexically against goal keywords (path matches weighted above content matches), keeps the top
+candidates, and asks the model to pick the most relevant subset — falling back to the lexical
+top-N when the model does not answer in schema, so the default offline path stays deterministic.
+The `Coder` then reads those files via the gated `fs.read` tool and embeds their contents
+(budgeted: at most 8 files, ~8 KB each, ~32 KB total) in its prompt, so edits are grounded in
+real file contents. With this, the whole spine — Planner → ContextFinder → Coder → Verifier — is
+real, with no stubs remaining.
 
 ### `Workspace` — the workspace-axis seam
 
