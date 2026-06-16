@@ -6,17 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 otto is an agentic coding engine: a deterministic orchestrator drives a spine of atomic
 agents (Planner → ContextFinder → Coder → Verifier) over a workspace, routing LLM calls
-across local and remote providers. The codebase is being built up plan-by-plan and is
-currently a **walking skeleton** — the spine, trait seams, providers, router, tools, and
-permission gate are real and tested, but several agents are still stubs (`StubPlanner`,
-`StubContextFinder`, `EchoCoder`, `StubVerifier`). Real LLM-backed agents are landing in
-Plan 4b (current branch).
+across local and remote providers. The codebase is being built up plan-by-plan. The
+**full single-machine spine is real and tested**: all four agents are LLM-backed (no stubs
+remain), the Coder's edits are gated, and the Verifier runs the project's test command in a
+sandbox and drives the Repair loop. Agents fall back to a deterministic offline path when no
+model answers, so the default test suite needs no network or keys.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
-not exist yet (`mcp-fs`, `mcp-git`, `persistence`, `remote`, `extensions`, `cli`, `ui`,
-etc.). Treat it as the destination, not the current state. The per-plan specs in
-`docs/superpowers/plans/` and the design spec in `docs/superpowers/specs/` record what was
-built and why; check the latest plan to see where the skeleton currently stands.
+not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `persistence`,
+`remote`, `extensions`, `cli`, `ui`, etc.) and the remote/distribution axis (`serve` mode,
+`RemoteWorkspace`). Treat it as the destination, not the current state. The per-plan specs
+in `docs/superpowers/plans/` and the design spec in `docs/superpowers/specs/` record what
+was built and why; check the latest plan to see where the build currently stands.
 
 ## Commands
 
@@ -54,12 +55,12 @@ impl crate.
 | Crate | Role |
 |---|---|
 | `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`). No I/O. The crate a future UI shares. |
-| `engine-core` | The orchestrator state machine + the trait seams: `Agent`, `Workspace`, `Provider`, `Router`, `Tool`/`ToolRegistry`/`PermissionGate`, plus `AgentRegistry` and shared `types`. |
-| `agents` | Built-in atomic agents implementing `Agent` (currently stubs). |
-| `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. |
+| `engine-core` | The orchestrator state machine + the trait seams: `Agent`, `WorkspaceRead`/`Workspace`, `Provider`, `Router`, `Tool`/`ToolRegistry`/`PermissionGate`, plus `AgentRegistry` and shared `types`. |
+| `agents` | Built-in atomic agents implementing `Agent`: `Planner`, `ContextFinder` (lexical prefilter → LLM rank, with bounded per-turn read budget), `Coder`, `Verifier` (data-driven recipe table; runs the detected ecosystem's test command). All LLM-backed, all with a deterministic offline fallback. |
+| `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. (`gemini`/`openai` are intended but not yet built.) |
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
-| `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). |
-| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). |
+| `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). In-process today; the MCP-server form (`mcp-fs` etc.) is the destination. |
+| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace`; agents see only the read-only `WorkspaceRead` view. |
 | `engine` | Binary `otto` + wiring library (`build_router`, `build_tool_registry`, `run_goal`). |
 
 ### The orchestrator spine
@@ -67,10 +68,12 @@ impl crate.
 `Orchestrator::run_turn` (`crates/engine-core/src/orchestrator.rs`) is the deterministic
 control flow: **Plan → Execute (ContextFinder → Coder → apply gated edits → Verify, looping to Repair on failure) → Done**. It
 owns control flow and event emission only; all capability lives in the agents. Agents
-receive an `AgentCtx` granting scoped access to `router()`, `workspace()`, and `tools()` —
-add a capability by extending `AgentCtx` (private fields + accessors), never by widening a
-struct's public surface. Events are emitted as bare `EventKind`s; the engine layer
-(`run_goal`) assigns the monotonic per-session `seq`.
+receive an `AgentCtx` granting scoped access to `router()`, `workspace()` (the read-only
+`WorkspaceRead` view — agents never get the writable `Workspace`), and `tools()` — add a
+capability by extending `AgentCtx` (private fields + accessors), never by widening a
+struct's public surface. The only path to disk writes is the gated `fs.write` tool. Events
+are emitted as bare `EventKind`s; the engine layer (`run_goal`) assigns the monotonic
+per-session `seq`.
 
 ### Permission gate (security spine — get this right)
 
@@ -98,9 +101,10 @@ filesystem read-only except the workspace root, network/pid/ipc isolated, minima
 
 ## Conventions
 
-- **Trait seams are remote-ready by design.** When adding to a seam (`Agent`, `Workspace`,
-  `Provider`, `Router`, `Tool`), keep it `Send + Sync` and async, and preserve the property
-  that the orchestrator only ever holds trait objects — never concrete impls.
+- **Trait seams are remote-ready by design.** When adding to a seam (`Agent`,
+  `WorkspaceRead`/`Workspace`, `Provider`, `Router`, `Tool`), keep it `Send + Sync` and
+  async, and preserve the property that the orchestrator only ever holds trait objects —
+  never concrete impls.
 - **Determinism is a test invariant.** The default offline path must stay reproducible:
   `LocalProvider`/`ScriptedProvider` do no I/O. Anything reading `OTTO_*` / `ANTHROPIC_API_KEY`
   belongs behind `build_router`, not in core logic.
