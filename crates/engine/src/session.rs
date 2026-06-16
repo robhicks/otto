@@ -6,6 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
@@ -41,12 +42,85 @@ impl<'a> Session<'a> {
     pub fn id(&self) -> SessionId {
         self.id
     }
+
+    /// Run one orchestrator turn for `goal`, persisting the turn's events (fail-closed: a
+    /// store error fails the turn), then recording the turn and updating status to `Done`
+    /// (or `Failed`). The per-session `seq` counter continues across calls. Returns the
+    /// turn's events and outcome. (≙ `Command::SendPrompt`.)
+    pub async fn run_prompt(
+        &mut self,
+        registry: &AgentRegistry,
+        router: &dyn Router,
+        workspace: &dyn Workspace,
+        tools: &ToolRegistry,
+        goal: &str,
+    ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
+        let store = self.store;
+        let id = self.id;
+
+        let collected: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let seq = Arc::new(Mutex::new(self.next_seq));
+        let sink = {
+            let collected = Arc::clone(&collected);
+            let seq = Arc::clone(&seq);
+            move |kind: EventKind| {
+                let mut s = seq.lock().unwrap();
+                collected.lock().unwrap().push(Event {
+                    seq: *s,
+                    session: id,
+                    kind,
+                });
+                *s += 1;
+            }
+        };
+
+        let orchestrator = Orchestrator {
+            registry,
+            router,
+            workspace,
+            tools,
+        };
+        let outcome = orchestrator.run_turn(id, goal, &sink).await?;
+        let events = collected.lock().unwrap().clone();
+
+        // Persist this turn's events. Fail-closed: a store error fails the turn rather than
+        // silently dropping events (the durable log is the whole point of the store).
+        for event in &events {
+            store.append_event(id, event).await?;
+        }
+        self.next_seq = *seq.lock().unwrap();
+
+        store
+            .record_turn(
+                id,
+                &TurnRecord {
+                    turn_index: self.next_turn,
+                    goal: goal.to_string(),
+                    outcome: serde_json::json!({ "ok": outcome.ok }),
+                },
+            )
+            .await?;
+        self.next_turn += 1;
+
+        let status = if outcome.ok {
+            SessionStatus::Done
+        } else {
+            SessionStatus::Failed
+        };
+        store.set_status(id, status).await?;
+
+        Ok((events, outcome))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use otto_persistence::SqliteStore;
+    use otto_providers::ScriptedProvider;
+    use otto_router::SingleProviderRouter;
+    use otto_workspace::LocalWorkspace;
+    use std::sync::Arc;
 
     async fn store_in(dir: &tempfile::TempDir) -> SqliteStore {
         SqliteStore::open(dir.path().join("sessions.db"))
@@ -65,5 +139,48 @@ mod tests {
             store.session_status(session.id()).await.unwrap(),
             SessionStatus::Active
         );
+    }
+
+    #[tokio::test]
+    async fn run_prompt_persists_events_and_marks_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir).await;
+
+        // Scripted model: planner prompt contains "milestones", coder prompt contains "edits".
+        let provider = ScriptedProvider::new("{}")
+            .on(
+                "edits",
+                r#"{"edits": [{"path": "out.txt", "contents": "hi add a greeting"}]}"#,
+            )
+            .on(
+                "milestones",
+                r#"{"milestones": [{"description": "write it"}]}"#,
+            );
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let workspace = LocalWorkspace::new(dir.path());
+        let tools_ws: Arc<dyn otto_engine_core::traits::Workspace> =
+            Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = crate::build_tool_registry(tools_ws, dir.path().to_path_buf());
+        let registry = crate::build_default_registry();
+
+        let mut session = Session::create(&store, "add a greeting", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let id = session.id();
+        let (events, outcome) = session
+            .run_prompt(&registry, &router, &workspace, &tools, "add a greeting")
+            .await
+            .unwrap();
+
+        assert!(outcome.ok);
+        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
+
+        // The persisted log equals the returned events, with contiguous seqs from 0.
+        let replayed = store.replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, events);
+        assert!(!events.is_empty());
+        for (i, event) in events.iter().enumerate() {
+            assert_eq!(event.seq, i as u64);
+        }
     }
 }
