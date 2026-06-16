@@ -20,7 +20,12 @@ otto-tools = { path = "../tools" }
 otto-persistence = { path = "../persistence" }
 anyhow.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "net"] }
+async-trait.workspace = true
+serde = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
