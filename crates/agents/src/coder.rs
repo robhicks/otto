@@ -9,6 +9,7 @@ use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
 use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Edit};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::parse::extract_json;
 
@@ -25,20 +26,65 @@ struct EditDto {
     contents: String,
 }
 
-fn code_prompt(goal: &str, context: &[PathBuf], feedback: Option<&str>) -> String {
-    let files = if context.is_empty() {
+/// Context injection budgets (chars; ~bytes for ASCII source).
+const MAX_CONTEXT_FILES: usize = 8;
+const MAX_FILE_CHARS: usize = 8_000;
+const MAX_TOTAL_CHARS: usize = 32_000;
+
+/// Truncate to at most `max` chars on a char boundary, appending a marker when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push_str("\n… (truncated)");
+        out
+    }
+}
+
+/// Read up to the budget of context files via `fs.read`, returning (path, contents). Files that
+/// are unreadable, gate-denied, or non-UTF8 are skipped; the total-char budget stops the loop.
+async fn read_context(ctx: &AgentCtx<'_>, context: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for path in context.iter().take(MAX_CONTEXT_FILES) {
+        let content = match ctx
+            .tools()
+            .call("fs.read", json!({ "path": path.display().to_string() }))
+            .await
+        {
+            Ok(Value::Object(map)) => map
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        };
+        let Some(content) = content else { continue };
+        let content = truncate_chars(&content, MAX_FILE_CHARS);
+        let len = content.chars().count();
+        if total + len > MAX_TOTAL_CHARS {
+            break;
+        }
+        total += len;
+        out.push((path.clone(), content));
+    }
+    out
+}
+
+fn code_prompt(goal: &str, files: &[(PathBuf, String)], feedback: Option<&str>) -> String {
+    let context_block = if files.is_empty() {
         "(none)".to_string()
     } else {
-        context
+        files
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|(p, c)| format!("--- {} ---\n{}", p.display(), c))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("\n\n")
     };
     let mut prompt = format!(
         "You are otto's coder. Produce the complete file edits that accomplish the goal.\n\
          Goal: {goal}\n\
-         Existing files: {files}\n\
+         Relevant files (each shown as a path then its current contents):\n{context_block}\n\
          Respond ONLY with valid JSON matching this schema:\n\
          edits: array of objects, each with a string field named path (a relative path) and \
          a string field named contents (the full new file contents)."
@@ -63,11 +109,12 @@ impl Agent for Coder {
         else {
             anyhow::bail!("Coder received a non-Code request");
         };
+        let files = read_context(ctx, &context).await;
         let completion = ctx
             .router()
             .complete(
                 CompleteRequest {
-                    prompt: code_prompt(&goal, &context, feedback.as_deref()),
+                    prompt: code_prompt(&goal, &files, feedback.as_deref()),
                 },
                 RouteHints {
                     task_kind: TaskKind::Edit,
@@ -143,6 +190,62 @@ mod tests {
         let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
         let edits = run_coder_with(&router, None).await;
         assert!(edits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reads_context_file_contents_into_prompt() {
+        use otto_engine_core::tool::Tool;
+        use otto_engine_core::traits::Workspace;
+        use otto_engine_core::types::Edit;
+        use otto_tools::FsReadTool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        ws.apply_edit(&Edit {
+            path: PathBuf::from("src/lib.rs"),
+            new_contents: "fn special_marker_42() {}".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let mut tools =
+            ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
+        let ws_arc: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        tools.register(Arc::new(FsReadTool::new(ws_arc)) as Arc<dyn Tool>);
+
+        // The scripted rule fires ONLY if the prompt contains the file's contents, proving the
+        // Coder read and injected them.
+        let provider = ScriptedProvider::new("{}").on(
+            "special_marker_42",
+            r#"{"edits": [{"path": "out.txt", "contents": "ok"}]}"#,
+        );
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let ctx = AgentCtx::new(&router, &ws, &tools);
+        let out = Coder
+            .run(
+                AgentRequest::Code {
+                    goal: "update".to_string(),
+                    context: vec![PathBuf::from("src/lib.rs")],
+                    feedback: None,
+                    prior_failures: 0,
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        match out {
+            AgentOutput::Code { edits } => assert_eq!(edits.len(), 1),
+            other => panic!("expected Code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_chars_caps_and_marks() {
+        let s: String = "x".repeat(100);
+        let t = truncate_chars(&s, 10);
+        assert!(t.starts_with(&"x".repeat(10)));
+        assert!(t.contains("truncated"));
+        assert_eq!(truncate_chars("short", 10), "short");
     }
 
     #[tokio::test]
