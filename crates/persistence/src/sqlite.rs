@@ -226,6 +226,25 @@ impl crate::SessionStore for SqliteStore {
         })
     }
 
+    async fn next_seq(&self, session: otto_protocol::SessionId) -> anyhow::Result<u64> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COALESCE(MAX(seq) + 1, 0) FROM events WHERE session_id = ?1")
+                .bind(session.0.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0 as u64)
+    }
+
+    async fn next_turn(&self, session: otto_protocol::SessionId) -> anyhow::Result<u32> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COALESCE(MAX(turn_index) + 1, 0) FROM turns WHERE session_id = ?1",
+        )
+        .bind(session.0.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 as u32)
+    }
+
     async fn restore(
         &self,
         state: &crate::SessionState,
@@ -552,6 +571,27 @@ mod tests {
         let snap = store.snapshot(id).await.unwrap();
         // Restoring into the same store collides on the sessions primary key.
         assert!(store.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cursors_advance_with_events_and_turns() {
+        let (store, _dir) = temp_store().await;
+        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        assert_eq!(store.next_seq(id).await.unwrap(), 0);
+        assert_eq!(store.next_turn(id).await.unwrap(), 0);
+        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
+        store.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+        assert_eq!(store.next_seq(id).await.unwrap(), 2);
+        assert_eq!(store.next_turn(id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cursors_are_zero_for_unknown_session() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert_eq!(store.next_seq(missing).await.unwrap(), 0);
+        assert_eq!(store.next_turn(missing).await.unwrap(), 0);
     }
 
     #[tokio::test]

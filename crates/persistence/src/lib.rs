@@ -43,6 +43,13 @@ pub trait SessionStore: Send + Sync {
     /// Read a session's current status. Errors if the session does not exist.
     async fn session_status(&self, session: SessionId) -> anyhow::Result<SessionStatus>;
 
+    /// The next event seq for `session` (`MAX(seq) + 1`, or 0 if none). Lets a long-lived
+    /// or reconnected writer continue the seq sequence without holding an in-memory counter.
+    async fn next_seq(&self, session: SessionId) -> anyhow::Result<u64>;
+
+    /// The next turn index for `session` (`MAX(turn_index) + 1`, or 0 if none).
+    async fn next_turn(&self, session: SessionId) -> anyhow::Result<u32>;
+
     /// Capture the full state of `session` — metadata, config, the complete event log, and
     /// turn history — as a serializable `SessionState`. Errors if the session does not
     /// exist. (The workspace patch-bundle is deferred until `RemoteWorkspace`.)
