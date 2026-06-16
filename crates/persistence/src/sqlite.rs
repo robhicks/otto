@@ -230,8 +230,11 @@ impl crate::SessionStore for SqliteStore {
         &self,
         state: &crate::SessionState,
     ) -> anyhow::Result<otto_protocol::SessionId> {
-        // Insert the session row preserving id/status/config/goal (timestamps regenerated).
+        // Atomic: either the whole session (row + events + turns) lands, or nothing does.
+        // Timestamps are regenerated; ids and seqs are preserved.
         let now = now_millis();
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -242,17 +245,33 @@ impl crate::SessionStore for SqliteStore {
         .bind(now)
         .bind(now)
         .bind(serde_json::to_string(&state.config)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
-        // Replay events (preserving seqs) and turns through the existing inserts.
         for event in &state.events {
-            self.append_event(state.id, event).await?;
-        }
-        for turn in &state.turns {
-            self.record_turn(state.id, turn).await?;
+            sqlx::query("INSERT INTO events (session_id, seq, kind) VALUES (?1, ?2, ?3)")
+                .bind(state.id.0.to_string())
+                .bind(event.seq as i64)
+                .bind(serde_json::to_string(&event.kind)?)
+                .execute(&mut *tx)
+                .await?;
         }
 
+        for turn in &state.turns {
+            sqlx::query(
+                "INSERT INTO turns (session_id, turn_index, goal, outcome, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(state.id.0.to_string())
+            .bind(turn.turn_index as i64)
+            .bind(&turn.goal)
+            .bind(serde_json::to_string(&turn.outcome)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(state.id)
     }
 }
@@ -268,7 +287,7 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionStatus, SessionStore, TurnRecord};
+    use crate::{SessionState, SessionStatus, SessionStore, TurnRecord};
     use otto_protocol::{Event, EventKind};
 
     /// Opens a fresh store in a temp dir. The returned `TempDir` must be kept alive for
@@ -503,6 +522,24 @@ mod tests {
             target.session_status(id).await.unwrap(),
             SessionStatus::Done
         );
+    }
+
+    #[tokio::test]
+    async fn restore_is_atomic_on_inconsistent_state() {
+        let (store, _dir) = temp_store().await;
+        let id = otto_protocol::SessionId::new();
+        // A SessionState with a duplicate seq in its event log is internally inconsistent.
+        let state = SessionState {
+            id,
+            goal: "g".to_string(),
+            status: SessionStatus::Done,
+            config: serde_json::json!({}),
+            events: vec![log_event(id, 0, "a"), log_event(id, 0, "dup")],
+            turns: vec![],
+        };
+        assert!(store.restore(&state).await.is_err());
+        // The transaction rolled back: no stranded session row.
+        assert!(store.session_status(id).await.is_err());
     }
 
     #[tokio::test]
