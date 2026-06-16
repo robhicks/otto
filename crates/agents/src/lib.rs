@@ -1,7 +1,8 @@
 //! otto's atomic agents. `Planner` and `Coder` are real LLM-backed agents — each prompts the
 //! router for structured JSON and parses it, falling back safely when no JSON is returned.
-//! `Verifier` is real too: it runs `cargo check` via the sandboxed `bash` tool. All four spine
-//! agents (`Planner`, `ContextFinder`, `Coder`, `Verifier`) are real.
+//! `Verifier` is real too: it detects the project ecosystem and runs that ecosystem's test
+//! command (e.g. `cargo test`, `go test`, `npm test`) via the sandboxed `bash` tool. All four
+//! spine agents (`Planner`, `ContextFinder`, `Coder`, `Verifier`) are real.
 
 pub mod coder;
 pub mod context_finder;

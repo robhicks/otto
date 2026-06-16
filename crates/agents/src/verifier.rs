@@ -127,7 +127,9 @@ impl Agent for Verifier {
                     }),
                     // Exit 127 = command not found: the toolchain isn't on the sandbox PATH (the
                     // curated env only guarantees cargo). We can't verify safely, so skip rather
-                    // than fail the turn.
+                    // than fail the turn. Tradeoff: a genuine in-test 127 (a missing binary inside
+                    // a test/make target) is also skipped rather than failed — accepted for v1, as
+                    // failing every project whose toolchain isn't on the PATH would be worse.
                     Some(127) => Ok(AgentOutput::Verify {
                         ok: true,
                         detail: format!("verification skipped: {} tooling not found", recipe.label),
