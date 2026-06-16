@@ -1,13 +1,14 @@
 //! Engine wiring: assemble the default agent registry and run a turn end-to-end.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use otto_agents::{Coder, ContextFinder, Planner, Verifier};
 use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolRegistry};
 use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
-use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
-use otto_protocol::{Event, EventKind, Role, SessionId};
+use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
+use otto_persistence::SessionStore;
+use otto_protocol::{Event, Role};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
 use otto_router::{BrainBlendRouter, SingleProviderRouter};
 use otto_tools::{
@@ -95,44 +96,38 @@ pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> Tool
     registry
 }
 
-/// Run one turn for `goal` against `workspace` using `router`, returning the
-/// sequenced events emitted and the final outcome. The engine assigns the per-session
-/// monotonic `seq` to each event here (the orchestrator emits bare `EventKind`s).
+/// Snapshot the provider-selection environment into JSON for a session's `config` column.
+/// Mirrors the env that `build_router` reads (without re-running provider selection), so a
+/// stored session records which backends it was configured to use. This lives in the wiring
+/// layer (not core) because it reads `OTTO_*` / `ANTHROPIC_API_KEY`.
+pub fn session_config() -> serde_json::Value {
+    let ollama = std::env::var("OTTO_OLLAMA").as_deref() == Ok("1");
+    let anthropic = std::env::var("ANTHROPIC_API_KEY")
+        .map(|k| !k.is_empty())
+        .unwrap_or(false);
+    serde_json::json!({
+        "ollama": ollama,
+        "anthropic": anthropic,
+        "ollama_model": std::env::var("OTTO_OLLAMA_MODEL").ok(),
+        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL").ok(),
+    })
+}
+
+/// Run one turn for `goal` against `workspace` using `router`, persisting the session and
+/// its events through `store`. Returns the sequenced events emitted and the final outcome.
+/// A thin wrapper over `Session`: create the session, then run one prompt.
 pub async fn run_goal(
     goal: &str,
+    store: &dyn SessionStore,
     router: &dyn Router,
     workspace: &dyn Workspace,
     tools: &ToolRegistry,
 ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
     let registry = build_default_registry();
-    let session = SessionId::new();
-
-    let collected: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
-    let next_seq = Arc::new(Mutex::new(0u64));
-    let sink = {
-        let collected = Arc::clone(&collected);
-        let next_seq = Arc::clone(&next_seq);
-        move |kind: EventKind| {
-            let mut seq = next_seq.lock().unwrap();
-            collected.lock().unwrap().push(Event {
-                seq: *seq,
-                session,
-                kind,
-            });
-            *seq += 1;
-        }
-    };
-
-    let orchestrator = Orchestrator {
-        registry: &registry,
-        router,
-        workspace,
-        tools,
-    };
-    let outcome = orchestrator.run_turn(session, goal, &sink).await?;
-
-    let events = collected.lock().unwrap().clone();
-    Ok((events, outcome))
+    let mut session = Session::create(store, goal, &session_config()).await?;
+    session
+        .run_prompt(&registry, router, workspace, tools, goal)
+        .await
 }
 
 #[cfg(test)]

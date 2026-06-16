@@ -37,7 +37,10 @@ async fn context_flows_from_finder_to_coder() {
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools = build_tool_registry(tools_workspace, dir.path().to_path_buf());
 
-    let (_events, outcome) = run_goal("update the thing function", &router, &workspace, &tools)
+    let store = otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
+        .await
+        .unwrap();
+    let (_events, outcome) = run_goal("update the thing function", &store, &router, &workspace, &tools)
         .await
         .unwrap();
 

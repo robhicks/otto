@@ -34,7 +34,10 @@ async fn full_turn_writes_parsed_edit_and_completes_ok() {
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools = build_tool_registry(tools_workspace, dir.path().to_path_buf());
 
-    let (events, outcome) = run_goal("add a greeting", &router, &workspace, &tools)
+    let store = otto_persistence::SqliteStore::open(dir.path().join("sessions.db"))
+        .await
+        .unwrap();
+    let (events, outcome) = run_goal("add a greeting", &store, &router, &workspace, &tools)
         .await
         .unwrap();
 
