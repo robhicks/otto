@@ -81,6 +81,99 @@ impl EngineService {
     pub async fn abort(&self, session: SessionId) -> anyhow::Result<()> {
         self.store.set_status(session, SessionStatus::Aborted).await
     }
+
+    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
+    /// (after persisting it, fail-closed), then recording the turn and updating status
+    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
+    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    pub async fn run_prompt(
+        &self,
+        session: SessionId,
+        goal: &str,
+        sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        let _guard = self.turn_lock.lock().await;
+
+        let start_seq = self.store.next_seq(session).await?;
+        let turn_index = self.store.next_turn(session).await?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+
+        // Spawn the turn. Its sync sink assigns seqs and pushes events into the channel; the
+        // orchestrator borrows the shared deps via the Arc clones moved into the task.
+        let handle = {
+            let registry = Arc::clone(&self.registry);
+            let router = Arc::clone(&self.router);
+            let workspace = Arc::clone(&self.workspace);
+            let tools = Arc::clone(&self.tools);
+            let goal = goal.to_string();
+            let counter = Arc::new(AtomicU64::new(start_seq));
+            tokio::spawn(async move {
+                let sink_fn = move |kind: EventKind| {
+                    let seq = counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = tx.send(Event {
+                        seq,
+                        session,
+                        kind,
+                    });
+                };
+                let orchestrator = Orchestrator {
+                    registry: &registry,
+                    router: &*router,
+                    workspace: &*workspace,
+                    tools: &tools,
+                };
+                orchestrator.run_turn(session, &goal, &sink_fn).await
+            })
+        };
+
+        // Drain live: persist each event (fail-closed) then forward to the sink, in order.
+        let mut stream_err: Option<anyhow::Error> = None;
+        while let Some(event) = rx.recv().await {
+            if let Err(e) = self.store.append_event(session, &event).await {
+                stream_err = Some(e);
+                break;
+            }
+            if let Err(e) = sink.emit(&event).await {
+                stream_err = Some(e);
+                break;
+            }
+        }
+        drop(rx); // any further sends from the (still finishing) turn task are dropped
+
+        let turn_result = handle.await?; // JoinError propagates
+
+        if let Some(e) = stream_err {
+            let _ = self.store.set_status(session, SessionStatus::Failed).await;
+            return Err(e);
+        }
+        let outcome = match turn_result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let _ = self.store.set_status(session, SessionStatus::Failed).await;
+                return Err(e);
+            }
+        };
+
+        self.store
+            .record_turn(
+                session,
+                &TurnRecord {
+                    turn_index,
+                    goal: goal.to_string(),
+                    outcome: serde_json::json!({ "ok": outcome.ok }),
+                },
+            )
+            .await?;
+        let status = if outcome.ok {
+            SessionStatus::Done
+        } else {
+            SessionStatus::Failed
+        };
+        self.store.set_status(session, status).await?;
+
+        Ok(outcome)
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +232,67 @@ mod tests {
         assert_eq!(
             service.store().session_status(id).await.unwrap(),
             SessionStatus::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn run_prompt_streams_persists_and_marks_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("add a greeting", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut sink = CollectingSink::default();
+        let outcome = service.run_prompt(id, "add a greeting", &mut sink).await.unwrap();
+
+        assert!(outcome.ok);
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Done
+        );
+        // The streamed events equal the persisted log, with contiguous seqs from 0.
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, sink.events);
+        assert!(!sink.events.is_empty());
+        for (i, event) in sink.events.iter().enumerate() {
+            assert_eq!(event.seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn second_prompt_continues_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service.create_session("g", &serde_json::json!({})).await.unwrap();
+
+        let mut s1 = CollectingSink::default();
+        service.run_prompt(id, "g", &mut s1).await.unwrap();
+        let mut s2 = CollectingSink::default();
+        service.run_prompt(id, "g", &mut s2).await.unwrap();
+
+        let last1 = s1.events.last().unwrap().seq;
+        assert_eq!(s2.events.first().unwrap().seq, last1 + 1);
+
+        let all = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(all.len(), s1.events.len() + s2.events.len());
+        for (i, event) in all.iter().enumerate() {
+            assert_eq!(event.seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_error_marks_session_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty registry: the orchestrator can't find the Planner, so run_turn errors.
+        let service = service_in(&dir, AgentRegistry::new()).await;
+        let id = service.create_session("g", &serde_json::json!({})).await.unwrap();
+        let mut sink = CollectingSink::default();
+        let result = service.run_prompt(id, "g", &mut sink).await;
+        assert!(result.is_err());
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Failed
         );
     }
 }
