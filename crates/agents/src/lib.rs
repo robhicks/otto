@@ -4,11 +4,13 @@
 //! `StubContextFinder` remains a stub until its real version lands.
 
 pub mod coder;
+pub mod context_finder;
 pub mod parse;
 pub mod planner;
 pub mod verifier;
 
 pub use coder::Coder;
+pub use context_finder::ContextFinder;
 pub use planner::Planner;
 pub use verifier::Verifier;
 
