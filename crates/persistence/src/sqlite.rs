@@ -71,13 +71,12 @@ impl SqliteStore {
         &self,
         session: otto_protocol::SessionId,
     ) -> anyhow::Result<crate::SessionStatus> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM sessions WHERE id = ?1")
-                .bind(session.0.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        let (status,) = row
-            .ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM sessions WHERE id = ?1")
+            .bind(session.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        let (status,) =
+            row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
         crate::SessionStatus::from_db_str(&status)
     }
 }
@@ -145,14 +144,12 @@ impl crate::SessionStore for SqliteStore {
         session: otto_protocol::SessionId,
         status: crate::SessionStatus,
     ) -> anyhow::Result<()> {
-        let result = sqlx::query(
-            "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        )
-        .bind(status.as_db_str())
-        .bind(now_millis())
-        .bind(session.0.to_string())
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(status.as_db_str())
+            .bind(now_millis())
+            .bind(session.0.to_string())
+            .execute(&self.pool)
+            .await?;
         if result.rows_affected() == 0 {
             anyhow::bail!("set_status: no session {}", session.0);
         }
@@ -166,7 +163,11 @@ impl crate::SessionStore for SqliteStore {
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
         // Bind -1 when after_seq == 0 so that `seq > -1` returns all events
         // (including seq = 0). For after_seq > 0 the predicate is `seq > after_seq`.
-        let bound = if after_seq == 0 { -1i64 } else { after_seq as i64 };
+        let bound = if after_seq == 0 {
+            -1i64
+        } else {
+            after_seq as i64
+        };
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT seq, kind FROM events
              WHERE session_id = ?1 AND seq > ?2
@@ -232,38 +233,58 @@ mod tests {
             .create_session("add a greeting", &serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Active);
+        assert_eq!(
+            store.session_status(id).await.unwrap(),
+            SessionStatus::Active
+        );
     }
 
     fn log_event(session: otto_protocol::SessionId, seq: u64, msg: &str) -> Event {
         Event {
             seq,
             session,
-            kind: EventKind::Log { message: msg.to_string() },
+            kind: EventKind::Log {
+                message: msg.to_string(),
+            },
         }
     }
 
     #[tokio::test]
     async fn append_then_replay_returns_events_in_order() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
-            store.append_event(id, &log_event(id, seq, msg)).await.unwrap();
+            store
+                .append_event(id, &log_event(id, seq, msg))
+                .await
+                .unwrap();
         }
         let replayed = store.replay_since(id, 0).await.unwrap();
-        assert_eq!(replayed, vec![
-            log_event(id, 0, "a"),
-            log_event(id, 1, "b"),
-            log_event(id, 2, "c"),
-        ]);
+        assert_eq!(
+            replayed,
+            vec![
+                log_event(id, 0, "a"),
+                log_event(id, 1, "b"),
+                log_event(id, 2, "c"),
+            ]
+        );
     }
 
     #[tokio::test]
     async fn replay_since_returns_only_the_gap() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
-            store.append_event(id, &log_event(id, seq, msg)).await.unwrap();
+            store
+                .append_event(id, &log_event(id, seq, msg))
+                .await
+                .unwrap();
         }
         let gap = store.replay_since(id, 1).await.unwrap();
         assert_eq!(gap, vec![log_event(id, 2, "c")]);
@@ -272,15 +293,29 @@ mod tests {
     #[tokio::test]
     async fn append_duplicate_seq_is_error() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
-        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
-        assert!(store.append_event(id, &log_event(id, 0, "dup")).await.is_err());
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .append_event(id, &log_event(id, 0, "dup"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn set_status_updates_existing_session() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         store.set_status(id, SessionStatus::Done).await.unwrap();
         assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
     }
@@ -289,7 +324,12 @@ mod tests {
     async fn set_status_on_missing_session_is_error() {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
-        assert!(store.set_status(missing, SessionStatus::Aborted).await.is_err());
+        assert!(
+            store
+                .set_status(missing, SessionStatus::Aborted)
+                .await
+                .is_err()
+        );
     }
 
     fn turn(idx: u32, ok: bool) -> TurnRecord {
@@ -303,15 +343,50 @@ mod tests {
     #[tokio::test]
     async fn record_turn_succeeds() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
     }
 
     #[tokio::test]
     async fn record_turn_rejects_duplicate_index() {
         let (store, _dir) = temp_store().await;
-        let id = store.create_session("g", &serde_json::json!({})).await.unwrap();
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
         assert!(store.record_turn(id, &turn(0, false)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_is_isolated_per_session() {
+        let (store, _dir) = temp_store().await;
+        let a = store
+            .create_session("a", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let b = store
+            .create_session("b", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(a, &log_event(a, 0, "for-a"))
+            .await
+            .unwrap();
+        store
+            .append_event(b, &log_event(b, 0, "for-b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.replay_since(a, 0).await.unwrap(),
+            vec![log_event(a, 0, "for-a")]
+        );
+        assert_eq!(
+            store.replay_since(b, 0).await.unwrap(),
+            vec![log_event(b, 0, "for-b")]
+        );
     }
 }

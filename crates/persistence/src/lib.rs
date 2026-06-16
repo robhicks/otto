@@ -32,9 +32,5 @@ pub trait SessionStore: Send + Sync {
 
     /// Replay the session's events with `seq > after_seq`, in ascending seq order.
     /// Pass `0` to get the full log (seqs are 0-based, so this returns everything).
-    async fn replay_since(
-        &self,
-        session: SessionId,
-        after_seq: u64,
-    ) -> anyhow::Result<Vec<Event>>;
+    async fn replay_since(&self, session: SessionId, after_seq: u64) -> anyhow::Result<Vec<Event>>;
 }
