@@ -10,7 +10,7 @@ use otto_protocol::{Event, SessionId};
 use serde_json::Value;
 
 pub use sqlite::SqliteStore;
-pub use types::{SessionStatus, TurnRecord};
+pub use types::{SessionState, SessionStatus, TurnRecord};
 
 /// Persists sessions and their event/turn history. Implementations are `Send + Sync`
 /// so the engine can hold one as `Box<dyn SessionStore>` across await points.
@@ -42,4 +42,9 @@ pub trait SessionStore: Send + Sync {
 
     /// Read a session's current status. Errors if the session does not exist.
     async fn session_status(&self, session: SessionId) -> anyhow::Result<SessionStatus>;
+
+    /// Capture the full state of `session` — metadata, config, the complete event log, and
+    /// turn history — as a serializable `SessionState`. Errors if the session does not
+    /// exist. (The workspace patch-bundle is deferred until `RemoteWorkspace`.)
+    async fn snapshot(&self, session: SessionId) -> anyhow::Result<SessionState>;
 }

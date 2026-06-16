@@ -183,6 +183,48 @@ impl crate::SessionStore for SqliteStore {
             row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
         crate::SessionStatus::from_db_str(&status)
     }
+
+    async fn snapshot(
+        &self,
+        session: otto_protocol::SessionId,
+    ) -> anyhow::Result<crate::SessionState> {
+        let row: Option<(String, String, String)> =
+            sqlx::query_as("SELECT goal, status, config FROM sessions WHERE id = ?1")
+                .bind(session.0.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (goal, status, config) =
+            row.ok_or_else(|| anyhow::anyhow!("snapshot: no session {}", session.0))?;
+        let status = crate::SessionStatus::from_db_str(&status)?;
+        let config: serde_json::Value = serde_json::from_str(&config)?;
+
+        let events = self.replay_since(session, None).await?;
+
+        let turn_rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT turn_index, goal, outcome FROM turns
+             WHERE session_id = ?1 ORDER BY turn_index ASC",
+        )
+        .bind(session.0.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut turns = Vec::with_capacity(turn_rows.len());
+        for (turn_index, turn_goal, outcome) in turn_rows {
+            turns.push(crate::TurnRecord {
+                turn_index: turn_index as u32,
+                goal: turn_goal,
+                outcome: serde_json::from_str(&outcome)?,
+            });
+        }
+
+        Ok(crate::SessionState {
+            id: session,
+            goal,
+            status,
+            config,
+            events,
+            turns,
+        })
+    }
 }
 
 /// Milliseconds since the Unix epoch, for `created_at`/`updated_at`/`started_at`.
@@ -362,6 +404,34 @@ mod tests {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
         assert!(store.replay_since(missing, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_metadata_events_and_turns() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("the goal", &serde_json::json!({ "k": 1 }))
+            .await
+            .unwrap();
+        store.append_event(id, &log_event(id, 0, "a")).await.unwrap();
+        store.append_event(id, &log_event(id, 1, "b")).await.unwrap();
+        store.record_turn(id, &turn(0, true)).await.unwrap();
+        store.set_status(id, SessionStatus::Done).await.unwrap();
+
+        let snap = store.snapshot(id).await.unwrap();
+        assert_eq!(snap.id, id);
+        assert_eq!(snap.goal, "the goal");
+        assert_eq!(snap.status, SessionStatus::Done);
+        assert_eq!(snap.config, serde_json::json!({ "k": 1 }));
+        assert_eq!(snap.events, vec![log_event(id, 0, "a"), log_event(id, 1, "b")]);
+        assert_eq!(snap.turns, vec![turn(0, true)]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_unknown_session_is_error() {
+        let (store, _dir) = temp_store().await;
+        let missing = otto_protocol::SessionId::new();
+        assert!(store.snapshot(missing).await.is_err());
     }
 
     #[tokio::test]
