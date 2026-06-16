@@ -1,7 +1,9 @@
 //! The Verifier agent: checks the workspace builds. For a Cargo project it runs
 //! `cargo check --offline` inside the sandboxed `bash` tool and reports pass/fail. It degrades
 //! gracefully: no recognized project -> "nothing to verify"; `bash` unavailable (no OS sandbox)
-//! -> "verification skipped". A failure here drives the orchestrator's Repair loop.
+//! -> "verification skipped". A failure here drives the orchestrator's Repair loop. A `bash`
+//! *execution* error (e.g. `cargo check` timed out, or the process couldn't spawn) is reported
+//! as a verification failure, not silently skipped — only genuine tool unavailability skips.
 //!
 //! Precondition: the check runs `--offline` because the sandbox has no network
 //! (`--unshare-net`). A project's dependencies must therefore already be present in the host
@@ -80,13 +82,37 @@ impl Agent for Verifier {
                     })
                 }
             }
-            // bash unavailable (no OS sandbox) or denied by the gate -> can't verify safely; skip.
-            _ => Ok(AgentOutput::Verify {
+            // bash is genuinely unavailable: no OS sandbox backend, so the tool is unregistered
+            // or its `Ask` verdict is denied. `ToolRegistry::call` reports these before dispatch
+            // (see `crates/engine-core/src/tool.rs`). We can't verify safely, so skip without
+            // failing the turn. The substrings mirror that crate's pre-dispatch error messages.
+            Err(e) if is_tool_unavailable(&e) => Ok(AgentOutput::Verify {
                 ok: true,
                 detail: "verification skipped: bash tool unavailable (no sandbox)".to_string(),
             }),
+            // bash ran but failed (e.g. `cargo check` timed out, or the process couldn't spawn),
+            // or returned an unexpected shape. Surface it as a verification failure rather than
+            // silently passing — a real problem must drive the Repair loop, not read as success.
+            Err(e) => Ok(AgentOutput::Verify {
+                ok: false,
+                detail: truncate(&format!("verification error: {e}"), 2000),
+            }),
+            Ok(_) => Ok(AgentOutput::Verify {
+                ok: false,
+                detail: "verification error: bash returned an unexpected result shape".to_string(),
+            }),
         }
     }
+}
+
+/// Whether a `ToolRegistry::call` error means the `bash` tool was unavailable (unregistered or
+/// permission-denied before dispatch) rather than a failure of the command itself. These
+/// substrings mirror the pre-dispatch `bail!` messages in `crates/engine-core/src/tool.rs`.
+fn is_tool_unavailable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("no tool registered")
+        || msg.contains("ask denied")
+        || msg.contains("denied by permission gate")
 }
 
 #[cfg(test)]
@@ -116,6 +142,19 @@ mod tests {
         }
         async fn call(&self, _args: Value) -> anyhow::Result<Value> {
             Ok(json!({ "stdout": self.output, "stderr": "", "exit_code": self.exit_code }))
+        }
+    }
+
+    /// A `bash` stand-in whose call fails the way a real execution error does (e.g. a timeout),
+    /// to prove the Verifier surfaces it instead of silently skipping.
+    struct ErroringBash;
+    #[async_trait]
+    impl Tool for ErroringBash {
+        fn name(&self) -> &str {
+            "bash"
+        }
+        async fn call(&self, _args: Value) -> anyhow::Result<Value> {
+            anyhow::bail!("bash command timed out after 180000 ms")
         }
     }
 
@@ -230,6 +269,33 @@ mod tests {
             AgentOutput::Verify { ok, detail } => {
                 assert!(ok);
                 assert!(detail.contains("skipped"));
+            }
+            other => panic!("expected Verify, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_when_bash_execution_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed_cargo_toml(&ws).await;
+        // Cargo project; bash IS permitted and registered, but the command errors (e.g. a
+        // timeout). This must surface as a verification failure, never a silent skip-as-ok.
+        let tools = registry(dir.path(), Some(Arc::new(ErroringBash)));
+        match run_verifier(&ws, &tools).await {
+            AgentOutput::Verify { ok, detail } => {
+                assert!(
+                    !ok,
+                    "an execution error must not pass verification: {detail}"
+                );
+                assert!(
+                    detail.contains("timed out"),
+                    "detail should carry the execution error: {detail}"
+                );
+                assert!(
+                    !detail.contains("skipped"),
+                    "an execution error must not be reported as skipped: {detail}"
+                );
             }
             other => panic!("expected Verify, got {other:?}"),
         }
