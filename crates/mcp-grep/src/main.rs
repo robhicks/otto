@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 /// Max matches returned before the search stops and reports truncation.
 const MAX_MATCHES: usize = 1000;
 
-/// Substrings (lowercase) that mark a path as sensitive — mirrors the engine gate's floor so a
-/// standalone `mcp-grep` never returns secret file contents (incl. non-dotfile `id_rsa`).
+/// Substrings (lowercase) that mark a path as sensitive — MIRRORS the engine gate's
+/// `SENSITIVE_MARKERS` in `crates/tools/src/gate.rs`. A standalone `mcp-grep` keeps its own copy
+/// so it never returns secret file contents (incl. the non-dotfile `id_rsa`). KEEP IN SYNC: any
+/// marker added to the gate's list MUST be added here too, or mcp-grep stops protecting it.
 const SENSITIVE_SKIP: &[&str] = &[".env", ".ssh", ".git", "id_rsa", ".aws"];
 
 fn is_sensitive(rel: &str) -> bool {
@@ -279,6 +281,25 @@ mod tests {
         );
         let (matches, _) = search(dir.path(), "PRIVATE", None).unwrap();
         assert!(matches.iter().all(|m| m.path != "id_rsa"));
+        assert!(matches.iter().any(|m| m.path == "ok.txt"));
+    }
+
+    #[test]
+    fn binary_file_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invalid UTF-8 bytes that also contain the ASCII bytes "PAT".
+        std::fs::write(
+            dir.path().join("bin.dat"),
+            [0u8, 159, 146, 150, b'P', b'A', b'T'],
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ok.txt"), "PATTERN here\n").unwrap();
+        let (matches, _) = search(dir.path(), "PAT", None).unwrap();
+        // The binary file is not searched/returned; no crash; the text file still matches.
+        assert!(
+            matches.iter().all(|m| m.path != "bin.dat"),
+            "binary file must not be returned"
+        );
         assert!(matches.iter().any(|m| m.path == "ok.txt"));
     }
 }

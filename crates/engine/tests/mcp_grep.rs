@@ -42,7 +42,9 @@ async fn mcp_grep_searches_and_stays_gated() {
     );
     assert_eq!(out["truncated"], json!(false));
 
-    // A grep call naming a sensitive path is gate-denied before reaching mcp-grep.
+    // `path` is not a real `grep` arg; including it makes the gate's sensitive-path floor fire
+    // before dispatch. (grep's real secret protection is mcp-grep's server-side skip; this just
+    // confirms the gate still runs in front of the MCP-backed tool.)
     let denied = registry
         .call("grep", json!({ "pattern": "x", "path": ".env" }))
         .await;
