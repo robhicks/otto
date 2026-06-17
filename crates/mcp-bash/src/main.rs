@@ -25,16 +25,23 @@ pub struct BashServer {
 
 impl BashServer {
     pub fn new(root: PathBuf) -> Self {
-        Self { root: Arc::new(root) }
+        Self {
+            root: Arc::new(root),
+        }
     }
 
     /// Run `command` in the OS sandbox. `Os` is hardcoded — there is no path to an unsandboxed
     /// run; if no backend exists, `run_sandboxed`/`build_argv` fails closed.
     pub async fn do_bash(&self, command: String, timeout_ms: Option<u64>) -> anyhow::Result<Value> {
-        let timeout = Duration::from_millis(
-            timeout_ms.unwrap_or(otto_tools::bash::DEFAULT_TIMEOUT_MS),
-        );
-        run_sandboxed(&SandboxPolicy::Os { allow_net: false }, &self.root, &command, timeout).await
+        let timeout =
+            Duration::from_millis(timeout_ms.unwrap_or(otto_tools::bash::DEFAULT_TIMEOUT_MS));
+        run_sandboxed(
+            &SandboxPolicy::Os { allow_net: false },
+            &self.root,
+            &command,
+            timeout,
+        )
+        .await
     }
 }
 
@@ -61,7 +68,10 @@ impl BashServer {
     #[tool(name = "bash", description = "Run a shell command in the OS sandbox")]
     async fn bash(
         &self,
-        Parameters(BashArgs { command, timeout_ms }): Parameters<BashArgs>,
+        Parameters(BashArgs {
+            command,
+            timeout_ms,
+        }): Parameters<BashArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = self.do_bash(command, timeout_ms).await.map_err(to_err)?;
         Ok(CallToolResult::structured(out))

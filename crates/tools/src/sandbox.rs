@@ -190,14 +190,34 @@ mod tests {
         use std::time::Duration;
         let root = std::path::PathBuf::from(".");
         // echo → stdout + exit 0
-        let out = run_sandboxed(&SandboxPolicy::None, &root, "echo hello", Duration::from_secs(5)).await.unwrap();
+        let out = run_sandboxed(
+            &SandboxPolicy::None,
+            &root,
+            "echo hello",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert!(out["stdout"].as_str().unwrap().contains("hello"));
         assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
         // non-zero exit
-        let out = run_sandboxed(&SandboxPolicy::None, &root, "exit 3", Duration::from_secs(5)).await.unwrap();
+        let out = run_sandboxed(
+            &SandboxPolicy::None,
+            &root,
+            "exit 3",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["exit_code"].as_i64().unwrap(), 3);
         // timeout → error (process killed via kill_on_drop)
-        let err = run_sandboxed(&SandboxPolicy::None, &root, "sleep 5", Duration::from_millis(100)).await;
+        let err = run_sandboxed(
+            &SandboxPolicy::None,
+            &root,
+            "sleep 5",
+            Duration::from_millis(100),
+        )
+        .await;
         assert!(err.is_err());
     }
 

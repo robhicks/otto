@@ -208,6 +208,10 @@ mod tests {
 
     #[tokio::test]
     async fn connect_bash_with_bogus_binary_errors() {
-        assert!(connect_bash("definitely-not-a-real-binary-xyz", Path::new(".")).await.is_err());
+        assert!(
+            connect_bash("definitely-not-a-real-binary-xyz", Path::new("."))
+                .await
+                .is_err()
+        );
     }
 }

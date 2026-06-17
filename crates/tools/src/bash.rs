@@ -46,7 +46,9 @@ impl Tool for BashTool {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("bash requires a string 'command' arg"))?;
         let timeout = Duration::from_millis(
-            args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(DEFAULT_TIMEOUT_MS),
+            args.get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_TIMEOUT_MS),
         );
         crate::sandbox::run_sandboxed(&self.policy, &self.root, command, timeout).await
     }
