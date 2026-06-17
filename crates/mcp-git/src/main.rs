@@ -57,6 +57,8 @@ pub async fn run_gh(root: &Path, args: &[&str]) -> anyhow::Result<String> {
 /// Substrings (lowercase) that mark a path as sensitive — MIRRORS the engine gate's
 /// `SENSITIVE_MARKERS` in `crates/tools/src/gate.rs` (also mirrored by `mcp-grep`). KEEP IN
 /// SYNC: a standalone `mcp-git` refuses to STAGE these so an agent can't commit a secret.
+/// (The gate lists `.ssh/`/`.git/`/`.aws/` variants too; the substring `contains` check here
+/// makes the trailing-slash forms redundant.)
 const SENSITIVE_SKIP: &[&str] = &[".env", ".ssh", ".git", "id_rsa", ".aws"];
 
 fn is_sensitive(p: &str) -> bool {
@@ -153,8 +155,12 @@ impl GitServer {
         let mut changes = Vec::new();
         for line in out.lines() {
             if let Some(rest) = line.strip_prefix("## ") {
-                // "## main", "## main...origin/main [ahead 1]"
-                branch = rest.split([' ', '.']).next().unwrap_or("").to_string();
+                branch = if let Some(b) = rest.strip_prefix("No commits yet on ") {
+                    b.trim().to_string()
+                } else {
+                    // "main" or "main...origin/main [ahead 1]" -> "main"
+                    rest.split([' ', '.']).next().unwrap_or("").to_string()
+                };
             } else if line.len() >= 3 {
                 let (code, path) = line.split_at(2);
                 changes.push(Change {
@@ -172,7 +178,13 @@ impl GitServer {
         let fmt = "--format=%H%x1f%s%x1f%an%x1f%aI%x1e";
         let out = match run_git(&self.root, &["log", &n, fmt]).await {
             Ok(o) => o,
-            Err(_) => return Ok(Vec::new()), // no commits yet → empty log
+            Err(e) => {
+                // A fresh repo with no commits → empty log; any other failure propagates.
+                if e.to_string().contains("does not have any commits") {
+                    return Ok(Vec::new());
+                }
+                return Err(e);
+            }
         };
         let mut commits = Vec::new();
         for record in out.split('\u{1e}') {
@@ -197,6 +209,7 @@ impl GitServer {
             args.push("--cached".into());
         }
         if let Some(p) = path {
+            reject_leading_dash(&p, "diff path")?;
             args.push("--".into());
             args.push(p);
         }
@@ -301,6 +314,9 @@ impl GitServer {
         remote: Option<String>,
         branch: Option<String>,
     ) -> anyhow::Result<String> {
+        if branch.is_some() && remote.is_none() {
+            anyhow::bail!("git.push: `branch` requires `remote`");
+        }
         let mut args: Vec<String> = vec!["push".into()];
         if let Some(r) = remote {
             reject_leading_dash(&r, "remote")?;
@@ -766,6 +782,24 @@ mod tests {
                 .do_push(Some("--exec=sh -c id".into()), None)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_refuses_leading_dash_path() {
+        let (_d, server) = repo().await;
+        assert!(server.do_diff(false, Some("-x".into())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn status_branch_on_fresh_repo() {
+        let (_d, server) = repo().await;
+        let st = server.do_status().await.unwrap();
+        // Whatever the default branch is, it must not be the bogus "No".
+        assert!(
+            !st.branch.is_empty() && st.branch != "No",
+            "got branch {:?}",
+            st.branch
         );
     }
 }
