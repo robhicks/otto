@@ -136,6 +136,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
     let tls = match resolve_tls_paths(tls_cert, tls_key) {
         Ok(Some((cert, key))) => {
+            // The rustls crypto provider is supplied at compile time by axum-server's tls-rustls (aws-lc-rs); no explicit install_default() is needed here.
             let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
             Some(cfg)
         }

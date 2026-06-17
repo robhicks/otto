@@ -1,7 +1,7 @@
 //! WebSocket transport for the engine. Maps WS frames to `Command`/event frames over an
 //! `EngineService`: bearer-token auth on upgrade, a `Ready { session }` frame on connect,
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
-//! Binds loopback; TLS and concurrent sessions are out of scope (see the design spec).
+//! Binds loopback (plaintext `ws://` or, with `serve::run` + a `RustlsConfig`, `wss://`); concurrent sessions are out of scope (see the design spec).
 
 use std::path::PathBuf;
 use std::sync::Arc;

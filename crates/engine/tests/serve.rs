@@ -188,6 +188,7 @@ async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
 
     // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
     // rcgen 0.13 uses CertifiedKey { cert, key_pair }.
+    // SAN is "localhost" (not 127.0.0.1) so the client connects via wss://localhost and gets a real hostname match; localhost resolves to the loopback the server bound.
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = cert.pem();
