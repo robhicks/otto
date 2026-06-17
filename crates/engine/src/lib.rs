@@ -16,9 +16,11 @@ use otto_tools::{
     os_sandbox_available,
 };
 
+mod remote;
 mod serve;
 mod service;
 
+pub use remote::{PromoteBundle, RemoteHandle, RemoteTarget, UnsupportedTarget, promote};
 pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
 pub use service::{CollectingSink, EngineService, EventSink};
 
