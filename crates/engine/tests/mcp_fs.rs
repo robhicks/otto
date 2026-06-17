@@ -26,10 +26,7 @@ async fn mcp_fs_tools_round_trip_and_stay_gated() {
     let (_conn, tools) = mcp_connect_fs(bin.to_str().unwrap(), dir.path())
         .await
         .expect("connect to mcp-fs");
-    let mut registry = ToolRegistry::new(
-        Arc::new(DefaultPermissionGate::new()),
-        Arc::new(DenyAsk),
-    );
+    let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), Arc::new(DenyAsk));
     for t in tools {
         registry.register(t);
     }
@@ -42,16 +39,28 @@ async fn mcp_fs_tools_round_trip_and_stay_gated() {
     assert_eq!(w, json!({ "bytes_written": 2 }));
 
     // read -> {content} (exact shape the Coder relies on)
-    let r = registry.call("fs.read", json!({ "path": "a.txt" })).await.unwrap();
+    let r = registry
+        .call("fs.read", json!({ "path": "a.txt" }))
+        .await
+        .unwrap();
     assert_eq!(r, json!({ "content": "hi" }));
 
     // list -> {paths}
-    let l = registry.call("fs.list", json!({ "glob": "**" })).await.unwrap();
+    let l = registry
+        .call("fs.list", json!({ "glob": "**" }))
+        .await
+        .unwrap();
     assert!(l["paths"].as_array().unwrap().iter().any(|p| p == "a.txt"));
 
     // The gate denies a sensitive write BEFORE it reaches mcp-fs.
     assert!(
-        registry.call("fs.write", json!({ "path": ".env", "contents": "SECRET=x" })).await.is_err(),
+        registry
+            .call(
+                "fs.write",
+                json!({ "path": ".env", "contents": "SECRET=x" })
+            )
+            .await
+            .is_err(),
         "the gate must deny a sensitive path over the MCP-backed tool"
     );
     // Nothing was written.

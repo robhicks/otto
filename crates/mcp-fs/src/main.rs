@@ -84,21 +84,36 @@ fn to_err(e: anyhow::Error) -> ErrorData {
 #[tool_router(server_handler)]
 impl FsServer {
     #[tool(name = "fs.read", description = "Read a file from the workspace")]
-    async fn read(&self, Parameters(ReadArgs { path }): Parameters<ReadArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn read(
+        &self,
+        Parameters(ReadArgs { path }): Parameters<ReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let content = self.do_read(path).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "content": content })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "content": content }),
+        ))
     }
 
     #[tool(name = "fs.write", description = "Write a file to the workspace")]
-    async fn write(&self, Parameters(WriteArgs { path, contents }): Parameters<WriteArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn write(
+        &self,
+        Parameters(WriteArgs { path, contents }): Parameters<WriteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let n = self.do_write(path, contents).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "bytes_written": n })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "bytes_written": n }),
+        ))
     }
 
     #[tool(name = "fs.list", description = "List files in the workspace")]
-    async fn list(&self, Parameters(ListArgs { glob }): Parameters<ListArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn list(
+        &self,
+        Parameters(ListArgs { glob }): Parameters<ListArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let paths = self.do_list(glob).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "paths": paths })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "paths": paths }),
+        ))
     }
 }
 
