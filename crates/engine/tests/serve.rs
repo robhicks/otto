@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use otto_engine::{EngineService, build_default_registry, build_tool_registry, serve_app, serve_run};
+use axum_server::tls_rustls::RustlsConfig;
 use otto_engine_core::traits::Workspace;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
@@ -149,6 +150,102 @@ async fn rejects_wrong_token() {
         .insert("Authorization", "Bearer wrong-token".parse().unwrap());
     let result = tokio_tungstenite::connect_async(req).await;
     assert!(result.is_err(), "a wrong token must be rejected");
+}
+
+/// Start the serve app over TLS on 127.0.0.1:0 with a self-signed cert for "localhost".
+/// Returns (port, cert_der, tempdir). The client must trust `cert_der`.
+async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
+    // rustls 0.23 requires an installed crypto provider; ring is the default when
+    // both ring and aws-lc-rs are available — ignore the error if already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "hi add a greeting"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(store, Arc::new(build_default_registry()), router, workspace, tools);
+    let app = serve_app(service, TOKEN.to_string());
+
+    // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
+    // rcgen 0.13 uses CertifiedKey { cert, key_pair }.
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+    let cert_der = cert.der().to_vec();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    let cfg = RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, Some(cfg)).await.unwrap();
+    });
+    (port, cert_der, dir)
+}
+
+#[tokio::test]
+async fn streams_a_turn_over_wss() {
+    let (port, cert_der, _dir) = start_tls_server().await;
+
+    // Install the ring crypto provider so rustls 0.23 can function.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Build a rustls client that trusts only the generated cert.
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .unwrap();
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_config));
+
+    // Connect via wss://localhost (loopback) so the cert SAN matches.
+    let url = format!("wss://localhost:{port}/ws");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
+            .await
+            .expect("wss connect");
+
+    let ready: Value = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            saw_turn_complete = true;
+            break;
+        }
+    }
+    assert!(saw_turn_complete, "expected a TurnComplete event over wss");
 }
 
 /// Receive the next text frame as JSON (panics on close/non-text or stream end).
