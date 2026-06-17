@@ -3,6 +3,7 @@
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
 //! Binds loopback; TLS and concurrent sessions are out of scope (see the design spec).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router as AxumRouter;
@@ -35,6 +36,19 @@ struct ConnectParams {
 struct ServeState {
     service: EngineService,
     token: String,
+}
+
+/// Resolve the TLS flag pair: both present -> `Some((cert, key))`; neither -> `None`;
+/// exactly one -> error (the flags must be given together).
+pub fn resolve_tls_paths(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    match (cert, key) {
+        (Some(c), Some(k)) => Ok(Some((c, k))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+    }
 }
 
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
@@ -185,6 +199,29 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
                 // The session is already established on connect; nothing to do.
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tls_paths_both_present_is_some() {
+        let got = resolve_tls_paths(Some(PathBuf::from("c.pem")), Some(PathBuf::from("k.pem"))).unwrap();
+        assert_eq!(got, Some((PathBuf::from("c.pem"), PathBuf::from("k.pem"))));
+    }
+
+    #[test]
+    fn tls_paths_neither_is_none() {
+        assert_eq!(resolve_tls_paths(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn tls_paths_only_one_is_error() {
+        assert!(resolve_tls_paths(Some(PathBuf::from("c.pem")), None).is_err());
+        assert!(resolve_tls_paths(None, Some(PathBuf::from("k.pem"))).is_err());
     }
 }
 
