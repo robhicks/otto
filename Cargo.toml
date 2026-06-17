@@ -13,6 +13,7 @@ members = [
     "crates/mcp-fs",
     "crates/mcp-grep",
     "crates/mcp-git",
+    "crates/mcp-bash",
 ]
 
 [workspace.package]

@@ -15,32 +15,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use otto_engine_core::tool::Tool;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::sandbox::{SandboxPolicy, build_argv};
+use crate::sandbox::SandboxPolicy;
 
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-
-/// The curated environment for a sandboxed command. The host environment is cleared (no
-/// credential leakage), then a minimal env is set that also makes the Rust toolchain usable:
-/// `PATH` includes the host's `~/.cargo/bin`, and `CARGO_HOME`/`RUSTUP_HOME` point at the host
-/// toolchain. These are non-secret locations; the host filesystem is already read-only-readable
-/// inside the sandbox, so this grants no new read access — it only makes `cargo`/`rustc` runnable.
-/// `HOME` is set separately to the workspace root by the caller.
-fn curated_env() -> Vec<(String, String)> {
-    let host_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| format!("{host_home}/.cargo"));
-    let rustup_home =
-        std::env::var("RUSTUP_HOME").unwrap_or_else(|_| format!("{host_home}/.rustup"));
-    let path =
-        format!("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{cargo_home}/bin");
-    vec![
-        ("PATH".to_string(), path),
-        ("TERM".to_string(), "dumb".to_string()),
-        ("CARGO_HOME".to_string(), cargo_home),
-        ("RUSTUP_HOME".to_string(), rustup_home),
-    ]
-}
+pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 /// `bash` — args `{ "command": "<sh>", "timeout_ms": <n>? }` →
 /// `{ "stdout": "...", "stderr": "...", "exit_code": <i32|null> }`.
@@ -71,42 +50,14 @@ impl Tool for BashTool {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_TIMEOUT_MS),
         );
-
-        let (program, argv) = build_argv(&self.policy, &self.root, command)?;
-
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(argv).current_dir(&self.root).env_clear();
-        for (key, val) in curated_env() {
-            cmd.env(key, val);
-        }
-        // HOME and TMPDIR are set last so they always point at the writable workspace root and
-        // cannot be overridden by curated_env. TMPDIR is required because the sandbox's default
-        // /tmp is read-only (see the module doc).
-        cmd.env("HOME", &self.root)
-            .env("TMPDIR", &self.root)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        let child = cmd.spawn()?;
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            // On timeout the wait_with_output future is dropped, and kill_on_drop kills the child.
-            Err(_) => anyhow::bail!("bash command timed out after {} ms", timeout.as_millis()),
-            Ok(result) => result?,
-        };
-
-        Ok(json!({
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
-            "exit_code": output.status.code(),
-        }))
+        crate::sandbox::run_sandboxed(&self.policy, &self.root, command, timeout).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn unsandboxed() -> BashTool {
         let dir = tempfile::tempdir().unwrap();
@@ -161,7 +112,8 @@ mod tests {
 
     #[test]
     fn curated_env_exposes_the_rust_toolchain() {
-        let env: std::collections::HashMap<String, String> = curated_env().into_iter().collect();
+        let env: std::collections::HashMap<String, String> =
+            crate::sandbox::curated_env().into_iter().collect();
         let path = env.get("PATH").expect("PATH set");
         assert!(
             path.contains("/.cargo/bin"),

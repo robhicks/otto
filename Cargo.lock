@@ -1360,6 +1360,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "otto-mcp-bash"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "otto-tools",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "otto-mcp-fs"
 version = "0.1.0"
 dependencies = [

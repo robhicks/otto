@@ -8,4 +8,4 @@ pub mod sandbox;
 pub use bash::BashTool;
 pub use fs::{FsListTool, FsReadTool, FsWriteTool};
 pub use gate::DefaultPermissionGate;
-pub use sandbox::{SandboxPolicy, build_argv, os_sandbox_available};
+pub use sandbox::{SandboxPolicy, build_argv, os_sandbox_available, run_sandboxed};
