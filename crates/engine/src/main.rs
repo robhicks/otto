@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use otto_engine::{
-    McpConnection, build_router, build_tool_registry, mcp_connect_fs, mcp_connect_grep,
-    mcp_connect_git, resolve_tls_paths, run_goal, serve_app, serve_run,
+    McpConnection, build_router, build_tool_registry, mcp_connect_fs, mcp_connect_git,
+    mcp_connect_grep, resolve_tls_paths, run_goal, serve_app, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;

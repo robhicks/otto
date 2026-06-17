@@ -41,7 +41,11 @@ pub async fn run_gh(root: &Path, args: &[&str]) -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn gh (is it installed?): {e}"))?;
     if !out.status.success() {
-        anyhow::bail!("gh {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "gh {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -101,7 +105,9 @@ pub struct BranchInfo {
 
 impl GitServer {
     pub fn new(root: PathBuf) -> Self {
-        Self { root: Arc::new(root) }
+        Self {
+            root: Arc::new(root),
+        }
     }
 
     pub async fn do_status(&self) -> anyhow::Result<Status> {
@@ -183,8 +189,15 @@ impl GitServer {
     pub async fn do_branch(&self) -> anyhow::Result<BranchInfo> {
         let current = run_git(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
         let listing = run_git(&self.root, &["branch", "--format=%(refname:short)"]).await?;
-        let branches = listing.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-        Ok(BranchInfo { current: current.trim().to_string(), branches })
+        let branches = listing
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok(BranchInfo {
+            current: current.trim().to_string(),
+            branches,
+        })
     }
 
     pub async fn do_checkout(&self, name: String, create: bool) -> anyhow::Result<String> {
@@ -202,7 +215,14 @@ impl GitServer {
         // Containment: no absolute, no parent-dir components.
         let rel = Path::new(&dir);
         if rel.is_absolute()
-            || rel.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir))
+            || rel.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            })
         {
             anyhow::bail!("clone target escapes root: {dir}");
         }
@@ -211,7 +231,11 @@ impl GitServer {
     }
 
     /// Push to a remote. Manual/credentialed; errors cleanly when no remote/creds are configured.
-    pub async fn do_push(&self, remote: Option<String>, branch: Option<String>) -> anyhow::Result<String> {
+    pub async fn do_push(
+        &self,
+        remote: Option<String>,
+        branch: Option<String>,
+    ) -> anyhow::Result<String> {
         let mut args: Vec<String> = vec!["push".into()];
         if let Some(r) = remote {
             args.push(r);
@@ -225,7 +249,12 @@ impl GitServer {
 
     /// Open a PR via `gh`. Manual/external: requires `gh` installed + authenticated; otherwise
     /// returns an error (no CI test for the success path).
-    pub async fn do_pr_open(&self, title: String, body: Option<String>, base: Option<String>) -> anyhow::Result<String> {
+    pub async fn do_pr_open(
+        &self,
+        title: String,
+        body: Option<String>,
+        base: Option<String>,
+    ) -> anyhow::Result<String> {
         let mut args: Vec<String> = vec!["pr".into(), "create".into(), "--title".into(), title];
         args.push("--body".into());
         args.push(body.unwrap_or_default());
@@ -236,7 +265,13 @@ impl GitServer {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = run_gh(&self.root, &arg_refs).await?;
         // gh prints the PR URL; take the last non-empty line.
-        Ok(out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string())
+        Ok(out
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string())
     }
 }
 
@@ -303,15 +338,23 @@ impl GitServer {
     #[tool(name = "git.status", description = "Working-tree status")]
     async fn status(&self) -> Result<CallToolResult, ErrorData> {
         let s = self.do_status().await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::to_value(s).map_err(|e| to_err(e.into()))?))
+        Ok(CallToolResult::structured(
+            serde_json::to_value(s).map_err(|e| to_err(e.into()))?,
+        ))
     }
 
-    #[tool(name = "git.diff", description = "Show diff of working tree or staged changes")]
+    #[tool(
+        name = "git.diff",
+        description = "Show diff of working tree or staged changes"
+    )]
     async fn diff(
         &self,
         Parameters(DiffArgs { staged, path }): Parameters<DiffArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let d = self.do_diff(staged.unwrap_or(false), path).await.map_err(to_err)?;
+        let d = self
+            .do_diff(staged.unwrap_or(false), path)
+            .await
+            .map_err(to_err)?;
         Ok(CallToolResult::structured(serde_json::json!({ "diff": d })))
     }
 
@@ -321,16 +364,23 @@ impl GitServer {
         Parameters(LogArgs { max }): Parameters<LogArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let commits = self.do_log(max).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "commits": commits })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "commits": commits }),
+        ))
     }
 
-    #[tool(name = "git.add", description = "Stage paths (refuses sensitive paths)")]
+    #[tool(
+        name = "git.add",
+        description = "Stage paths (refuses sensitive paths)"
+    )]
     async fn add(
         &self,
         Parameters(AddArgs { paths }): Parameters<AddArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let added = self.do_add(paths).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "added": added })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "added": added }),
+        ))
     }
 
     #[tool(name = "git.commit", description = "Commit staged changes")]
@@ -339,13 +389,20 @@ impl GitServer {
         Parameters(CommitArgs { message }): Parameters<CommitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let hash = self.do_commit(message).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "hash": hash })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "hash": hash }),
+        ))
     }
 
-    #[tool(name = "git.branch", description = "List branches and show current branch")]
+    #[tool(
+        name = "git.branch",
+        description = "List branches and show current branch"
+    )]
     async fn branch(&self) -> Result<CallToolResult, ErrorData> {
         let info = self.do_branch().await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::to_value(info).map_err(|e| to_err(e.into()))?))
+        Ok(CallToolResult::structured(
+            serde_json::to_value(info).map_err(|e| to_err(e.into()))?,
+        ))
     }
 
     #[tool(name = "git.checkout", description = "Checkout or create a branch")]
@@ -353,35 +410,55 @@ impl GitServer {
         &self,
         Parameters(CheckoutArgs { name, create }): Parameters<CheckoutArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let branch = self.do_checkout(name, create.unwrap_or(false)).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "branch": branch })))
+        let branch = self
+            .do_checkout(name, create.unwrap_or(false))
+            .await
+            .map_err(to_err)?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "branch": branch }),
+        ))
     }
 
-    #[tool(name = "git.clone", description = "Clone a repository into a subdirectory of root")]
+    #[tool(
+        name = "git.clone",
+        description = "Clone a repository into a subdirectory of root"
+    )]
     async fn clone(
         &self,
         Parameters(CloneArgs { url, dir }): Parameters<CloneArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = self.do_clone(url, dir).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "path": path })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "path": path }),
+        ))
     }
 
-    #[tool(name = "git.push", description = "Push to a remote (requires credentials)")]
+    #[tool(
+        name = "git.push",
+        description = "Push to a remote (requires credentials)"
+    )]
     async fn push(
         &self,
         Parameters(PushArgs { remote, branch }): Parameters<PushArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let output = self.do_push(remote, branch).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "output": output })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "output": output }),
+        ))
     }
 
-    #[tool(name = "git.pr_open", description = "Open a pull request via gh (requires gh installed + authenticated)")]
+    #[tool(
+        name = "git.pr_open",
+        description = "Open a pull request via gh (requires gh installed + authenticated)"
+    )]
     async fn pr_open(
         &self,
         Parameters(PrArgs { title, body, base }): Parameters<PrArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let url = self.do_pr_open(title, body, base).await.map_err(to_err)?;
-        Ok(CallToolResult::structured(serde_json::json!({ "url": url })))
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "url": url }),
+        ))
     }
 }
 
@@ -414,9 +491,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         run_git(&root, &["init", "-q"]).await.unwrap();
-        run_git(&root, &["config", "user.name", "Test"]).await.unwrap();
-        run_git(&root, &["config", "user.email", "test@example.com"]).await.unwrap();
-        run_git(&root, &["config", "commit.gpgsign", "false"]).await.unwrap();
+        run_git(&root, &["config", "user.name", "Test"])
+            .await
+            .unwrap();
+        run_git(&root, &["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        run_git(&root, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
         let server = GitServer::new(root);
         (dir, server)
     }
@@ -445,7 +528,10 @@ mod tests {
         let hash = server.do_commit("seed".into()).await.unwrap();
         let commits = server.do_log(Some(10)).await.unwrap();
         assert_eq!(commits.len(), 1);
-        assert!(hash.starts_with(&commits[0].hash[..7.min(commits[0].hash.len())]) || commits[0].hash == hash);
+        assert!(
+            hash.starts_with(&commits[0].hash[..7.min(commits[0].hash.len())])
+                || commits[0].hash == hash
+        );
         assert_eq!(commits[0].summary, "seed");
     }
 
@@ -482,7 +568,11 @@ mod tests {
         assert!(err.is_err(), "staging a sensitive path must be refused");
         // Nothing staged: status still shows .env as untracked, not staged.
         let st = server.do_status().await.unwrap();
-        assert!(st.changes.iter().any(|c| c.path == ".env" && c.status.contains('?')));
+        assert!(
+            st.changes
+                .iter()
+                .any(|c| c.path == ".env" && c.status.contains('?'))
+        );
     }
 
     // --- Task 4 tests ---
@@ -511,13 +601,21 @@ mod tests {
         src.do_add(vec!["a.txt".into()]).await.unwrap();
         src.do_commit("c1".into()).await.unwrap();
         let bare = tempfile::tempdir().unwrap();
-        run_git(bare.path(), &["clone", "--bare", src_dir.path().to_str().unwrap(), "."]).await.unwrap();
+        run_git(
+            bare.path(),
+            &["clone", "--bare", src_dir.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
         let bare_url = format!("file://{}", bare.path().display());
 
         // Clone into a subdir of a fresh root.
         let dest_root = tempfile::tempdir().unwrap();
         let server = GitServer::new(dest_root.path().to_path_buf());
-        let path = server.do_clone(bare_url, Some("checkout".into())).await.unwrap();
+        let path = server
+            .do_clone(bare_url, Some("checkout".into()))
+            .await
+            .unwrap();
         assert_eq!(path, "checkout");
         assert!(dest_root.path().join("checkout/a.txt").exists());
     }
@@ -526,7 +624,12 @@ mod tests {
     async fn clone_rejects_escaping_dir() {
         let dir = tempfile::tempdir().unwrap();
         let server = GitServer::new(dir.path().to_path_buf());
-        assert!(server.do_clone("file:///nope".into(), Some("../escape".into())).await.is_err());
+        assert!(
+            server
+                .do_clone("file:///nope".into(), Some("../escape".into()))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

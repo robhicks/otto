@@ -189,6 +189,10 @@ mod tests {
 
     #[tokio::test]
     async fn connect_git_with_bogus_binary_errors() {
-        assert!(connect_git("definitely-not-a-real-binary-xyz", Path::new(".")).await.is_err());
+        assert!(
+            connect_git("definitely-not-a-real-binary-xyz", Path::new("."))
+                .await
+                .is_err()
+        );
     }
 }
