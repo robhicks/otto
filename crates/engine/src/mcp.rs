@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use otto_engine_core::tool::Tool;
 use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
-use rmcp::service::{Peer, RoleClient, RunningService};
+use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
 
@@ -20,16 +20,21 @@ use serde_json::Value;
 /// Type alias for the running rmcp client service.
 type McpClientService = RunningService<RoleClient, ()>;
 
-/// A live MCP client connection. Held alive by the caller so the child process stays running.
+/// A live MCP client connection. Optionally retained by the caller, but no longer the sole anchor
+/// of the child process — each registered `McpTool` independently holds a strong ref.
 pub struct McpConnection {
     #[allow(dead_code)]
     service: Arc<McpClientService>,
 }
 
 /// An rmcp-backed `Tool` that forwards calls to an MCP server over stdio.
+///
+/// Each `McpTool` holds a strong ref to the running MCP client service, so the spawned MCP server
+/// stays alive as long as any of its tools are registered (independently of whether the caller
+/// retains the `McpConnection`).
 struct McpTool {
-    /// The `Arc` keeps the child process alive as long as any tool is alive.
-    peer: Peer<RoleClient>,
+    /// Strong ref to the running client service — keeps the child process alive.
+    service: Arc<McpClientService>,
     /// The tool name as the MCP server knows it (may use underscores).
     server_name: String,
     /// The tool name the `ToolRegistry` / gate sees (dotted: `fs.read` etc.).
@@ -52,7 +57,7 @@ impl Tool for McpTool {
         if let Some(obj) = arguments {
             params = params.with_arguments(obj);
         }
-        let result = self.peer.call_tool(params).await?;
+        let result = self.service.peer().call_tool(params).await?;
         if result.is_error == Some(true) {
             // Extract the first text content as the error message.
             let msg = result
@@ -85,7 +90,11 @@ impl Tool for McpTool {
 // Name remapping: server names -> gate names
 // ---------------------------------------------------------------------------
 
-/// Map `fs_read` → `fs.read` etc. If the server already used dotted names, this is a no-op.
+/// Map server tool names to the gate names the `ToolRegistry` expects.
+///
+/// Currently a no-op for mcp-fs (which advertises dotted names natively). Kept as a client-side
+/// normalization shim so MCP servers that expose underscore tool names (`fs_read`, ...) still
+/// register under the dotted gate names (`fs.read`, ...).
 fn to_gate_name(server_name: &str) -> String {
     match server_name {
         "fs_read" => "fs.read".to_string(),
@@ -115,7 +124,7 @@ pub async fn connect(
             let server_name = t.name.to_string();
             let gate_name = to_gate_name(&server_name);
             Arc::new(McpTool {
-                peer: service.peer().clone(),
+                service: Arc::clone(&service),
                 server_name,
                 gate_name,
             }) as Arc<dyn Tool>

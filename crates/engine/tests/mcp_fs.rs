@@ -53,16 +53,16 @@ async fn mcp_fs_tools_round_trip_and_stay_gated() {
     assert!(l["paths"].as_array().unwrap().iter().any(|p| p == "a.txt"));
 
     // The gate denies a sensitive write BEFORE it reaches mcp-fs.
+    let denied = registry
+        .call(
+            "fs.write",
+            json!({ "path": ".env", "contents": "SECRET=x" }),
+        )
+        .await;
+    let err = denied.expect_err("sensitive write must be denied");
     assert!(
-        registry
-            .call(
-                "fs.write",
-                json!({ "path": ".env", "contents": "SECRET=x" })
-            )
-            .await
-            .is_err(),
-        "the gate must deny a sensitive path over the MCP-backed tool"
+        err.to_string().contains("denied"),
+        "denial must come from the permission gate, got: {err}"
     );
-    // Nothing was written.
     assert!(!dir.path().join(".env").exists());
 }
