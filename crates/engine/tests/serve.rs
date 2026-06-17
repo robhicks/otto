@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use otto_engine::{EngineService, build_default_registry, build_tool_registry, serve_app};
+use otto_engine::{EngineService, build_default_registry, build_tool_registry, serve_app, serve_run};
 use otto_engine_core::traits::Workspace;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
@@ -44,10 +44,11 @@ async fn start_server() -> (u16, tempfile::TempDir) {
     );
 
     let app = serve_app(service, TOKEN.to_string());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        serve_run(listener, app, None).await.unwrap();
     });
     (port, dir)
 }

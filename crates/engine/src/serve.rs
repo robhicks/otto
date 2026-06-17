@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router as AxumRouter;
+use axum_server::tls_rustls::RustlsConfig;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -58,6 +59,29 @@ pub fn app(service: EngineService, token: String) -> AxumRouter {
     AxumRouter::new()
         .route("/ws", get(ws_handler))
         .with_state(state)
+}
+
+/// Serve `app` on a pre-bound listener, over TLS when `tls` is `Some`. Unifies the plaintext
+/// and TLS paths on `axum-server` so both run from a `std::net::TcpListener` (testable on a
+/// `127.0.0.1:0` ephemeral port). The listener must be in non-blocking mode.
+pub async fn run(
+    listener: std::net::TcpListener,
+    app: AxumRouter,
+    tls: Option<RustlsConfig>,
+) -> anyhow::Result<()> {
+    match tls {
+        Some(cfg) => {
+            axum_server::from_tcp_rustls(listener, cfg)
+                .serve(app.into_make_service())
+                .await?
+        }
+        None => {
+            axum_server::from_tcp(listener)
+                .serve(app.into_make_service())
+                .await?
+        }
+    }
+    Ok(())
 }
 
 async fn ws_handler(
