@@ -12,19 +12,22 @@ remain), the Coder's edits are gated, and the Verifier runs the project's test c
 sandbox and drives the Repair loop. Agents fall back to a deterministic offline path when no
 model answers, so the default test suite needs no network or keys.
 
-The **distribution axis is underway**: a `persistence` crate persists sessions and their
-seq-ordered event log to sqlite, the engine runs turns through an `EngineService` that streams
-and records each turn, and `otto serve` exposes the `Command`/`Event` protocol over a
-bearer-authed WebSocket — plaintext `ws://`, or `wss://` with `--tls-cert`/`--tls-key` — with
-`Last-Event-ID` reconnect (replay from the store). Session snapshot/restore and a
-`Workspace::snapshot()`/`restore` (the workspace-handover primitive) are in place; the same
-protocol runs embedded (CLI) or served.
+The **distribution axis works end to end (on loopback)**: a `persistence` crate persists
+sessions and their seq-ordered event log to sqlite; the engine runs turns through an
+`EngineService` that streams and records each turn; `otto serve` exposes the `Command`/`Event`
+protocol over a bearer-authed WebSocket — plaintext `ws://`, or `wss://` with
+`--tls-cert`/`--tls-key` — with `Last-Event-ID` reconnect (replay from the store); a
+`RemoteWorkspace` proxies the `Workspace` seam over a gated `POST /workspace` RPC; and
+`promote()` + `LoopbackTarget` move a whole session (session snapshot/restore +
+`Workspace::snapshot`/`restore`) onto a freshly-provisioned in-process engine that the client
+reconnects to. The same protocol runs embedded (CLI) or served.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
-not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `remote`,
-`extensions`, `cli`, `ui`, etc.) and the rest of the remote/distribution axis (TLS/WSS,
-`RemoteTarget`/`RemoteWorkspace`, promote-to-remote). Treat it as the destination, not the
-current state. The per-plan specs in `docs/superpowers/plans/` and the design spec in
+not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `extensions`, `cli`,
+`ui`, etc.) and the parts of the remote axis that need external infrastructure — a real
+`vps`/`microvm` `RemoteTarget` provisioner (`UnsupportedTarget` marks that boundary in-tree),
+the client-side handover UX, and a split-out `remote` crate. Treat it as the destination, not
+the current state. The per-plan specs in `docs/superpowers/plans/` and the design spec in
 `docs/superpowers/specs/` record what was built and why; check the latest plan to see where
 the build currently stands.
 
@@ -69,9 +72,9 @@ impl crate.
 | `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. (`gemini`/`openai` are intended but not yet built.) |
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
 | `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). In-process today; the MCP-server form (`mcp-fs` etc.) is the destination. |
-| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace` (incl. `snapshot()` — a full-content capture of the listed files; plus an inherent `restore` that writes a snapshot back through the gated `apply_edit`); agents see only the read-only `WorkspaceRead` view. |
+| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace` (incl. `snapshot()` — a full-content capture of the listed files; plus an inherent `restore` that writes a snapshot back through the gated `apply_edit`); agents see only the read-only `WorkspaceRead` view. Also `RemoteWorkspace` — a `Workspace` over the bearer-authed `POST /workspace` RPC (reqwest client). |
 | `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq; `snapshot`/`restore` capture a session as a serializable `SessionState` and atomically re-create it in a fresh store (the promote-to-remote primitive). A leaf crate depending only on `protocol`. |
-| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay); `serve::run` serves plaintext or TLS (`wss://`, via `axum-server` + rustls) from one path. |
+| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay) plus the gated `POST /workspace` RPC; `serve::run` serves plaintext or TLS (`wss://`, via `axum-server` + rustls) from one path. `remote.rs` is the `RemoteTarget` seam + `promote()` + a `LoopbackTarget` (provisions a real second in-process engine) + `UnsupportedTarget` (marks the external-VPS boundary). |
 
 ### The orchestrator spine
 
