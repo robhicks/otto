@@ -1,6 +1,8 @@
 # Rust / Cargo
 /target
 **/*.rs.bk
+# Stray compiler outputs outside target/ (e.g. ad-hoc `rustc` probes)
+*.rlib
 
 # Node / UI
 ui/node_modules
