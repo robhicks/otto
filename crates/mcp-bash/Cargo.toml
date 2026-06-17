@@ -1,0 +1,22 @@
+[package]
+name = "otto-mcp-bash"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcp-bash"
+path = "src/main.rs"
+
+[dependencies]
+otto-tools = { path = "../tools" }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process"] }
+
+[dev-dependencies]
+tempfile.workspace = true
