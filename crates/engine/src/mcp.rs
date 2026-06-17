@@ -164,6 +164,16 @@ pub async fn connect_git(
     connect(command).await
 }
 
+/// Convenience: build the `mcp-bash <root>` command and connect.
+pub async fn connect_bash(
+    bin: &str,
+    root: &Path,
+) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+    let mut command = tokio::process::Command::new(bin);
+    command.arg(root);
+    connect(command).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -194,5 +204,10 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn connect_bash_with_bogus_binary_errors() {
+        assert!(connect_bash("definitely-not-a-real-binary-xyz", Path::new(".")).await.is_err());
     }
 }

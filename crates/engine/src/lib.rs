@@ -22,8 +22,8 @@ mod serve;
 mod service;
 
 pub use mcp::{
-    McpConnection, connect_fs as mcp_connect_fs, connect_git as mcp_connect_git,
-    connect_grep as mcp_connect_grep,
+    McpConnection, connect_bash as mcp_connect_bash, connect_fs as mcp_connect_fs,
+    connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
 };
 pub use remote::{
     LoopbackTarget, PromoteBundle, RemoteHandle, RemoteTarget, UnsupportedTarget, promote,
