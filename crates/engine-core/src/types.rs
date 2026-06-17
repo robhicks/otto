@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// A request to an LLM provider.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompleteRequest {
@@ -20,6 +22,16 @@ pub struct CompleteResponse {
 pub struct Edit {
     pub path: PathBuf,
     pub new_contents: String,
+}
+
+/// A transferable capture of a workspace's current files (relative path -> contents).
+/// Excludes the same paths `list("**")` excludes (`target`/`.git`/`node_modules`/dotfiles).
+/// Serde-serializable so it can later cross the wire to a remote engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    // TODO(remote): Vec<u8> serializes as a JSON int array; switch to base64 when
+    // WorkspaceSnapshot starts crossing the wire (RemoteWorkspace).
+    pub files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 /// One unit of a plan.
@@ -57,4 +69,22 @@ pub enum AgentOutput {
     Context { files: Vec<PathBuf> },
     Code { edits: Vec<Edit> },
     Verify { ok: bool, detail: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_snapshot_round_trips_through_json() {
+        let snap = WorkspaceSnapshot {
+            files: vec![
+                (PathBuf::from("a.txt"), b"hello".to_vec()),
+                (PathBuf::from("src/lib.rs"), vec![0, 1, 2, 255]),
+            ],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: WorkspaceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
+    }
 }

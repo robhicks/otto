@@ -8,7 +8,9 @@ use async_trait::async_trait;
 
 use crate::router::Router;
 use crate::tool::ToolRegistry;
-use crate::types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit};
+use crate::types::{
+    AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, WorkspaceSnapshot,
+};
 
 /// An LLM provider (local Ollama, remote Claude, etc.). In-process by default.
 #[async_trait]
@@ -32,6 +34,10 @@ pub trait WorkspaceRead: Send + Sync {
 pub trait Workspace: WorkspaceRead {
     /// Apply a full-file edit, returning the number of bytes written.
     async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64>;
+
+    /// Capture the workspace's current files as a transferable snapshot, for handover.
+    /// Excludes the same paths `list` excludes. (`RemoteWorkspace` reconstitutes from this.)
+    async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot>;
 }
 
 /// A small, single-purpose atomic agent. Native in v1; the trait is the seam where

@@ -182,7 +182,7 @@ mod tests {
     use crate::router::{RouteHints, Router};
     use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
     use crate::traits::{Agent, Workspace, WorkspaceRead};
-    use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone};
+    use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone, WorkspaceSnapshot};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
@@ -256,6 +256,9 @@ mod tests {
         async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64> {
             self.edits.lock().unwrap().push(edit.clone());
             Ok(edit.new_contents.len() as u64)
+        }
+        async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
+            Ok(WorkspaceSnapshot { files: Vec::new() })
         }
     }
 

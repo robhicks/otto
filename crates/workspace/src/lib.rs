@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use otto_engine_core::traits::{Workspace, WorkspaceRead};
-use otto_engine_core::types::Edit;
+use otto_engine_core::types::{Edit, WorkspaceSnapshot};
 
 /// A workspace rooted at a real directory on disk. All paths are resolved relative
 /// to `root` and may never escape it.
@@ -15,6 +15,25 @@ pub struct LocalWorkspace {
 impl LocalWorkspace {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    /// Materialize a snapshot into this workspace, writing each file through the gated
+    /// `apply_edit` path (so path containment is enforced). UTF-8 only for v1: a non-UTF-8
+    /// file errors rather than corrupting (raw-bytes restore is a future refinement).
+    /// Non-atomic: if an error is returned, files processed before the failure are already
+    /// written and are not rolled back.
+    pub async fn restore(&self, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
+        for (path, bytes) in &snapshot.files {
+            let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
+                anyhow::anyhow!("restore: non-UTF-8 contents for {}", path.display())
+            })?;
+            self.apply_edit(&Edit {
+                path: path.clone(),
+                new_contents,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Resolve a workspace-relative path against the root, rejecting any path that
@@ -121,6 +140,16 @@ impl Workspace for LocalWorkspace {
         }
         tokio::fs::write(&full, edit.new_contents.as_bytes()).await?;
         Ok(edit.new_contents.len() as u64)
+    }
+
+    async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
+        let paths = self.list("**").await?;
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = self.read(&path).await?;
+            files.push((path, bytes));
+        }
+        Ok(WorkspaceSnapshot { files })
     }
 }
 
@@ -229,6 +258,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_captures_listed_files_and_excludes_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        for (p, c) in [
+            ("a.txt", "A"),
+            ("src/lib.rs", "L"),
+            ("src/inner/mod.rs", "M"),
+            ("target/junk.rs", "x"),
+            (".git/config", "x"),
+            ("node_modules/x/i.js", "x"),
+        ] {
+            ws.apply_edit(&Edit {
+                path: PathBuf::from(p),
+                new_contents: c.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let snap = ws.snapshot().await.unwrap();
+        let paths: Vec<_> = snap.files.iter().map(|(p, _)| p.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("a.txt")));
+        assert!(paths.contains(&PathBuf::from("src/lib.rs")));
+        assert!(paths.contains(&PathBuf::from("src/inner/mod.rs")));
+        assert!(!paths.iter().any(|p| p.starts_with("target")));
+        assert!(!paths.iter().any(|p| p.starts_with(".git")));
+        assert!(!paths.iter().any(|p| p.starts_with("node_modules")));
+        // Contents are captured, not just paths.
+        let lib = snap
+            .files
+            .iter()
+            .find(|(p, _)| p == &PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(lib.1, b"L");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_into_fresh_workspace() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = LocalWorkspace::new(src_dir.path());
+        for (p, c) in [
+            ("a.txt", "A"),
+            ("src/lib.rs", "L"),
+            ("src/inner/mod.rs", "M"),
+        ] {
+            src.apply_edit(&Edit {
+                path: PathBuf::from(p),
+                new_contents: c.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+        let snap = src.snapshot().await.unwrap();
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = LocalWorkspace::new(dst_dir.path());
+        dst.restore(&snap).await.unwrap();
+
+        // Re-snapshotting the destination yields the same files + contents.
+        let mut original = snap.files.clone();
+        original.sort();
+        let mut restored = dst.snapshot().await.unwrap().files;
+        restored.sort();
+        assert_eq!(original, restored);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = WorkspaceSnapshot {
+            files: vec![(PathBuf::from("../escape.txt"), b"x".to_vec())],
+        };
+        assert!(ws.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = WorkspaceSnapshot {
+            files: vec![(PathBuf::from("bin.dat"), vec![0xff, 0xfe])],
+        };
+        assert!(ws.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
     async fn shallow_list_unchanged_for_star_glob() {
         let dir = tempfile::tempdir().unwrap();
         let ws = LocalWorkspace::new(dir.path());
@@ -248,5 +364,34 @@ mod tests {
         assert!(listing.contains(&PathBuf::from("a.txt")));
         assert!(listing.contains(&PathBuf::from("sub")));
         assert!(!listing.contains(&PathBuf::from("sub/b.txt")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_empty_workspace_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        assert_eq!(ws.snapshot().await.unwrap().files, Vec::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_fails_loud_on_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        ws.apply_edit(&Edit {
+            path: PathBuf::from("secret.txt"),
+            new_contents: "x".to_string(),
+        })
+        .await
+        .unwrap();
+        let p = dir.path().join("secret.txt");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // If the file is still readable (e.g. running as root), the premise doesn't hold — skip.
+        if tokio::fs::read(&p).await.is_ok() {
+            return;
+        }
+        // snapshot reads each listed file; an unreadable one must fail loudly, not be skipped.
+        assert!(ws.snapshot().await.is_err());
     }
 }
