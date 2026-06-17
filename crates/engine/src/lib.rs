@@ -19,7 +19,7 @@ use otto_tools::{
 mod serve;
 mod service;
 
-pub use serve::app as serve_app;
+pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
 pub use service::{CollectingSink, EngineService, EventSink};
 
 /// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by

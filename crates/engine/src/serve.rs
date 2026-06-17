@@ -1,8 +1,9 @@
 //! WebSocket transport for the engine. Maps WS frames to `Command`/event frames over an
 //! `EngineService`: bearer-token auth on upgrade, a `Ready { session }` frame on connect,
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
-//! Binds loopback; TLS and concurrent sessions are out of scope (see the design spec).
+//! Binds loopback (plaintext `ws://` or, with `serve::run` + a `RustlsConfig`, `wss://`); concurrent sessions are out of scope (see the design spec).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router as AxumRouter;
@@ -11,6 +12,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum_server::tls_rustls::RustlsConfig;
 use otto_protocol::{Command, Event, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +39,19 @@ struct ServeState {
     token: String,
 }
 
+/// Resolve the TLS flag pair: both present -> `Some((cert, key))`; neither -> `None`;
+/// exactly one -> error (the flags must be given together).
+pub fn resolve_tls_paths(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    match (cert, key) {
+        (Some(c), Some(k)) => Ok(Some((c, k))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+    }
+}
+
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
 pub fn app(service: EngineService, token: String) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
@@ -44,6 +59,29 @@ pub fn app(service: EngineService, token: String) -> AxumRouter {
     AxumRouter::new()
         .route("/ws", get(ws_handler))
         .with_state(state)
+}
+
+/// Serve `app` on a pre-bound listener, over TLS when `tls` is `Some`. Unifies the plaintext
+/// and TLS paths on `axum-server` so both run from a `std::net::TcpListener` (testable on a
+/// `127.0.0.1:0` ephemeral port). The listener must be in non-blocking mode.
+pub async fn run(
+    listener: std::net::TcpListener,
+    app: AxumRouter,
+    tls: Option<RustlsConfig>,
+) -> anyhow::Result<()> {
+    match tls {
+        Some(cfg) => {
+            axum_server::from_tcp_rustls(listener, cfg)
+                .serve(app.into_make_service())
+                .await?
+        }
+        None => {
+            axum_server::from_tcp(listener)
+                .serve(app.into_make_service())
+                .await?
+        }
+    }
+    Ok(())
 }
 
 async fn ws_handler(
@@ -200,5 +238,29 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
                 .create_session("(serve/ws)", &serde_json::json!({}))
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tls_paths_both_present_is_some() {
+        let got =
+            resolve_tls_paths(Some(PathBuf::from("c.pem")), Some(PathBuf::from("k.pem"))).unwrap();
+        assert_eq!(got, Some((PathBuf::from("c.pem"), PathBuf::from("k.pem"))));
+    }
+
+    #[test]
+    fn tls_paths_neither_is_none() {
+        assert_eq!(resolve_tls_paths(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn tls_paths_only_one_is_error() {
+        assert!(resolve_tls_paths(Some(PathBuf::from("c.pem")), None).is_err());
+        assert!(resolve_tls_paths(None, Some(PathBuf::from("k.pem"))).is_err());
     }
 }

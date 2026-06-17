@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use otto_engine::{build_router, build_tool_registry, run_goal, serve_app};
+use otto_engine::{
+    build_router, build_tool_registry, resolve_tls_paths, run_goal, serve_app, serve_run,
+};
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
@@ -81,16 +83,33 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(7878);
+    let mut tls_cert: Option<PathBuf> = None;
+    let mut tls_key: Option<PathBuf> = None;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
-        if a == "--port" {
-            match it.next().and_then(|s| s.parse().ok()) {
+        match a.as_str() {
+            "--port" => match it.next().and_then(|s| s.parse().ok()) {
                 Some(p) => port = p,
                 None => {
                     eprintln!("error: --port requires a number");
                     std::process::exit(2);
                 }
-            }
+            },
+            "--tls-cert" => match it.next() {
+                Some(p) => tls_cert = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("error: --tls-cert requires a path");
+                    std::process::exit(2);
+                }
+            },
+            "--tls-key" => match it.next() {
+                Some(p) => tls_key = Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("error: --tls-key requires a path");
+                    std::process::exit(2);
+                }
+            },
+            _ => {}
         }
     }
 
@@ -114,9 +133,25 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
     let app = serve_app(service, token);
 
+    // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
+    let tls = match resolve_tls_paths(tls_cert, tls_key) {
+        Ok(Some((cert, key))) => {
+            // The rustls crypto provider is supplied at compile time by axum-server's tls-rustls (aws-lc-rs); no explicit install_default() is needed here.
+            let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+            Some(cfg)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
     let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("otto serve listening on ws://{addr}/ws");
-    axum::serve(listener, app).await?;
+    let listener = std::net::TcpListener::bind(&addr)?;
+    listener.set_nonblocking(true)?;
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    eprintln!("otto serve listening on {scheme}://{addr}/ws");
+    serve_run(listener, app, tls).await?;
     Ok(())
 }
