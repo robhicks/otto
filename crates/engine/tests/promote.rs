@@ -37,7 +37,8 @@ async fn next_json(
 #[tokio::test]
 async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     // --- Source engine: run a turn that writes a file. ---
-    let src_dir = tempfile::tempdir().unwrap();
+    let src_ws_dir = tempfile::tempdir().unwrap();
+    let src_db_dir = tempfile::tempdir().unwrap();
     let promote_base = tempfile::tempdir().unwrap();
 
     let provider = ScriptedProvider::new("{}")
@@ -48,11 +49,14 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
         .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
     let router: Arc<dyn otto_engine_core::Router> =
         Arc::new(SingleProviderRouter::new(Arc::new(provider)));
-    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_dir.path()));
-    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_dir.path()));
-    let tools = Arc::new(build_tool_registry(tools_ws, src_dir.path().to_path_buf()));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_ws_dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_ws_dir.path()));
+    let tools = Arc::new(build_tool_registry(
+        tools_ws,
+        src_ws_dir.path().to_path_buf(),
+    ));
     let store: Arc<dyn SessionStore> = Arc::new(
-        SqliteStore::open(src_dir.path().join("a.db"))
+        SqliteStore::open(src_db_dir.path().join("a.db"))
             .await
             .unwrap(),
     );

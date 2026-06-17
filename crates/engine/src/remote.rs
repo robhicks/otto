@@ -98,19 +98,10 @@ impl RemoteTarget for LoopbackTarget {
         let store = SqliteStore::open(dir.join("sessions.db")).await?;
         store.restore(&bundle.session).await?;
 
-        // Restore the workspace files. Filter to text-only files: the source workspace root may
-        // contain binary artifacts (e.g. sqlite WAL files) when the store and workspace share a
-        // directory; binary files cannot be restored as text and are not semantic workspace content.
-        let text_only = otto_engine_core::types::WorkspaceSnapshot {
-            files: bundle
-                .workspace
-                .files
-                .iter()
-                .filter(|(_, bytes)| std::str::from_utf8(bytes).is_ok())
-                .cloned()
-                .collect(),
-        };
-        LocalWorkspace::new(&ws_dir).restore(&text_only).await?;
+        // Restore the workspace files.
+        LocalWorkspace::new(&ws_dir)
+            .restore(&bundle.workspace)
+            .await?;
 
         // Build the remote engine over the restored state.
         let store: Arc<dyn SessionStore> = Arc::new(store);
