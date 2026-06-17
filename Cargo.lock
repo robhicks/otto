@@ -1181,6 +1181,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "otto-engine-core",
+ "otto-protocol",
+ "reqwest",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

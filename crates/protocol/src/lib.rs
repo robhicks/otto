@@ -60,6 +60,26 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// A unary workspace operation, sent to a remote engine's `POST /workspace`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceRequest {
+    Read { path: PathBuf },
+    List { glob: String },
+    ApplyEdit { path: PathBuf, contents: String },
+    Snapshot,
+}
+
+/// The response to a `WorkspaceRequest`. `Error` carries an application-level failure
+/// (the HTTP status is still 200); the client maps it to an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WorkspaceResponse {
+    Read { bytes: Vec<u8> },
+    List { paths: Vec<PathBuf> },
+    ApplyEdit { bytes_written: u64 },
+    Snapshot { files: Vec<(PathBuf, Vec<u8>)> },
+    Error { message: String },
+}
+
 /// What the running engine environment can do. The frontend composes its behavior
 /// from the intersection of this manifest and its own form factor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,5 +121,23 @@ mod tests {
         let back: Command = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn workspace_rpc_types_round_trip_through_json() {
+        let req = WorkspaceRequest::ApplyEdit {
+            path: PathBuf::from("src/a.rs"),
+            contents: "fn main() {}".to_string(),
+        };
+        let back: WorkspaceRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(req, back);
+
+        let resp = WorkspaceResponse::Snapshot {
+            files: vec![(PathBuf::from("a.txt"), vec![1, 2, 3])],
+        };
+        let back: WorkspaceResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(resp, back);
     }
 }

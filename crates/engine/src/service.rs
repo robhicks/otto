@@ -7,11 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine_core::tool::ToolRegistry;
+use otto_engine_core::tool::{Decision, ToolRegistry};
 use otto_engine_core::traits::Workspace;
+use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
-use otto_protocol::{Event, EventKind, SessionId};
+use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
+use serde_json::json;
 
 /// Receives a turn's events in seq order, each AFTER it is durably persisted. The CLI uses a
 /// collecting sink; the serve layer uses one that writes to a WebSocket.
@@ -170,6 +172,85 @@ impl EngineService {
 
         Ok(outcome)
     }
+
+    /// Handle one unary workspace RPC against this service's workspace. `read` and
+    /// `apply_edit` are routed through the permission gate (Allow-only), so the
+    /// network-exposed primitive cannot read/write sensitive paths even though it bypasses
+    /// the orchestrator. `list` and `snapshot` are ALSO gate-filtered: any path the read
+    /// gate denies is omitted from the result, so a sensitive non-dotfile (e.g. `id_rsa`)
+    /// cannot appear in a listing or snapshot even if the workspace walk includes it.
+    pub async fn workspace_rpc(&self, req: WorkspaceRequest) -> WorkspaceResponse {
+        match req {
+            WorkspaceRequest::Read { path } => {
+                if self
+                    .tools
+                    .check("fs.read", &json!({ "path": path.to_string_lossy() }))
+                    != Decision::Allow
+                {
+                    return WorkspaceResponse::Error {
+                        message: format!("read denied by permission gate: {}", path.display()),
+                    };
+                }
+                match self.workspace.read(&path).await {
+                    Ok(bytes) => WorkspaceResponse::Read { bytes },
+                    Err(e) => WorkspaceResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            WorkspaceRequest::List { glob } => match self.workspace.list(&glob).await {
+                Ok(mut paths) => {
+                    paths.retain(|p| {
+                        self.tools
+                            .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                            == Decision::Allow
+                    });
+                    WorkspaceResponse::List { paths }
+                }
+                Err(e) => WorkspaceResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+            WorkspaceRequest::ApplyEdit { path, contents } => {
+                if self
+                    .tools
+                    .check("fs.write", &json!({ "path": path.to_string_lossy() }))
+                    != Decision::Allow
+                {
+                    return WorkspaceResponse::Error {
+                        message: format!("write denied by permission gate: {}", path.display()),
+                    };
+                }
+                let edit = Edit {
+                    path,
+                    new_contents: contents,
+                };
+                match self.workspace.apply_edit(&edit).await {
+                    Ok(bytes_written) => WorkspaceResponse::ApplyEdit { bytes_written },
+                    Err(e) => WorkspaceResponse::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            WorkspaceRequest::Snapshot => match self.workspace.snapshot().await {
+                Ok(snap) => {
+                    let files: Vec<_> = snap
+                        .files
+                        .into_iter()
+                        .filter(|(p, _)| {
+                            self.tools
+                                .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                                == Decision::Allow
+                        })
+                        .collect();
+                    WorkspaceResponse::Snapshot { files }
+                }
+                Err(e) => WorkspaceResponse::Error {
+                    message: e.to_string(),
+                },
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +367,115 @@ mod tests {
         assert_eq!(all.len(), s1.events.len() + s2.events.len());
         for (i, event) in all.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_rpc_write_read_list_snapshot() {
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+
+        // Write
+        match service
+            .workspace_rpc(WorkspaceRequest::ApplyEdit {
+                path: std::path::PathBuf::from("a.txt"),
+                contents: "hi".to_string(),
+            })
+            .await
+        {
+            WorkspaceResponse::ApplyEdit { bytes_written } => assert_eq!(bytes_written, 2),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Read it back
+        match service
+            .workspace_rpc(WorkspaceRequest::Read {
+                path: std::path::PathBuf::from("a.txt"),
+            })
+            .await
+        {
+            WorkspaceResponse::Read { bytes } => assert_eq!(bytes, b"hi".to_vec()),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // List + Snapshot return Ok variants
+        assert!(matches!(
+            service
+                .workspace_rpc(WorkspaceRequest::List {
+                    glob: "**".to_string()
+                })
+                .await,
+            WorkspaceResponse::List { .. }
+        ));
+        assert!(matches!(
+            service.workspace_rpc(WorkspaceRequest::Snapshot).await,
+            WorkspaceResponse::Snapshot { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_rpc_gates_sensitive_write_and_read() {
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+
+        // Writing a sensitive path is denied by the gate floor (nothing written).
+        assert!(matches!(
+            service
+                .workspace_rpc(WorkspaceRequest::ApplyEdit {
+                    path: std::path::PathBuf::from(".env"),
+                    contents: "SECRET=x".to_string(),
+                })
+                .await,
+            WorkspaceResponse::Error { .. }
+        ));
+        // Reading a sensitive path is denied too.
+        assert!(matches!(
+            service
+                .workspace_rpc(WorkspaceRequest::Read {
+                    path: std::path::PathBuf::from(".env"),
+                })
+                .await,
+            WorkspaceResponse::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_rpc_snapshot_and_list_filter_sensitive_files() {
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        // Seed a benign file and a sensitive non-dotfile (id_rsa) directly on disk.
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "PRIVATE KEY").unwrap();
+
+        match service
+            .workspace_rpc(WorkspaceRequest::List {
+                glob: "**".to_string(),
+            })
+            .await
+        {
+            WorkspaceResponse::List { paths } => {
+                assert!(paths.contains(&std::path::PathBuf::from("a.txt")));
+                assert!(
+                    !paths.iter().any(|p| p.ends_with("id_rsa")),
+                    "id_rsa must be gate-filtered from list"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match service.workspace_rpc(WorkspaceRequest::Snapshot).await {
+            WorkspaceResponse::Snapshot { files } => {
+                assert!(
+                    files
+                        .iter()
+                        .any(|(p, _)| p == &std::path::PathBuf::from("a.txt"))
+                );
+                assert!(
+                    !files.iter().any(|(p, _)| p.ends_with("id_rsa")),
+                    "id_rsa must be gate-filtered from snapshot"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 

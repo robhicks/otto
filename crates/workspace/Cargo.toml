@@ -7,9 +7,12 @@ license.workspace = true
 
 [dependencies]
 otto-engine-core = { path = "../engine-core" }
+otto-protocol = { path = "../protocol" }
 async-trait.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

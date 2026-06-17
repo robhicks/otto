@@ -1,5 +1,8 @@
 //! `LocalWorkspace`: edits a real on-disk folder in place, with path containment.
 
+mod remote;
+pub use remote::RemoteWorkspace;
+
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
