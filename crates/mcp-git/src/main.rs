@@ -4,7 +4,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use rmcp::ServiceExt;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{ErrorData, tool, tool_router};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // run_git / run_gh helpers
@@ -92,8 +96,7 @@ pub struct BranchInfo {
 }
 
 // ---------------------------------------------------------------------------
-// GitServer impl: read ops (Task 2) + write ops (Task 3) + branch/checkout (Task 4)
-//                + clone/push/pr_open (Task 5)
+// GitServer impl: core do_* methods
 // ---------------------------------------------------------------------------
 
 impl GitServer {
@@ -238,14 +241,163 @@ impl GitServer {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point (placeholder — serve wired in Task 6)
+// Arg structs for rmcp parameter deserialization
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AddArgs {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CommitArgs {
+    message: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct DiffArgs {
+    staged: Option<bool>,
+    path: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct LogArgs {
+    max: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CheckoutArgs {
+    name: String,
+    create: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CloneArgs {
+    url: String,
+    dir: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct PushArgs {
+    remote: Option<String>,
+    branch: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct PrArgs {
+    title: String,
+    body: Option<String>,
+    base: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// rmcp tool wrappers (thin shims over the do_* methods)
+// ---------------------------------------------------------------------------
+
+fn to_err(e: anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
+#[tool_router(server_handler)]
+impl GitServer {
+    #[tool(name = "git.status", description = "Working-tree status")]
+    async fn status(&self) -> Result<CallToolResult, ErrorData> {
+        let s = self.do_status().await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::to_value(s).map_err(|e| to_err(e.into()))?))
+    }
+
+    #[tool(name = "git.diff", description = "Show diff of working tree or staged changes")]
+    async fn diff(
+        &self,
+        Parameters(DiffArgs { staged, path }): Parameters<DiffArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let d = self.do_diff(staged.unwrap_or(false), path).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "diff": d })))
+    }
+
+    #[tool(name = "git.log", description = "Show commit log")]
+    async fn log(
+        &self,
+        Parameters(LogArgs { max }): Parameters<LogArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let commits = self.do_log(max).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "commits": commits })))
+    }
+
+    #[tool(name = "git.add", description = "Stage paths (refuses sensitive paths)")]
+    async fn add(
+        &self,
+        Parameters(AddArgs { paths }): Parameters<AddArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let added = self.do_add(paths).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "added": added })))
+    }
+
+    #[tool(name = "git.commit", description = "Commit staged changes")]
+    async fn commit(
+        &self,
+        Parameters(CommitArgs { message }): Parameters<CommitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let hash = self.do_commit(message).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "hash": hash })))
+    }
+
+    #[tool(name = "git.branch", description = "List branches and show current branch")]
+    async fn branch(&self) -> Result<CallToolResult, ErrorData> {
+        let info = self.do_branch().await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::to_value(info).map_err(|e| to_err(e.into()))?))
+    }
+
+    #[tool(name = "git.checkout", description = "Checkout or create a branch")]
+    async fn checkout(
+        &self,
+        Parameters(CheckoutArgs { name, create }): Parameters<CheckoutArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let branch = self.do_checkout(name, create.unwrap_or(false)).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "branch": branch })))
+    }
+
+    #[tool(name = "git.clone", description = "Clone a repository into a subdirectory of root")]
+    async fn clone(
+        &self,
+        Parameters(CloneArgs { url, dir }): Parameters<CloneArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = self.do_clone(url, dir).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "path": path })))
+    }
+
+    #[tool(name = "git.push", description = "Push to a remote (requires credentials)")]
+    async fn push(
+        &self,
+        Parameters(PushArgs { remote, branch }): Parameters<PushArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let output = self.do_push(remote, branch).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "output": output })))
+    }
+
+    #[tool(name = "git.pr_open", description = "Open a pull request via gh (requires gh installed + authenticated)")]
+    async fn pr_open(
+        &self,
+        Parameters(PrArgs { title, body, base }): Parameters<PrArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.do_pr_open(title, body, base).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({ "url": url })))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let root = std::env::args().nth(1).map(PathBuf::from)
+    let root = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("usage: mcp-git <root>"))?;
-    let _ = root; // serve lands in Task 6
+    let server = GitServer::new(root);
+    let service = server.serve(rmcp::transport::io::stdio()).await?;
+    service.waiting().await?;
     Ok(())
 }
 
