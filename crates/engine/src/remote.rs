@@ -59,7 +59,9 @@ pub struct UnsupportedTarget;
 #[async_trait]
 impl RemoteTarget for UnsupportedTarget {
     async fn provision(&self, _bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
-        anyhow::bail!("real VPS provisioning requires external infrastructure; not available in-tree")
+        anyhow::bail!(
+            "real VPS provisioning requires external infrastructure; not available in-tree"
+        )
     }
     async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
         Ok(())

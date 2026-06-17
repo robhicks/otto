@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use otto_engine::{
     CollectingSink, EngineService, LoopbackTarget, RemoteTarget, build_default_registry,
-    build_tool_registry, promote, serve_run,
+    build_tool_registry, promote,
 };
 use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_persistence::{SessionStore, SqliteStore};
@@ -51,8 +51,11 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_dir.path()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_dir.path()));
     let tools = Arc::new(build_tool_registry(tools_ws, src_dir.path().to_path_buf()));
-    let store: Arc<dyn SessionStore> =
-        Arc::new(SqliteStore::open(src_dir.path().join("a.db")).await.unwrap());
+    let store: Arc<dyn SessionStore> = Arc::new(
+        SqliteStore::open(src_dir.path().join("a.db"))
+            .await
+            .unwrap(),
+    );
     let service = EngineService::new(
         store.clone(),
         Arc::new(build_default_registry()),
@@ -61,23 +64,36 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
         tools,
     );
 
-    let session = service.create_session("g", &serde_json::json!({})).await.unwrap();
+    let session = service
+        .create_session("g", &serde_json::json!({}))
+        .await
+        .unwrap();
     let mut sink = CollectingSink::default();
-    service.run_prompt(session, "add a greeting", &mut sink).await.unwrap();
+    service
+        .run_prompt(session, "add a greeting", &mut sink)
+        .await
+        .unwrap();
     let src_events = store.replay_since(session, None).await.unwrap();
-    assert!(src_events.len() >= 2, "the source turn should emit several events");
+    assert!(
+        src_events.len() >= 2,
+        "the source turn should emit several events"
+    );
     let last_seq = src_events.last().unwrap().seq;
 
     // --- Promote to a loopback remote. ---
     let target = LoopbackTarget::new(TOKEN, promote_base.path().to_path_buf());
-    let handle = promote(&*store, &*workspace, session, &target).await.unwrap();
+    let handle = promote(&*store, &*workspace, session, &target)
+        .await
+        .unwrap();
 
     // --- Reconnect to the remote: same session, replayed gap after seq 0. ---
     let url = format!("{}/ws?session={}&last_seq=0", handle.endpoint, session.0);
     let mut req = url.into_client_request().unwrap();
     req.headers_mut()
         .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("connect to remote");
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("connect to remote");
 
     let ready = next_json(&mut ws).await.expect("ready frame");
     assert_eq!(ready["type"], "ready");
@@ -94,14 +110,21 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
         }
     }
     // The gap after seq 0 is every source event with seq > 0.
-    let expected: Vec<u64> = src_events.iter().map(|e| e.seq).filter(|s| *s > 0).collect();
+    let expected: Vec<u64> = src_events
+        .iter()
+        .map(|e| e.seq)
+        .filter(|s| *s > 0)
+        .collect();
     assert_eq!(replayed, expected);
     drop(ws);
 
     // --- The workspace transferred: read the promoted file via the remote's /workspace RPC. ---
     let http_base = handle.endpoint.replace("ws://", "http://");
     let remote_ws = RemoteWorkspace::new(http_base, TOKEN);
-    assert_eq!(remote_ws.read(Path::new("out.txt")).await.unwrap(), b"PROMOTED");
+    assert_eq!(
+        remote_ws.read(Path::new("out.txt")).await.unwrap(),
+        b"PROMOTED"
+    );
 
     // --- Teardown stops the remote: a subsequent connect fails. ---
     let endpoint = handle.endpoint.clone();
