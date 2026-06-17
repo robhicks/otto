@@ -1,0 +1,25 @@
+[package]
+name = "otto-mcp-grep"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcp-grep"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+ignore = "0.4"
+globset = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile.workspace = true
