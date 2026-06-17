@@ -3,8 +3,13 @@
 //! `grep` tool behind the gate.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use serde::Serialize;
+use rmcp::ServiceExt;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{ErrorData, tool, tool_router};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Search core
@@ -119,7 +124,56 @@ pub fn search(
 }
 
 // ---------------------------------------------------------------------------
-// Entry point (serve lands in Task 3)
+// rmcp server
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct GrepServer {
+    root: Arc<PathBuf>,
+}
+
+impl GrepServer {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+        }
+    }
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct GrepArgs {
+    pattern: String,
+    glob: Option<String>,
+}
+
+fn to_err(e: anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
+#[tool_router(server_handler)]
+impl GrepServer {
+    #[tool(name = "grep", description = "Regex search over the workspace (ripgrep-style)")]
+    async fn grep(
+        &self,
+        Parameters(GrepArgs { pattern, glob }): Parameters<GrepArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let root = Arc::clone(&self.root);
+        // The search is sync/CPU-bound; run it off the async executor.
+        let (matches, truncated) = tokio::task::spawn_blocking(move || {
+            search(&root, &pattern, glob.as_deref())
+        })
+        .await
+        .map_err(|e| to_err(anyhow::anyhow!("search task failed: {e}")))?
+        .map_err(to_err)?;
+
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "matches": matches, "truncated": truncated }),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
@@ -128,7 +182,9 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("usage: mcp-grep <root>"))?;
-    let _ = root; // serve lands in Task 3
+    let server = GrepServer::new(root);
+    let service = server.serve(rmcp::transport::io::stdio()).await?;
+    service.waiting().await?;
     Ok(())
 }
 
@@ -155,7 +211,9 @@ mod tests {
         let (matches, truncated) = search(dir.path(), "TODO", None).unwrap();
         assert!(!truncated);
         // Both files matched; paths are relative; line numbers are 1-based.
-        assert!(matches.iter().any(|m| m.path == "a.txt" && m.line_number == 2 && m.line.contains("TODO")));
+        assert!(matches
+            .iter()
+            .any(|m| m.path == "a.txt" && m.line_number == 2 && m.line.contains("TODO")));
         assert!(matches.iter().any(|m| m.path == "src/b.rs" && m.line.contains("TODO")));
     }
 
