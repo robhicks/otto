@@ -1,0 +1,23 @@
+[package]
+name = "otto-mcp-fs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcp-fs"
+path = "src/main.rs"
+
+[dependencies]
+otto-workspace = { path = "../workspace" }
+otto-engine-core = { path = "../engine-core" }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow.workspace = true
+schemars = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
