@@ -107,6 +107,19 @@ async fn remote_write_to_sensitive_path_is_denied() {
 }
 
 #[tokio::test]
+async fn remote_read_of_sensitive_path_is_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    // Seed .env directly on disk (bypassing the gate), then attempt to read it over the RPC.
+    std::fs::write(dir.path().join(".env"), "SECRET=x").unwrap();
+    let port = start_server(dir.path()).await;
+    let remote = RemoteWorkspace::new(format!("http://127.0.0.1:{port}"), TOKEN);
+    assert!(
+        remote.read(Path::new(".env")).await.is_err(),
+        "reading a sensitive path over the RPC must be denied"
+    );
+}
+
+#[tokio::test]
 async fn remote_workspace_rejects_wrong_token() {
     let dir = tempfile::tempdir().unwrap();
     let port = start_server(dir.path()).await;

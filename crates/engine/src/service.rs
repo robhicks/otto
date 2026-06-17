@@ -176,11 +176,17 @@ impl EngineService {
     /// Handle one unary workspace RPC against this service's workspace. `read` and
     /// `apply_edit` are routed through the permission gate (Allow-only), so the
     /// network-exposed primitive cannot read/write sensitive paths even though it bypasses
-    /// the orchestrator. `list`/`snapshot` rely on the list walk's dotfile/`.git` exclusion.
+    /// the orchestrator. `list` and `snapshot` are ALSO gate-filtered: any path the read
+    /// gate denies is omitted from the result, so a sensitive non-dotfile (e.g. `id_rsa`)
+    /// cannot appear in a listing or snapshot even if the workspace walk includes it.
     pub async fn workspace_rpc(&self, req: WorkspaceRequest) -> WorkspaceResponse {
         match req {
             WorkspaceRequest::Read { path } => {
-                if self.tools.check("fs.read", &json!({ "path": path })) != Decision::Allow {
+                if self
+                    .tools
+                    .check("fs.read", &json!({ "path": path.to_string_lossy() }))
+                    != Decision::Allow
+                {
                     return WorkspaceResponse::Error {
                         message: format!("read denied by permission gate: {}", path.display()),
                     };
@@ -193,13 +199,24 @@ impl EngineService {
                 }
             }
             WorkspaceRequest::List { glob } => match self.workspace.list(&glob).await {
-                Ok(paths) => WorkspaceResponse::List { paths },
+                Ok(mut paths) => {
+                    paths.retain(|p| {
+                        self.tools
+                            .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                            == Decision::Allow
+                    });
+                    WorkspaceResponse::List { paths }
+                }
                 Err(e) => WorkspaceResponse::Error {
                     message: e.to_string(),
                 },
             },
             WorkspaceRequest::ApplyEdit { path, contents } => {
-                if self.tools.check("fs.write", &json!({ "path": path })) != Decision::Allow {
+                if self
+                    .tools
+                    .check("fs.write", &json!({ "path": path.to_string_lossy() }))
+                    != Decision::Allow
+                {
                     return WorkspaceResponse::Error {
                         message: format!("write denied by permission gate: {}", path.display()),
                     };
@@ -216,7 +233,18 @@ impl EngineService {
                 }
             }
             WorkspaceRequest::Snapshot => match self.workspace.snapshot().await {
-                Ok(snap) => WorkspaceResponse::Snapshot { files: snap.files },
+                Ok(snap) => {
+                    let files: Vec<_> = snap
+                        .files
+                        .into_iter()
+                        .filter(|(p, _)| {
+                            self.tools
+                                .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                                == Decision::Allow
+                        })
+                        .collect();
+                    WorkspaceResponse::Snapshot { files }
+                }
                 Err(e) => WorkspaceResponse::Error {
                     message: e.to_string(),
                 },
@@ -409,6 +437,46 @@ mod tests {
                 .await,
             WorkspaceResponse::Error { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn workspace_rpc_snapshot_and_list_filter_sensitive_files() {
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        // Seed a benign file and a sensitive non-dotfile (id_rsa) directly on disk.
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "PRIVATE KEY").unwrap();
+
+        match service
+            .workspace_rpc(WorkspaceRequest::List {
+                glob: "**".to_string(),
+            })
+            .await
+        {
+            WorkspaceResponse::List { paths } => {
+                assert!(paths.contains(&std::path::PathBuf::from("a.txt")));
+                assert!(
+                    !paths.iter().any(|p| p.ends_with("id_rsa")),
+                    "id_rsa must be gate-filtered from list"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match service.workspace_rpc(WorkspaceRequest::Snapshot).await {
+            WorkspaceResponse::Snapshot { files } => {
+                assert!(
+                    files
+                        .iter()
+                        .any(|(p, _)| p == &std::path::PathBuf::from("a.txt"))
+                );
+                assert!(
+                    !files.iter().any(|(p, _)| p.ends_with("id_rsa")),
+                    "id_rsa must be gate-filtered from snapshot"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[tokio::test]

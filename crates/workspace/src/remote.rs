@@ -19,11 +19,17 @@ pub struct RemoteWorkspace {
 impl RemoteWorkspace {
     /// `base_url` is the engine origin (e.g. `http://127.0.0.1:7878` or `https://host:port`);
     /// `token` is the bearer token the server requires.
+    ///
+    /// Note: an https base_url uses the system/default root store; connecting to a self-signed
+    /// remote is not yet supported (a later refinement).
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
         }
     }
 
