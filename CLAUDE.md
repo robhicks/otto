@@ -15,8 +15,10 @@ model answers, so the default test suite needs no network or keys.
 The **distribution axis is underway**: a `persistence` crate persists sessions and their
 seq-ordered event log to sqlite, the engine runs turns through an `EngineService` that streams
 and records each turn, and `otto serve` exposes the `Command`/`Event` protocol over a
-bearer-authed WebSocket with `Last-Event-ID` reconnect (replay from the store). Snapshot/restore
-of a session is in place; the same protocol runs embedded (CLI) or served.
+bearer-authed WebSocket — plaintext `ws://`, or `wss://` with `--tls-cert`/`--tls-key` — with
+`Last-Event-ID` reconnect (replay from the store). Session snapshot/restore and a
+`Workspace::snapshot()`/`restore` (the workspace-handover primitive) are in place; the same
+protocol runs embedded (CLI) or served.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`mcp-fs`, `mcp-git`, `mcp-grep`, `mcp-bash`, `retrieval`, `remote`,
@@ -67,9 +69,9 @@ impl crate.
 | `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. (`gemini`/`openai` are intended but not yet built.) |
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
 | `tools` | `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). In-process today; the MCP-server form (`mcp-fs` etc.) is the destination. |
-| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace`; agents see only the read-only `WorkspaceRead` view. |
+| `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace` (incl. `snapshot()` — a full-content capture of the listed files; plus an inherent `restore` that writes a snapshot back through the gated `apply_edit`); agents see only the read-only `WorkspaceRead` view. |
 | `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq; `snapshot`/`restore` capture a session as a serializable `SessionState` and atomically re-create it in a fresh store (the promote-to-remote primitive). A leaf crate depending only on `protocol`. |
-| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay). |
+| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay); `serve::run` serves plaintext or TLS (`wss://`, via `axum-server` + rustls) from one path. |
 
 ### The orchestrator spine
 
