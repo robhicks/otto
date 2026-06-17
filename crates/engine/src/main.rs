@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use otto_engine::{
-    McpConnection, build_router, build_tool_registry, mcp_connect_fs, mcp_connect_grep,
-    resolve_tls_paths, run_goal, serve_app, serve_run,
+    McpConnection, build_router, build_tool_registry, mcp_connect_fs, mcp_connect_git,
+    mcp_connect_grep, resolve_tls_paths, run_goal, serve_app, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
@@ -62,6 +62,10 @@ fn mcp_grep_bin() -> String {
     std::env::var("OTTO_MCP_GREP_BIN").unwrap_or_else(|_| "mcp-grep".to_string())
 }
 
+fn mcp_git_bin() -> String {
+    std::env::var("OTTO_MCP_GIT_BIN").unwrap_or_else(|_| "mcp-git".to_string())
+}
+
 /// Build the tool registry, preferring mcp-fs for fs tools and falling back to in-process.
 /// Also registers the grep tool from mcp-grep (additive; absent if mcp-grep can't be spawned).
 /// Returns the registry and the live MCP connections to keep alive for the process lifetime.
@@ -92,6 +96,17 @@ async fn build_tools_preferring_mcp(
             conns.push(conn);
         }
         Err(e) => eprintln!("mcp-grep unavailable ({e}); search disabled"),
+    }
+
+    // git: additive — absent (logged) if mcp-git can't be spawned.
+    match mcp_connect_git(&mcp_git_bin(), &root).await {
+        Ok((conn, mcp_tools)) => {
+            for t in mcp_tools {
+                registry.register(t);
+            }
+            conns.push(conn);
+        }
+        Err(e) => eprintln!("mcp-git unavailable ({e}); git tools disabled"),
     }
 
     (registry, conns)

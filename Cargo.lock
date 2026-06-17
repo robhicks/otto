@@ -1375,6 +1375,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "otto-mcp-git"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "otto-mcp-grep"
 version = "0.1.0"
 dependencies = [
