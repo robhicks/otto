@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router as AxumRouter;
-use axum_server::tls_rustls::RustlsConfig;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum_server::tls_rustls::RustlsConfig;
 use otto_protocol::{Command, Event, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -226,29 +226,6 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn tls_paths_both_present_is_some() {
-        let got = resolve_tls_paths(Some(PathBuf::from("c.pem")), Some(PathBuf::from("k.pem"))).unwrap();
-        assert_eq!(got, Some((PathBuf::from("c.pem"), PathBuf::from("k.pem"))));
-    }
-
-    #[test]
-    fn tls_paths_neither_is_none() {
-        assert_eq!(resolve_tls_paths(None, None).unwrap(), None);
-    }
-
-    #[test]
-    fn tls_paths_only_one_is_error() {
-        assert!(resolve_tls_paths(Some(PathBuf::from("c.pem")), None).is_err());
-        assert!(resolve_tls_paths(None, Some(PathBuf::from("k.pem"))).is_err());
-    }
-}
-
 async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::Result<SessionId> {
     match &params.session {
         Some(s) => {
@@ -261,5 +238,29 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
                 .create_session("(serve/ws)", &serde_json::json!({}))
                 .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn tls_paths_both_present_is_some() {
+        let got =
+            resolve_tls_paths(Some(PathBuf::from("c.pem")), Some(PathBuf::from("k.pem"))).unwrap();
+        assert_eq!(got, Some((PathBuf::from("c.pem"), PathBuf::from("k.pem"))));
+    }
+
+    #[test]
+    fn tls_paths_neither_is_none() {
+        assert_eq!(resolve_tls_paths(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn tls_paths_only_one_is_error() {
+        assert!(resolve_tls_paths(Some(PathBuf::from("c.pem")), None).is_err());
+        assert!(resolve_tls_paths(None, Some(PathBuf::from("k.pem"))).is_err());
     }
 }

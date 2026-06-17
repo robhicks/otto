@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use otto_engine::{build_router, build_tool_registry, resolve_tls_paths, run_goal, serve_app, serve_run};
+use otto_engine::{
+    build_router, build_tool_registry, resolve_tls_paths, run_goal, serve_app, serve_run,
+};
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 

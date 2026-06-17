@@ -4,9 +4,11 @@
 
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
-use otto_engine::{EngineService, build_default_registry, build_tool_registry, serve_app, serve_run};
 use axum_server::tls_rustls::RustlsConfig;
+use futures_util::{SinkExt, StreamExt};
+use otto_engine::{
+    EngineService, build_default_registry, build_tool_registry, serve_app, serve_run,
+};
 use otto_engine_core::traits::Workspace;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
@@ -175,7 +177,13 @@ async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
             .await
             .unwrap(),
     );
-    let service = EngineService::new(store, Arc::new(build_default_registry()), router, workspace, tools);
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
     let app = serve_app(service, TOKEN.to_string());
 
     // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
