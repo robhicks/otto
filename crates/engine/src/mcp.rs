@@ -170,6 +170,10 @@ mod tests {
 
     #[tokio::test]
     async fn connect_grep_with_bogus_binary_errors() {
-        assert!(connect_grep("definitely-not-a-real-binary-xyz", Path::new(".")).await.is_err());
+        assert!(
+            connect_grep("definitely-not-a-real-binary-xyz", Path::new("."))
+                .await
+                .is_err()
+        );
     }
 }

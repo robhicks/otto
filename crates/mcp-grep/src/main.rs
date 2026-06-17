@@ -152,19 +152,21 @@ fn to_err(e: anyhow::Error) -> ErrorData {
 
 #[tool_router(server_handler)]
 impl GrepServer {
-    #[tool(name = "grep", description = "Regex search over the workspace (ripgrep-style)")]
+    #[tool(
+        name = "grep",
+        description = "Regex search over the workspace (ripgrep-style)"
+    )]
     async fn grep(
         &self,
         Parameters(GrepArgs { pattern, glob }): Parameters<GrepArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let root = Arc::clone(&self.root);
         // The search is sync/CPU-bound; run it off the async executor.
-        let (matches, truncated) = tokio::task::spawn_blocking(move || {
-            search(&root, &pattern, glob.as_deref())
-        })
-        .await
-        .map_err(|e| to_err(anyhow::anyhow!("search task failed: {e}")))?
-        .map_err(to_err)?;
+        let (matches, truncated) =
+            tokio::task::spawn_blocking(move || search(&root, &pattern, glob.as_deref()))
+                .await
+                .map_err(|e| to_err(anyhow::anyhow!("search task failed: {e}")))?
+                .map_err(to_err)?;
 
         Ok(CallToolResult::structured(
             serde_json::json!({ "matches": matches, "truncated": truncated }),
@@ -207,14 +209,23 @@ mod tests {
     #[test]
     fn finds_matches_with_shape() {
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), &[("a.txt", "alpha\nTODO: x\n"), ("src/b.rs", "// TODO: y\n")]);
+        seed(
+            dir.path(),
+            &[("a.txt", "alpha\nTODO: x\n"), ("src/b.rs", "// TODO: y\n")],
+        );
         let (matches, truncated) = search(dir.path(), "TODO", None).unwrap();
         assert!(!truncated);
         // Both files matched; paths are relative; line numbers are 1-based.
-        assert!(matches
-            .iter()
-            .any(|m| m.path == "a.txt" && m.line_number == 2 && m.line.contains("TODO")));
-        assert!(matches.iter().any(|m| m.path == "src/b.rs" && m.line.contains("TODO")));
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.path == "a.txt" && m.line_number == 2 && m.line.contains("TODO"))
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.path == "src/b.rs" && m.line.contains("TODO"))
+        );
     }
 
     #[test]
@@ -245,7 +256,10 @@ mod tests {
     #[test]
     fn does_not_search_dotfile_secret() {
         let dir = tempfile::tempdir().unwrap();
-        seed(dir.path(), &[(".env", "SECRET=hunter2\n"), ("ok.txt", "SECRET=visible\n")]);
+        seed(
+            dir.path(),
+            &[(".env", "SECRET=hunter2\n"), ("ok.txt", "SECRET=visible\n")],
+        );
         let (matches, _) = search(dir.path(), "SECRET", None).unwrap();
         // The dotfile secret is never searched; only the non-sensitive file matches.
         assert!(matches.iter().all(|m| m.path != ".env"));
@@ -256,7 +270,13 @@ mod tests {
     fn does_not_search_id_rsa_secret() {
         let dir = tempfile::tempdir().unwrap();
         // id_rsa is NOT a dotfile, so hidden-skip alone wouldn't exclude it — the marker skip does.
-        seed(dir.path(), &[("id_rsa", "PRIVATE KEY material\n"), ("ok.txt", "PRIVATE matches\n")]);
+        seed(
+            dir.path(),
+            &[
+                ("id_rsa", "PRIVATE KEY material\n"),
+                ("ok.txt", "PRIVATE matches\n"),
+            ],
+        );
         let (matches, _) = search(dir.path(), "PRIVATE", None).unwrap();
         assert!(matches.iter().all(|m| m.path != "id_rsa"));
         assert!(matches.iter().any(|m| m.path == "ok.txt"));
