@@ -22,12 +22,15 @@ protocol over a bearer-authed WebSocket — plaintext `ws://`, or `wss://` with
 `Workspace::snapshot`/`restore`) onto a freshly-provisioned in-process engine that the client
 reconnects to. The same protocol runs embedded (CLI) or served.
 
-The **MCP tool axis has started**: `mcp-fs` is a real rmcp stdio server (path-contained
-`fs.read`/`fs.write`/`fs.list`), and the engine's MCP client adapter spawns it and registers its
-tools behind the gate — the binary prefers `mcp-fs` and falls back to the in-process fs tools.
+The **MCP tool axis is well underway**: `mcp-fs` (path-contained `fs.read`/`fs.write`/`fs.list`),
+`mcp-grep` (ripgrep-style search via the grep/ignore crates), and `mcp-git` (full git/gh:
+status/diff/log/add/commit/branch/checkout/clone/push/pr_open) are real rmcp stdio servers. The
+engine's MCP client adapter spawns each and registers its tools behind the gate (binary prefers
+`mcp-fs` with an in-process fallback; `mcp-grep`/`mcp-git` are additive). `mcp-git` is hardened
+against agent-input argv injection and refuses to stage sensitive files.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
-not exist yet (`mcp-git`, `mcp-grep`, `mcp-bash`, `mcp-lsp`, `retrieval`, `extensions`, `cli`,
+not exist yet (`mcp-bash`, `mcp-lsp`, `retrieval`, `extensions`, `cli`,
 `ui`, etc.) and the parts of the remote axis that need external infrastructure — a real
 `vps`/`microvm` `RemoteTarget` provisioner (`UnsupportedTarget` marks that boundary in-tree),
 the client-side handover UX, and a split-out `remote` crate. Treat it as the destination, not
@@ -77,9 +80,11 @@ impl crate.
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback). |
 | `tools` | In-process `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`). The fs tools are now also the in-process *fallback* for `mcp-fs`; `bash` migration to `mcp-bash` is still pending. |
 | `mcp-fs` | Standalone rmcp stdio server binary (`mcp-fs <root>`): path-contained `fs.read`/`fs.write`/`fs.list` over a `LocalWorkspace`. The engine spawns it via its MCP client (`crates/engine/src/mcp.rs`) and registers its tools behind the gate — never linked. |
+| `mcp-grep` | rmcp stdio server (`mcp-grep <root>`): a `grep` tool (regex search via the grep/ignore crates), rooted, hidden-skip + sensitive-marker-skip (never returns secret contents), capped results. |
+| `mcp-git` | rmcp stdio server (`mcp-git <root>`): full git/gh ops by shelling to `git`/`gh`. Hardened against agent-input argv injection (leading-dash reject, clone URL-scheme allowlist + `clone -- …`); `git.add` enumerates the actually-staged set and refuses sensitive files. |
 | `workspace` | `LocalWorkspace` — edits a real on-disk path in place (no clone). Implements the writable `Workspace` (incl. `snapshot()` — a full-content capture of the listed files; plus an inherent `restore` that writes a snapshot back through the gated `apply_edit`); agents see only the read-only `WorkspaceRead` view. Also `RemoteWorkspace` — a `Workspace` over the bearer-authed `POST /workspace` RPC (reqwest client). |
 | `persistence` | Durable session store. The `SessionStore` trait + a sqlx-backed `SqliteStore`: persists sessions, their seq-ordered event log, and turn records; `replay_since(Option<u64>)` gives the full log or the gap after a seq; `snapshot`/`restore` capture a session as a serializable `SessionState` and atomically re-create it in a fresh store (the promote-to-remote primitive). A leaf crate depending only on `protocol`. |
-| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay) plus the gated `POST /workspace` RPC; `serve::run` serves plaintext or TLS (`wss://`, via `axum-server` + rustls) from one path. `remote.rs` is the `RemoteTarget` seam + `promote()` + a `LoopbackTarget` (provisions a real second in-process engine) + `UnsupportedTarget` (marks the external-VPS boundary). `mcp.rs` is the rmcp MCP client adapter (`connect_fs` spawns an MCP stdio server and wraps its tools as gated `Tool`s). |
+| `engine` | Binary `otto` (`run` / `serve`) + wiring library (`build_router`, `build_tool_registry`, `run_goal`). `EngineService` (`create_session`/`run_prompt`/`abort`) holds the store + shared deps and runs a turn by spawning the orchestrator, streaming each event live through an `EventSink` after persisting it (fail-closed), one turn at a time. `serve.rs` is the axum WebSocket transport (bearer auth, `Ready` frame, `last_seq` replay) plus the gated `POST /workspace` RPC; `serve::run` serves plaintext or TLS (`wss://`, via `axum-server` + rustls) from one path. `remote.rs` is the `RemoteTarget` seam + `promote()` + a `LoopbackTarget` (provisions a real second in-process engine) + `UnsupportedTarget` (marks the external-VPS boundary). `mcp.rs` is the rmcp MCP client adapter (`connect`/`connect_fs`/`connect_grep`/`connect_git` spawn an MCP stdio server and wrap its tools as gated `Tool`s); `build_tools_preferring_mcp` registers fs/grep/git over the in-process tools. |
 
 ### The orchestrator spine
 
