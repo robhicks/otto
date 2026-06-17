@@ -296,7 +296,11 @@ mod tests {
     async fn snapshot_restore_round_trips_into_fresh_workspace() {
         let src_dir = tempfile::tempdir().unwrap();
         let src = LocalWorkspace::new(src_dir.path());
-        for (p, c) in [("a.txt", "A"), ("src/lib.rs", "L"), ("src/inner/mod.rs", "M")] {
+        for (p, c) in [
+            ("a.txt", "A"),
+            ("src/lib.rs", "L"),
+            ("src/inner/mod.rs", "M"),
+        ] {
             src.apply_edit(&Edit {
                 path: PathBuf::from(p),
                 new_contents: c.to_string(),

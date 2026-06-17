@@ -8,7 +8,9 @@ use async_trait::async_trait;
 
 use crate::router::Router;
 use crate::tool::ToolRegistry;
-use crate::types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, WorkspaceSnapshot};
+use crate::types::{
+    AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, WorkspaceSnapshot,
+};
 
 /// An LLM provider (local Ollama, remote Claude, etc.). In-process by default.
 #[async_trait]
