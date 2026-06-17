@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use otto_engine::{
-    McpConnection, build_router, build_tool_registry, mcp_connect_fs, resolve_tls_paths, run_goal,
-    serve_app, serve_run,
+    McpConnection, build_router, build_tool_registry, mcp_connect_fs, mcp_connect_grep,
+    resolve_tls_paths, run_goal, serve_app, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
@@ -58,25 +58,43 @@ fn mcp_fs_bin() -> String {
     std::env::var("OTTO_MCP_FS_BIN").unwrap_or_else(|_| "mcp-fs".to_string())
 }
 
+fn mcp_grep_bin() -> String {
+    std::env::var("OTTO_MCP_GREP_BIN").unwrap_or_else(|_| "mcp-grep".to_string())
+}
+
 /// Build the tool registry, preferring mcp-fs for fs tools and falling back to in-process.
-/// Returns the registry and the (optional) MCP connection to keep alive for the process lifetime.
+/// Also registers the grep tool from mcp-grep (additive; absent if mcp-grep can't be spawned).
+/// Returns the registry and the live MCP connections to keep alive for the process lifetime.
 async fn build_tools_preferring_mcp(
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
-) -> (ToolRegistry, Option<McpConnection>) {
+) -> (ToolRegistry, Vec<McpConnection>) {
     let mut registry = build_tool_registry(tools_workspace, root.clone());
+    let mut conns = Vec::new();
+
+    // fs: prefer mcp-fs, fall back to the in-process fs tools already in the registry.
     match mcp_connect_fs(&mcp_fs_bin(), &root).await {
         Ok((conn, mcp_tools)) => {
             for t in mcp_tools {
-                registry.register(t); // overwrites in-process fs.read/write/list by name
+                registry.register(t);
             }
-            (registry, Some(conn))
+            conns.push(conn);
         }
-        Err(e) => {
-            eprintln!("mcp-fs unavailable ({e}); using in-process fs tools");
-            (registry, None)
-        }
+        Err(e) => eprintln!("mcp-fs unavailable ({e}); using in-process fs tools"),
     }
+
+    // grep: additive new capability — absent (logged) if mcp-grep can't be spawned.
+    match mcp_connect_grep(&mcp_grep_bin(), &root).await {
+        Ok((conn, mcp_tools)) => {
+            for t in mcp_tools {
+                registry.register(t);
+            }
+            conns.push(conn);
+        }
+        Err(e) => eprintln!("mcp-grep unavailable ({e}); search disabled"),
+    }
+
+    (registry, conns)
 }
 
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
@@ -89,8 +107,8 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
-    // _mcp is held until end of function so the mcp-fs child stays alive.
+    let (tools, _mcp_conns) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    // _mcp_conns is held until end of function so the mcp children stay alive.
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -154,7 +172,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_guard) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    let (tools, _mcp_conns) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
