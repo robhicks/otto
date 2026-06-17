@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use otto_engine::{
-    build_router, build_tool_registry, resolve_tls_paths, run_goal, serve_app, serve_run,
+    McpConnection, build_router, build_tool_registry, mcp_connect_fs, resolve_tls_paths, run_goal,
+    serve_app, serve_run,
 };
+use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
@@ -52,6 +54,31 @@ fn open_db_path() -> String {
     std::env::var("OTTO_DB").unwrap_or_else(|_| "otto-sessions.db".to_string())
 }
 
+fn mcp_fs_bin() -> String {
+    std::env::var("OTTO_MCP_FS_BIN").unwrap_or_else(|_| "mcp-fs".to_string())
+}
+
+/// Build the tool registry, preferring mcp-fs for fs tools and falling back to in-process.
+/// Returns the registry and the (optional) MCP connection to keep alive for the process lifetime.
+async fn build_tools_preferring_mcp(
+    tools_workspace: Arc<dyn Workspace>,
+    root: PathBuf,
+) -> (ToolRegistry, Option<McpConnection>) {
+    let mut registry = build_tool_registry(tools_workspace, root.clone());
+    match mcp_connect_fs(&mcp_fs_bin(), &root).await {
+        Ok((conn, mcp_tools)) => {
+            for t in mcp_tools {
+                registry.register(t); // overwrites in-process fs.read/write/list by name
+            }
+            (registry, Some(conn))
+        }
+        Err(e) => {
+            eprintln!("mcp-fs unavailable ({e}); using in-process fs tools");
+            (registry, None)
+        }
+    }
+}
+
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let (root, positional) = parse_root(&args);
     let goal = positional.into_iter().next().unwrap_or_else(|| {
@@ -62,7 +89,9 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let tools = Arc::new(build_tool_registry(tools_workspace, root.clone()));
+    let (tools, _mcp) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    // _mcp is held until end of function so the mcp-fs child stays alive.
+    let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
 
@@ -125,7 +154,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let tools = Arc::new(build_tool_registry(tools_workspace, root.clone()));
+    let (tools, _mcp_guard) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
     let registry = Arc::new(otto_engine::build_default_registry());
