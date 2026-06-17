@@ -20,6 +20,8 @@ impl LocalWorkspace {
     /// Materialize a snapshot into this workspace, writing each file through the gated
     /// `apply_edit` path (so path containment is enforced). UTF-8 only for v1: a non-UTF-8
     /// file errors rather than corrupting (raw-bytes restore is a future refinement).
+    /// Non-atomic: if an error is returned, files processed before the failure are already
+    /// written and are not rolled back.
     pub async fn restore(&self, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
         for (path, bytes) in &snapshot.files {
             let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
@@ -362,5 +364,34 @@ mod tests {
         assert!(listing.contains(&PathBuf::from("a.txt")));
         assert!(listing.contains(&PathBuf::from("sub")));
         assert!(!listing.contains(&PathBuf::from("sub/b.txt")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_of_empty_workspace_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        assert_eq!(ws.snapshot().await.unwrap().files, Vec::new());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_fails_loud_on_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        ws.apply_edit(&Edit {
+            path: PathBuf::from("secret.txt"),
+            new_contents: "x".to_string(),
+        })
+        .await
+        .unwrap();
+        let p = dir.path().join("secret.txt");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // If the file is still readable (e.g. running as root), the premise doesn't hold — skip.
+        if tokio::fs::read(&p).await.is_ok() {
+            return;
+        }
+        // snapshot reads each listed file; an unreadable one must fail loudly, not be skipped.
+        assert!(ws.snapshot().await.is_err());
     }
 }

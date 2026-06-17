@@ -29,6 +29,8 @@ pub struct Edit {
 /// Serde-serializable so it can later cross the wire to a remote engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
+    // TODO(remote): Vec<u8> serializes as a JSON int array; switch to base64 when
+    // WorkspaceSnapshot starts crossing the wire (RemoteWorkspace).
     pub files: Vec<(PathBuf, Vec<u8>)>,
 }
 
