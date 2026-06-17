@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use otto_engine_core::traits::{Workspace, WorkspaceRead};
-use otto_engine_core::types::Edit;
+use otto_engine_core::types::{Edit, WorkspaceSnapshot};
 
 /// A workspace rooted at a real directory on disk. All paths are resolved relative
 /// to `root` and may never escape it.
@@ -122,6 +122,16 @@ impl Workspace for LocalWorkspace {
         tokio::fs::write(&full, edit.new_contents.as_bytes()).await?;
         Ok(edit.new_contents.len() as u64)
     }
+
+    async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
+        let paths = self.list("**").await?;
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let bytes = self.read(&path).await?;
+            files.push((path, bytes));
+        }
+        Ok(WorkspaceSnapshot { files })
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +236,43 @@ mod tests {
         let mut sorted = listing.clone();
         sorted.sort();
         assert_eq!(listing, sorted);
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_listed_files_and_excludes_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        for (p, c) in [
+            ("a.txt", "A"),
+            ("src/lib.rs", "L"),
+            ("src/inner/mod.rs", "M"),
+            ("target/junk.rs", "x"),
+            (".git/config", "x"),
+            ("node_modules/x/i.js", "x"),
+        ] {
+            ws.apply_edit(&Edit {
+                path: PathBuf::from(p),
+                new_contents: c.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let snap = ws.snapshot().await.unwrap();
+        let paths: Vec<_> = snap.files.iter().map(|(p, _)| p.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("a.txt")));
+        assert!(paths.contains(&PathBuf::from("src/lib.rs")));
+        assert!(paths.contains(&PathBuf::from("src/inner/mod.rs")));
+        assert!(!paths.iter().any(|p| p.starts_with("target")));
+        assert!(!paths.iter().any(|p| p.starts_with(".git")));
+        assert!(!paths.iter().any(|p| p.starts_with("node_modules")));
+        // Contents are captured, not just paths.
+        let lib = snap
+            .files
+            .iter()
+            .find(|(p, _)| p == &PathBuf::from("src/lib.rs"))
+            .unwrap();
+        assert_eq!(lib.1, b"L");
     }
 
     #[tokio::test]

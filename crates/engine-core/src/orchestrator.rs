@@ -257,6 +257,9 @@ mod tests {
             self.edits.lock().unwrap().push(edit.clone());
             Ok(edit.new_contents.len() as u64)
         }
+        async fn snapshot(&self) -> anyhow::Result<crate::types::WorkspaceSnapshot> {
+            Ok(crate::types::WorkspaceSnapshot { files: Vec::new() })
+        }
     }
 
     struct FixedPlanner;
