@@ -65,6 +65,43 @@ fn is_sensitive(p: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Argument-injection guards
+// ---------------------------------------------------------------------------
+
+/// Reject any user-supplied positional that starts with `-`.  A leading dash is reparsed
+/// by git as a flag, enabling argv flag-smuggling attacks such as
+/// `git clone --upload-pack=<cmd>` or `git clone ext::sh -c <cmd>`.
+fn reject_leading_dash(value: &str, what: &str) -> anyhow::Result<()> {
+    if value.starts_with('-') {
+        anyhow::bail!("invalid {what}: must not start with '-': {value}");
+    }
+    Ok(())
+}
+
+/// Allow only well-known URL schemes for `git clone`.  This blocks `ext::`, `fd::`,
+/// bare relative paths, and any other transport that could be weaponised by an LLM agent.
+fn validate_clone_url(url: &str) -> anyhow::Result<()> {
+    if url.starts_with('-') {
+        anyhow::bail!("invalid clone url: {url}");
+    }
+    const ALLOWED_SCHEMES: &[&str] = &["https://", "http://", "ssh://", "file://"];
+    let scheme_ok = ALLOWED_SCHEMES.iter().any(|s| url.starts_with(s)) || is_scp_like(url);
+    if !scheme_ok {
+        anyhow::bail!("unsupported clone url (allowed: https/http/ssh/file/scp-like): {url}");
+    }
+    Ok(())
+}
+
+/// `user@host:path` scp-like SSH syntax (no scheme): a `:` whose left side has no `/`
+/// and contains `@`.
+fn is_scp_like(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((host, _)) => host.contains('@') && !host.contains('/'),
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GitServer core types
 // ---------------------------------------------------------------------------
 
@@ -168,7 +205,9 @@ impl GitServer {
     }
 
     pub async fn do_add(&self, paths: Vec<String>) -> anyhow::Result<Vec<String>> {
+        // Fast-path literal checks: dash injection + known-sensitive marker in the pathspec itself.
         for p in &paths {
+            reject_leading_dash(p, "path")?;
             if is_sensitive(p) {
                 anyhow::bail!("refusing to stage sensitive path: {p}");
             }
@@ -177,6 +216,24 @@ impl GitServer {
         args.extend(paths.iter().cloned());
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         run_git(&self.root, &arg_refs).await?;
+
+        // Authoritative guard: a pathspec like "." or a directory can transitively stage a
+        // contained secret whose marker never appeared in the pathspec.  Inspect what was
+        // actually staged and refuse (+ best-effort unstage) if any sensitive file snuck in.
+        let staged = run_git(&self.root, &["diff", "--cached", "--name-only"]).await?;
+        let offending: Vec<String> = staged
+            .lines()
+            .filter(|f| is_sensitive(f))
+            .map(str::to_string)
+            .collect();
+        if !offending.is_empty() {
+            // Best-effort: unstage the offending paths so the secret is not left staged.
+            let mut reset: Vec<String> = vec!["reset".into(), "-q".into(), "--".into()];
+            reset.extend(offending.iter().cloned());
+            let reset_refs: Vec<&str> = reset.iter().map(String::as_str).collect();
+            let _ = run_git(&self.root, &reset_refs).await;
+            anyhow::bail!("refusing to stage sensitive path(s): {offending:?}");
+        }
         Ok(paths)
     }
 
@@ -201,6 +258,7 @@ impl GitServer {
     }
 
     pub async fn do_checkout(&self, name: String, create: bool) -> anyhow::Result<String> {
+        reject_leading_dash(&name, "branch name")?;
         if create {
             run_git(&self.root, &["checkout", "-b", &name]).await?;
         } else {
@@ -226,7 +284,14 @@ impl GitServer {
         {
             anyhow::bail!("clone target escapes root: {dir}");
         }
-        run_git(&self.root, &["clone", &url, &dir]).await?;
+        // Argv injection: reject leading-dash on both url and dir.
+        reject_leading_dash(&url, "clone url")?;
+        reject_leading_dash(&dir, "clone dir")?;
+        // Scheme allowlist: blocks ext::, fd::, bare local relative paths, and other
+        // transports that could be weaponised (e.g. --upload-pack= via ext::).
+        validate_clone_url(&url)?;
+        // Use `--` so git treats the next argument as a path/URL, not a flag.
+        run_git(&self.root, &["clone", "--", &url, &dir]).await?;
         Ok(dir)
     }
 
@@ -238,8 +303,10 @@ impl GitServer {
     ) -> anyhow::Result<String> {
         let mut args: Vec<String> = vec!["push".into()];
         if let Some(r) = remote {
+            reject_leading_dash(&r, "remote")?;
             args.push(r);
             if let Some(b) = branch {
+                reject_leading_dash(&b, "branch")?;
                 args.push(b);
             }
         }
@@ -637,5 +704,68 @@ mod tests {
         let (_dir, server) = repo().await;
         // No remote configured → push errors (not a panic).
         assert!(server.do_push(None, None).await.is_err());
+    }
+
+    // --- Security hardening tests ---
+
+    #[tokio::test]
+    async fn clone_rejects_flag_and_bad_scheme_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = GitServer::new(dir.path().to_path_buf());
+        // Leading-dash url → argv flag injection.
+        assert!(
+            server
+                .do_clone("--upload-pack=touch /tmp/pwn".into(), Some("d".into()))
+                .await
+                .is_err()
+        );
+        // ext:: transport → RCE via custom helper.
+        assert!(
+            server
+                .do_clone("ext::sh -c id".into(), Some("d".into()))
+                .await
+                .is_err()
+        );
+        // Valid url but leading-dash dir → argv injection via dir positional.
+        assert!(
+            server
+                .do_clone("https://example.com/r.git".into(), Some("-x".into()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_directory_containing_secret_is_refused() {
+        let (dir, server) = repo().await;
+        write_file(&dir, "src/main.rs", "fn main() {}\n").await;
+        write_file(&dir, "src/.env", "SECRET=x\n").await;
+        // Staging the directory would transitively stage src/.env — must be refused.
+        assert!(
+            server.do_add(vec!["src".into()]).await.is_err(),
+            "staging a directory containing a secret must be refused"
+        );
+        // src/.env must not be left staged after the refusal.
+        let staged = run_git(dir.path(), &["diff", "--cached", "--name-only"])
+            .await
+            .unwrap();
+        assert!(
+            !staged.contains(".env"),
+            "secret must not remain staged after refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_and_push_reject_leading_dash() {
+        let (_d, server) = repo().await;
+        // Leading-dash branch name → git would reparse as a flag (e.g. --orphan).
+        assert!(server.do_checkout("--orphan".into(), false).await.is_err());
+        // Leading-dash remote → would be reparsed as a flag (e.g. --exec=sh -c id).
+        assert!(
+            server
+                .do_push(Some("--exec=sh -c id".into()), None)
+                .await
+                .is_err()
+        );
     }
 }
