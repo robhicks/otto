@@ -187,12 +187,16 @@ impl EngineService {
                 }
                 match self.workspace.read(&path).await {
                     Ok(bytes) => WorkspaceResponse::Read { bytes },
-                    Err(e) => WorkspaceResponse::Error { message: e.to_string() },
+                    Err(e) => WorkspaceResponse::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
             WorkspaceRequest::List { glob } => match self.workspace.list(&glob).await {
                 Ok(paths) => WorkspaceResponse::List { paths },
-                Err(e) => WorkspaceResponse::Error { message: e.to_string() },
+                Err(e) => WorkspaceResponse::Error {
+                    message: e.to_string(),
+                },
             },
             WorkspaceRequest::ApplyEdit { path, contents } => {
                 if self.tools.check("fs.write", &json!({ "path": path })) != Decision::Allow {
@@ -206,12 +210,16 @@ impl EngineService {
                 };
                 match self.workspace.apply_edit(&edit).await {
                     Ok(bytes_written) => WorkspaceResponse::ApplyEdit { bytes_written },
-                    Err(e) => WorkspaceResponse::Error { message: e.to_string() },
+                    Err(e) => WorkspaceResponse::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
             WorkspaceRequest::Snapshot => match self.workspace.snapshot().await {
                 Ok(snap) => WorkspaceResponse::Snapshot { files: snap.files },
-                Err(e) => WorkspaceResponse::Error { message: e.to_string() },
+                Err(e) => WorkspaceResponse::Error {
+                    message: e.to_string(),
+                },
             },
         }
     }
@@ -363,7 +371,11 @@ mod tests {
         }
         // List + Snapshot return Ok variants
         assert!(matches!(
-            service.workspace_rpc(WorkspaceRequest::List { glob: "**".to_string() }).await,
+            service
+                .workspace_rpc(WorkspaceRequest::List {
+                    glob: "**".to_string()
+                })
+                .await,
             WorkspaceResponse::List { .. }
         ));
         assert!(matches!(

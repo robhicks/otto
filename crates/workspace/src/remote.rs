@@ -50,14 +50,24 @@ impl RemoteWorkspace {
 #[async_trait]
 impl WorkspaceRead for RemoteWorkspace {
     async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
-        match self.rpc(&WorkspaceRequest::Read { path: path.to_path_buf() }).await? {
+        match self
+            .rpc(&WorkspaceRequest::Read {
+                path: path.to_path_buf(),
+            })
+            .await?
+        {
             WorkspaceResponse::Read { bytes } => Ok(bytes),
             other => anyhow::bail!("unexpected response to Read: {other:?}"),
         }
     }
 
     async fn list(&self, glob: &str) -> anyhow::Result<Vec<PathBuf>> {
-        match self.rpc(&WorkspaceRequest::List { glob: glob.to_string() }).await? {
+        match self
+            .rpc(&WorkspaceRequest::List {
+                glob: glob.to_string(),
+            })
+            .await?
+        {
             WorkspaceResponse::List { paths } => Ok(paths),
             other => anyhow::bail!("unexpected response to List: {other:?}"),
         }
