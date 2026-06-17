@@ -133,6 +133,7 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     // --- Teardown stops the remote: a subsequent connect fails. ---
     let endpoint = handle.endpoint.clone();
     target.teardown(handle).await.unwrap();
+    tokio::task::yield_now().await;
     let down_url = format!("{endpoint}/ws");
     let mut down_req = down_url.into_client_request().unwrap();
     down_req

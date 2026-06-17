@@ -31,6 +31,14 @@ pub struct RemoteHandle {
     shutdown: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for RemoteHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self.shutdown.take() {
+            task.abort();
+        }
+    }
+}
+
 #[async_trait]
 pub trait RemoteTarget: Send + Sync {
     async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle>;
