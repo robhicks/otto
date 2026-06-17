@@ -4,6 +4,8 @@
 use otto_engine_core::tool::{Decision, PermissionGate};
 use serde_json::Value;
 
+// NOTE: `crates/mcp-grep` mirrors this list (its `SENSITIVE_SKIP`) so a tree-wide grep never
+// returns secret contents. Add any new marker there too.
 /// Substrings (lowercase) that mark a path as sensitive. A tool-call argument naming such a
 /// path is denied. Matching is case-insensitive (see `is_sensitive`). NOTE: symlink-to-secret
 /// escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve

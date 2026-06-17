@@ -21,7 +21,7 @@ mod remote;
 mod serve;
 mod service;
 
-pub use mcp::{McpConnection, connect_fs as mcp_connect_fs};
+pub use mcp::{McpConnection, connect_fs as mcp_connect_fs, connect_grep as mcp_connect_grep};
 pub use remote::{
     LoopbackTarget, PromoteBundle, RemoteHandle, RemoteTarget, UnsupportedTarget, promote,
 };

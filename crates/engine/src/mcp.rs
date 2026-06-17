@@ -144,6 +144,16 @@ pub async fn connect_fs(
     connect(command).await
 }
 
+/// Convenience: build the `mcp-grep <root>` command and connect.
+pub async fn connect_grep(
+    bin: &str,
+    root: &Path,
+) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+    let mut command = tokio::process::Command::new(bin);
+    command.arg(root);
+    connect(command).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -156,5 +166,14 @@ mod tests {
     async fn connect_fs_with_bogus_binary_errors() {
         let err = connect_fs("definitely-not-a-real-binary-xyz", Path::new(".")).await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_grep_with_bogus_binary_errors() {
+        assert!(
+            connect_grep("definitely-not-a-real-binary-xyz", Path::new("."))
+                .await
+                .is_err()
+        );
     }
 }
