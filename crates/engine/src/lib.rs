@@ -16,10 +16,12 @@ use otto_tools::{
     os_sandbox_available,
 };
 
+mod mcp;
 mod remote;
 mod serve;
 mod service;
 
+pub use mcp::{McpConnection, connect_fs as mcp_connect_fs};
 pub use remote::{
     LoopbackTarget, PromoteBundle, RemoteHandle, RemoteTarget, UnsupportedTarget, promote,
 };
