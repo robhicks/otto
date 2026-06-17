@@ -11,9 +11,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
-use otto_protocol::{Command, Event, SessionId};
+use otto_protocol::{Command, Event, SessionId, WorkspaceRequest};
 use serde::{Deserialize, Serialize};
 
 use crate::service::{EngineService, EventSink};
@@ -39,6 +39,15 @@ struct ServeState {
     token: String,
 }
 
+/// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        == Some(token)
+}
+
 /// Resolve the TLS flag pair: both present -> `Some((cert, key))`; neither -> `None`;
 /// exactly one -> error (the flags must be given together).
 pub fn resolve_tls_paths(
@@ -58,6 +67,7 @@ pub fn app(service: EngineService, token: String) -> AxumRouter {
     let state = Arc::new(ServeState { service, token });
     AxumRouter::new()
         .route("/ws", get(ws_handler))
+        .route("/workspace", post(workspace_handler))
         .with_state(state)
 }
 
@@ -90,14 +100,26 @@ async fn ws_handler(
     Query(params): Query<ConnectParams>,
     State(state): State<Arc<ServeState>>,
 ) -> Response {
-    let presented = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented != Some(state.token.as_str()) {
+    if !authorized(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, params, state))
+}
+
+async fn workspace_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<ServeState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let req: WorkspaceRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
+    };
+    let resp = state.service.workspace_rpc(req).await;
+    axum::Json(resp).into_response()
 }
 
 /// Send one `ServerMessage` as a JSON text frame.
