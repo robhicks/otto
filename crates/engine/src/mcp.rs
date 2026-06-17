@@ -154,6 +154,16 @@ pub async fn connect_grep(
     connect(command).await
 }
 
+/// Convenience: build the `mcp-git <root>` command and connect.
+pub async fn connect_git(
+    bin: &str,
+    root: &Path,
+) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+    let mut command = tokio::process::Command::new(bin);
+    command.arg(root);
+    connect(command).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -175,5 +185,10 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn connect_git_with_bogus_binary_errors() {
+        assert!(connect_git("definitely-not-a-real-binary-xyz", Path::new(".")).await.is_err());
     }
 }
