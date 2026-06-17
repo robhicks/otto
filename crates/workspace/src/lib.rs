@@ -17,6 +17,23 @@ impl LocalWorkspace {
         Self { root: root.into() }
     }
 
+    /// Materialize a snapshot into this workspace, writing each file through the gated
+    /// `apply_edit` path (so path containment is enforced). UTF-8 only for v1: a non-UTF-8
+    /// file errors rather than corrupting (raw-bytes restore is a future refinement).
+    pub async fn restore(&self, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
+        for (path, bytes) in &snapshot.files {
+            let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
+                anyhow::anyhow!("restore: non-UTF-8 contents for {}", path.display())
+            })?;
+            self.apply_edit(&Edit {
+                path: path.clone(),
+                new_contents,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Resolve a workspace-relative path against the root, rejecting any path that
     /// escapes the root via `..` or absolute components.
     fn contain(&self, path: &Path) -> anyhow::Result<PathBuf> {
@@ -273,6 +290,52 @@ mod tests {
             .find(|(p, _)| p == &PathBuf::from("src/lib.rs"))
             .unwrap();
         assert_eq!(lib.1, b"L");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_into_fresh_workspace() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = LocalWorkspace::new(src_dir.path());
+        for (p, c) in [("a.txt", "A"), ("src/lib.rs", "L"), ("src/inner/mod.rs", "M")] {
+            src.apply_edit(&Edit {
+                path: PathBuf::from(p),
+                new_contents: c.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+        let snap = src.snapshot().await.unwrap();
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = LocalWorkspace::new(dst_dir.path());
+        dst.restore(&snap).await.unwrap();
+
+        // Re-snapshotting the destination yields the same files + contents.
+        let mut original = snap.files.clone();
+        original.sort();
+        let mut restored = dst.snapshot().await.unwrap().files;
+        restored.sort();
+        assert_eq!(original, restored);
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = WorkspaceSnapshot {
+            files: vec![(PathBuf::from("../escape.txt"), b"x".to_vec())],
+        };
+        assert!(ws.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = WorkspaceSnapshot {
+            files: vec![(PathBuf::from("bin.dat"), vec![0xff, 0xfe])],
+        };
+        assert!(ws.restore(&snap).await.is_err());
     }
 
     #[tokio::test]
