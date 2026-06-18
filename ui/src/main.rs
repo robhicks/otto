@@ -1,3 +1,4 @@
+mod components;
 mod url;
 mod view_model;
 mod ws;
