@@ -30,9 +30,12 @@ pub fn App() -> impl IntoView {
             return;
         }
         let target = build_ws_url(&base, &tok, session.get().as_deref(), last_seq.get());
-        // Close any existing socket before opening a new one so its callbacks can't
-        // later flip the UI state out from under the new connection.
+        // Detach the old socket's handlers, then close it, so its (forget()-leaked)
+        // callbacks can't fire late and flip the new connection's state.
         if let Some(old) = socket.get_untracked() {
+            old.set_onmessage(None);
+            old.set_onclose(None);
+            old.set_onerror(None);
             let _ = old.close();
             socket.set(None);
         }

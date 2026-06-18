@@ -8,7 +8,10 @@ pub fn build_ws_url(
     session: Option<&str>,
     last_seq: Option<u64>,
 ) -> String {
+    // Normalize the base: tolerate a trailing slash and a base that already ends in
+    // `/ws` (e.g. the endpoint URL `otto serve` prints), so we never produce `/ws/ws`.
     let base = base.trim_end_matches('/');
+    let base = base.strip_suffix("/ws").unwrap_or(base);
     let mut url = format!("{base}/ws?token={}", urlencoding::encode(token));
     if let Some(s) = session {
         url.push_str(&format!("&session={}", urlencoding::encode(s)));
@@ -71,5 +74,18 @@ mod tests {
         assert_eq!(advance_last_seq(None, 0), Some(0));
         assert_eq!(advance_last_seq(Some(3), 7), Some(7));
         assert_eq!(advance_last_seq(Some(7), 3), Some(7));
+    }
+
+    #[test]
+    fn url_tolerates_base_already_ending_in_ws() {
+        assert_eq!(
+            build_ws_url("ws://127.0.0.1:8787/ws", "tok", None, None),
+            "ws://127.0.0.1:8787/ws?token=tok"
+        );
+        // trailing slash + /ws both handled
+        assert_eq!(
+            build_ws_url("ws://h/ws/", "t", None, None),
+            "ws://h/ws?token=t"
+        );
     }
 }
