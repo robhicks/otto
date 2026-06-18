@@ -3,16 +3,23 @@
 An agentic coding engine. A deterministic orchestrator drives a spine of small, atomic
 agents — **Planner → ContextFinder → Coder → Verifier** — over a workspace, routing LLM
 calls across local and remote providers behind a stable set of trait seams. The frontend
-(future) never branches on "local vs remote": it speaks one protocol to an engine that may
+never branches on "local vs remote": it speaks one protocol to an engine that may
 be embedded in-process or served over the network.
 
-> **Status: the single-machine spine is real.** The orchestrator, all four agents
-> (Planner, ContextFinder, Coder, Verifier), trait seams, providers, router, tools, sandbox,
-> and permission gate are implemented and tested — no stubs remain. The agents are LLM-backed
-> with a deterministic offline fallback, so the test suite runs without keys or network. Still
-> ahead: the remote/distribution axis (`serve` mode, `RemoteWorkspace`), MCP tool servers,
-> retrieval, persistence, extensions, and the UI. The full intended design lives in
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`.
+> **Status: the single-machine spine is real, and the distribution axis works end to end on
+> loopback.** The orchestrator, all four agents (Planner, ContextFinder, Coder, Verifier),
+> trait seams, providers, router, tools, sandbox, and permission gate are implemented and
+> tested — no stubs remain. The agents are LLM-backed with a deterministic offline fallback, so
+> the test suite runs without keys or network. Also landed: **persistence** (sqlite session +
+> event-log store), **`otto serve`** (bearer-authed WebSocket with `Last-Event-ID` reconnect,
+> plaintext or `wss://`), **`RemoteWorkspace`** + `promote()`/`LoopbackTarget`, the **MCP tool
+> servers** (`mcp-fs`/`mcp-grep`/`mcp-git`/`mcp-bash`), and the **first UI slice** — a
+> browser-first Leptos (Rust→WASM) app shell in [`ui/`](ui/) that talks to `otto serve`. Still
+> ahead: retrieval, extensions, the external-VPS remote provisioner, and UI sub-projects B–F
+> (capabilities strip, workspace tree/editor, diff approval, token meter, promote UX) plus the
+> Tauri desktop wrapper. The full intended design lives in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`,
+> and the UI roadmap is in [`docs/superpowers/specs/2026-06-17-ui-roadmap.md`](docs/superpowers/specs/2026-06-17-ui-roadmap.md).
 
 ## Quick start
 
@@ -73,6 +80,32 @@ The trait seams — `Agent`, `WorkspaceRead`/`Workspace`, `Provider`/`Router`, `
 the extension points. They are `Send + Sync` async traits, and the orchestrator only ever
 holds trait objects, so new agents, providers, routing policies, or tools slot in without
 touching the spine.
+
+## Serving the engine + the browser UI
+
+The same protocol runs embedded (the `run` command above) or served. `otto serve` exposes the
+`Command`/`Event` protocol over a bearer-authed WebSocket; the bearer token is mandatory:
+
+```bash
+OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787   # prints ws://127.0.0.1:8787/ws
+```
+
+The first UI slice lives in [`ui/`](ui/) — a browser-first **Leptos CSR** app (Rust→WASM). It
+is a **standalone crate, intentionally excluded from the cargo workspace**, depending only on
+`protocol`, so `cargo build --workspace` and the offline test suite are unaffected. Build and
+run it from inside `ui/`:
+
+```bash
+cd ui
+cargo test                                  # pure host-side logic tests (no browser)
+cargo build --target wasm32-unknown-unknown # wasm compile check
+trunk serve                                 # dev server in a browser tab (needs `cargo install trunk`)
+```
+
+Then enter the engine's `ws://…/ws` URL and the token, and you get the live event stream with
+`Send`/`Abort` and reconnect-with-replay. See
+[`docs/superpowers/specs/2026-06-17-ui-roadmap.md`](docs/superpowers/specs/2026-06-17-ui-roadmap.md)
+for the UI roadmap.
 
 ## Developing
 

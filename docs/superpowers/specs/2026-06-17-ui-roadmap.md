@@ -1,7 +1,7 @@
 # otto UI — Build Roadmap
 
 **Date:** 2026-06-17
-**Status:** Approved decomposition
+**Status:** Approved decomposition — **Sub-project A shipped 2026-06-18** (PR #47); B–F pending.
 **Scope:** The frontend (`ui/`) described in `docs/ARCHITECTURE.md` and the design spec
 (`docs/superpowers/specs/2026-06-13-otto-design.md`).
 
@@ -35,7 +35,7 @@ Ordered so each builds on a working, demoable predecessor.
 
 | # | Sub-project | What it adds | Protocol / engine changes |
 |---|---|---|---|
-| **A** | **App shell + live session** | `ui/` Leptos CSR project (browser-first). Connect to a `ws://`/`wss://` URL with a bearer token → `Ready{session}`; prompt box sends `SendPrompt`; render the live `Event` stream; `Abort`; reconnect with `last_seq` replay. The reusable shell every later sub-project extends. | Two small **additive** changes: move the WS framing enum (`ServerMessage`) into `protocol` so the UI can deserialize it; accept the bearer token via a `?token=` query param (browser `WebSocket` can't set headers). Header auth and existing tests stay green. |
+| **A** ✅ | **App shell + live session** *(shipped — [design](2026-06-17-ui-shell-live-session-design.md) · [plan](../plans/2026-06-17-ui-shell-live-session.md))* | `ui/` Leptos CSR project (browser-first). Connect to a `ws://`/`wss://` URL with a bearer token → `Ready{session}`; prompt box sends `SendPrompt`; render the live `Event` stream; `Abort`; reconnect with `last_seq` replay. The reusable shell every later sub-project extends. | **Done:** moved the WS framing enum (`ServerMessage`) into `protocol` so the UI can deserialize it; `/ws` accepts the bearer token via a `?token=` query param (browser `WebSocket` can't set headers) with the header path still preferred. Header auth and existing tests stayed green. |
 | **B** | **Capabilities + status strip** | Engine emits `CapabilitiesManifest` on connect; UI status strip shows engine/LLM/sandbox state with **visible** degradation. | `Ready` frame carries the manifest (the type already exists in `protocol`). |
 | **C** | **Workspace tree + editor** | File tree (via `POST /workspace` `List`), read-only file view, then CodeMirror 6 editing through a wasm-bindgen JS glue module (`mountEditor`/`getDoc`/`setDoc`/`onChange`). | None for read/list (reuses the `/workspace` RPC); editor is pure frontend + JS interop. |
 | **D** | **Diff approval** | Render Coder diffs; an approve/reject gate for `fs.write` `Ask` verdicts, wiring the permission gate's `Ask` path through to the UI. | `ApproveDiff` command; `Diff` + `ApprovalRequest` events; orchestrator/gate wiring to block on the UI's verdict. |
