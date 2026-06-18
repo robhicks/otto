@@ -30,6 +30,12 @@ pub fn App() -> impl IntoView {
             return;
         }
         let target = build_ws_url(&base, &tok, session.get().as_deref(), last_seq.get());
+        // Close any existing socket before opening a new one so its callbacks can't
+        // later flip the UI state out from under the new connection.
+        if let Some(old) = socket.get_untracked() {
+            let _ = old.close();
+            socket.set(None);
+        }
         conn.set(ConnState::Connecting);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
