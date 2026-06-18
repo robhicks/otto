@@ -1,4 +1,5 @@
 mod url;
+mod view_model;
 mod ws;
 
 use leptos::prelude::*;
