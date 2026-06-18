@@ -31,9 +31,23 @@ in-process `fs.*`/`bash` tools as fallbacks (`mcp-grep`/`mcp-git` are additive).
 hardened against agent-input argv injection; `mcp-bash` reuses the shared `run_sandboxed` core and
 hardcodes the OS sandbox (the gate + sandbox-only registration are preserved across the move).
 
+The **UI has its first slice** (sub-project A, "app shell + live session"): `ui/` is a
+browser-first **Leptos CSR** app (Rust→WASM, built with `trunk`) that connects to `otto serve`
+over WebSocket, sends a prompt, renders the live `Event` stream, aborts, and reconnects with
+`last_seq` replay. It is a **standalone crate, deliberately excluded from the cargo workspace**
+(`exclude = ["ui"]` in the root `Cargo.toml`), depends **only** on `protocol` (compiled to
+WASM), and is built/tested from inside `ui/` (`cargo test`, `cargo build --target
+wasm32-unknown-unknown`) — so `cargo build --workspace` and the offline determinism suite are
+untouched. Enabling it took two additive changes: the WS framing enum `ServerMessage` now lives
+in `protocol` (so the UI can deserialize it), and `/ws` accepts the bearer token via a `?token=`
+query param (the header path is still preferred). The roadmap and per-slice spec/plan live in
+`docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects B–F are pending.
+
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
-not exist yet (`mcp-lsp`, `retrieval`, `extensions`, `cli`,
-`ui`, etc.) and the parts of the remote axis that need external infrastructure — a real
+not exist yet (`mcp-lsp`, `retrieval`, `extensions`, `cli`, etc.), the rest of the UI
+(sub-projects B–F: capabilities strip, workspace tree/editor, diff approval, token meter,
+promote-to-remote, and the Tauri desktop wrapper), and the parts of the remote axis that need
+external infrastructure — a real
 `vps`/`microvm` `RemoteTarget` provisioner (`UnsupportedTarget` marks that boundary in-tree),
 the client-side handover UX, and a split-out `remote` crate. Treat it as the destination, not
 the current state. The per-plan specs in `docs/superpowers/plans/` and the design spec in
@@ -52,6 +66,14 @@ cargo clippy --workspace --all-targets   # lint
 
 # Run the engine end-to-end (single turn):
 cargo run -p otto-engine -- run "<goal>" [--root <path>]
+
+# Serve the engine over WebSocket (for the UI / remote clients); token is mandatory:
+OTTO_TOKEN=<token> cargo run -p otto-engine -- serve [--port <p>] [--root <path>]
+
+# The browser UI (standalone, NOT part of the workspace — run from inside ui/):
+cd ui && cargo test                              # pure host-side unit tests
+cd ui && cargo build --target wasm32-unknown-unknown   # wasm compile check
+cd ui && trunk serve                             # dev server in a browser tab (needs `cargo install trunk`)
 ```
 
 Toolchain is pinned to stable in `rust-toolchain.toml` (edition 2024, rust-version 1.85).
@@ -75,7 +97,7 @@ impl crate.
 
 | Crate | Role |
 |---|---|
-| `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`). No I/O. The crate a future UI shares. |
+| `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`, plus the WS framing enum `ServerMessage` and `CapabilitiesManifest`). No I/O. The crate the `ui/` build shares (compiled to WASM). |
 | `engine-core` | The orchestrator state machine + the trait seams: `Agent`, `WorkspaceRead`/`Workspace`, `Provider`, `Router`, `Tool`/`ToolRegistry`/`PermissionGate`, plus `AgentRegistry` and shared `types`. |
 | `agents` | Built-in atomic agents implementing `Agent`: `Planner`, `ContextFinder` (lexical prefilter → LLM rank, with bounded per-turn read budget), `Coder`, `Verifier` (data-driven recipe table; runs the detected ecosystem's test command). All LLM-backed, all with a deterministic offline fallback. |
 | `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. (`gemini`/`openai` are intended but not yet built.) |
