@@ -13,24 +13,22 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
-use otto_protocol::{Command, Event, SessionId, WorkspaceRequest};
-use serde::{Deserialize, Serialize};
+use otto_protocol::{Command, Event, ServerMessage, SessionId, WorkspaceRequest};
+use serde::Deserialize;
 
 use crate::service::{EngineService, EventSink};
-
-/// Outbound WS frame. Reuses the core `Event`; `Ready`/`Error` are transport framing.
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage {
-    Ready { session: SessionId },
-    Event { event: Event },
-    Error { message: String },
-}
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {
     session: Option<String>,
     last_seq: Option<u64>,
+    /// Bearer token carried in the query string. A browser `WebSocket` can't set an
+    /// `Authorization` header, so the `/ws` upgrade accepts the token here as well.
+    /// Security: tokens in URLs can leak into server logs and browser history — acceptable
+    /// for the loopback/dev posture of sub-project A; the header path stays the recommended
+    /// one for non-browser clients. A later sub-project may move this to a WS subprotocol
+    /// carrier or route through Tauri's Rust-side WS client (which can set headers).
+    token: Option<String>,
 }
 
 /// Shared server state: the engine service and the required bearer token.
@@ -46,6 +44,12 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         == Some(token)
+}
+
+/// True if the `/ws` upgrade is authorized: a matching `Authorization: Bearer` header
+/// (preferred) or a matching `?token=` query param (the browser path).
+fn authorized_ws(headers: &HeaderMap, token: &str, params: &ConnectParams) -> bool {
+    authorized(headers, token) || params.token.as_deref() == Some(token)
 }
 
 /// Resolve the TLS flag pair: both present -> `Some((cert, key))`; neither -> `None`;
@@ -100,7 +104,7 @@ async fn ws_handler(
     Query(params): Query<ConnectParams>,
     State(state): State<Arc<ServeState>>,
 ) -> Response {
-    if !authorized(&headers, &state.token) {
+    if !authorized_ws(&headers, &state.token, &params) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
     ws.on_upgrade(move |socket| handle_socket(socket, params, state))

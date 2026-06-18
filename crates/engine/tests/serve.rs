@@ -154,6 +154,34 @@ async fn rejects_wrong_token() {
     assert!(result.is_err(), "a wrong token must be rejected");
 }
 
+#[tokio::test]
+async fn authorizes_via_query_token() {
+    let (port, _dir) = start_server().await;
+    // No Authorization header — token rides in the query string (browser path).
+    let url = format!("ws://127.0.0.1:{port}/ws?token={TOKEN}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("query-token connection must be accepted");
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+}
+
+#[tokio::test]
+async fn rejects_wrong_query_token() {
+    let (port, _dir) = start_server().await;
+    let url = format!("ws://127.0.0.1:{port}/ws?token=wrong-token");
+    let result = tokio_tungstenite::connect_async(url).await;
+    assert!(result.is_err(), "a wrong query token must be rejected");
+}
+
+#[tokio::test]
+async fn rejects_empty_query_token() {
+    let (port, _dir) = start_server().await;
+    let url = format!("ws://127.0.0.1:{port}/ws?token=");
+    let result = tokio_tungstenite::connect_async(url).await;
+    assert!(result.is_err(), "an empty query token must be rejected");
+}
+
 /// Start the serve app over TLS on 127.0.0.1:0 with a self-signed cert for "localhost".
 /// Returns (port, cert_der, tempdir). The client must trust `cert_der`.
 async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {

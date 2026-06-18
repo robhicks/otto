@@ -60,6 +60,16 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// Outbound WS framing for the engine→frontend stream. Reuses the core `Event`;
+/// `Ready`/`Error` are transport framing. Shared so browser clients can deserialize it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMessage {
+    Ready { session: SessionId },
+    Event { event: Event },
+    Error { message: String },
+}
+
 /// A unary workspace operation, sent to a remote engine's `POST /workspace`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceRequest {
@@ -92,6 +102,31 @@ pub struct CapabilitiesManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_message_ready_has_snake_case_tag() {
+        let session = SessionId::new();
+        let msg = ServerMessage::Ready { session };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(v["type"], "ready");
+        // SessionId is a newtype over Uuid → serializes as a bare string.
+        assert_eq!(v["session"], serde_json::json!(session.0.to_string()));
+    }
+
+    #[test]
+    fn server_message_event_round_trips() {
+        let msg = ServerMessage::Event {
+            event: Event {
+                seq: 3,
+                session: SessionId::new(),
+                kind: EventKind::TurnComplete { ok: true },
+            },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(msg, back);
+    }
 
     #[test]
     fn event_round_trips_through_json() {
