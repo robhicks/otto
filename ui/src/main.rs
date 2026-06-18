@@ -1,4 +1,5 @@
 mod url;
+mod ws;
 
 use leptos::prelude::*;
 
