@@ -307,7 +307,10 @@ web-sys = { version = "0.3", features = [
 ] }
 serde_json = "1"
 urlencoding = "2.1"
-uuid = "1"
+# uuid's `js` feature is required for its randomness on wasm32-unknown-unknown (a uuid 1.x
+# requirement separate from the getrandom backend cfg below); v4/serde come transitively
+# via otto-protocol.
+uuid = { version = "1", features = ["js"] }
 console_error_panic_hook = "0.1"
 # uuid pulls getrandom (v4); on wasm32-unknown-unknown getrandom needs an explicit
 # browser backend even though the UI never generates randomness — enable it here and
