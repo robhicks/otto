@@ -13,19 +13,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
-use otto_protocol::{Command, Event, SessionId, WorkspaceRequest};
-use serde::{Deserialize, Serialize};
+use otto_protocol::{Command, Event, ServerMessage, SessionId, WorkspaceRequest};
+use serde::Deserialize;
 
 use crate::service::{EngineService, EventSink};
-
-/// Outbound WS frame. Reuses the core `Event`; `Ready`/`Error` are transport framing.
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage {
-    Ready { session: SessionId },
-    Event { event: Event },
-    Error { message: String },
-}
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {
