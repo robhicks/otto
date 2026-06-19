@@ -20,9 +20,9 @@ pub fn App() -> impl IntoView {
     let last_seq = RwSignal::new(None::<u64>); // retained across disconnects for replay
     let session = RwSignal::new(None::<String>); // retained across disconnects for reconnect
     let socket = RwSignal::new(None::<WebSocket>);
-    // `capabilities`: set on Ready; cleared on (re)connect and explicit disconnect. It may go
-    // stale after an unexpected drop (on_close/on_error don't clear it) — StatusLine gates
-    // display on ConnState::Connected, so a stale manifest is never shown.
+    // `capabilities`: set on Ready; cleared on every disconnect path (connect-start, explicit
+    // disconnect, and the on_close/on_error socket drops). So `Some` ⟺ a live manifest for the
+    // current connection; StatusLine additionally gates display on ConnState::Connected.
     let capabilities = RwSignal::new(None::<CapabilitiesManifest>);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
@@ -69,9 +69,13 @@ pub fn App() -> impl IntoView {
                 rows.update(|v| v.push(client_error_row(&detail)));
             }
         };
-        let on_close = move || conn.set(ConnState::Disconnected);
+        let on_close = move || {
+            capabilities.set(None);
+            conn.set(ConnState::Disconnected);
+        };
         let on_error = move || {
             rows.update(|v| v.push(client_error_row("connection rejected — check URL/token")));
+            capabilities.set(None);
             conn.set(ConnState::Disconnected);
         };
 
