@@ -133,6 +133,9 @@ impl EngineService {
                     let _ = tx.send(Event { seq, session, kind });
                 };
                 let next_id = || uuid::Uuid::new_v4();
+                // Neutral meter/pauser: zero usage emits no meter events and `NeverPause`
+                // never pauses, so behavior is unchanged. Real wiring lands in a later task.
+                let meter = otto_engine_core::TokenMeter::default();
                 let orchestrator = Orchestrator {
                     registry: &registry,
                     router: &*router,
@@ -140,6 +143,8 @@ impl EngineService {
                     tools: &tools,
                     approver: &*approver,
                     next_id: &next_id,
+                    meter: &meter,
+                    pauser: &otto_engine_core::tool::NeverPause,
                 };
                 orchestrator.run_turn(session, &goal, &sink_fn).await
             })

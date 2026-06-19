@@ -38,9 +38,26 @@ pub struct Orchestrator<'a> {
     /// Mints the correlation id for an `ApprovalRequest`. Injected by the engine layer so the
     /// orchestrator stays free of nondeterministic calls (the offline path never reaches it).
     pub next_id: &'a (dyn Fn() -> Uuid + Send + Sync),
+    /// Running token totals for this turn (fed by the engine's `MeteringRouter`). The
+    /// orchestrator reads it to emit `TokenCostMeter`; zero totals (offline) emit nothing.
+    pub meter: &'a crate::meter::TokenMeter,
+    /// Cooperative pause checked at phase boundaries (wired in the pause task).
+    pub pauser: &'a dyn crate::tool::PauseController,
 }
 
 impl<'a> Orchestrator<'a> {
+    /// Emit a cumulative meter event — but only when usage has been recorded, so the offline
+    /// path (no usage) emits nothing and its event stream is unchanged.
+    fn emit_meter(&self, emit: &dyn Emitter) {
+        if self.meter.total() > 0 {
+            let (input_tokens, output_tokens) = self.meter.snapshot();
+            emit.emit(EventKind::TokenCostMeter {
+                input_tokens,
+                output_tokens,
+            });
+        }
+    }
+
     /// Run a single orchestrator turn for `goal`: Plan -> Execute -> Verify -> Done.
     /// Events are emitted in deterministic order via `emit`. Session sequencing
     /// (monotonic `seq` on `Event`) is applied by the engine layer, not here.
@@ -75,6 +92,7 @@ impl<'a> Orchestrator<'a> {
         emit.emit(EventKind::AgentFinished {
             role: Role::Planner,
         });
+        self.emit_meter(emit);
 
         // --- Execute ---
         emit.emit(EventKind::AgentStarted {
@@ -96,6 +114,7 @@ impl<'a> Orchestrator<'a> {
         emit.emit(EventKind::AgentFinished {
             role: Role::ContextFinder,
         });
+        self.emit_meter(emit);
 
         // --- Code -> apply (gated) -> Verify -> (Repair) ---
         // On verify failure, re-run the Coder with the failure as feedback and re-verify,
@@ -174,6 +193,7 @@ impl<'a> Orchestrator<'a> {
                 });
             }
             emit.emit(EventKind::AgentFinished { role: Role::Coder });
+            self.emit_meter(emit);
 
             // Verify
             emit.emit(EventKind::AgentStarted {
@@ -194,6 +214,7 @@ impl<'a> Orchestrator<'a> {
             emit.emit(EventKind::AgentFinished {
                 role: Role::Verifier,
             });
+            self.emit_meter(emit);
 
             if ok {
                 break true;
@@ -217,10 +238,15 @@ impl<'a> Orchestrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meter::TokenMeter;
     use crate::router::{RouteHints, Router};
-    use crate::tool::{Approver, Decision, DenyApprover, DenyAsk, PermissionGate, ToolRegistry};
+    use crate::tool::{
+        Approver, Decision, DenyApprover, DenyAsk, NeverPause, PermissionGate, ToolRegistry,
+    };
     use crate::traits::{Agent, Workspace, WorkspaceRead};
-    use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone, WorkspaceSnapshot};
+    use crate::types::{
+        CompleteRequest, CompleteResponse, Edit, Milestone, Usage, WorkspaceSnapshot,
+    };
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
@@ -363,6 +389,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = empty_tools();
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -370,6 +397,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -431,6 +460,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = empty_tools();
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -438,6 +468,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let err = orch
@@ -453,6 +485,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = deny_write_tools();
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -460,6 +493,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -491,6 +526,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -498,6 +534,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let outcome = orch
@@ -561,6 +599,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = empty_tools();
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -568,6 +607,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -603,6 +644,7 @@ mod tests {
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
         let tools = empty_tools();
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -610,6 +652,8 @@ mod tests {
             tools: &tools,
             approver: &DenyApprover,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -668,6 +712,7 @@ mod tests {
             approve: true,
             seen: Mutex::new(Vec::new()),
         };
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -675,6 +720,8 @@ mod tests {
             tools: &tools,
             approver: &approver,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -714,6 +761,7 @@ mod tests {
             approve: false,
             seen: Mutex::new(Vec::new()),
         };
+        let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
             router: &router,
@@ -721,6 +769,8 @@ mod tests {
             tools: &tools,
             approver: &approver,
             next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -742,6 +792,76 @@ mod tests {
             !recorded
                 .iter()
                 .any(|e| matches!(e, EventKind::FileEdit { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_cumulative_token_cost_meter_when_usage_present() {
+        let reg = registry();
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
+        let meter = TokenMeter::default();
+        // Simulate usage recorded by the MeteringRouter during the turn.
+        meter.add(&Usage {
+            input_tokens: 3,
+            output_tokens: 5,
+        });
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
+        };
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+        orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let recorded = events.lock().unwrap().clone();
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            EventKind::TokenCostMeter {
+                input_tokens: 3,
+                output_tokens: 5
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn no_token_cost_meter_when_usage_absent() {
+        let reg = registry();
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
+        let meter = TokenMeter::default(); // stays zero — offline path
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
+        };
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+        orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            !recorded
+                .iter()
+                .any(|e| matches!(e, EventKind::TokenCostMeter { .. })),
+            "offline path (no usage) must emit no meter events"
         );
     }
 }
