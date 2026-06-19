@@ -13,8 +13,8 @@ pub use orchestrator::{Emitter, Orchestrator, TurnOutcome};
 pub use registry::AgentRegistry;
 pub use router::{RouteHints, Router, TaskKind};
 pub use tool::{
-    AllowListAskResolver, Approver, AskResolver, Decision, DenyApprover, DenyAsk, PermissionGate,
-    Tool, ToolRegistry,
+    AllowListAskResolver, Approver, AskResolver, Decision, DenyApprover, DenyAsk, NeverPause,
+    PauseController, PermissionGate, Tool, ToolRegistry,
 };
 pub use traits::{Agent, AgentCtx, Provider, Workspace, WorkspaceRead};
 pub use types::{

@@ -66,6 +66,28 @@ impl Approver for DenyApprover {
     }
 }
 
+/// Cooperative pause for an in-flight turn. The orchestrator calls this at each phase
+/// boundary: if a pause is requested it parks the turn until resumed. The default never
+/// pauses, so CLI/headless/offline runs are unaffected.
+#[async_trait]
+pub trait PauseController: Send + Sync {
+    /// A sync peek at a phase boundary: is a pause currently requested?
+    fn should_pause(&self) -> bool;
+    /// Park until resumed (or released on disconnect/abort). Returns promptly if not paused.
+    async fn wait_for_resume(&self);
+}
+
+/// Default: never pauses.
+pub struct NeverPause;
+
+#[async_trait]
+impl PauseController for NeverPause {
+    fn should_pause(&self) -> bool {
+        false
+    }
+    async fn wait_for_resume(&self) {}
+}
+
 /// Resolves `Ask` to allow only for an explicit allow-list of tool names. Used by the engine
 /// to permit a tool that is `Ask`-gated but otherwise confined (e.g. a sandboxed `bash`).
 pub struct AllowListAskResolver {
@@ -228,6 +250,13 @@ mod tests {
             !a.request(Uuid::from_u128(1), Path::new("y.rs"), Some("old"), "new")
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn never_pause_does_not_pause() {
+        let p = NeverPause;
+        assert!(!p.should_pause());
+        p.wait_for_resume().await; // returns immediately
     }
 
     #[test]
