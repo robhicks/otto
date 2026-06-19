@@ -1,7 +1,7 @@
 # otto UI — Build Roadmap
 
 **Date:** 2026-06-17
-**Status:** Approved decomposition — **Sub-project A shipped 2026-06-18** (PR #47); B–F pending.
+**Status:** Approved decomposition — **Sub-projects A–B shipped** (A: PR #47, 2026-06-18; B: capabilities + status strip, 2026-06-18); C–F pending.
 **Scope:** The frontend (`ui/`) described in `docs/ARCHITECTURE.md` and the design spec
 (`docs/superpowers/specs/2026-06-13-otto-design.md`).
 
@@ -36,7 +36,7 @@ Ordered so each builds on a working, demoable predecessor.
 | # | Sub-project | What it adds | Protocol / engine changes |
 |---|---|---|---|
 | **A** ✅ | **App shell + live session** *(shipped — [design](2026-06-17-ui-shell-live-session-design.md) · [plan](../plans/2026-06-17-ui-shell-live-session.md))* | `ui/` Leptos CSR project (browser-first). Connect to a `ws://`/`wss://` URL with a bearer token → `Ready{session}`; prompt box sends `SendPrompt`; render the live `Event` stream; `Abort`; reconnect with `last_seq` replay. The reusable shell every later sub-project extends. | **Done:** moved the WS framing enum (`ServerMessage`) into `protocol` so the UI can deserialize it; `/ws` accepts the bearer token via a `?token=` query param (browser `WebSocket` can't set headers) with the header path still preferred. Header auth and existing tests stayed green. |
-| **B** | **Capabilities + status strip** | Engine emits `CapabilitiesManifest` on connect; UI status strip shows engine/LLM/sandbox state with **visible** degradation. | `Ready` frame carries the manifest (the type already exists in `protocol`). |
+| **B** ✅ | **Capabilities + status strip** *(shipped — [design](2026-06-17-ui-capabilities-status-strip-design.md) · [plan](../plans/2026-06-18-ui-capabilities-status-strip.md))* | Engine emits `CapabilitiesManifest` on connect; UI status strip shows engine/LLM/sandbox state with **visible** degradation. | **Done:** extended `CapabilitiesManifest` with `remote_llm` (so the strip distinguishes offline-deterministic from remote-backed); the `Ready` frame now carries the manifest; `build_capabilities()` derives it from the serve environment. |
 | **C** | **Workspace tree + editor** | File tree (via `POST /workspace` `List`), read-only file view, then CodeMirror 6 editing through a wasm-bindgen JS glue module (`mountEditor`/`getDoc`/`setDoc`/`onChange`). | None for read/list (reuses the `/workspace` RPC); editor is pure frontend + JS interop. |
 | **D** | **Diff approval** | Render Coder diffs; an approve/reject gate for `fs.write` `Ask` verdicts, wiring the permission gate's `Ask` path through to the UI. | `ApproveDiff` command; `Diff` + `ApprovalRequest` events; orchestrator/gate wiring to block on the UI's verdict. |
 | **E** | **Token/cost meter + Pause/Resume** | Live token/cost meter; pause/resume an in-flight turn. | `TokenCostMeter` event; `Pause`/`Resume` commands; provider-level token accounting. |
