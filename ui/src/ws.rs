@@ -2,8 +2,8 @@
 //! and by manual browser testing (the pure routing/seq logic lives in `url.rs`).
 
 use otto_protocol::{Command, ServerMessage};
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::JsCast;
 use web_sys::{CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 
 /// Open a WebSocket to `url`, wiring callbacks:

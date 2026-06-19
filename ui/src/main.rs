@@ -1,7 +1,9 @@
 mod app;
 mod components;
+mod tree;
 mod url;
 mod view_model;
+mod workspace;
 mod ws;
 
 use app::App;
