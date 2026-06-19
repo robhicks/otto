@@ -69,8 +69,12 @@ pub enum ServerMessage {
         session: SessionId,
         capabilities: CapabilitiesManifest,
     },
-    Event { event: Event },
-    Error { message: String },
+    Event {
+        event: Event,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// A unary workspace operation, sent to a remote engine's `POST /workspace`.
