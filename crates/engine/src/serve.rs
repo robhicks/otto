@@ -3,8 +3,11 @@
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
 //! Binds loopback (plaintext `ws://` or, with `serve::run` + a `RustlsConfig`, `wss://`); concurrent sessions are out of scope (see the design spec).
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use axum::Router as AxumRouter;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,11 +16,16 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
+use futures_util::SinkExt;
+use futures_util::stream::{SplitSink, StreamExt};
+use otto_engine_core::tool::Approver;
 use otto_protocol::{
     CapabilitiesManifest, Command, Event, ServerMessage, SessionId, WorkspaceRequest,
 };
 use serde::Deserialize;
+use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
 
 use crate::service::{EngineService, EventSink};
 
@@ -150,23 +158,77 @@ async fn workspace_handler(
     axum::Json(resp).into_response()
 }
 
-/// Send one `ServerMessage` as a JSON text frame.
-async fn send_msg(socket: &mut WebSocket, msg: &ServerMessage) -> anyhow::Result<()> {
+/// The writer half of a split WebSocket — what events and frames are sent through.
+type WsWriter = SplitSink<WebSocket, Message>;
+
+/// Per-connection registry of pending edit approvals, keyed by the `ApprovalRequest` id.
+/// Shared between the running turn's `InteractiveApprover` and the socket-reader that routes
+/// inbound `ApproveDiff` frames. Dropping a sender (on `clear`/disconnect) resolves the awaiting
+/// `request()` to `false` — the single fail-closed rule.
+#[derive(Clone, Default)]
+struct ApprovalRegistry {
+    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>,
+}
+
+impl ApprovalRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, id: Uuid, tx: oneshot::Sender<bool>) {
+        self.pending.lock().unwrap().insert(id, tx);
+    }
+
+    fn resolve(&self, id: Uuid, approved: bool) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(approved);
+        }
+    }
+
+    /// Drop all pending senders → every awaiting `request()` resolves `false` (fail-closed).
+    fn clear(&self) {
+        self.pending.lock().unwrap().clear();
+    }
+}
+
+/// Approver that surfaces each request to the connected UI and awaits its `ApproveDiff` reply.
+struct InteractiveApprover {
+    registry: ApprovalRegistry,
+}
+
+impl InteractiveApprover {
+    fn new(registry: ApprovalRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for InteractiveApprover {
+    async fn request(&self, id: Uuid, _path: &Path, _old: Option<&str>, _new: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        self.registry.insert(id, tx);
+        // A closed channel (disconnect / clear) → reject. Fail-closed.
+        rx.await.unwrap_or(false)
+    }
+}
+
+/// Send one `ServerMessage` as a JSON text frame through the writer half.
+async fn send_msg(writer: &mut WsWriter, msg: &ServerMessage) -> anyhow::Result<()> {
     let json = serde_json::to_string(msg)?;
-    socket.send(Message::Text(json.into())).await?;
+    writer.send(Message::Text(json.into())).await?;
     Ok(())
 }
 
-/// A sink that writes each event to the socket as a `ServerMessage::Event` frame.
+/// A sink that writes each event to the socket's writer half as a `ServerMessage::Event` frame.
 struct WsSink<'a> {
-    socket: &'a mut WebSocket,
+    writer: &'a mut WsWriter,
 }
 
 #[async_trait::async_trait]
 impl EventSink for WsSink<'_> {
     async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
         send_msg(
-            self.socket,
+            self.writer,
             &ServerMessage::Event {
                 event: event.clone(),
             },
@@ -175,13 +237,15 @@ impl EventSink for WsSink<'_> {
     }
 }
 
-async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<ServeState>) {
-    // Resolve the session: reuse `?session=<uuid>` or mint a new one.
+async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<ServeState>) {
+    // Split up-front so the turn (writer) and inbound approvals (reader) can run concurrently.
+    let (mut writer, mut reader) = socket.split();
+
     let session = match resolve_session(&params, &state).await {
         Ok(s) => s,
         Err(e) => {
             let _ = send_msg(
-                &mut socket,
+                &mut writer,
                 &ServerMessage::Error {
                     message: e.to_string(),
                 },
@@ -192,7 +256,7 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
     };
 
     if send_msg(
-        &mut socket,
+        &mut writer,
         &ServerMessage::Ready {
             session,
             capabilities: state.capabilities.clone(),
@@ -214,7 +278,7 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         {
             Ok(events) => {
                 for event in events {
-                    if send_msg(&mut socket, &ServerMessage::Event { event })
+                    if send_msg(&mut writer, &ServerMessage::Event { event })
                         .await
                         .is_err()
                     {
@@ -224,7 +288,7 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
             }
             Err(e) => {
                 let _ = send_msg(
-                    &mut socket,
+                    &mut writer,
                     &ServerMessage::Error {
                         message: e.to_string(),
                     },
@@ -235,9 +299,9 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         }
     }
 
-    // The loop ends on a clean close, a transport error, or an Abort. A disconnect with no
-    // in-flight turn intentionally leaves the session Active so the client can reconnect.
-    while let Some(Ok(msg)) = socket.recv().await {
+    let approvals = ApprovalRegistry::new();
+
+    'outer: while let Some(Ok(msg)) = reader.next().await {
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
@@ -247,7 +311,7 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
             Ok(c) => c,
             Err(e) => {
                 let _ = send_msg(
-                    &mut socket,
+                    &mut writer,
                     &ServerMessage::Error {
                         message: format!("bad command: {e}"),
                     },
@@ -258,12 +322,59 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         };
         match command {
             Command::SendPrompt { text, .. } => {
-                let mut sink = WsSink {
-                    socket: &mut socket,
-                };
-                if let Err(e) = state.service.run_prompt(session, &text, &mut sink).await {
+                let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
+                // Drive the turn while concurrently reading inbound approvals. The turn borrows
+                // `writer` (via the sink); the reader borrows `reader` — disjoint, so `select!`
+                // can poll both. `StreamExt::next` is cancel-safe, so the reader future being
+                // dropped when the turn wins a race loses no inbound frame.
+                let turn_err = {
+                    let mut sink = WsSink {
+                        writer: &mut writer,
+                    };
+                    let turn = state
+                        .service
+                        .run_prompt_with_approver(session, &text, &mut sink, approver);
+                    tokio::pin!(turn);
+                    let mut err: Option<anyhow::Error> = None;
+                    loop {
+                        tokio::select! {
+                            res = &mut turn => {
+                                if let Err(e) = res {
+                                    err = Some(e);
+                                }
+                                approvals.clear();
+                                break;
+                            }
+                            inbound = reader.next() => match inbound {
+                                Some(Ok(Message::Text(t))) => {
+                                    match serde_json::from_str::<Command>(t.as_str()) {
+                                        Ok(Command::ApproveDiff { id, approved, .. }) => {
+                                            approvals.resolve(id, approved);
+                                        }
+                                        Ok(Command::Abort { .. }) => {
+                                            let _ = state.service.abort(session).await;
+                                            approvals.clear();
+                                            break 'outer;
+                                        }
+                                        // A second SendPrompt mid-turn is ignored (one turn at a
+                                        // time); other commands are no-ops here.
+                                        _ => {}
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None => {
+                                    approvals.clear();
+                                    break 'outer;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    err
+                }; // `sink` dropped here → `writer` is free again
+
+                if let Some(e) = turn_err {
                     let _ = send_msg(
-                        &mut socket,
+                        &mut writer,
                         &ServerMessage::Error {
                             message: e.to_string(),
                         },
@@ -275,11 +386,11 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
                 let _ = state.service.abort(session).await;
                 break;
             }
+            Command::ApproveDiff { .. } => {
+                // No turn in flight: a stray approval is ignored.
+            }
             Command::CreateSession => {
                 // The session is already established on connect; nothing to do.
-            }
-            Command::ApproveDiff { .. } => {
-                // Interactive approval handling is wired in a later task; ignore for now.
             }
         }
     }
