@@ -38,6 +38,7 @@ pub fn App() -> impl IntoView {
     let editor_dirty = RwSignal::new(false);
     let pending_approval = RwSignal::new(None::<crate::components::PendingApproval>);
     let meter = RwSignal::new(None::<(u64, u64)>); // (input, output) tokens for the current turn
+    let paused = RwSignal::new(false);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -61,6 +62,7 @@ pub fn App() -> impl IntoView {
         capabilities.set(None);
         pending_approval.set(None);
         meter.set(None);
+        paused.set(false);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
             Ok(ServerMessage::Ready {
@@ -106,6 +108,7 @@ pub fn App() -> impl IntoView {
             capabilities.set(None);
             pending_approval.set(None);
             meter.set(None);
+            paused.set(false);
             conn.set(ConnState::Disconnected);
         };
         let on_error = move || {
@@ -113,6 +116,7 @@ pub fn App() -> impl IntoView {
             capabilities.set(None);
             pending_approval.set(None);
             meter.set(None);
+            paused.set(false);
             conn.set(ConnState::Disconnected);
         };
 
@@ -133,6 +137,7 @@ pub fn App() -> impl IntoView {
         capabilities.set(None);
         pending_approval.set(None);
         meter.set(None);
+        paused.set(false);
         conn.set(ConnState::Disconnected);
     };
 
@@ -146,6 +151,7 @@ pub fn App() -> impl IntoView {
             return;
         };
         meter.set(None); // a new turn starts fresh
+        paused.set(false);
         let cmd = Command::SendPrompt {
             session: SessionId(uuid),
             text,
@@ -166,6 +172,35 @@ pub fn App() -> impl IntoView {
                     session: SessionId(uuid),
                 },
             );
+        }
+    };
+
+    let pause = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(
+                &ws,
+                &Command::Pause {
+                    session: SessionId(uuid),
+                },
+            );
+            paused.set(true);
+        }
+    };
+    let resume = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(
+                &ws,
+                &Command::Resume {
+                    session: SessionId(uuid),
+                },
+            );
+            paused.set(false);
         }
     };
 
@@ -272,8 +307,11 @@ pub fn App() -> impl IntoView {
             <EventLog rows=rows />
             <PromptBar
                 conn=conn
+                paused=paused
                 on_send=Callback::new(send_prompt)
                 on_abort=Callback::new(move |_| abort())
+                on_pause=Callback::new(move |_| pause())
+                on_resume=Callback::new(move |_| resume())
             />
             <ConnectionForm
                 url=url
