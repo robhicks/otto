@@ -392,6 +392,10 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::CreateSession => {
                 // The session is already established on connect; nothing to do.
             }
+            Command::Pause { .. } | Command::Resume { .. } => {
+                // No turn in flight: pause/resume have no effect here. Real connection-scoped
+                // handling is wired in the serve pause/resume task.
+            }
         }
     }
 }

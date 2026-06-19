@@ -48,6 +48,12 @@ pub enum Command {
         id: Uuid,
         approved: bool,
     },
+    Pause {
+        session: SessionId,
+    },
+    Resume {
+        session: SessionId,
+    },
 }
 
 /// The body of an event emitted by the engine.
@@ -81,6 +87,13 @@ pub enum EventKind {
     },
     TurnComplete {
         ok: bool,
+    },
+    /// Cumulative token usage for the current turn, emitted as the turn progresses. Only fires
+    /// when a metered provider reported usage (the offline path emits none). The UI renders the
+    /// counts and derives an approximate cost from the remote model in the capabilities manifest.
+    TokenCostMeter {
+        input_tokens: u64,
+        output_tokens: u64,
     },
 }
 
@@ -256,6 +269,30 @@ mod tests {
         };
         let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn pause_and_resume_commands_round_trip() {
+        let session = SessionId::new();
+        for cmd in [Command::Pause { session }, Command::Resume { session }] {
+            let back: Command =
+                serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+            assert_eq!(cmd, back);
+        }
+    }
+
+    #[test]
+    fn token_cost_meter_event_round_trips() {
+        let event = Event {
+            seq: 5,
+            session: SessionId::new(),
+            kind: EventKind::TokenCostMeter {
+                input_tokens: 1234,
+                output_tokens: 567,
+            },
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(event, back);
     }
 
     #[test]
