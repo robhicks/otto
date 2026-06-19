@@ -39,16 +39,16 @@ pub fn capability_segments(m: &CapabilitiesManifest) -> Vec<CapSegment> {
         value: if m.engine_remote { "remote" } else { "local" }.to_string(),
         degraded: false,
     };
-    let llm_value = match (m.local_llm, m.remote_llm) {
-        (true, true) => "local+remote",
-        (false, true) => "remote",
-        (true, false) => "local",
-        (false, false) => "offline (deterministic)",
+    let (llm_value, llm_degraded) = match (m.local_llm, m.remote_llm) {
+        (true, true) => ("local+remote", false),
+        (false, true) => ("remote", false),
+        (true, false) => ("local", false),
+        (false, false) => ("offline (deterministic)", true),
     };
     let llm = CapSegment {
         label: "LLM",
         value: llm_value.to_string(),
-        degraded: !m.local_llm && !m.remote_llm,
+        degraded: llm_degraded,
     };
     let sandbox = CapSegment {
         label: "sandbox",
@@ -216,6 +216,14 @@ mod tests {
         let segs = capability_segments(&manifest(false, true, true, true));
         let llm = segs.iter().find(|s| s.label == "LLM").unwrap();
         assert_eq!(llm.value, "local+remote");
+        assert!(!llm.degraded);
+    }
+
+    #[test]
+    fn local_only_llm_labels_local() {
+        let segs = capability_segments(&manifest(false, true, false, true));
+        let llm = segs.iter().find(|s| s.label == "LLM").unwrap();
+        assert_eq!(llm.value, "local");
         assert!(!llm.degraded);
     }
 

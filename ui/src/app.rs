@@ -20,7 +20,10 @@ pub fn App() -> impl IntoView {
     let last_seq = RwSignal::new(None::<u64>); // retained across disconnects for replay
     let session = RwSignal::new(None::<String>); // retained across disconnects for reconnect
     let socket = RwSignal::new(None::<WebSocket>);
-    let capabilities = RwSignal::new(None::<CapabilitiesManifest>); // set on Ready, cleared on (re)connect/disconnect
+    // `capabilities`: set on Ready; cleared on (re)connect and explicit disconnect. It may go
+    // stale after an unexpected drop (on_close/on_error don't clear it) — StatusLine gates
+    // display on ConnState::Connected, so a stale manifest is never shown.
+    let capabilities = RwSignal::new(None::<CapabilitiesManifest>);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
