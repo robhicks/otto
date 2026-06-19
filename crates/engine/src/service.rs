@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine_core::tool::{Decision, ToolRegistry};
+use otto_engine_core::tool::{Decision, DenyApprover, ToolRegistry};
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
@@ -115,11 +115,14 @@ impl EngineService {
                     let seq = counter.fetch_add(1, Ordering::SeqCst);
                     let _ = tx.send(Event { seq, session, kind });
                 };
+                let next_id = || uuid::Uuid::new_v4();
                 let orchestrator = Orchestrator {
                     registry: &registry,
                     router: &*router,
                     workspace: &*workspace,
                     tools: &tools,
+                    approver: &DenyApprover,
+                    next_id: &next_id,
                 };
                 orchestrator.run_turn(session, &goal, &sink_fn).await
             })

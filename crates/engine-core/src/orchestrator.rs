@@ -2,10 +2,11 @@
 //! It owns control flow and event emission; capabilities live in the agents.
 
 use otto_protocol::{EventKind, Role, SessionId};
+use uuid::Uuid;
 
 use crate::registry::AgentRegistry;
 use crate::router::Router;
-use crate::tool::{Decision, ToolRegistry};
+use crate::tool::{Approver, Decision, ToolRegistry};
 use crate::traits::{AgentCtx, Workspace};
 use crate::types::{AgentOutput, AgentRequest};
 
@@ -32,6 +33,11 @@ pub struct Orchestrator<'a> {
     pub router: &'a dyn Router,
     pub workspace: &'a dyn Workspace,
     pub tools: &'a ToolRegistry,
+    /// Resolves an `Ask` verdict on a proposed edit to apply/skip (interactive approval).
+    pub approver: &'a dyn Approver,
+    /// Mints the correlation id for an `ApprovalRequest`. Injected by the engine layer so the
+    /// orchestrator stays free of nondeterministic calls (the offline path never reaches it).
+    pub next_id: &'a (dyn Fn() -> Uuid + Send + Sync),
 }
 
 impl<'a> Orchestrator<'a> {
@@ -120,14 +126,46 @@ impl<'a> Orchestrator<'a> {
             };
             for edit in &edits {
                 let check_args = serde_json::json!({ "path": edit.path.to_string_lossy() });
-                if self.tools.check("fs.write", &check_args) != Decision::Allow {
-                    emit.emit(EventKind::Log {
-                        message: format!(
-                            "edit to {} denied by permission gate; skipped",
-                            edit.path.display()
-                        ),
-                    });
-                    continue;
+                match self.tools.check("fs.write", &check_args) {
+                    Decision::Allow => {}
+                    Decision::Deny => {
+                        emit.emit(EventKind::Log {
+                            message: format!(
+                                "edit to {} denied by permission gate; skipped",
+                                edit.path.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    Decision::Ask => {
+                        // Read current contents for the diff (None if the file does not exist).
+                        let old = self
+                            .workspace
+                            .read(&edit.path)
+                            .await
+                            .ok()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+                        let id = (self.next_id)();
+                        emit.emit(EventKind::ApprovalRequest {
+                            id,
+                            path: edit.path.clone(),
+                            old: old.clone(),
+                            new: edit.new_contents.clone(),
+                        });
+                        let approved = self
+                            .approver
+                            .request(id, &edit.path, old.as_deref(), &edit.new_contents)
+                            .await;
+                        if !approved {
+                            emit.emit(EventKind::Log {
+                                message: format!(
+                                    "edit to {} rejected; skipped",
+                                    edit.path.display()
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let bytes_written = self.workspace.apply_edit(edit).await?;
                 emit.emit(EventKind::FileEdit {
@@ -180,7 +218,7 @@ impl<'a> Orchestrator<'a> {
 mod tests {
     use super::*;
     use crate::router::{RouteHints, Router};
-    use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
+    use crate::tool::{Approver, Decision, DenyApprover, DenyAsk, PermissionGate, ToolRegistry};
     use crate::traits::{Agent, Workspace, WorkspaceRead};
     use crate::types::{CompleteRequest, CompleteResponse, Edit, Milestone, WorkspaceSnapshot};
     use async_trait::async_trait;
@@ -188,6 +226,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    /// A fixed id so `ApprovalRequest` assertions are deterministic in tests.
+    fn test_id() -> Uuid {
+        Uuid::from_u128(0)
+    }
 
     struct TestAllowGate;
     impl PermissionGate for TestAllowGate {
@@ -323,6 +367,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -389,6 +435,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let err = orch
@@ -409,6 +457,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -445,6 +495,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let outcome = orch
@@ -513,6 +565,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -553,6 +607,8 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
         };
 
         let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
@@ -578,6 +634,111 @@ mod tests {
         assert_eq!(
             recorded.last(),
             Some(&EventKind::TurnComplete { ok: false })
+        );
+    }
+
+    /// Records each approval request and returns a fixed verdict.
+    struct ScriptedApprover {
+        approve: bool,
+        seen: Mutex<Vec<(Uuid, PathBuf, Option<String>, String)>>,
+    }
+    #[async_trait]
+    impl Approver for ScriptedApprover {
+        async fn request(&self, id: Uuid, path: &Path, old: Option<&str>, new: &str) -> bool {
+            self.seen.lock().unwrap().push((
+                id,
+                path.to_path_buf(),
+                old.map(|s| s.to_string()),
+                new.to_string(),
+            ));
+            self.approve
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_edit_approved_is_applied_and_emits_request() {
+        let reg = registry(); // OneEditCoder → edit to out.txt
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let approver = ScriptedApprover {
+            approve: true,
+            seen: Mutex::new(Vec::new()),
+        };
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            approver: &approver,
+            next_id: &test_id,
+        };
+
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+
+        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        assert_eq!(outcome, TurnOutcome { ok: true });
+        // Approved → edit applied.
+        assert_eq!(workspace.edits.lock().unwrap().len(), 1);
+
+        // The approver saw the proposed edit (RecordingWorkspace::read yields empty → old = "").
+        let seen = approver.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, Uuid::from_u128(0));
+        assert_eq!(seen[0].1, PathBuf::from("out.txt"));
+        assert_eq!(seen[0].3, "hi");
+
+        // An ApprovalRequest event was emitted with the same id/path/new.
+        let recorded = events.lock().unwrap().clone();
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            EventKind::ApprovalRequest { id, path, new, .. }
+            if *id == Uuid::from_u128(0) && path == &PathBuf::from("out.txt") && new == "hi"
+        )));
+    }
+
+    #[tokio::test]
+    async fn ask_edit_rejected_is_skipped_but_turn_completes() {
+        let reg = registry();
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let approver = ScriptedApprover {
+            approve: false,
+            seen: Mutex::new(Vec::new()),
+        };
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            approver: &approver,
+            next_id: &test_id,
+        };
+
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+
+        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        assert_eq!(outcome, TurnOutcome { ok: true });
+        // Rejected → no edit applied.
+        assert_eq!(workspace.edits.lock().unwrap().len(), 0);
+        let recorded = events.lock().unwrap().clone();
+        assert!(recorded.iter().any(|e| matches!(
+            e,
+            EventKind::Log { message } if message.contains("rejected")
+        )));
+        assert!(
+            !recorded
+                .iter()
+                .any(|e| matches!(e, EventKind::FileEdit { .. }))
         );
     }
 }

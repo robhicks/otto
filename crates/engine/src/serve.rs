@@ -278,6 +278,9 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
             Command::CreateSession => {
                 // The session is already established on connect; nothing to do.
             }
+            Command::ApproveDiff { .. } => {
+                // Interactive approval handling is wired in a later task; ignore for now.
+            }
         }
     }
 }
