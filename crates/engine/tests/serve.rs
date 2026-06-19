@@ -7,7 +7,8 @@ use std::sync::Arc;
 use axum_server::tls_rustls::RustlsConfig;
 use futures_util::{SinkExt, StreamExt};
 use otto_engine::{
-    EngineService, build_default_registry, build_tool_registry, serve_app, serve_run,
+    EngineService, build_default_registry, build_tool_registry, build_tool_registry_approving,
+    serve_app, serve_run,
 };
 use otto_engine_core::traits::Workspace;
 use otto_providers::ScriptedProvider;
@@ -65,6 +66,173 @@ async fn start_server() -> (u16, tempfile::TempDir) {
         serve_run(listener, app, None).await.unwrap();
     });
     (port, dir)
+}
+
+/// Start a serve app in **approval mode** (ordinary writes gated `Ask`). Returns the bound
+/// port and the tempdir (whose path is the workspace root the Coder edits: `out.txt`).
+async fn start_approval_server() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "approved contents"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry_approving(
+        tools_ws,
+        dir.path().to_path_buf(),
+    ));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
+/// Read frames until an `ApprovalRequest` event arrives; return its `id`. Panics on TurnComplete
+/// or stream end first (means no approval was requested).
+async fn next_approval_id(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> String {
+    while let Some(frame) = next_json_opt(ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(req) = kind.get("ApprovalRequest") {
+                return req["id"].as_str().unwrap().to_string();
+            }
+            if kind.get("TurnComplete").is_some() {
+                panic!("turn completed before any ApprovalRequest");
+            }
+        }
+    }
+    panic!("stream ended before any ApprovalRequest");
+}
+
+#[tokio::test]
+async fn approved_edit_is_written() {
+    let (port, dir) = start_approval_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    // Approve every ApprovalRequest until the turn completes (the repair loop may re-propose).
+    let id = next_approval_id(&mut ws).await;
+    let approve =
+        serde_json::json!({ "ApproveDiff": { "session": session, "id": id, "approved": true } });
+    ws.send(Message::Text(serde_json::to_string(&approve).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(req) = kind.get("ApprovalRequest") {
+                let id = req["id"].as_str().unwrap().to_string();
+                let a = serde_json::json!({ "ApproveDiff": { "session": session, "id": id, "approved": true } });
+                ws.send(Message::Text(serde_json::to_string(&a).unwrap()))
+                    .await
+                    .unwrap();
+            } else if kind.get("TurnComplete").is_some() {
+                saw_turn_complete = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_turn_complete);
+    let written = std::fs::read_to_string(dir.path().join("out.txt")).expect("out.txt written");
+    assert_eq!(written, "approved contents");
+}
+
+#[tokio::test]
+async fn rejected_edit_is_not_written() {
+    let (port, dir) = start_approval_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    // Reject every ApprovalRequest until the turn completes.
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(req) = kind.get("ApprovalRequest") {
+                let id = req["id"].as_str().unwrap().to_string();
+                let r = serde_json::json!({ "ApproveDiff": { "session": session, "id": id, "approved": false } });
+                ws.send(Message::Text(serde_json::to_string(&r).unwrap()))
+                    .await
+                    .unwrap();
+            } else if kind.get("TurnComplete").is_some() {
+                saw_turn_complete = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_turn_complete);
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "a rejected edit must not be written"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_mid_approval_fails_closed() {
+    let (port, dir) = start_approval_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    // Wait until the server is blocked on an approval, then drop the socket without replying.
+    let _id = next_approval_id(&mut ws).await;
+    drop(ws);
+
+    // The edit is only ever written on approval; a disconnect resolves the pending request to
+    // false (fail-closed), so out.txt must never appear. Give the server a moment to settle.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "a disconnect mid-approval must not write the edit"
+    );
 }
 
 fn authed_request(
