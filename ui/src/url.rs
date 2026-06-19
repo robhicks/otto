@@ -39,6 +39,21 @@ pub fn advance_last_seq(current: Option<u64>, incoming: u64) -> Option<u64> {
     }
 }
 
+/// Derive the HTTP origin for the `/workspace` RPC from the `ws`/`wss` connection URL.
+/// `ws://…`→`http://…`, `wss://…`→`https://…`; a trailing slash and a `/ws` suffix are
+/// trimmed (the UI form may hold the endpoint URL `otto serve` prints).
+pub fn ws_to_http_base(ws_url: &str) -> String {
+    let trimmed = ws_url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/ws").unwrap_or(trimmed);
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +89,19 @@ mod tests {
         assert_eq!(advance_last_seq(None, 0), Some(0));
         assert_eq!(advance_last_seq(Some(3), 7), Some(7));
         assert_eq!(advance_last_seq(Some(7), 3), Some(7));
+    }
+
+    #[test]
+    fn ws_to_http_base_maps_schemes_and_strips_ws_suffix() {
+        assert_eq!(
+            ws_to_http_base("ws://127.0.0.1:8787"),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(ws_to_http_base("wss://host:9000"), "https://host:9000");
+        assert_eq!(ws_to_http_base("ws://h/ws"), "http://h");
+        assert_eq!(ws_to_http_base("ws://h/ws/"), "http://h");
+        // A non-ws base is passed through untouched (only trailing slash/`/ws` trimmed).
+        assert_eq!(ws_to_http_base("http://h:1/"), "http://h:1");
     }
 
     #[test]
