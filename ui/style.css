@@ -96,6 +96,7 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 .file-tree { padding: 4px 0; font: inherit; }
 .tree-row { padding: 1px 8px; white-space: nowrap; cursor: pointer; }
 .tree-row:hover { background: #11151a; }
+.tree-row:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
 .tree-dir-row { color: var(--accent); }
 .tree-file-row { color: var(--fg); padding-left: 24px; }
 .tree-children { padding-left: 12px; }

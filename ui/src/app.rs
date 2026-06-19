@@ -158,6 +158,9 @@ pub fn App() -> impl IntoView {
 
     // Read a file and mount it in the editor (or show a binary/oversize notice).
     let open_path = move |path: PathBuf| {
+        if !matches!(conn.get(), ConnState::Connected { .. }) {
+            return;
+        }
         let http_base = ws_to_http_base(&url.get());
         let tok = token.get();
         if http_base.is_empty() || tok.is_empty() {

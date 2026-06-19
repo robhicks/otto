@@ -32,11 +32,21 @@ fn TreeNodeView(node: TreeNode, on_open: Callback<PathBuf>) -> impl IntoView {
         let expanded = RwSignal::new(false);
         let name = node.name.clone();
         let children = node.children.clone();
+        let toggle = move || expanded.update(|e| *e = !*e);
         view! {
             <div class="tree-dir">
                 <div
                     class="tree-row tree-dir-row"
-                    on:click=move |_| expanded.update(|e| *e = !*e)
+                    role="button"
+                    tabindex=0
+                    attr:aria-expanded=move || if expanded.get() { "true" } else { "false" }
+                    on:click=move |_| toggle()
+                    on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                        if ev.key() == "Enter" || ev.key() == " " {
+                            ev.prevent_default();
+                            toggle();
+                        }
+                    }
                 >
                     {move || if expanded.get() { "▾ " } else { "▸ " }}
                     {name.clone()}
@@ -55,11 +65,20 @@ fn TreeNodeView(node: TreeNode, on_open: Callback<PathBuf>) -> impl IntoView {
         .into_any()
     } else {
         let path = node.path.clone();
+        let path2 = path.clone();
         let name = node.name.clone();
         view! {
             <div
                 class="tree-row tree-file-row"
+                role="button"
+                tabindex=0
                 on:click=move |_| on_open.run(path.clone())
+                on:keydown=move |ev: leptos::ev::KeyboardEvent| {
+                    if ev.key() == "Enter" || ev.key() == " " {
+                        ev.prevent_default();
+                        on_open.run(path2.clone());
+                    }
+                }
             >
                 {name}
             </div>

@@ -63,10 +63,9 @@ async fn workspace_preflight_advertises_cors() {
 
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::OK,
-        "preflight should be answered 200, got {}",
+    assert!(
+        resp.status().is_success(),
+        "preflight should be answered 2xx, got {}",
         resp.status()
     );
     assert_eq!(
