@@ -36,19 +36,52 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     CreateSession,
-    SendPrompt { session: SessionId, text: String },
-    Abort { session: SessionId },
+    SendPrompt {
+        session: SessionId,
+        text: String,
+    },
+    Abort {
+        session: SessionId,
+    },
+    ApproveDiff {
+        session: SessionId,
+        id: Uuid,
+        approved: bool,
+    },
 }
 
 /// The body of an event emitted by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
-    AgentStarted { role: Role },
-    AgentFinished { role: Role },
-    FileEdit { path: PathBuf, bytes_written: u64 },
-    VerifyResult { ok: bool, detail: String },
-    Log { message: String },
-    TurnComplete { ok: bool },
+    AgentStarted {
+        role: Role,
+    },
+    AgentFinished {
+        role: Role,
+    },
+    FileEdit {
+        path: PathBuf,
+        bytes_written: u64,
+    },
+    /// The Coder proposes an edit that needs human approval. `old` is the file's current
+    /// contents (`None` if it does not exist yet); `new` is the proposed contents. The UI
+    /// renders the diff and replies with `Command::ApproveDiff { id, approved }`.
+    ApprovalRequest {
+        id: Uuid,
+        path: PathBuf,
+        old: Option<String>,
+        new: String,
+    },
+    VerifyResult {
+        ok: bool,
+        detail: String,
+    },
+    Log {
+        message: String,
+    },
+    TurnComplete {
+        ok: bool,
+    },
 }
 
 /// A sequenced, session-scoped event in the engine -> frontend stream.
@@ -212,6 +245,43 @@ mod tests {
         let back: Command = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn approve_diff_command_round_trips() {
+        let cmd = Command::ApproveDiff {
+            session: SessionId::new(),
+            id: Uuid::from_u128(7),
+            approved: true,
+        };
+        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn approval_request_event_round_trips() {
+        let event = Event {
+            seq: 4,
+            session: SessionId::new(),
+            kind: EventKind::ApprovalRequest {
+                id: Uuid::from_u128(9),
+                path: PathBuf::from("src/a.rs"),
+                old: Some("old line\n".to_string()),
+                new: "new line\n".to_string(),
+            },
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(event, back);
+        // A new file carries `old: None`.
+        let new_file = EventKind::ApprovalRequest {
+            id: Uuid::from_u128(1),
+            path: PathBuf::from("new.rs"),
+            old: None,
+            new: "x".to_string(),
+        };
+        let back: EventKind =
+            serde_json::from_str(&serde_json::to_string(&new_file).unwrap()).unwrap();
+        assert_eq!(new_file, back);
     }
 
     #[test]
