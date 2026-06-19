@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod tree;
 mod url;
 mod view_model;
 mod ws;
