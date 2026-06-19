@@ -36,6 +36,9 @@ pub fn EditorPane(
                                 {header}
                                 {move || if dirty.get() { " ●" } else { "" }}
                             </div>
+                            // Correctness note: this CodeEditor is rebuilt whenever `open`
+                            // changes (the enclosing match re-runs), so a new file remounts a
+                            // fresh editor seeded from `seed`. Keep `seed` written only on open.
                             <CodeEditor
                                 language=lang
                                 content=seed
@@ -60,5 +63,16 @@ fn kode_language(id: &'static str) -> Language {
         Language::PLAIN
     } else {
         Language::new_static(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kode_language_text_is_plain_known_is_not() {
+        assert!(kode_language("text").is_plain());
+        assert!(!kode_language("rust").is_plain());
     }
 }

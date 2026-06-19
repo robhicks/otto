@@ -160,6 +160,9 @@ pub fn App() -> impl IntoView {
     let open_path = move |path: PathBuf| {
         let http_base = ws_to_http_base(&url.get());
         let tok = token.get();
+        if http_base.is_empty() || tok.is_empty() {
+            return;
+        }
         leptos::task::spawn_local(async move {
             match read_file(&http_base, &tok, path.clone()).await {
                 Ok(bytes) => {
@@ -167,9 +170,9 @@ pub fn App() -> impl IntoView {
                     // editor_seed/editor_dirty are written ONLY here, in the file-open flow.
                     // Only text files seed the editor; for Binary/TooLarge, EditorPane shows a
                     // notice instead of mounting the editor, so a stale `editor_seed` is never read.
+                    editor_dirty.set(false); // reset on every open; only text re-seeds the editor
                     if let FileBody::Text(ref s) = body {
                         editor_seed.set(s.clone());
-                        editor_dirty.set(false);
                     }
                     open_file.set(Some((path, body)));
                 }

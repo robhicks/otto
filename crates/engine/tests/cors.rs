@@ -90,6 +90,10 @@ async fn workspace_preflight_advertises_cors() {
         allow_headers.contains("authorization"),
         "allow-headers was {allow_headers:?}"
     );
+    assert!(
+        allow_headers.contains("content-type"),
+        "allow-headers must include content-type, was {allow_headers:?}"
+    );
 }
 
 #[tokio::test]

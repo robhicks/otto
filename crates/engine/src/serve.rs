@@ -86,6 +86,8 @@ pub fn app(
     // `allow_origin(Any)` matches the loopback/dev posture already accepted for the `?token=`
     // query param on /ws; auth rides the Authorization header (not cookies), so wildcard origin
     // without credentials mode is correct and exposes nothing extra.
+    // SECURITY: never add `.allow_credentials(true)` here — with `allow_origin(Any)` that is
+    // both a tower-http startup panic and a real cross-origin credential leak.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])

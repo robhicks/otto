@@ -182,4 +182,38 @@ mod tests {
         big_invalid[0] = 0xff; // already invalid UTF-8 throughout
         assert_eq!(decode_or_binary(&big_invalid), FileBody::TooLarge);
     }
+
+    #[test]
+    fn build_tree_upgrades_file_to_dir_when_seen_later() {
+        // "a" first appears as a bare file, then as a directory prefix; it must upgrade.
+        let tree = build_tree(&[p("a"), p("a/b.rs")]);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "a");
+        assert!(tree[0].is_dir, "a must upgrade to a directory");
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(tree[0].children[0].name, "b.rs");
+    }
+
+    #[test]
+    fn language_for_path_covers_alias_arms() {
+        assert_eq!(language_for_path(Path::new("a.markdown")), "markdown");
+        assert_eq!(language_for_path(Path::new("a.mjs")), "javascript");
+        assert_eq!(language_for_path(Path::new("a.cjs")), "javascript");
+        assert_eq!(language_for_path(Path::new("a.js")), "javascript");
+        assert_eq!(language_for_path(Path::new("a.ts")), "typescript");
+        assert_eq!(language_for_path(Path::new("a.py")), "python");
+        assert_eq!(language_for_path(Path::new("a.htm")), "html");
+        assert_eq!(language_for_path(Path::new("a.html")), "html");
+        assert_eq!(language_for_path(Path::new("a.css")), "css");
+        assert_eq!(language_for_path(Path::new("a.sh")), "bash");
+        assert_eq!(language_for_path(Path::new("a.bash")), "bash");
+        assert_eq!(language_for_path(Path::new("a.sql")), "sql");
+        assert_eq!(language_for_path(Path::new("a.yaml")), "yaml");
+        assert_eq!(language_for_path(Path::new("a.yml")), "yaml");
+    }
+
+    #[test]
+    fn decode_or_binary_empty_is_text() {
+        assert_eq!(decode_or_binary(b""), FileBody::Text(String::new()));
+    }
 }
