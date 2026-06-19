@@ -36,7 +36,16 @@ async fn start_server(dir: &Path) -> u16 {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string());
+    let app = serve_app(
+        service,
+        TOKEN.to_string(),
+        otto_protocol::CapabilitiesManifest {
+            engine_remote: false,
+            local_llm: false,
+            remote_llm: false,
+            sandbox: false,
+        },
+    );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
