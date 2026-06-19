@@ -239,6 +239,65 @@ async fn pause_before_prompt_parks_turn_until_resume() {
     assert!(completed, "expected the turn to complete after resume");
 }
 
+#[tokio::test]
+async fn disconnect_while_paused_does_not_hang() {
+    let (port, _dir) = start_metering_server().await;
+
+    // Connection 1: pause before prompting so the turn parks at its first checkpoint.
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let pause = serde_json::json!({ "Pause": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&pause).unwrap()))
+        .await
+        .unwrap();
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    // Wait until the turn has actually parked, then drop the socket mid-pause.
+    let mut paused = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if kind.get("Log").and_then(|l| l["message"].as_str()) == Some("turn paused") {
+                paused = true;
+                break;
+            }
+        }
+    }
+    assert!(paused, "expected the turn to park before disconnect");
+    drop(ws); // disconnect while paused → the release path must unwedge the server
+
+    // The server must still serve: a fresh connection on a NEW session runs a turn to completion.
+    let (mut ws2, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("server still accepts connections after a paused-disconnect");
+    let ready2: Value = next_json(&mut ws2).await;
+    let session2 = ready2["session"].as_str().unwrap().to_string();
+    let cmd2 =
+        serde_json::json!({ "SendPrompt": { "session": session2, "text": "add a greeting" } });
+    ws2.send(Message::Text(serde_json::to_string(&cmd2).unwrap()))
+        .await
+        .unwrap();
+
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws2).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "server wedged: a new turn did not complete after a paused-disconnect"
+    );
+}
+
 /// Read frames until an `ApprovalRequest` event arrives; return its `id`. Panics on TurnComplete
 /// or stream end first (means no approval was requested).
 async fn next_approval_id(
