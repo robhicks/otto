@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::Router as AxumRouter;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
@@ -17,6 +17,7 @@ use otto_protocol::{
     CapabilitiesManifest, Command, Event, ServerMessage, SessionId, WorkspaceRequest,
 };
 use serde::Deserialize;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::service::{EngineService, EventSink};
 
@@ -80,9 +81,19 @@ pub fn app(
         token,
         capabilities,
     });
+    // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
+    // POST /workspace carries an `Authorization` header, so the browser sends a preflight.
+    // `allow_origin(Any)` matches the loopback/dev posture already accepted for the `?token=`
+    // query param on /ws; auth rides the Authorization header (not cookies), so wildcard origin
+    // without credentials mode is correct and exposes nothing extra.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     AxumRouter::new()
         .route("/ws", get(ws_handler))
         .route("/workspace", post(workspace_handler))
+        .layer(cors)
         .with_state(state)
 }
 

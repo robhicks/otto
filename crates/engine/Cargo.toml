@@ -26,10 +26,12 @@ async-trait.workspace = true
 serde = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower-http = { version = "0.6", features = ["cors"] }
 uuid.workspace = true
 
 [dev-dependencies]
 escargot = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tempfile.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
