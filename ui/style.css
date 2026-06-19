@@ -78,3 +78,33 @@ button {
 }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 button:hover:not(:disabled) { border-color: var(--accent); }
+
+.workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  border-top: 1px solid #1c2128;
+}
+.workspace-side {
+  flex: 0 0 240px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #1c2128;
+  overflow: auto;
+}
+.refresh-btn { margin: 6px; }
+.file-tree { padding: 4px 0; font: inherit; }
+.tree-row { padding: 1px 8px; white-space: nowrap; cursor: pointer; }
+.tree-row:hover { background: #11151a; }
+.tree-dir-row { color: var(--accent); }
+.tree-file-row { color: var(--fg); }
+.tree-children { padding-left: 12px; }
+.tree-empty, .editor-empty, .editor-notice { padding: 8px 10px; color: var(--dim); }
+.editor-pane { flex: 1 1 auto; display: flex; min-width: 0; }
+.editor-host { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+.editor-header {
+  padding: 4px 10px;
+  border-bottom: 1px solid #1c2128;
+  color: var(--dim);
+  font: inherit;
+}

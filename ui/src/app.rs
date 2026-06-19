@@ -1,11 +1,15 @@
+use std::path::PathBuf;
+
 use leptos::prelude::*;
 use otto_protocol::{CapabilitiesManifest, Command, ServerMessage, SessionId};
 use uuid::Uuid;
 use web_sys::WebSocket;
 
-use crate::components::{ConnectionForm, EventLog, PromptBar, StatusLine};
-use crate::url::{advance_last_seq, build_ws_url, should_apply};
+use crate::components::{ConnectionForm, EditorPane, EventLog, FileTree, PromptBar, StatusLine};
+use crate::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
+use crate::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
+use crate::workspace::{list_files, read_file};
 use crate::ws::{open_ws, send_command};
 
 #[component]
@@ -24,6 +28,12 @@ pub fn App() -> impl IntoView {
     // disconnect, and the on_close/on_error socket drops). So `Some` ⟺ a live manifest for the
     // current connection; StatusLine additionally gates display on ConnState::Connected.
     let capabilities = RwSignal::new(None::<CapabilitiesManifest>);
+
+    // Workspace tree + editor state.
+    let tree = RwSignal::new(Vec::<TreeNode>::new());
+    let open_file = RwSignal::new(None::<(PathBuf, FileBody)>);
+    let editor_seed = RwSignal::new(String::new()); // file text set once at open time
+    let editor_dirty = RwSignal::new(false);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -129,9 +139,73 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Fetch the file list over the /workspace RPC and rebuild the tree. No-op without
+    // url+token (the form gates Connect on both, so by Connected they are present).
+    // A `Callback` so it can be shared between the Effect and the Refresh button.
+    let load_files = Callback::new(move |_: ()| {
+        let http_base = ws_to_http_base(&url.get());
+        let tok = token.get();
+        if http_base.is_empty() || tok.is_empty() {
+            return;
+        }
+        leptos::task::spawn_local(async move {
+            match list_files(&http_base, &tok).await {
+                Ok(paths) => tree.set(build_tree(&paths)),
+                Err(e) => rows.update(|v| v.push(client_error_row(&e))),
+            }
+        });
+    });
+
+    // Read a file and mount it in the editor (or show a binary/oversize notice).
+    let open_path = move |path: PathBuf| {
+        let http_base = ws_to_http_base(&url.get());
+        let tok = token.get();
+        leptos::task::spawn_local(async move {
+            match read_file(&http_base, &tok, path.clone()).await {
+                Ok(bytes) => {
+                    let body = decode_or_binary(&bytes);
+                    // editor_seed/editor_dirty are written ONLY here, in the file-open flow.
+                    if let FileBody::Text(ref s) = body {
+                        editor_seed.set(s.clone());
+                        editor_dirty.set(false);
+                    }
+                    open_file.set(Some((path, body)));
+                }
+                Err(e) => rows.update(|v| v.push(client_error_row(&e))),
+            }
+        });
+    };
+
+    // Auto-load the tree when the connection reaches Connected.
+    Effect::new(move |_| {
+        if matches!(conn.get(), ConnState::Connected { .. }) {
+            load_files.run(());
+        }
+    });
+
     view! {
         <div class="app">
             <StatusLine conn=conn last_seq=last_seq capabilities=capabilities />
+            <div class="workspace">
+                <div class="workspace-side">
+                    <button
+                        class="refresh-btn"
+                        on:click=move |_| load_files.run(())
+                        disabled=move || !matches!(conn.get(), ConnState::Connected { .. })
+                    >
+                        "Refresh files"
+                    </button>
+                    <FileTree
+                        nodes=tree.into()
+                        on_open=Callback::new(open_path)
+                    />
+                </div>
+                <EditorPane
+                    open=open_file.into()
+                    seed=editor_seed.into()
+                    dirty=editor_dirty
+                />
+            </div>
             <EventLog rows=rows />
             <PromptBar
                 conn=conn

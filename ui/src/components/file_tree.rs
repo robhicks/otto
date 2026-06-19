@@ -61,7 +61,6 @@ fn TreeNodeView(node: TreeNode, on_open: Callback<PathBuf>) -> impl IntoView {
                 class="tree-row tree-file-row"
                 on:click=move |_| on_open.run(path.clone())
             >
-                {"  "}
                 {name}
             </div>
         }
