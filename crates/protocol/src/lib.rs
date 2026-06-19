@@ -65,7 +65,10 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Ready { session: SessionId },
+    Ready {
+        session: SessionId,
+        capabilities: CapabilitiesManifest,
+    },
     Event { event: Event },
     Error { message: String },
 }
@@ -96,6 +99,9 @@ pub enum WorkspaceResponse {
 pub struct CapabilitiesManifest {
     pub engine_remote: bool,
     pub local_llm: bool,
+    /// A remote provider (Anthropic) is configured. Distinct from `local_llm` (Ollama);
+    /// with both false the engine is on its deterministic offline path (no real LLM).
+    pub remote_llm: bool,
     pub sandbox: bool,
 }
 
@@ -104,14 +110,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_message_ready_has_snake_case_tag() {
+    fn server_message_ready_has_snake_case_tag_and_capabilities() {
         let session = SessionId::new();
-        let msg = ServerMessage::Ready { session };
+        let msg = ServerMessage::Ready {
+            session,
+            capabilities: CapabilitiesManifest {
+                engine_remote: false,
+                local_llm: true,
+                remote_llm: false,
+                sandbox: true,
+            },
+        };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(v["type"], "ready");
         // SessionId is a newtype over Uuid → serializes as a bare string.
         assert_eq!(v["session"], serde_json::json!(session.0.to_string()));
+        // The manifest is a nested sibling object; lock its shape.
+        assert_eq!(v["capabilities"]["engine_remote"], false);
+        assert_eq!(v["capabilities"]["local_llm"], true);
+        assert_eq!(v["capabilities"]["remote_llm"], false);
+        assert_eq!(v["capabilities"]["sandbox"], true);
+    }
+
+    #[test]
+    fn capabilities_manifest_round_trips_with_remote_llm() {
+        let m = CapabilitiesManifest {
+            engine_remote: true,
+            local_llm: false,
+            remote_llm: true,
+            sandbox: false,
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: CapabilitiesManifest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(m, back);
     }
 
     #[test]
