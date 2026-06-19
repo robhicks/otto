@@ -51,6 +51,8 @@ fn insert_components(level: &mut Vec<TreeNode>, comps: &[String], prefix: PathBu
             level.len() - 1
         }
     };
+    // The one-directional file->dir upgrade is sound: the `/workspace` List RPC returns only
+    // real files, so a name is never both a file and a directory within one listing.
     if is_dir {
         level[idx].is_dir = true;
         insert_components(&mut level[idx].children, rest, here);
@@ -160,5 +162,24 @@ mod tests {
         assert_eq!(decode_or_binary(&[0xff, 0xfe, 0x00]), FileBody::Binary);
         let big = vec![b'a'; MAX_EDITABLE_BYTES + 1];
         assert_eq!(decode_or_binary(&big), FileBody::TooLarge);
+    }
+
+    #[test]
+    fn decode_or_binary_allows_exactly_max_bytes() {
+        // The cap is exclusive (`>`), so a file of exactly MAX_EDITABLE_BYTES is editable.
+        let exact = vec![b'a'; MAX_EDITABLE_BYTES];
+        assert_eq!(
+            decode_or_binary(&exact),
+            FileBody::Text("a".repeat(MAX_EDITABLE_BYTES))
+        );
+    }
+
+    #[test]
+    fn decode_or_binary_size_cap_takes_precedence_over_invalid_utf8() {
+        // Bytes that are BOTH over-limit AND invalid UTF-8 must classify as TooLarge
+        // (size checked first), not Binary.
+        let mut big_invalid = vec![0xffu8; MAX_EDITABLE_BYTES + 1];
+        big_invalid[0] = 0xff; // already invalid UTF-8 throughout
+        assert_eq!(decode_or_binary(&big_invalid), FileBody::TooLarge);
     }
 }
