@@ -52,6 +52,9 @@ pub fn EditorPane(
 }
 
 /// Map the stable language id from `language_for_path` to a `kode_leptos::Language`.
+/// kode-leptos resolves lowercase grammar names internally (rust/json/markdown/…); an
+/// unregistered name renders as plain text, so passing the id through `new_static` is safe.
+/// "text" maps to the explicit `Language::PLAIN` constant.
 fn kode_language(id: &'static str) -> Language {
     if id == "text" {
         Language::PLAIN

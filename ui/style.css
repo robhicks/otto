@@ -97,7 +97,7 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 .tree-row { padding: 1px 8px; white-space: nowrap; cursor: pointer; }
 .tree-row:hover { background: #11151a; }
 .tree-dir-row { color: var(--accent); }
-.tree-file-row { color: var(--fg); }
+.tree-file-row { color: var(--fg); padding-left: 24px; }
 .tree-children { padding-left: 12px; }
 .tree-empty, .editor-empty, .editor-notice { padding: 8px 10px; color: var(--dim); }
 .editor-pane { flex: 1 1 auto; display: flex; min-width: 0; }

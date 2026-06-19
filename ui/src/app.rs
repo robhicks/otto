@@ -165,6 +165,8 @@ pub fn App() -> impl IntoView {
                 Ok(bytes) => {
                     let body = decode_or_binary(&bytes);
                     // editor_seed/editor_dirty are written ONLY here, in the file-open flow.
+                    // Only text files seed the editor; for Binary/TooLarge, EditorPane shows a
+                    // notice instead of mounting the editor, so a stale `editor_seed` is never read.
                     if let FileBody::Text(ref s) = body {
                         editor_seed.set(s.clone());
                         editor_dirty.set(false);
