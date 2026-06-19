@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine_core::tool::{Decision, DenyApprover, ToolRegistry};
+use otto_engine_core::tool::{Approver, Decision, DenyApprover, ToolRegistry};
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
@@ -84,15 +84,31 @@ impl EngineService {
         self.store.set_status(session, SessionStatus::Aborted).await
     }
 
-    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
-    /// (after persisting it, fail-closed), then recording the turn and updating status
-    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
-    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    /// Run one turn with the headless default approver (`DenyApprover`): an `Ask` edit is
+    /// skipped (fail-closed). (≙ `Command::SendPrompt` from a non-interactive caller.)
     pub async fn run_prompt(
         &self,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.run_prompt_with_approver(session, goal, sink, Arc::new(DenyApprover))
+            .await
+    }
+
+    /// As `run_prompt`, but resolves `Ask` edits through `approver` (the serve layer supplies an
+    /// interactive one). The approver is moved into the spawned turn task.
+    ///
+    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
+    /// (after persisting it, fail-closed), then recording the turn and updating status
+    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
+    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    pub async fn run_prompt_with_approver(
+        &self,
+        session: SessionId,
+        goal: &str,
+        sink: &mut dyn EventSink,
+        approver: Arc<dyn Approver>,
     ) -> anyhow::Result<TurnOutcome> {
         let _guard = self.turn_lock.lock().await;
 
@@ -110,6 +126,7 @@ impl EngineService {
             let tools = Arc::clone(&self.tools);
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
+            let approver = Arc::clone(&approver);
             tokio::spawn(async move {
                 let sink_fn = move |kind: EventKind| {
                     let seq = counter.fetch_add(1, Ordering::SeqCst);
@@ -121,7 +138,7 @@ impl EngineService {
                     router: &*router,
                     workspace: &*workspace,
                     tools: &tools,
-                    approver: &DenyApprover,
+                    approver: &*approver,
                     next_id: &next_id,
                 };
                 orchestrator.run_turn(session, &goal, &sink_fn).await
