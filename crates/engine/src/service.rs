@@ -7,12 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine_core::tool::{Approver, Decision, DenyApprover, ToolRegistry};
+use otto_engine_core::tool::{
+    Approver, Decision, DenyApprover, NeverPause, PauseController, ToolRegistry,
+};
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
-use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
+use otto_engine_core::{AgentRegistry, Orchestrator, Router, TokenMeter, TurnOutcome};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
 use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
+use otto_router::MeteringRouter;
 use serde_json::json;
 
 /// Receives a turn's events in seq order, each AFTER it is durably persisted. The CLI uses a
@@ -33,6 +36,22 @@ impl EventSink for CollectingSink {
     async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
         self.events.push(event.clone());
         Ok(())
+    }
+}
+
+/// The per-turn control handles the serve layer can inject: how `Ask` edits are approved, and
+/// how the turn is paused. `Default` is the headless/CLI posture (deny approvals, never pause).
+pub struct TurnControls {
+    pub approver: Arc<dyn Approver>,
+    pub pauser: Arc<dyn PauseController>,
+}
+
+impl Default for TurnControls {
+    fn default() -> Self {
+        Self {
+            approver: Arc::new(DenyApprover),
+            pauser: Arc::new(NeverPause),
+        }
     }
 }
 
@@ -84,31 +103,47 @@ impl EngineService {
         self.store.set_status(session, SessionStatus::Aborted).await
     }
 
-    /// Run one turn with the headless default approver (`DenyApprover`): an `Ask` edit is
-    /// skipped (fail-closed). (≙ `Command::SendPrompt` from a non-interactive caller.)
+    /// Run one turn with the headless defaults (deny approvals, never pause). (≙ `SendPrompt`.)
     pub async fn run_prompt(
         &self,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
     ) -> anyhow::Result<TurnOutcome> {
-        self.run_prompt_with_approver(session, goal, sink, Arc::new(DenyApprover))
+        self.run_prompt_with_controls(session, goal, sink, TurnControls::default())
             .await
     }
 
-    /// As `run_prompt`, but resolves `Ask` edits through `approver` (the serve layer supplies an
-    /// interactive one). The approver is moved into the spawned turn task.
-    ///
-    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
-    /// (after persisting it, fail-closed), then recording the turn and updating status
-    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
-    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    /// Back-compat wrapper: run with `approver` and no pause. (Used by serve until it migrates
+    /// to `run_prompt_with_controls`.)
     pub async fn run_prompt_with_approver(
         &self,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
         approver: Arc<dyn Approver>,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.run_prompt_with_controls(
+            session,
+            goal,
+            sink,
+            TurnControls {
+                approver,
+                pauser: Arc::new(NeverPause),
+            },
+        )
+        .await
+    }
+
+    /// Run one orchestrator turn for `goal`, streaming each event to `sink` after persisting it
+    /// (fail-closed), recording the turn, and updating status. `controls` supply the approver
+    /// and pause controller. The seq sequence continues from the store. One turn at a time.
+    pub async fn run_prompt_with_controls(
+        &self,
+        session: SessionId,
+        goal: &str,
+        sink: &mut dyn EventSink,
+        controls: TurnControls,
     ) -> anyhow::Result<TurnOutcome> {
         let _guard = self.turn_lock.lock().await;
 
@@ -126,25 +161,26 @@ impl EngineService {
             let tools = Arc::clone(&self.tools);
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
-            let approver = Arc::clone(&approver);
+            let approver = Arc::clone(&controls.approver);
+            let pauser = Arc::clone(&controls.pauser);
             tokio::spawn(async move {
+                // Per-turn meter; the metering router tallies usage as completions pass through.
+                let meter = Arc::new(TokenMeter::default());
+                let metering_router = MeteringRouter::new(router, Arc::clone(&meter));
                 let sink_fn = move |kind: EventKind| {
                     let seq = counter.fetch_add(1, Ordering::SeqCst);
                     let _ = tx.send(Event { seq, session, kind });
                 };
                 let next_id = || uuid::Uuid::new_v4();
-                // Neutral meter/pauser: zero usage emits no meter events and `NeverPause`
-                // never pauses, so behavior is unchanged. Real wiring lands in a later task.
-                let meter = otto_engine_core::TokenMeter::default();
                 let orchestrator = Orchestrator {
                     registry: &registry,
-                    router: &*router,
+                    router: &metering_router,
                     workspace: &*workspace,
                     tools: &tools,
                     approver: &*approver,
                     next_id: &next_id,
                     meter: &meter,
-                    pauser: &otto_engine_core::tool::NeverPause,
+                    pauser: &*pauser,
                 };
                 orchestrator.run_turn(session, &goal, &sink_fn).await
             })
@@ -300,6 +336,65 @@ mod tests {
             )
             .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
         Arc::new(SingleProviderRouter::new(Arc::new(provider)))
+    }
+
+    fn metered_router() -> Arc<dyn Router> {
+        let provider = ScriptedProvider::new("{}")
+            .on(
+                "edits",
+                r#"{"edits": [{"path": "out.txt", "contents": "hi g"}]}"#,
+            )
+            .on("milestones", r#"{"milestones": [{"description": "x"}]}"#)
+            .with_usage(10, 20);
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)))
+    }
+
+    #[tokio::test]
+    async fn run_prompt_streams_token_cost_meter_with_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteStore::open(dir.path().join("s.db")).await.unwrap());
+        let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = Arc::new(crate::build_tool_registry(
+            tools_ws,
+            dir.path().to_path_buf(),
+        ));
+        let service = EngineService::new(
+            store,
+            Arc::new(crate::build_default_registry()),
+            metered_router(),
+            workspace,
+            tools,
+        );
+        let id = service
+            .create_session("add a greeting", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt(id, "add a greeting", &mut sink)
+            .await
+            .unwrap();
+
+        let meters: Vec<_> = sink
+            .events
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::TokenCostMeter {
+                    input_tokens,
+                    output_tokens,
+                } => Some((input_tokens, output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !meters.is_empty(),
+            "expected at least one TokenCostMeter event"
+        );
+        for w in meters.windows(2) {
+            assert!(w[1].0 >= w[0].0 && w[1].1 >= w[0].1);
+        }
     }
 
     async fn service_in(dir: &tempfile::TempDir, registry: AgentRegistry) -> EngineService {
