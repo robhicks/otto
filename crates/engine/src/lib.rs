@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use otto_agents::{Coder, ContextFinder, Planner, Verifier};
-use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolRegistry};
+use otto_engine_core::tool::{
+    AllowListAskResolver, AskResolver, DenyAsk, PermissionGate, ToolRegistry,
+};
 use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
 use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
 use otto_persistence::SessionStore;
@@ -16,11 +18,13 @@ use otto_tools::{
     os_sandbox_available,
 };
 
+mod approval;
 mod mcp;
 mod remote;
 mod serve;
 mod service;
 
+pub use approval::ApprovalModeGate;
 pub use mcp::{
     McpConnection, connect_bash as mcp_connect_bash, connect_fs as mcp_connect_fs,
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
@@ -81,22 +85,47 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     }
 }
 
-/// Build the default tool registry. Always includes the sensitive-path-floor gate and the
-/// in-process fs tools. A sandboxed `bash` tool is registered ONLY when an OS sandbox backend
-/// (bwrap/sandbox-exec) is available; in that case the `Ask` verdict the gate gives `bash` is
-/// resolved by an allow-list resolver (safe because the registered bash is OS-confined — and
-/// the no-orphans-on-timeout guarantee holds because we only ever wire the `Os` policy, never
+/// Build the tool registry with the default gate (ordinary writes auto-`Allow`ed).
+pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
+    build_tool_registry_inner(workspace, root, false)
+}
+
+/// Build the tool registry in **approval mode**: ordinary `fs.write` is gated `Ask` (the
+/// interactive approver applies it only on an explicit approval). The sensitive floor is
+/// unchanged. Used by `serve --approve-edits`.
+pub fn build_tool_registry_approving(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
+    build_tool_registry_inner(workspace, root, true)
+}
+
+/// Always includes the sensitive-path-floor gate and the in-process fs tools. A sandboxed
+/// `bash` tool is registered ONLY when an OS sandbox backend (bwrap/sandbox-exec) is
+/// available; in that case the `Ask` verdict the gate gives `bash` is resolved by an
+/// allow-list resolver (safe because the registered bash is OS-confined — and the
+/// no-orphans-on-timeout guarantee holds because we only ever wire the `Os` policy, never
 /// `None`). With no sandbox backend, `bash` is absent and the resolver denies all `Ask`
 /// (fail-closed).
-pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
+fn build_tool_registry_inner(
+    workspace: Arc<dyn Workspace>,
+    root: PathBuf,
+    approve_edits: bool,
+) -> ToolRegistry {
     let sandboxed = os_sandbox_available();
+    // NB: the ask-resolver only ever auto-allows `bash`. An `Ask` on `fs.write` (approval mode)
+    // is resolved by the orchestrator's `Approver`, never here — so writes can't slip through.
     let ask: Arc<dyn AskResolver> = if sandboxed {
         Arc::new(AllowListAskResolver::new(vec!["bash".to_string()]))
     } else {
         Arc::new(DenyAsk)
     };
 
-    let mut registry = ToolRegistry::new(Arc::new(DefaultPermissionGate::new()), ask);
+    let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
+    let gate: Arc<dyn PermissionGate> = if approve_edits {
+        Arc::new(ApprovalModeGate::new(base_gate))
+    } else {
+        base_gate
+    };
+
+    let mut registry = ToolRegistry::new(gate, ask);
     // fs.read / fs.list need only the read-only view; fs.write holds the full workspace.
     let read_workspace: Arc<dyn WorkspaceRead> = workspace.clone();
     registry.register(Arc::new(FsReadTool::new(read_workspace.clone())));
