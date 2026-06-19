@@ -1,5 +1,6 @@
 //! Pure view helpers — formatting and connection state. Browser-free, host-tested.
 
+use otto_protocol::CapabilitiesManifest;
 use otto_protocol::EventKind;
 
 /// The single connection-state signal that drives the whole UI.
@@ -19,6 +20,42 @@ pub struct LogRow {
 
 fn row(class: &'static str, text: String) -> LogRow {
     LogRow { class, text }
+}
+
+/// One capability segment in the status strip: a label, its current value, and whether it
+/// represents a degraded/lost capability (rendered in the warning style).
+#[derive(Clone, PartialEq, Debug)]
+pub struct CapSegment {
+    pub label: &'static str,
+    pub value: String,
+    pub degraded: bool,
+}
+
+/// Derive the engine/LLM/sandbox segments from the manifest. The two degradations the strip
+/// exists to surface: a fully-offline (deterministic) LLM, and an absent sandbox (bash off).
+pub fn capability_segments(m: &CapabilitiesManifest) -> Vec<CapSegment> {
+    let engine = CapSegment {
+        label: "engine",
+        value: if m.engine_remote { "remote" } else { "local" }.to_string(),
+        degraded: false,
+    };
+    let llm_value = match (m.local_llm, m.remote_llm) {
+        (true, true) => "local+remote",
+        (false, true) => "remote",
+        (true, false) => "local",
+        (false, false) => "offline (deterministic)",
+    };
+    let llm = CapSegment {
+        label: "LLM",
+        value: llm_value.to_string(),
+        degraded: !m.local_llm && !m.remote_llm,
+    };
+    let sandbox = CapSegment {
+        label: "sandbox",
+        value: if m.sandbox { "on" } else { "off" }.to_string(),
+        degraded: !m.sandbox,
+    };
+    vec![engine, llm, sandbox]
 }
 
 /// Human label for the status line.
@@ -45,7 +82,10 @@ pub fn describe_event(kind: &EventKind) -> LogRow {
     match kind {
         EventKind::AgentStarted { role } => row("row-agent", format!("▸ {role:?} started")),
         EventKind::AgentFinished { role } => row("row-agent", format!("▸ {role:?} finished")),
-        EventKind::FileEdit { path, bytes_written } => row(
+        EventKind::FileEdit {
+            path,
+            bytes_written,
+        } => row(
             "row-edit",
             format!("✎ FileEdit {} (+{} bytes)", path.display(), bytes_written),
         ),
@@ -54,7 +94,11 @@ pub fn describe_event(kind: &EventKind) -> LogRow {
             format!(
                 "{} Verify {}",
                 if *ok { "✓" } else { "✗" },
-                if detail.is_empty() { "ok".to_string() } else { detail.clone() },
+                if detail.is_empty() {
+                    "ok".to_string()
+                } else {
+                    detail.clone()
+                },
             ),
         ),
         EventKind::Log { message } => row("row-log", format!("· {message}")),
@@ -91,7 +135,9 @@ mod tests {
     fn status_labels() {
         assert_eq!(status_label(&ConnState::Disconnected), "disconnected");
         assert_eq!(
-            status_label(&ConnState::Connected { session: "x".into() }),
+            status_label(&ConnState::Connected {
+                session: "x".into()
+            }),
             "connected"
         );
     }
@@ -113,14 +159,79 @@ mod tests {
             "● TurnComplete ok"
         );
         assert_eq!(
-            describe_event(&EventKind::VerifyResult { ok: false, detail: "boom".into() }).text,
+            describe_event(&EventKind::VerifyResult {
+                ok: false,
+                detail: "boom".into()
+            })
+            .text,
             "✗ Verify boom"
         );
     }
 
     #[test]
     fn describe_agent_uses_role_name() {
-        let r = describe_event(&EventKind::AgentStarted { role: Role::Planner });
+        let r = describe_event(&EventKind::AgentStarted {
+            role: Role::Planner,
+        });
         assert_eq!(r.text, "▸ Planner started");
+    }
+
+    fn manifest(
+        engine_remote: bool,
+        local_llm: bool,
+        remote_llm: bool,
+        sandbox: bool,
+    ) -> CapabilitiesManifest {
+        CapabilitiesManifest {
+            engine_remote,
+            local_llm,
+            remote_llm,
+            sandbox,
+        }
+    }
+
+    #[test]
+    fn offline_engine_marks_llm_segment_degraded() {
+        let segs = capability_segments(&manifest(false, false, false, true));
+        let llm = segs.iter().find(|s| s.label == "LLM").unwrap();
+        assert_eq!(llm.value, "offline (deterministic)");
+        assert!(llm.degraded);
+        let engine = segs.iter().find(|s| s.label == "engine").unwrap();
+        assert_eq!(engine.value, "local");
+        assert!(!engine.degraded);
+        let sandbox = segs.iter().find(|s| s.label == "sandbox").unwrap();
+        assert!(!sandbox.degraded);
+    }
+
+    #[test]
+    fn remote_llm_is_not_degraded() {
+        let segs = capability_segments(&manifest(false, false, true, true));
+        let llm = segs.iter().find(|s| s.label == "LLM").unwrap();
+        assert_eq!(llm.value, "remote");
+        assert!(!llm.degraded);
+    }
+
+    #[test]
+    fn local_and_remote_llm_labels_both() {
+        let segs = capability_segments(&manifest(false, true, true, true));
+        let llm = segs.iter().find(|s| s.label == "LLM").unwrap();
+        assert_eq!(llm.value, "local+remote");
+        assert!(!llm.degraded);
+    }
+
+    #[test]
+    fn sandbox_off_is_degraded() {
+        let segs = capability_segments(&manifest(false, true, false, false));
+        let sandbox = segs.iter().find(|s| s.label == "sandbox").unwrap();
+        assert_eq!(sandbox.value, "off");
+        assert!(sandbox.degraded);
+    }
+
+    #[test]
+    fn engine_remote_labels_remote() {
+        let segs = capability_segments(&manifest(true, true, false, true));
+        let engine = segs.iter().find(|s| s.label == "engine").unwrap();
+        assert_eq!(engine.value, "remote");
+        assert!(!engine.degraded);
     }
 }
