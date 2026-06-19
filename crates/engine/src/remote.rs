@@ -125,8 +125,13 @@ impl RemoteTarget for LoopbackTarget {
             tools,
         );
 
-        // Serve it on a loopback ephemeral port.
-        let app = crate::serve::app(service, self.token.clone());
+        // Serve it on a loopback ephemeral port. This is the provisioned remote engine, so
+        // it reports `engine_remote = true` (over its own env-derived capabilities).
+        let capabilities = otto_protocol::CapabilitiesManifest {
+            engine_remote: true,
+            ..crate::build_capabilities()
+        };
+        let app = crate::serve::app(service, self.token.clone(), capabilities);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();

@@ -13,7 +13,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
-use otto_protocol::{Command, Event, ServerMessage, SessionId, WorkspaceRequest};
+use otto_protocol::{
+    CapabilitiesManifest, Command, Event, ServerMessage, SessionId, WorkspaceRequest,
+};
 use serde::Deserialize;
 
 use crate::service::{EngineService, EventSink};
@@ -35,6 +37,7 @@ struct ConnectParams {
 struct ServeState {
     service: EngineService,
     token: String,
+    capabilities: CapabilitiesManifest,
 }
 
 /// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
@@ -66,9 +69,17 @@ pub fn resolve_tls_paths(
 }
 
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
-pub fn app(service: EngineService, token: String) -> AxumRouter {
+pub fn app(
+    service: EngineService,
+    token: String,
+    capabilities: CapabilitiesManifest,
+) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
-    let state = Arc::new(ServeState { service, token });
+    let state = Arc::new(ServeState {
+        service,
+        token,
+        capabilities,
+    });
     AxumRouter::new()
         .route("/ws", get(ws_handler))
         .route("/workspace", post(workspace_handler))
@@ -167,9 +178,15 @@ async fn handle_socket(mut socket: WebSocket, params: ConnectParams, state: Arc<
         }
     };
 
-    if send_msg(&mut socket, &ServerMessage::Ready { session })
-        .await
-        .is_err()
+    if send_msg(
+        &mut socket,
+        &ServerMessage::Ready {
+            session,
+            capabilities: state.capabilities.clone(),
+        },
+    )
+    .await
+    .is_err()
     {
         return;
     }

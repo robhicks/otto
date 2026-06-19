@@ -19,6 +19,17 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "test-token";
 
+/// A fixed manifest the test server reports, so the assertion below is deterministic and
+/// also proves non-default values are threaded through (not hardcoded false).
+fn test_capabilities() -> otto_protocol::CapabilitiesManifest {
+    otto_protocol::CapabilitiesManifest {
+        engine_remote: false,
+        local_llm: true,
+        remote_llm: false,
+        sandbox: true,
+    }
+}
+
 /// Start the serve app on 127.0.0.1:0 and return the bound port. Keeps the tempdir alive.
 async fn start_server() -> (u16, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -46,7 +57,7 @@ async fn start_server() -> (u16, tempfile::TempDir) {
         tools,
     );
 
-    let app = serve_app(service, TOKEN.to_string());
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -132,6 +143,23 @@ async fn streams_a_turn_then_reconnects_with_replay() {
 }
 
 #[tokio::test]
+async fn ready_frame_carries_capabilities() {
+    let (port, _dir) = start_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+
+    let ready: Value = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let caps = &ready["capabilities"];
+    assert!(caps.is_object(), "Ready must carry a capabilities object");
+    assert_eq!(caps["engine_remote"], false);
+    assert_eq!(caps["local_llm"], true);
+    assert_eq!(caps["remote_llm"], false);
+    assert_eq!(caps["sandbox"], true);
+}
+
+#[tokio::test]
 async fn rejects_missing_token() {
     let (port, _dir) = start_server().await;
     let url = format!("ws://127.0.0.1:{port}/ws");
@@ -212,7 +240,7 @@ async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string());
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities());
 
     // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
     // rcgen 0.13 uses CertifiedKey { cert, key_pair }.

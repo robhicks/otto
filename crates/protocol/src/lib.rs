@@ -65,9 +65,17 @@ pub struct Event {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Ready { session: SessionId },
-    Event { event: Event },
-    Error { message: String },
+    Ready {
+        session: SessionId,
+        #[serde(default)]
+        capabilities: CapabilitiesManifest,
+    },
+    Event {
+        event: Event,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// A unary workspace operation, sent to a remote engine's `POST /workspace`.
@@ -92,10 +100,17 @@ pub enum WorkspaceResponse {
 
 /// What the running engine environment can do. The frontend composes its behavior
 /// from the intersection of this manifest and its own form factor.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `#[serde(default)]`: a missing field deserializes to `false` ("capability absent"),
+/// so adding a capability stays a semver-minor wire change for the separately-built UI.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CapabilitiesManifest {
     pub engine_remote: bool,
     pub local_llm: bool,
+    /// A remote provider (Anthropic) is configured. Distinct from `local_llm` (Ollama);
+    /// with both false the engine is on its deterministic offline path (no real LLM).
+    pub remote_llm: bool,
     pub sandbox: bool,
 }
 
@@ -104,14 +119,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_message_ready_has_snake_case_tag() {
+    fn server_message_ready_has_snake_case_tag_and_capabilities() {
         let session = SessionId::new();
-        let msg = ServerMessage::Ready { session };
+        let msg = ServerMessage::Ready {
+            session,
+            capabilities: CapabilitiesManifest {
+                engine_remote: false,
+                local_llm: true,
+                remote_llm: false,
+                sandbox: true,
+            },
+        };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
         assert_eq!(v["type"], "ready");
         // SessionId is a newtype over Uuid → serializes as a bare string.
         assert_eq!(v["session"], serde_json::json!(session.0.to_string()));
+        // The manifest is a nested sibling object; lock its shape.
+        assert_eq!(v["capabilities"]["engine_remote"], false);
+        assert_eq!(v["capabilities"]["local_llm"], true);
+        assert_eq!(v["capabilities"]["remote_llm"], false);
+        assert_eq!(v["capabilities"]["sandbox"], true);
+    }
+
+    #[test]
+    fn capabilities_manifest_round_trips_with_remote_llm() {
+        let m = CapabilitiesManifest {
+            engine_remote: true,
+            local_llm: false,
+            remote_llm: true,
+            sandbox: false,
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        let back: CapabilitiesManifest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn ready_without_capabilities_defaults_to_all_false() {
+        // An out-of-step peer (e.g. an older engine) that omits `capabilities` must still
+        // deserialize — defaulting every capability to false (absent → shown as degraded).
+        let session = SessionId::new();
+        let json = format!(r#"{{"type":"ready","session":"{}"}}"#, session.0);
+        let msg: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        match msg {
+            ServerMessage::Ready { capabilities, .. } => {
+                assert_eq!(capabilities, CapabilitiesManifest::default());
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
   --dim: #6b7480;
   --accent: #7aa2f7;
   --error: #f7768e;
+  --warn: #e0af68;
 }
 
 * { box-sizing: border-box; }
@@ -43,6 +44,10 @@ body {
 .row-log { color: var(--fg); }
 .row-turn { color: var(--accent); font-weight: bold; }
 .row-error { color: var(--error); }
+
+.cap { color: var(--fg); }
+.cap-degraded { color: var(--warn); font-weight: bold; }
+.cap-sep { color: var(--dim); }
 
 .prompt, .conn-form {
   display: flex;

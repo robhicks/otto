@@ -40,12 +40,16 @@ WASM), and is built/tested from inside `ui/` (`cargo test`, `cargo build --targe
 wasm32-unknown-unknown`) — so `cargo build --workspace` and the offline determinism suite are
 untouched. Enabling it took two additive changes: the WS framing enum `ServerMessage` now lives
 in `protocol` (so the UI can deserialize it), and `/ws` accepts the bearer token via a `?token=`
-query param (the header path is still preferred). The roadmap and per-slice spec/plan live in
-`docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects B–F are pending.
+query param (the header path is still preferred). **Sub-project B then shipped** (capabilities +
+status strip): the `Ready` frame now carries a `CapabilitiesManifest` (extended with a `remote_llm`
+field), derived at serve time by `build_capabilities()`, and the UI replaces its plain status line
+with a strip showing engine/LLM/sandbox state — degraded states (offline-deterministic LLM, absent
+sandbox) render visibly. The roadmap and per-slice spec/plan live in
+`docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects C–F are pending.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`mcp-lsp`, `retrieval`, `extensions`, `cli`, etc.), the rest of the UI
-(sub-projects B–F: capabilities strip, workspace tree/editor, diff approval, token meter,
+(sub-projects C–F: workspace tree/editor, diff approval, token meter,
 promote-to-remote, and the Tauri desktop wrapper), and the parts of the remote axis that need
 external infrastructure — a real
 `vps`/`microvm` `RemoteTarget` provisioner (`UnsupportedTarget` marks that boundary in-tree),

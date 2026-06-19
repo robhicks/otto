@@ -8,7 +8,7 @@ use otto_engine_core::tool::{AllowListAskResolver, AskResolver, DenyAsk, ToolReg
 use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
 use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
 use otto_persistence::SessionStore;
-use otto_protocol::{Event, Role};
+use otto_protocol::{CapabilitiesManifest, Event, Role};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
 use otto_router::{BrainBlendRouter, SingleProviderRouter};
 use otto_tools::{
@@ -134,6 +134,36 @@ pub fn session_config() -> serde_json::Value {
     })
 }
 
+/// Pure capability derivation from raw env inputs. Kept separate from `build_capabilities`
+/// so the mapping is unit-testable without mutating process-global env (which would race the
+/// env-reading tests in this binary). `engine_remote` is always false here: `otto serve` is
+/// the local engine; the promote path (sub-project F) provisions a separate remote engine
+/// that computes its own manifest with `engine_remote = true`.
+fn capabilities_from_env(
+    otto_ollama: Option<&str>,
+    anthropic_key: Option<&str>,
+    sandbox: bool,
+) -> CapabilitiesManifest {
+    CapabilitiesManifest {
+        engine_remote: false,
+        local_llm: otto_ollama == Some("1"),
+        remote_llm: anthropic_key.map(|k| !k.is_empty()).unwrap_or(false),
+        sandbox,
+    }
+}
+
+/// Derive the running engine's capabilities from the environment `build_router` reads, plus
+/// the OS sandbox probe. Lives in the wiring layer (not core) because it reads `OTTO_*` /
+/// `ANTHROPIC_API_KEY`. Mirrors `session_config`'s predicates so a session's recorded config
+/// and its reported capabilities stay consistent.
+pub fn build_capabilities() -> CapabilitiesManifest {
+    capabilities_from_env(
+        std::env::var("OTTO_OLLAMA").ok().as_deref(),
+        std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+        os_sandbox_available(),
+    )
+}
+
 /// Run one turn for `goal` through an `EngineService` backed by `store`, returning the
 /// sequenced events and the outcome. A thin wrapper: build the service, create a session,
 /// run one prompt with a collecting sink.
@@ -194,5 +224,29 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert!(a.text.contains("ping"));
+    }
+
+    #[test]
+    fn capabilities_from_env_maps_flags() {
+        // Pure mapping — takes raw env inputs, touches no process-global env, so it does
+        // NOT race the env-reading router test in this same binary.
+        // Nothing set → fully offline, local engine, no sandbox.
+        assert_eq!(
+            capabilities_from_env(None, None, false),
+            CapabilitiesManifest {
+                engine_remote: false,
+                local_llm: false,
+                remote_llm: false,
+                sandbox: false,
+            }
+        );
+        // OTTO_OLLAMA must equal exactly "1" to count as a local LLM.
+        assert!(capabilities_from_env(Some("1"), None, false).local_llm);
+        assert!(!capabilities_from_env(Some("0"), None, false).local_llm);
+        // A non-empty ANTHROPIC_API_KEY means a remote LLM; an empty one does not.
+        assert!(capabilities_from_env(None, Some("sk-xyz"), false).remote_llm);
+        assert!(!capabilities_from_env(None, Some(""), false).remote_llm);
+        // sandbox passes through unchanged.
+        assert!(capabilities_from_env(None, None, true).sandbox);
     }
 }

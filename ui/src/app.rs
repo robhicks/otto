@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use otto_protocol::{Command, ServerMessage, SessionId};
+use otto_protocol::{CapabilitiesManifest, Command, ServerMessage, SessionId};
 use uuid::Uuid;
 use web_sys::WebSocket;
 
@@ -20,6 +20,10 @@ pub fn App() -> impl IntoView {
     let last_seq = RwSignal::new(None::<u64>); // retained across disconnects for replay
     let session = RwSignal::new(None::<String>); // retained across disconnects for reconnect
     let socket = RwSignal::new(None::<WebSocket>);
+    // `capabilities`: set on Ready; cleared on every disconnect path (connect-start, explicit
+    // disconnect, and the on_close/on_error socket drops). So `Some` ⟺ a live manifest for the
+    // current connection; StatusLine additionally gates display on ConnState::Connected.
+    let capabilities = RwSignal::new(None::<CapabilitiesManifest>);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -40,11 +44,16 @@ pub fn App() -> impl IntoView {
             socket.set(None);
         }
         conn.set(ConnState::Connecting);
+        capabilities.set(None);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
-            Ok(ServerMessage::Ready { session: s }) => {
+            Ok(ServerMessage::Ready {
+                session: s,
+                capabilities: caps,
+            }) => {
                 let id = s.0.to_string();
                 session.set(Some(id.clone()));
+                capabilities.set(Some(caps));
                 conn.set(ConnState::Connected { session: id });
             }
             Ok(ServerMessage::Event { event }) => {
@@ -60,9 +69,13 @@ pub fn App() -> impl IntoView {
                 rows.update(|v| v.push(client_error_row(&detail)));
             }
         };
-        let on_close = move || conn.set(ConnState::Disconnected);
+        let on_close = move || {
+            capabilities.set(None);
+            conn.set(ConnState::Disconnected);
+        };
         let on_error = move || {
             rows.update(|v| v.push(client_error_row("connection rejected — check URL/token")));
+            capabilities.set(None);
             conn.set(ConnState::Disconnected);
         };
 
@@ -80,6 +93,7 @@ pub fn App() -> impl IntoView {
             let _ = ws.close();
         }
         socket.set(None);
+        capabilities.set(None);
         conn.set(ConnState::Disconnected);
     };
 
@@ -92,7 +106,10 @@ pub fn App() -> impl IntoView {
         let Ok(uuid) = Uuid::parse_str(&sid) else {
             return;
         };
-        let cmd = Command::SendPrompt { session: SessionId(uuid), text };
+        let cmd = Command::SendPrompt {
+            session: SessionId(uuid),
+            text,
+        };
         if let Err(e) = send_command(&ws, &cmd) {
             rows.update(|v| v.push(client_error_row(&e)));
         }
@@ -103,13 +120,18 @@ pub fn App() -> impl IntoView {
             return;
         };
         if let Ok(uuid) = Uuid::parse_str(&sid) {
-            let _ = send_command(&ws, &Command::Abort { session: SessionId(uuid) });
+            let _ = send_command(
+                &ws,
+                &Command::Abort {
+                    session: SessionId(uuid),
+                },
+            );
         }
     };
 
     view! {
         <div class="app">
-            <StatusLine conn=conn last_seq=last_seq />
+            <StatusLine conn=conn last_seq=last_seq capabilities=capabilities />
             <EventLog rows=rows />
             <PromptBar
                 conn=conn
