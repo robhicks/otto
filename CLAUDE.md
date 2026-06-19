@@ -44,8 +44,13 @@ query param (the header path is still preferred). **Sub-project B then shipped**
 status strip): the `Ready` frame now carries a `CapabilitiesManifest` (extended with a `remote_llm`
 field), derived at serve time by `build_capabilities()`, and the UI replaces its plain status line
 with a strip showing engine/LLM/sandbox state — degraded states (offline-deterministic LLM, absent
-sandbox) render visibly. The roadmap and per-slice spec/plan live in
-`docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects C–F are pending.
+sandbox) render visibly. **Sub-project C then shipped** (workspace tree + editor): the UI now lists
+the served workspace via the bearer-authed `POST /workspace` RPC — unblocked by a new **tower-http
+CORS layer** on the engine (the one engine change; not a protocol change) — renders a collapsible
+file tree, and opens files into a **`kode-leptos`** editor (native Leptos CSR, syntax-highlighted)
+with a local, unsaved buffer; persistence stays deferred to sub-project D. `kode-leptos`/`gloo-net`
+are UI-only deps and the `ui/` crate still depends only on `protocol`. The roadmap and per-slice
+spec/plan live in `docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects D–F are pending.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`mcp-lsp`, `retrieval`, `extensions`, `cli`, etc.), the rest of the UI
