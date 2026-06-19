@@ -159,7 +159,7 @@ impl<'a> Orchestrator<'a> {
                         if !approved {
                             emit.emit(EventKind::Log {
                                 message: format!(
-                                    "edit to {} rejected; skipped",
+                                    "edit to {} rejected by approver; skipped",
                                     edit.path.display()
                                 ),
                             });
@@ -637,10 +637,12 @@ mod tests {
         );
     }
 
+    type SeenEntry = (Uuid, PathBuf, Option<String>, String);
+
     /// Records each approval request and returns a fixed verdict.
     struct ScriptedApprover {
         approve: bool,
-        seen: Mutex<Vec<(Uuid, PathBuf, Option<String>, String)>>,
+        seen: Mutex<Vec<SeenEntry>>,
     }
     #[async_trait]
     impl Approver for ScriptedApprover {
