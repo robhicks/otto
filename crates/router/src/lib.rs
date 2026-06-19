@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use otto_engine_core::TokenMeter;
 use otto_engine_core::router::{RouteHints, Router, TaskKind};
 use otto_engine_core::traits::Provider;
 use otto_engine_core::types::{CompleteRequest, CompleteResponse};
@@ -122,6 +123,36 @@ impl Router for BrainBlendRouter {
                     })
             }
         }
+    }
+}
+
+/// A `Router` decorator that tallies each completion's reported token usage into a shared
+/// `TokenMeter`, passing the response through unchanged. Agents are unaffected — they still
+/// receive a `CompleteResponse`. Per-turn, the engine wraps the real router in this and reads
+/// the meter to emit `TokenCostMeter` events.
+pub struct MeteringRouter {
+    inner: Arc<dyn Router>,
+    meter: Arc<TokenMeter>,
+}
+
+impl MeteringRouter {
+    pub fn new(inner: Arc<dyn Router>, meter: Arc<TokenMeter>) -> Self {
+        Self { inner, meter }
+    }
+}
+
+#[async_trait]
+impl Router for MeteringRouter {
+    async fn complete(
+        &self,
+        req: CompleteRequest,
+        hints: RouteHints,
+    ) -> anyhow::Result<CompleteResponse> {
+        let resp = self.inner.complete(req, hints).await?;
+        if let Some(u) = &resp.usage {
+            self.meter.add(u);
+        }
+        Ok(resp)
     }
 }
 
@@ -303,5 +334,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "local");
+    }
+
+    use otto_engine_core::TokenMeter;
+    use otto_engine_core::types::Usage;
+
+    struct UsageRouter(Option<Usage>);
+    #[async_trait]
+    impl Router for UsageRouter {
+        async fn complete(
+            &self,
+            _req: CompleteRequest,
+            _hints: RouteHints,
+        ) -> anyhow::Result<CompleteResponse> {
+            Ok(CompleteResponse {
+                text: "x".to_string(),
+                usage: self.0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn metering_router_tallies_usage_and_passes_through() {
+        let meter = Arc::new(TokenMeter::default());
+        let inner: Arc<dyn Router> = Arc::new(UsageRouter(Some(Usage {
+            input_tokens: 2,
+            output_tokens: 3,
+        })));
+        let r = MeteringRouter::new(inner, Arc::clone(&meter));
+
+        let out = r
+            .complete(
+                CompleteRequest { prompt: "p".into() },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "x"); // passed through unchanged
+        assert_eq!(meter.snapshot(), (2, 3));
+
+        r.complete(
+            CompleteRequest { prompt: "p".into() },
+            RouteHints::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meter.snapshot(), (4, 6)); // cumulative
+    }
+
+    #[tokio::test]
+    async fn metering_router_ignores_none_usage() {
+        let meter = Arc::new(TokenMeter::default());
+        let inner: Arc<dyn Router> = Arc::new(UsageRouter(None));
+        let r = MeteringRouter::new(inner, Arc::clone(&meter));
+        r.complete(
+            CompleteRequest { prompt: "p".into() },
+            RouteHints::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meter.snapshot(), (0, 0));
     }
 }
