@@ -278,6 +278,7 @@ mod tests {
         ) -> anyhow::Result<CompleteResponse> {
             Ok(CompleteResponse {
                 text: "fake".to_string(),
+                usage: None,
             })
         }
     }

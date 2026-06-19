@@ -10,10 +10,20 @@ pub struct CompleteRequest {
     pub prompt: String,
 }
 
+/// Token usage reported by a provider for one completion. Absent for providers that do not
+/// report it (the offline `LocalProvider`/`ScriptedProvider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
 /// A provider's completion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompleteResponse {
     pub text: String,
+    /// Token usage, when the provider reports it. `None` on the offline/deterministic path.
+    pub usage: Option<Usage>,
 }
 
 /// A single file edit. For the walking skeleton an edit is a full-file write;

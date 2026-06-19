@@ -64,6 +64,7 @@ impl Provider for OllamaProvider {
             .await?;
         Ok(CompleteResponse {
             text: resp.response,
+            usage: None,
         })
     }
 }

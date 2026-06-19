@@ -94,7 +94,7 @@ impl Provider for AnthropicProvider {
             .map(|b| b.text)
             .collect::<Vec<_>>()
             .join("");
-        Ok(CompleteResponse { text })
+        Ok(CompleteResponse { text, usage: None })
     }
 }
 

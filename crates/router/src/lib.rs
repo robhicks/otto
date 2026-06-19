@@ -138,6 +138,7 @@ mod tests {
         async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
             Ok(CompleteResponse {
                 text: format!("echo:{}", req.prompt),
+                usage: None,
             })
         }
     }
@@ -151,6 +152,7 @@ mod tests {
         async fn complete(&self, _req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
             Ok(CompleteResponse {
                 text: self.0.to_string(),
+                usage: None,
             })
         }
     }

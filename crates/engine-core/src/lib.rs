@@ -15,4 +15,6 @@ pub use tool::{
     Tool, ToolRegistry,
 };
 pub use traits::{Agent, AgentCtx, Provider, Workspace, WorkspaceRead};
-pub use types::{AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, Milestone};
+pub use types::{
+    AgentOutput, AgentRequest, CompleteRequest, CompleteResponse, Edit, Milestone, Usage,
+};
