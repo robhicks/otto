@@ -1,7 +1,9 @@
 use leptos::prelude::*;
 use otto_protocol::CapabilitiesManifest;
 
-use crate::view_model::{capability_segments, short_session, status_label, ConnState};
+use crate::view_model::{
+    capability_segments, cost_estimate, format_meter, short_session, status_label, ConnState,
+};
 
 /// Status strip: the transport half (connection state · session · seq) plus the engine/LLM/
 /// sandbox capability segments. Capability segments render only while connected with a
@@ -11,6 +13,7 @@ pub fn StatusLine(
     conn: RwSignal<ConnState>,
     last_seq: RwSignal<Option<u64>>,
     capabilities: RwSignal<Option<CapabilitiesManifest>>,
+    meter: RwSignal<Option<(u64, u64)>>,
 ) -> impl IntoView {
     view! {
         <div class="status">
@@ -43,6 +46,17 @@ pub fn StatusLine(
                                 .collect_view()}
                         </span>
                     }
+                })
+            }}
+            {move || {
+                let connected = matches!(conn.get(), ConnState::Connected { .. });
+                meter.get().filter(|_| connected).map(|(i, o)| {
+                    let remote = capabilities.get().map(|m| m.remote_llm).unwrap_or(false);
+                    let text = match cost_estimate(i, o, remote) {
+                        Some(c) => format!("{} · ~${:.4}", format_meter(i, o), c),
+                        None => format_meter(i, o),
+                    };
+                    view! { <span class="cap-sep">" | "</span><span class="meter">{text}</span> }
                 })
             }}
         </div>

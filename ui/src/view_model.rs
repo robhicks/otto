@@ -140,6 +140,29 @@ pub fn capability_segments(m: &CapabilitiesManifest) -> Vec<CapSegment> {
     vec![engine, llm, sandbox]
 }
 
+/// Approximate per-million-token display rates for the default remote model (claude-haiku-4-5).
+/// These drive only the UI cost estimate; update freely — they are not load-bearing.
+const COST_PER_MTOK_IN: f64 = 0.80;
+const COST_PER_MTOK_OUT: f64 = 4.00;
+
+/// Running token counts for the status strip.
+pub fn format_meter(input_tokens: u64, output_tokens: u64) -> String {
+    format!("↑{input_tokens} ↓{output_tokens} tok")
+}
+
+/// Approximate dollar cost, or `None` when no remote (billable) model is configured — in that
+/// case the meter shows tokens only. A clearly-labeled estimate: it applies the remote rate to
+/// all counted tokens.
+pub fn cost_estimate(input_tokens: u64, output_tokens: u64, remote_llm: bool) -> Option<f64> {
+    if !remote_llm {
+        return None;
+    }
+    Some(
+        input_tokens as f64 / 1_000_000.0 * COST_PER_MTOK_IN
+            + output_tokens as f64 / 1_000_000.0 * COST_PER_MTOK_OUT,
+    )
+}
+
 /// Human label for the status line.
 pub fn status_label(c: &ConnState) -> &'static str {
     match c {
@@ -191,6 +214,13 @@ pub fn describe_event(kind: &EventKind) -> LogRow {
         EventKind::ApprovalRequest { path, .. } => row(
             "row-approval",
             format!("⏸ approval needed: {}", path.display()),
+        ),
+        EventKind::TokenCostMeter {
+            input_tokens,
+            output_tokens,
+        } => row(
+            "row-meter",
+            format!("◷ tokens ↑{input_tokens} ↓{output_tokens}"),
         ),
     }
 }
@@ -390,5 +420,31 @@ mod tests {
         });
         assert_eq!(r.class, "row-approval");
         assert!(r.text.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn format_meter_shows_both_counts() {
+        assert_eq!(format_meter(12, 34), "↑12 ↓34 tok");
+    }
+
+    #[test]
+    fn cost_is_none_without_remote_model() {
+        assert_eq!(cost_estimate(1_000, 1_000, false), None);
+    }
+
+    #[test]
+    fn cost_uses_remote_rates() {
+        let c = cost_estimate(1_000_000, 1_000_000, true).unwrap();
+        assert!((c - (0.80 + 4.00)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn describe_token_cost_meter_row() {
+        let r = describe_event(&EventKind::TokenCostMeter {
+            input_tokens: 7,
+            output_tokens: 9,
+        });
+        assert_eq!(r.class, "row-meter");
+        assert!(r.text.contains("↑7"));
     }
 }

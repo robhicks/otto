@@ -37,6 +37,7 @@ pub fn App() -> impl IntoView {
     let editor_seed = RwSignal::new(String::new()); // file text set once at open time
     let editor_dirty = RwSignal::new(false);
     let pending_approval = RwSignal::new(None::<crate::components::PendingApproval>);
+    let meter = RwSignal::new(None::<(u64, u64)>); // (input, output) tokens for the current turn
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -59,6 +60,7 @@ pub fn App() -> impl IntoView {
         conn.set(ConnState::Connecting);
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
             Ok(ServerMessage::Ready {
@@ -75,6 +77,13 @@ pub fn App() -> impl IntoView {
                     last_seq.set(advance_last_seq(last_seq.get_untracked(), event.seq));
                     if let EventKind::ApprovalRequest { id, path, old, new } = &event.kind {
                         pending_approval.set(Some((*id, path.clone(), old.clone(), new.clone())));
+                    }
+                    if let EventKind::TokenCostMeter {
+                        input_tokens,
+                        output_tokens,
+                    } = &event.kind
+                    {
+                        meter.set(Some((*input_tokens, *output_tokens)));
                     }
                     // The turn ending resolves any outstanding approval (the orchestrator parks on
                     // the approval *before* emitting TurnComplete, so this never clears a genuinely
@@ -96,12 +105,14 @@ pub fn App() -> impl IntoView {
         let on_close = move || {
             capabilities.set(None);
             pending_approval.set(None);
+            meter.set(None);
             conn.set(ConnState::Disconnected);
         };
         let on_error = move || {
             rows.update(|v| v.push(client_error_row("connection rejected — check URL/token")));
             capabilities.set(None);
             pending_approval.set(None);
+            meter.set(None);
             conn.set(ConnState::Disconnected);
         };
 
@@ -121,6 +132,7 @@ pub fn App() -> impl IntoView {
         socket.set(None);
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
         conn.set(ConnState::Disconnected);
     };
 
@@ -133,6 +145,7 @@ pub fn App() -> impl IntoView {
         let Ok(uuid) = Uuid::parse_str(&sid) else {
             return;
         };
+        meter.set(None); // a new turn starts fresh
         let cmd = Command::SendPrompt {
             session: SessionId(uuid),
             text,
@@ -231,7 +244,7 @@ pub fn App() -> impl IntoView {
 
     view! {
         <div class="app">
-            <StatusLine conn=conn last_seq=last_seq capabilities=capabilities />
+            <StatusLine conn=conn last_seq=last_seq capabilities=capabilities meter=meter />
             <div class="workspace">
                 <div class="workspace-side">
                     <button
