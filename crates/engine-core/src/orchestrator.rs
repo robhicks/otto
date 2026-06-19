@@ -58,6 +58,20 @@ impl<'a> Orchestrator<'a> {
         }
     }
 
+    /// At a phase boundary: if a pause is requested, park the turn until resumed, bracketing
+    /// the park with `Log` lines so the pause is recorded in the event stream.
+    async fn checkpoint(&self, emit: &dyn Emitter) {
+        if self.pauser.should_pause() {
+            emit.emit(EventKind::Log {
+                message: "turn paused".to_string(),
+            });
+            self.pauser.wait_for_resume().await;
+            emit.emit(EventKind::Log {
+                message: "turn resumed".to_string(),
+            });
+        }
+    }
+
     /// Run a single orchestrator turn for `goal`: Plan -> Execute -> Verify -> Done.
     /// Events are emitted in deterministic order via `emit`. Session sequencing
     /// (monotonic `seq` on `Event`) is applied by the engine layer, not here.
@@ -70,6 +84,7 @@ impl<'a> Orchestrator<'a> {
         let ctx = AgentCtx::new(self.router, self.workspace, self.tools);
 
         // --- Plan ---
+        self.checkpoint(emit).await;
         emit.emit(EventKind::AgentStarted {
             role: Role::Planner,
         });
@@ -95,6 +110,7 @@ impl<'a> Orchestrator<'a> {
         self.emit_meter(emit);
 
         // --- Execute ---
+        self.checkpoint(emit).await;
         emit.emit(EventKind::AgentStarted {
             role: Role::ContextFinder,
         });
@@ -125,6 +141,7 @@ impl<'a> Orchestrator<'a> {
 
         let ok = loop {
             // Coder
+            self.checkpoint(emit).await;
             emit.emit(EventKind::AgentStarted { role: Role::Coder });
             let coded = self
                 .registry
@@ -250,7 +267,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
@@ -862,6 +879,58 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, EventKind::TokenCostMeter { .. })),
             "offline path (no usage) must emit no meter events"
+        );
+    }
+
+    struct PauseOnce {
+        fired: AtomicBool,
+    }
+    #[async_trait]
+    impl crate::tool::PauseController for PauseOnce {
+        fn should_pause(&self) -> bool {
+            // Pause on the first checkpoint only, then run freely.
+            !self.fired.swap(true, Ordering::SeqCst)
+        }
+        async fn wait_for_resume(&self) {}
+    }
+
+    #[tokio::test]
+    async fn pause_checkpoint_brackets_with_logs_and_completes() {
+        let reg = registry();
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
+        let meter = TokenMeter::default();
+        let pauser = PauseOnce {
+            fired: AtomicBool::new(false),
+        };
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            approver: &DenyApprover,
+            next_id: &test_id,
+            meter: &meter,
+            pauser: &pauser,
+        };
+        let events: Arc<Mutex<Vec<EventKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let events = Arc::clone(&events);
+            move |kind: EventKind| events.lock().unwrap().push(kind)
+        };
+        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        assert_eq!(outcome, TurnOutcome { ok: true });
+        let recorded = events.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|e| matches!(e, EventKind::Log { message } if message == "turn paused"))
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|e| matches!(e, EventKind::Log { message } if message == "turn resumed"))
         );
     }
 }
