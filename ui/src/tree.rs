@@ -68,6 +68,51 @@ fn sort_nodes(nodes: &mut [TreeNode]) {
     }
 }
 
+/// The largest file we mount in the editor; bigger files show a notice instead.
+pub const MAX_EDITABLE_BYTES: usize = 512 * 1024;
+
+/// A file's body as the UI treats it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FileBody {
+    /// Valid UTF-8 text, ready to edit.
+    Text(String),
+    /// Not valid UTF-8 — not editable here.
+    Binary,
+    /// Over `MAX_EDITABLE_BYTES` — not mounted.
+    TooLarge,
+}
+
+/// Editor language id for a path, by extension. Returns a stable lowercase id (mapped to a
+/// `kode_leptos::Language` in the editor component); unknown extensions get `"text"`.
+pub fn language_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("rs") => "rust",
+        Some("toml") => "toml",
+        Some("json") => "json",
+        Some("md") | Some("markdown") => "markdown",
+        Some("js") | Some("mjs") | Some("cjs") => "javascript",
+        Some("ts") => "typescript",
+        Some("py") => "python",
+        Some("html") | Some("htm") => "html",
+        Some("css") => "css",
+        Some("sh") | Some("bash") => "bash",
+        Some("sql") => "sql",
+        Some("yaml") | Some("yml") => "yaml",
+        _ => "text",
+    }
+}
+
+/// Classify raw file bytes for the editor: size cap first, then UTF-8 validity.
+pub fn decode_or_binary(bytes: &[u8]) -> FileBody {
+    if bytes.len() > MAX_EDITABLE_BYTES {
+        return FileBody::TooLarge;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => FileBody::Text(s.to_string()),
+        Err(_) => FileBody::Binary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +143,22 @@ mod tests {
         assert!(tree[0].children[0].is_dir);
         assert_eq!(tree[0].children[0].children.len(), 2);
         assert_eq!(tree[0].children[1].name, "c.rs");
+    }
+
+    #[test]
+    fn language_for_path_maps_known_extensions() {
+        assert_eq!(language_for_path(Path::new("src/main.rs")), "rust");
+        assert_eq!(language_for_path(Path::new("Cargo.toml")), "toml");
+        assert_eq!(language_for_path(Path::new("a/b.json")), "json");
+        assert_eq!(language_for_path(Path::new("notes.md")), "markdown");
+        assert_eq!(language_for_path(Path::new("LICENSE")), "text");
+    }
+
+    #[test]
+    fn decode_or_binary_classifies_bytes() {
+        assert_eq!(decode_or_binary(b"hello"), FileBody::Text("hello".into()));
+        assert_eq!(decode_or_binary(&[0xff, 0xfe, 0x00]), FileBody::Binary);
+        let big = vec![b'a'; MAX_EDITABLE_BYTES + 1];
+        assert_eq!(decode_or_binary(&big), FileBody::TooLarge);
     }
 }
