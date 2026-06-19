@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router as AxumRouter;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -19,15 +20,17 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
 use otto_engine_core::tool::Approver;
+use otto_engine_core::tool::PauseController;
 use otto_protocol::{
     CapabilitiesManifest, Command, Event, ServerMessage, SessionId, WorkspaceRequest,
 };
 use serde::Deserialize;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use crate::service::{EngineService, EventSink};
+use crate::service::{EngineService, EventSink, TurnControls};
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {
@@ -212,6 +215,46 @@ impl Approver for InteractiveApprover {
     }
 }
 
+/// Connection-scoped pause state: a flag plus a notify to wake parked turns. Shared between the
+/// running turn's `InteractivePauser` and the socket reader that routes `Pause`/`Resume`.
+#[derive(Default)]
+struct PauseState {
+    paused: AtomicBool,
+    resume: Notify,
+}
+
+impl PauseState {
+    fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+    /// Clear the flag and wake any parked turn (also the disconnect/abort release path).
+    fn resume_all(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.resume.notify_waiters();
+    }
+}
+
+/// Pause controller backed by a connection's `PauseState`.
+struct InteractivePauser(Arc<PauseState>);
+
+#[async_trait::async_trait]
+impl PauseController for InteractivePauser {
+    fn should_pause(&self) -> bool {
+        self.0.paused.load(Ordering::SeqCst)
+    }
+    async fn wait_for_resume(&self) {
+        loop {
+            // Arm the notified future BEFORE re-checking the flag, so a Resume that fires between
+            // the check and the await is not lost.
+            let notified = self.0.resume.notified();
+            if !self.0.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Send one `ServerMessage` as a JSON text frame through the writer half.
 async fn send_msg(writer: &mut WsWriter, msg: &ServerMessage) -> anyhow::Result<()> {
     let json = serde_json::to_string(msg)?;
@@ -300,6 +343,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
     }
 
     let approvals = ApprovalRegistry::new();
+    let pause_state = Arc::new(PauseState::default());
 
     'outer: while let Some(Ok(msg)) = reader.next().await {
         let text = match msg {
@@ -323,6 +367,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
         match command {
             Command::SendPrompt { text, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
+                let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
+                let controls = TurnControls { approver, pauser };
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
                 // `writer` (via the sink); the reader borrows `reader` — disjoint, so `select!`
                 // can poll both. `StreamExt::next` is cancel-safe, so the reader future being
@@ -333,7 +379,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     };
                     let turn = state
                         .service
-                        .run_prompt_with_approver(session, &text, &mut sink, approver);
+                        .run_prompt_with_controls(session, &text, &mut sink, controls);
                     tokio::pin!(turn);
                     let mut err: Option<anyhow::Error> = None;
                     loop {
@@ -351,9 +397,16 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                                         Ok(Command::ApproveDiff { id, approved, .. }) => {
                                             approvals.resolve(id, approved);
                                         }
+                                        Ok(Command::Pause { .. }) => {
+                                            pause_state.pause();
+                                        }
+                                        Ok(Command::Resume { .. }) => {
+                                            pause_state.resume_all();
+                                        }
                                         Ok(Command::Abort { .. }) => {
                                             let _ = state.service.abort(session).await;
                                             approvals.clear();
+                                            pause_state.resume_all();
                                             break 'outer;
                                         }
                                         // A second SendPrompt mid-turn is ignored (one turn at a
@@ -363,6 +416,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                                 }
                                 Some(Ok(Message::Close(_))) | None => {
                                     approvals.clear();
+                                    pause_state.resume_all();
                                     break 'outer;
                                 }
                                 _ => {}
@@ -392,9 +446,11 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::CreateSession => {
                 // The session is already established on connect; nothing to do.
             }
-            Command::Pause { .. } | Command::Resume { .. } => {
-                // No turn in flight: pause/resume have no effect here. Real connection-scoped
-                // handling is wired in the serve pause/resume task.
+            Command::Pause { .. } => {
+                pause_state.pause();
+            }
+            Command::Resume { .. } => {
+                pause_state.resume_all();
             }
         }
     }

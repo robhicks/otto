@@ -114,27 +114,6 @@ impl EngineService {
             .await
     }
 
-    /// Back-compat wrapper: run with `approver` and no pause. (Used by serve until it migrates
-    /// to `run_prompt_with_controls`.)
-    pub async fn run_prompt_with_approver(
-        &self,
-        session: SessionId,
-        goal: &str,
-        sink: &mut dyn EventSink,
-        approver: Arc<dyn Approver>,
-    ) -> anyhow::Result<TurnOutcome> {
-        self.run_prompt_with_controls(
-            session,
-            goal,
-            sink,
-            TurnControls {
-                approver,
-                pauser: Arc::new(NeverPause),
-            },
-        )
-        .await
-    }
-
     /// Run one orchestrator turn for `goal`, streaming each event to `sink` after persisting it
     /// (fail-closed), recording the turn, and updating status. `controls` supply the approver
     /// and pause controller. The seq sequence continues from the store. One turn at a time.

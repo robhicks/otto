@@ -108,6 +108,137 @@ async fn start_approval_server() -> (u16, tempfile::TempDir) {
     (port, dir)
 }
 
+/// Start a serve app whose router reports token usage (so meter events fire) with ordinary
+/// (auto-allowed) writes. Returns the bound port and the tempdir.
+async fn start_metering_server() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "hi add a greeting"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#)
+        .with_usage(10, 20);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
+#[tokio::test]
+async fn streams_token_cost_meter_events() {
+    let (port, _dir) = start_metering_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_meter = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(m) = kind.get("TokenCostMeter") {
+                assert!(m["input_tokens"].as_u64().unwrap() > 0);
+                saw_meter = true;
+            }
+            if kind.get("TurnComplete").is_some() {
+                break;
+            }
+        }
+    }
+    assert!(saw_meter, "expected at least one TokenCostMeter event");
+}
+
+#[tokio::test]
+async fn pause_before_prompt_parks_turn_until_resume() {
+    let (port, _dir) = start_metering_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    // Pause BEFORE prompting → the turn's first checkpoint parks deterministically.
+    let pause = serde_json::json!({ "Pause": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&pause).unwrap()))
+        .await
+        .unwrap();
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    // Read until "turn paused"; assert TurnComplete did NOT arrive first.
+    let mut paused = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(msg) = kind.get("Log").and_then(|l| l["message"].as_str()) {
+                if msg == "turn paused" {
+                    paused = true;
+                    break;
+                }
+            }
+            assert!(
+                kind.get("TurnComplete").is_none(),
+                "turn completed before pausing"
+            );
+        }
+    }
+    assert!(paused, "expected a 'turn paused' log");
+
+    // Resume → expect "turn resumed" then TurnComplete.
+    let resume = serde_json::json!({ "Resume": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&resume).unwrap()))
+        .await
+        .unwrap();
+    let mut resumed = false;
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(msg) = kind.get("Log").and_then(|l| l["message"].as_str()) {
+                if msg == "turn resumed" {
+                    resumed = true;
+                }
+            }
+            if kind.get("TurnComplete").is_some() {
+                completed = true;
+                break;
+            }
+        }
+    }
+    assert!(resumed, "expected a 'turn resumed' log");
+    assert!(completed, "expected the turn to complete after resume");
+}
+
 /// Read frames until an `ApprovalRequest` event arrives; return its `id`. Panics on TurnComplete
 /// or stream end first (means no approval was requested).
 async fn next_approval_id(
