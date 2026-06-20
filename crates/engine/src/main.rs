@@ -223,7 +223,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
     let capabilities = otto_engine::build_capabilities();
-    let app = serve_app(service, token, capabilities);
+    let app = serve_app(service, token, capabilities, None);
 
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
     let tls = match resolve_tls_paths(tls_cert, tls_key) {

@@ -17,6 +17,15 @@ use otto_workspace::LocalWorkspace;
 use crate::service::EngineService;
 use crate::{build_default_registry, build_router, build_tool_registry};
 
+/// Enables session handover on a served engine. `token` is the bearer the provisioned engine
+/// requires (reused from the source, by design); `base_dir` is where restored stores/workspaces
+/// are written. `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback`.
+#[derive(Clone)]
+pub struct PromoteConfig {
+    pub token: String,
+    pub base_dir: PathBuf,
+}
+
 /// A captured session ready to move to another engine: persisted session state + workspace files.
 pub struct PromoteBundle {
     pub session: SessionState,
@@ -131,7 +140,7 @@ impl RemoteTarget for LoopbackTarget {
             engine_remote: true,
             ..crate::build_capabilities()
         };
-        let app = crate::serve::app(service, self.token.clone(), capabilities);
+        let app = crate::serve::app(service, self.token.clone(), capabilities, None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();

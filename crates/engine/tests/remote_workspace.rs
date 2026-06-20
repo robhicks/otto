@@ -45,6 +45,7 @@ async fn start_server(dir: &Path) -> u16 {
             remote_llm: false,
             sandbox: false,
         },
+        None,
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();

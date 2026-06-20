@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::remote::{PromoteConfig, RemoteHandle};
 use crate::service::{EngineService, EventSink, TurnControls};
 
 #[derive(Deserialize, Default)]
@@ -50,6 +51,11 @@ struct ServeState {
     service: EngineService,
     token: String,
     capabilities: CapabilitiesManifest,
+    /// `Some` when `--promote-loopback` is set; enables the handover commands.
+    promote: Option<PromoteConfig>,
+    /// Provisioned engines, retained so they outlive the local connection that created them
+    /// (a dropped `RemoteHandle` aborts its engine task).
+    remotes: Mutex<HashMap<SessionId, RemoteHandle>>,
 }
 
 /// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
@@ -85,12 +91,15 @@ pub fn app(
     service: EngineService,
     token: String,
     capabilities: CapabilitiesManifest,
+    promote: Option<PromoteConfig>,
 ) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
         service,
         token,
         capabilities,
+        promote,
+        remotes: Mutex::new(HashMap::new()),
     });
     // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
     // POST /workspace carries an `Authorization` header, so the browser sends a preflight.
