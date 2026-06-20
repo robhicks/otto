@@ -213,6 +213,7 @@ impl<'a> Orchestrator<'a> {
             self.emit_meter(emit);
 
             // Verify
+            self.checkpoint(emit).await;
             emit.emit(EventKind::AgentStarted {
                 role: Role::Verifier,
             });

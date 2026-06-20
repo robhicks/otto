@@ -245,8 +245,12 @@ impl PauseController for InteractivePauser {
     async fn wait_for_resume(&self) {
         loop {
             // Arm the notified future BEFORE re-checking the flag, so a Resume that fires between
-            // the check and the await is not lost.
+            // the check and the await is not lost. `notified()` alone does not enqueue the waiter
+            // until first polled, so `enable()` registers it now — otherwise a `notify_waiters()`
+            // landing in this window would wake nothing and the turn would park forever.
             let notified = self.0.resume.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if !self.0.paused.load(Ordering::SeqCst) {
                 return;
             }
@@ -389,6 +393,9 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                                     err = Some(e);
                                 }
                                 approvals.clear();
+                                // Drop any leftover pause flag so a Pause that arrived but was
+                                // never resumed before the turn ended cannot pre-pause the next one.
+                                pause_state.resume_all();
                                 break;
                             }
                             inbound = reader.next() => match inbound {

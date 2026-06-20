@@ -93,6 +93,7 @@ pub fn App() -> impl IntoView {
                     // turn already finished fail-closed.
                     if let EventKind::TurnComplete { .. } = &event.kind {
                         pending_approval.set(None);
+                        paused.set(false);
                     }
                     rows.update(|v| v.push(describe_event(&event.kind)));
                 }
@@ -172,6 +173,7 @@ pub fn App() -> impl IntoView {
                     session: SessionId(uuid),
                 },
             );
+            paused.set(false); // the aborted turn is gone; don't leave the button on "Resume"
         }
     };
 
