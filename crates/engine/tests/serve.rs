@@ -777,6 +777,7 @@ async fn promote_then_demote_round_trip_preserves_session() {
             break;
         }
     }
+    assert!(last_seq > 0, "expected at least one event in the local turn before promoting");
 
     // Promote.
     let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
