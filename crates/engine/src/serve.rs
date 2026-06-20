@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
+use crate::remote::{LoopbackTarget, PromoteConfig, RemoteHandle, promote};
 use crate::service::{EngineService, EventSink, TurnControls};
 
 #[derive(Deserialize, Default)]
@@ -50,6 +51,13 @@ struct ServeState {
     service: EngineService,
     token: String,
     capabilities: CapabilitiesManifest,
+    /// `Some` when `--promote-loopback` is set; enables the handover commands.
+    promote: Option<PromoteConfig>,
+    /// Provisioned engines, retained so they outlive the local connection that created them
+    /// (a dropped `RemoteHandle` aborts its engine task). Keyed by `(session, to_remote)` so a
+    /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
+    /// by a malformed client sequence that flips the direction on a repeat call.
+    remotes: Mutex<HashMap<(SessionId, bool), RemoteHandle>>,
 }
 
 /// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
@@ -85,12 +93,15 @@ pub fn app(
     service: EngineService,
     token: String,
     capabilities: CapabilitiesManifest,
+    promote: Option<PromoteConfig>,
 ) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
         service,
         token,
         capabilities,
+        promote,
+        remotes: Mutex::new(HashMap::new()),
     });
     // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
     // POST /workspace carries an `Authorization` header, so the browser sends a preflight.
@@ -459,8 +470,86 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::Resume { .. } => {
                 pause_state.resume_all();
             }
+            Command::PromoteToRemote { .. } => {
+                handle_handover(&state, &mut writer, session, true).await;
+            }
+            Command::DemoteToLocal { .. } => {
+                handle_handover(&state, &mut writer, session, false).await;
+            }
         }
     }
+}
+
+/// Provision the session onto a fresh engine (remote for promote, local for demote), retain the
+/// handle so it outlives this connection, and tell the client where to reconnect. A no-op error
+/// reply when promotion is not enabled (the `UnsupportedTarget` posture). Handled between turns.
+async fn handle_handover(
+    state: &ServeState,
+    writer: &mut WsWriter,
+    session: SessionId,
+    to_remote: bool,
+) {
+    let Some(cfg) = state.promote.as_ref() else {
+        let _ = send_msg(
+            writer,
+            &ServerMessage::Error {
+                message:
+                    "remote provisioning unavailable (start otto serve with --promote-loopback)"
+                        .to_string(),
+            },
+        )
+        .await;
+        return;
+    };
+    // Reuse an existing handover for this session (idempotent): provisioning again would drop the
+    // prior RemoteHandle and abort an engine a client may still be connected to. Bind the lookup
+    // to a local so the Mutex guard is released at the `;` — never held across the await below.
+    let existing = state
+        .remotes
+        .lock()
+        .unwrap()
+        .get(&(session, to_remote))
+        .map(|h| h.endpoint.clone());
+    let endpoint = match existing {
+        Some(endpoint) => endpoint,
+        None => {
+            let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
+            let handle = match promote(
+                state.service.store(),
+                state.service.workspace(),
+                session,
+                &target,
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let endpoint = handle.endpoint.clone();
+            // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
+            state
+                .remotes
+                .lock()
+                .unwrap()
+                .insert((session, to_remote), handle);
+            endpoint
+        }
+    };
+    let msg = if to_remote {
+        ServerMessage::Promoted { session, endpoint }
+    } else {
+        ServerMessage::Demoted { session, endpoint }
+    };
+    let _ = send_msg(writer, &msg).await;
 }
 
 async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::Result<SessionId> {

@@ -54,6 +54,17 @@ pub enum Command {
     Resume {
         session: SessionId,
     },
+    /// Hand this session off to a freshly-provisioned remote engine. The engine replies with
+    /// `ServerMessage::Promoted { endpoint }`; the client reconnects there (same token + session
+    /// + last_seq). Handled only between turns.
+    PromoteToRemote {
+        session: SessionId,
+    },
+    /// Hand this session back to a freshly-provisioned local engine (the reverse of
+    /// `PromoteToRemote`). The engine replies with `ServerMessage::Demoted { endpoint }`.
+    DemoteToLocal {
+        session: SessionId,
+    },
 }
 
 /// The body of an event emitted by the engine.
@@ -121,6 +132,18 @@ pub enum ServerMessage {
     },
     Error {
         message: String,
+    },
+    /// Handover framing: the session has been provisioned onto a remote engine reachable at
+    /// `endpoint` (a `ws://host:port` base). The client reconnects there reusing its token,
+    /// session, and last_seq. Not a sequenced `Event` — never persisted/replayed from the store.
+    Promoted {
+        session: SessionId,
+        endpoint: String,
+    },
+    /// Handover framing for the reverse trip: the session is now on a local engine at `endpoint`.
+    Demoted {
+        session: SessionId,
+        endpoint: String,
     },
 }
 
@@ -319,6 +342,46 @@ mod tests {
         let back: EventKind =
             serde_json::from_str(&serde_json::to_string(&new_file).unwrap()).unwrap();
         assert_eq!(new_file, back);
+    }
+
+    #[test]
+    fn promote_commands_round_trip() {
+        let s = SessionId::new();
+        for cmd in [
+            Command::PromoteToRemote { session: s },
+            Command::DemoteToLocal { session: s },
+        ] {
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        }
+        // External tagging matches the rest of Command (e.g. {"PromoteToRemote":{...}}).
+        let json = serde_json::to_string(&Command::PromoteToRemote { session: s }).unwrap();
+        assert!(json.contains("PromoteToRemote"));
+    }
+
+    #[test]
+    fn handover_server_messages_round_trip() {
+        let s = SessionId::new();
+        for msg in [
+            ServerMessage::Promoted {
+                session: s,
+                endpoint: "ws://127.0.0.1:9000".into(),
+            },
+            ServerMessage::Demoted {
+                session: s,
+                endpoint: "ws://127.0.0.1:9001".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
+        }
+        // ServerMessage is `#[serde(tag="type", rename_all="snake_case")]`.
+        let json = serde_json::to_string(&ServerMessage::Promoted {
+            session: s,
+            endpoint: "x".into(),
+        })
+        .unwrap();
+        assert!(json.contains("\"type\":\"promoted\""));
     }
 
     #[test]

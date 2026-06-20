@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
-//! `otto serve [--root <path>] [--port <p>] [--approve-edits]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback]` — serve over WebSocket (needs OTTO_TOKEN).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => cmd_serve(rest).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits]"
+                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback]"
             );
             std::process::exit(2);
         }
@@ -173,6 +173,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut approve_edits = false;
+    let mut promote_loopback = false;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -198,6 +199,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                 }
             },
             "--approve-edits" => approve_edits = true,
+            "--promote-loopback" => promote_loopback = true,
             _ => {}
         }
     }
@@ -223,7 +225,18 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
     let capabilities = otto_engine::build_capabilities();
-    let app = serve_app(service, token, capabilities);
+    let promote = if promote_loopback {
+        Some(otto_engine::PromoteConfig {
+            // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
+            // provisioned engine's restored store/workspace under here is never recursively
+            // captured by a later `workspace.snapshot()`. Do not rename without that guarantee.
+            token: token.clone(),
+            base_dir: root.join(".otto-remotes"),
+        })
+    } else {
+        None
+    };
+    let app = serve_app(service, token, capabilities, promote);
 
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
     let tls = match resolve_tls_paths(tls_cert, tls_key) {

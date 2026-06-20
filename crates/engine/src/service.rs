@@ -89,6 +89,12 @@ impl EngineService {
         &*self.store
     }
 
+    /// The workspace this service edits, for operations that need it directly (e.g. `promote`,
+    /// which snapshots the workspace). Agents never get this — they see only the read-only view.
+    pub fn workspace(&self) -> &dyn Workspace {
+        &*self.workspace
+    }
+
     /// Create and persist a new session. (≙ `Command::CreateSession`.)
     pub async fn create_session(
         &self,
@@ -627,6 +633,29 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_accessor_reads_written_file() {
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        // Write through the RPC, then read back through the accessor.
+        assert!(matches!(
+            service
+                .workspace_rpc(WorkspaceRequest::ApplyEdit {
+                    path: std::path::PathBuf::from("a.txt"),
+                    contents: "hi".to_string(),
+                })
+                .await,
+            WorkspaceResponse::ApplyEdit { .. }
+        ));
+        let bytes = service
+            .workspace()
+            .read(std::path::Path::new("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hi".to_vec());
     }
 
     #[tokio::test]
