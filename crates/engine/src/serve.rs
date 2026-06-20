@@ -498,24 +498,39 @@ async fn handle_handover(
         .await;
         return;
     };
-    let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
-    let handle = match promote(
-        state.service.store(),
-        state.service.workspace(),
-        session,
-        &target,
-    )
-    .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = send_msg(writer, &ServerMessage::Error { message: e.to_string() }).await;
-            return;
+    // Reuse an existing handover for this session (idempotent): provisioning again would drop the
+    // prior RemoteHandle and abort an engine a client may still be connected to. Bind the lookup
+    // to a local so the Mutex guard is released at the `;` — never held across the await below.
+    let existing = state
+        .remotes
+        .lock()
+        .unwrap()
+        .get(&session)
+        .map(|h| h.endpoint.clone());
+    let endpoint = match existing {
+        Some(endpoint) => endpoint,
+        None => {
+            let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
+            let handle = match promote(
+                state.service.store(),
+                state.service.workspace(),
+                session,
+                &target,
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = send_msg(writer, &ServerMessage::Error { message: e.to_string() }).await;
+                    return;
+                }
+            };
+            let endpoint = handle.endpoint.clone();
+            // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
+            state.remotes.lock().unwrap().insert(session, handle);
+            endpoint
         }
     };
-    let endpoint = handle.endpoint.clone();
-    // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
-    state.remotes.lock().unwrap().insert(session, handle);
     let msg = if to_remote {
         ServerMessage::Promoted { session, endpoint }
     } else {
