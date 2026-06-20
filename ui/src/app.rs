@@ -76,6 +76,13 @@ pub fn App() -> impl IntoView {
                     if let EventKind::ApprovalRequest { id, path, old, new } = &event.kind {
                         pending_approval.set(Some((*id, path.clone(), old.clone(), new.clone())));
                     }
+                    // The turn ending resolves any outstanding approval (the orchestrator parks on
+                    // the approval *before* emitting TurnComplete, so this never clears a genuinely
+                    // pending one). On reconnect this also clears a replayed-but-stale request whose
+                    // turn already finished fail-closed.
+                    if let EventKind::TurnComplete { .. } = &event.kind {
+                        pending_approval.set(None);
+                    }
                     rows.update(|v| v.push(describe_event(&event.kind)));
                 }
             }
@@ -161,10 +168,13 @@ pub fn App() -> impl IntoView {
             id,
             approved,
         };
-        if let Err(e) = send_command(&ws, &cmd) {
-            rows.update(|v| v.push(client_error_row(&e)));
+        // Only dismiss the panel once the verdict is actually on the wire. If the send fails the
+        // orchestrator is still blocked on this approval, so keep the panel up for a retry rather
+        // than silently dropping the diff.
+        match send_command(&ws, &cmd) {
+            Ok(()) => pending_approval.set(None),
+            Err(e) => rows.update(|v| v.push(client_error_row(&e))),
         }
-        pending_approval.set(None);
     };
 
     // Fetch the file list over the /workspace RPC and rebuild the tree. No-op without

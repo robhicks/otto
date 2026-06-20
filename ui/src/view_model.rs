@@ -83,6 +83,24 @@ pub fn diff_lines(old: Option<&str>, new: &str) -> Vec<DiffLine> {
             text: (*line).to_string(),
         });
     }
+
+    // `.lines()` discards a trailing newline (and `\r`), so a change confined to the final newline
+    // would otherwise render as an all-context, visually-identical diff — and the user could
+    // approve a file that differs from what's shown. If the rendered diff is pure context but the
+    // raw contents differ, surface the change so it is never invisible.
+    if let Some(old) = old {
+        if old != new && out.iter().all(|l| l.kind == DiffKind::Context) {
+            let (kind, text) = if new.ends_with('\n') {
+                (DiffKind::Add, "(trailing newline added)")
+            } else {
+                (DiffKind::Del, "(trailing newline removed)")
+            };
+            out.push(DiffLine {
+                kind,
+                text: text.to_string(),
+            });
+        }
+    }
     out
 }
 
@@ -347,6 +365,19 @@ mod tests {
         assert_eq!(d[0].kind, DiffKind::Context);
         assert_eq!(d[1].kind, DiffKind::Add);
         assert_eq!(d[1].text, "b");
+    }
+
+    #[test]
+    fn diff_trailing_newline_removed_is_visible() {
+        // Same line content, only the final newline differs — must not render as an empty diff.
+        let d = diff_lines(Some("a\nb\n"), "a\nb");
+        assert!(d.iter().any(|l| l.kind == DiffKind::Del));
+    }
+
+    #[test]
+    fn diff_trailing_newline_added_is_visible() {
+        let d = diff_lines(Some("a\nb"), "a\nb\n");
+        assert!(d.iter().any(|l| l.kind == DiffKind::Add));
     }
 
     #[test]
