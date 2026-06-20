@@ -101,6 +101,9 @@ pub fn App() -> impl IntoView {
             Ok(ServerMessage::Error { message }) => {
                 rows.update(|v| v.push(error_row(&message)));
             }
+            Ok(ServerMessage::Promoted { .. }) | Ok(ServerMessage::Demoted { .. }) => {
+                // Handover reconnect — wired in Task 8.
+            }
             Err(detail) => {
                 rows.update(|v| v.push(client_error_row(&detail)));
             }

@@ -140,6 +140,29 @@ pub fn capability_segments(m: &CapabilitiesManifest) -> Vec<CapSegment> {
     vec![engine, llm, sandbox]
 }
 
+/// True when the Promote button should be enabled: connected, the engine is local, and no turn
+/// is running (promoting mid-turn would snapshot partial state, so it is disabled).
+pub fn can_promote(
+    conn: &ConnState,
+    caps: &Option<CapabilitiesManifest>,
+    turn_running: bool,
+) -> bool {
+    matches!(conn, ConnState::Connected { .. })
+        && !turn_running
+        && matches!(caps, Some(c) if !c.engine_remote)
+}
+
+/// True when the Demote button should be enabled: connected, the engine is remote, no turn running.
+pub fn can_demote(
+    conn: &ConnState,
+    caps: &Option<CapabilitiesManifest>,
+    turn_running: bool,
+) -> bool {
+    matches!(conn, ConnState::Connected { .. })
+        && !turn_running
+        && matches!(caps, Some(c) if c.engine_remote)
+}
+
 /// Approximate per-million-token display rates for the default remote model (claude-haiku-4-5).
 /// These drive only the UI cost estimate; update freely — they are not load-bearing.
 const COST_PER_MTOK_IN: f64 = 0.80;
@@ -446,5 +469,37 @@ mod tests {
         });
         assert_eq!(r.class, "row-meter");
         assert!(r.text.contains("↑7"));
+    }
+
+    fn caps(engine_remote: bool) -> CapabilitiesManifest {
+        CapabilitiesManifest {
+            engine_remote,
+            local_llm: true,
+            remote_llm: false,
+            sandbox: true,
+        }
+    }
+
+    #[test]
+    fn can_promote_only_when_connected_local_and_idle() {
+        let connected = ConnState::Connected { session: "s".into() };
+        assert!(can_promote(&connected, &Some(caps(false)), false));
+        // not while a turn runs
+        assert!(!can_promote(&connected, &Some(caps(false)), true));
+        // not when already remote
+        assert!(!can_promote(&connected, &Some(caps(true)), false));
+        // not when disconnected / caps unknown
+        assert!(!can_promote(&ConnState::Disconnected, &Some(caps(false)), false));
+        assert!(!can_promote(&connected, &None, false));
+    }
+
+    #[test]
+    fn can_demote_only_when_connected_remote_and_idle() {
+        let connected = ConnState::Connected { session: "s".into() };
+        assert!(can_demote(&connected, &Some(caps(true)), false));
+        assert!(!can_demote(&connected, &Some(caps(true)), true));
+        assert!(!can_demote(&connected, &Some(caps(false)), false));
+        assert!(!can_demote(&ConnState::Disconnected, &Some(caps(true)), false));
+        assert!(!can_demote(&connected, &None, false));
     }
 }
