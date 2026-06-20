@@ -10,7 +10,9 @@ use crate::components::{
 };
 use crate::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
-use crate::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
+use crate::view_model::{
+    can_demote, can_promote, client_error_row, describe_event, error_row, ConnState, LogRow,
+};
 use crate::workspace::{list_files, read_file};
 use crate::ws::{open_ws, send_command};
 
@@ -39,6 +41,10 @@ pub fn App() -> impl IntoView {
     let pending_approval = RwSignal::new(None::<crate::components::PendingApproval>);
     let meter = RwSignal::new(None::<(u64, u64)>); // (input, output) tokens for the current turn
     let paused = RwSignal::new(false);
+    let turn_running = RwSignal::new(false);
+    // Set by a Promoted/Demoted frame; an Effect below performs the actual reconnect to the
+    // handed-back endpoint (on_msg can't call `connect` directly — it's defined inside it).
+    let reconnect_to = RwSignal::new(None::<String>);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -63,6 +69,7 @@ pub fn App() -> impl IntoView {
         pending_approval.set(None);
         meter.set(None);
         paused.set(false);
+        turn_running.set(false);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
             Ok(ServerMessage::Ready {
@@ -91,9 +98,13 @@ pub fn App() -> impl IntoView {
                     // the approval *before* emitting TurnComplete, so this never clears a genuinely
                     // pending one). On reconnect this also clears a replayed-but-stale request whose
                     // turn already finished fail-closed.
+                    if let EventKind::AgentStarted { .. } = &event.kind {
+                        turn_running.set(true);
+                    }
                     if let EventKind::TurnComplete { .. } = &event.kind {
                         pending_approval.set(None);
                         paused.set(false);
+                        turn_running.set(false);
                     }
                     rows.update(|v| v.push(describe_event(&event.kind)));
                 }
@@ -101,8 +112,11 @@ pub fn App() -> impl IntoView {
             Ok(ServerMessage::Error { message }) => {
                 rows.update(|v| v.push(error_row(&message)));
             }
-            Ok(ServerMessage::Promoted { .. }) | Ok(ServerMessage::Demoted { .. }) => {
-                // Handover reconnect — wired in Task 8.
+            Ok(ServerMessage::Promoted { endpoint, .. })
+            | Ok(ServerMessage::Demoted { endpoint, .. }) => {
+                // Reconnect to the handed-back engine, reusing token + session + last_seq. The new
+                // engine's manifest flips the status strip local↔remote. Deferred to an Effect.
+                reconnect_to.set(Some(endpoint));
             }
             Err(detail) => {
                 rows.update(|v| v.push(client_error_row(&detail)));
@@ -113,6 +127,7 @@ pub fn App() -> impl IntoView {
             pending_approval.set(None);
             meter.set(None);
             paused.set(false);
+            turn_running.set(false);
             conn.set(ConnState::Disconnected);
         };
         let on_error = move || {
@@ -121,6 +136,7 @@ pub fn App() -> impl IntoView {
             pending_approval.set(None);
             meter.set(None);
             paused.set(false);
+            turn_running.set(false);
             conn.set(ConnState::Disconnected);
         };
 
@@ -142,6 +158,7 @@ pub fn App() -> impl IntoView {
         pending_approval.set(None);
         meter.set(None);
         paused.set(false);
+        turn_running.set(false);
         conn.set(ConnState::Disconnected);
     };
 
@@ -156,6 +173,7 @@ pub fn App() -> impl IntoView {
         };
         meter.set(None); // a new turn starts fresh
         paused.set(false);
+        turn_running.set(true);
         let cmd = Command::SendPrompt {
             session: SessionId(uuid),
             text,
@@ -206,6 +224,23 @@ pub fn App() -> impl IntoView {
                 },
             );
             paused.set(false);
+        }
+    };
+
+    let promote_remote = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(&ws, &Command::PromoteToRemote { session: SessionId(uuid) });
+        }
+    };
+    let demote_local = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(&ws, &Command::DemoteToLocal { session: SessionId(uuid) });
         }
     };
 
@@ -282,6 +317,16 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Perform a handover reconnect: point the URL at the new endpoint and reconnect. `connect`
+    // closes the old socket first and reuses session + last_seq for replay.
+    Effect::new(move |_| {
+        if let Some(endpoint) = reconnect_to.get() {
+            reconnect_to.set(None);
+            url.set(endpoint);
+            connect();
+        }
+    });
+
     view! {
         <div class="app">
             <StatusLine conn=conn last_seq=last_seq capabilities=capabilities meter=meter />
@@ -310,6 +355,16 @@ pub fn App() -> impl IntoView {
                 on_decide=Callback::new(decide)
             />
             <EventLog rows=rows />
+            <div class="handover">
+                <button
+                    on:click=move |_| promote_remote()
+                    disabled=move || !can_promote(&conn.get(), &capabilities.get(), turn_running.get())
+                >"Promote to remote"</button>
+                <button
+                    on:click=move |_| demote_local()
+                    disabled=move || !can_demote(&conn.get(), &capabilities.get(), turn_running.get())
+                >"Demote to local"</button>
+            </div>
             <PromptBar
                 conn=conn
                 paused=paused
