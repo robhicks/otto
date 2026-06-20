@@ -232,7 +232,12 @@ pub fn App() -> impl IntoView {
             return;
         };
         if let Ok(uuid) = Uuid::parse_str(&sid) {
-            let _ = send_command(&ws, &Command::PromoteToRemote { session: SessionId(uuid) });
+            let _ = send_command(
+                &ws,
+                &Command::PromoteToRemote {
+                    session: SessionId(uuid),
+                },
+            );
         }
     };
     let demote_local = move || {
@@ -240,7 +245,12 @@ pub fn App() -> impl IntoView {
             return;
         };
         if let Ok(uuid) = Uuid::parse_str(&sid) {
-            let _ = send_command(&ws, &Command::DemoteToLocal { session: SessionId(uuid) });
+            let _ = send_command(
+                &ws,
+                &Command::DemoteToLocal {
+                    session: SessionId(uuid),
+                },
+            );
         }
     };
 

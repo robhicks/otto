@@ -491,8 +491,9 @@ async fn handle_handover(
         let _ = send_msg(
             writer,
             &ServerMessage::Error {
-                message: "remote provisioning unavailable (start otto serve with --promote-loopback)"
-                    .to_string(),
+                message:
+                    "remote provisioning unavailable (start otto serve with --promote-loopback)"
+                        .to_string(),
             },
         )
         .await;
@@ -521,7 +522,13 @@ async fn handle_handover(
             {
                 Ok(h) => h,
                 Err(e) => {
-                    let _ = send_msg(writer, &ServerMessage::Error { message: e.to_string() }).await;
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                     return;
                 }
             };

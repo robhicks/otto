@@ -482,24 +482,36 @@ mod tests {
 
     #[test]
     fn can_promote_only_when_connected_local_and_idle() {
-        let connected = ConnState::Connected { session: "s".into() };
+        let connected = ConnState::Connected {
+            session: "s".into(),
+        };
         assert!(can_promote(&connected, &Some(caps(false)), false));
         // not while a turn runs
         assert!(!can_promote(&connected, &Some(caps(false)), true));
         // not when already remote
         assert!(!can_promote(&connected, &Some(caps(true)), false));
         // not when disconnected / caps unknown
-        assert!(!can_promote(&ConnState::Disconnected, &Some(caps(false)), false));
+        assert!(!can_promote(
+            &ConnState::Disconnected,
+            &Some(caps(false)),
+            false
+        ));
         assert!(!can_promote(&connected, &None, false));
     }
 
     #[test]
     fn can_demote_only_when_connected_remote_and_idle() {
-        let connected = ConnState::Connected { session: "s".into() };
+        let connected = ConnState::Connected {
+            session: "s".into(),
+        };
         assert!(can_demote(&connected, &Some(caps(true)), false));
         assert!(!can_demote(&connected, &Some(caps(true)), true));
         assert!(!can_demote(&connected, &Some(caps(false)), false));
-        assert!(!can_demote(&ConnState::Disconnected, &Some(caps(true)), false));
+        assert!(!can_demote(
+            &ConnState::Disconnected,
+            &Some(caps(true)),
+            false
+        ));
         assert!(!can_demote(&connected, &None, false));
     }
 }

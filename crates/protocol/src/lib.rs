@@ -363,16 +363,24 @@ mod tests {
     fn handover_server_messages_round_trip() {
         let s = SessionId::new();
         for msg in [
-            ServerMessage::Promoted { session: s, endpoint: "ws://127.0.0.1:9000".into() },
-            ServerMessage::Demoted { session: s, endpoint: "ws://127.0.0.1:9001".into() },
+            ServerMessage::Promoted {
+                session: s,
+                endpoint: "ws://127.0.0.1:9000".into(),
+            },
+            ServerMessage::Demoted {
+                session: s,
+                endpoint: "ws://127.0.0.1:9001".into(),
+            },
         ] {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), msg);
         }
         // ServerMessage is `#[serde(tag="type", rename_all="snake_case")]`.
-        let json = serde_json::to_string(
-            &ServerMessage::Promoted { session: s, endpoint: "x".into() }
-        ).unwrap();
+        let json = serde_json::to_string(&ServerMessage::Promoted {
+            session: s,
+            endpoint: "x".into(),
+        })
+        .unwrap();
         assert!(json.contains("\"type\":\"promoted\""));
     }
 

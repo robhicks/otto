@@ -750,7 +750,10 @@ async fn promote_without_flag_replies_error() {
             break;
         }
     }
-    assert!(saw_error, "promote without --promote-loopback must reply error");
+    assert!(
+        saw_error,
+        "promote without --promote-loopback must reply error"
+    );
 }
 
 #[tokio::test]
@@ -777,7 +780,10 @@ async fn promote_then_demote_round_trip_preserves_session() {
             break;
         }
     }
-    assert!(last_seq > 0, "expected at least one event in the local turn before promoting");
+    assert!(
+        last_seq > 0,
+        "expected at least one event in the local turn before promoting"
+    );
 
     // Promote.
     let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
@@ -791,7 +797,10 @@ async fn promote_then_demote_round_trip_preserves_session() {
             break;
         }
     }
-    assert!(remote_endpoint.starts_with("ws://"), "got endpoint {remote_endpoint}");
+    assert!(
+        remote_endpoint.starts_with("ws://"),
+        "got endpoint {remote_endpoint}"
+    );
 
     // Reconnect to the remote; it must report engine_remote = true and replay the session.
     let (mut ws_r, _) = tokio_tungstenite::connect_async(authed_endpoint_request(
@@ -817,16 +826,16 @@ async fn promote_then_demote_round_trip_preserves_session() {
             break;
         }
     }
-    assert!(local_endpoint.starts_with("ws://"), "got endpoint {local_endpoint}");
+    assert!(
+        local_endpoint.starts_with("ws://"),
+        "got endpoint {local_endpoint}"
+    );
 
     // Reconnect to the demoted-local engine; it must report engine_remote = false.
-    let (mut ws_l, _) = tokio_tungstenite::connect_async(authed_endpoint_request(
-        &local_endpoint,
-        &session,
-        0,
-    ))
-    .await
-    .expect("connect demoted-local");
+    let (mut ws_l, _) =
+        tokio_tungstenite::connect_async(authed_endpoint_request(&local_endpoint, &session, 0))
+            .await
+            .expect("connect demoted-local");
     let ready_l: Value = next_json(&mut ws_l).await;
     assert_eq!(ready_l["capabilities"]["engine_remote"], false);
     // Continuity: replaying from seq 0 yields the original session's events.
@@ -837,7 +846,10 @@ async fn promote_then_demote_round_trip_preserves_session() {
             break;
         }
     }
-    assert!(saw_event, "demoted-local engine should replay the session history");
+    assert!(
+        saw_event,
+        "demoted-local engine should replay the session history"
+    );
 }
 
 /// Receive the next text frame as JSON (panics on close/non-text or stream end).
