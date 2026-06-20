@@ -85,7 +85,7 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     let last_seq = src_events.last().unwrap().seq;
 
     // --- Promote to a loopback remote. ---
-    let target = LoopbackTarget::new(TOKEN, promote_base.path().to_path_buf());
+    let target = LoopbackTarget::new(TOKEN, promote_base.path().to_path_buf(), true);
     let handle = promote(&*store, &*workspace, session, &target)
         .await
         .unwrap();
