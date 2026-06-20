@@ -37,6 +37,8 @@ pub fn App() -> impl IntoView {
     let editor_seed = RwSignal::new(String::new()); // file text set once at open time
     let editor_dirty = RwSignal::new(false);
     let pending_approval = RwSignal::new(None::<crate::components::PendingApproval>);
+    let meter = RwSignal::new(None::<(u64, u64)>); // (input, output) tokens for the current turn
+    let paused = RwSignal::new(false);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -59,6 +61,8 @@ pub fn App() -> impl IntoView {
         conn.set(ConnState::Connecting);
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
+        paused.set(false);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
             Ok(ServerMessage::Ready {
@@ -76,12 +80,20 @@ pub fn App() -> impl IntoView {
                     if let EventKind::ApprovalRequest { id, path, old, new } = &event.kind {
                         pending_approval.set(Some((*id, path.clone(), old.clone(), new.clone())));
                     }
+                    if let EventKind::TokenCostMeter {
+                        input_tokens,
+                        output_tokens,
+                    } = &event.kind
+                    {
+                        meter.set(Some((*input_tokens, *output_tokens)));
+                    }
                     // The turn ending resolves any outstanding approval (the orchestrator parks on
                     // the approval *before* emitting TurnComplete, so this never clears a genuinely
                     // pending one). On reconnect this also clears a replayed-but-stale request whose
                     // turn already finished fail-closed.
                     if let EventKind::TurnComplete { .. } = &event.kind {
                         pending_approval.set(None);
+                        paused.set(false);
                     }
                     rows.update(|v| v.push(describe_event(&event.kind)));
                 }
@@ -96,12 +108,16 @@ pub fn App() -> impl IntoView {
         let on_close = move || {
             capabilities.set(None);
             pending_approval.set(None);
+            meter.set(None);
+            paused.set(false);
             conn.set(ConnState::Disconnected);
         };
         let on_error = move || {
             rows.update(|v| v.push(client_error_row("connection rejected — check URL/token")));
             capabilities.set(None);
             pending_approval.set(None);
+            meter.set(None);
+            paused.set(false);
             conn.set(ConnState::Disconnected);
         };
 
@@ -121,6 +137,8 @@ pub fn App() -> impl IntoView {
         socket.set(None);
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
+        paused.set(false);
         conn.set(ConnState::Disconnected);
     };
 
@@ -133,6 +151,8 @@ pub fn App() -> impl IntoView {
         let Ok(uuid) = Uuid::parse_str(&sid) else {
             return;
         };
+        meter.set(None); // a new turn starts fresh
+        paused.set(false);
         let cmd = Command::SendPrompt {
             session: SessionId(uuid),
             text,
@@ -153,6 +173,36 @@ pub fn App() -> impl IntoView {
                     session: SessionId(uuid),
                 },
             );
+            paused.set(false); // the aborted turn is gone; don't leave the button on "Resume"
+        }
+    };
+
+    let pause = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(
+                &ws,
+                &Command::Pause {
+                    session: SessionId(uuid),
+                },
+            );
+            paused.set(true);
+        }
+    };
+    let resume = move || {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        if let Ok(uuid) = Uuid::parse_str(&sid) {
+            let _ = send_command(
+                &ws,
+                &Command::Resume {
+                    session: SessionId(uuid),
+                },
+            );
+            paused.set(false);
         }
     };
 
@@ -231,7 +281,7 @@ pub fn App() -> impl IntoView {
 
     view! {
         <div class="app">
-            <StatusLine conn=conn last_seq=last_seq capabilities=capabilities />
+            <StatusLine conn=conn last_seq=last_seq capabilities=capabilities meter=meter />
             <div class="workspace">
                 <div class="workspace-side">
                     <button
@@ -259,8 +309,11 @@ pub fn App() -> impl IntoView {
             <EventLog rows=rows />
             <PromptBar
                 conn=conn
+                paused=paused
                 on_send=Callback::new(send_prompt)
                 on_abort=Callback::new(move |_| abort())
+                on_pause=Callback::new(move |_| pause())
+                on_resume=Callback::new(move |_| resume())
             />
             <ConnectionForm
                 url=url

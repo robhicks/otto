@@ -57,8 +57,18 @@ struct ContentBlock {
 }
 
 #[derive(Deserialize)]
+struct ApiUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+#[derive(Deserialize)]
 struct MessagesResponse {
     content: Vec<ContentBlock>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[async_trait]
@@ -88,13 +98,17 @@ impl Provider for AnthropicProvider {
             .error_for_status()?
             .json::<MessagesResponse>()
             .await?;
+        let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
         let text = resp
             .content
             .into_iter()
             .map(|b| b.text)
             .collect::<Vec<_>>()
             .join("");
-        Ok(CompleteResponse { text })
+        Ok(CompleteResponse { text, usage })
     }
 }
 
@@ -126,6 +140,33 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, "hello from claude");
         assert_eq!(provider.id(), "anthropic");
+    }
+
+    #[tokio::test]
+    async fn anthropic_parses_usage_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{ "type": "text", "text": "hi" }],
+                "usage": { "input_tokens": 12, "output_tokens": 34 }
+            })))
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new(server.uri(), "k", "claude-haiku-4-5");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            out.usage,
+            Some(otto_engine_core::types::Usage {
+                input_tokens: 12,
+                output_tokens: 34
+            })
+        );
     }
 
     #[tokio::test]

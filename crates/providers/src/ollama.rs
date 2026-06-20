@@ -38,6 +38,10 @@ struct GenerateRequest<'a> {
 #[derive(Deserialize)]
 struct GenerateResponse {
     response: String,
+    #[serde(default)]
+    prompt_eval_count: u32,
+    #[serde(default)]
+    eval_count: u32,
 }
 
 #[async_trait]
@@ -64,6 +68,10 @@ impl Provider for OllamaProvider {
             .await?;
         Ok(CompleteResponse {
             text: resp.response,
+            usage: Some(otto_engine_core::types::Usage {
+                input_tokens: resp.prompt_eval_count,
+                output_tokens: resp.eval_count,
+            }),
         })
     }
 }
@@ -95,6 +103,35 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, "hello from ollama");
         assert_eq!(provider.id(), "ollama");
+    }
+
+    #[tokio::test]
+    async fn ollama_parses_eval_counts_as_usage() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "response": "hi",
+                "prompt_eval_count": 9,
+                "eval_count": 5,
+                "done": true
+            })))
+            .mount(&server)
+            .await;
+        let provider = OllamaProvider::new(server.uri(), "llama3.2");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            out.usage,
+            Some(otto_engine_core::types::Usage {
+                input_tokens: 9,
+                output_tokens: 5
+            })
+        );
     }
 
     #[tokio::test]

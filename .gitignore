@@ -13,3 +13,8 @@ ui/dist
 
 # Heap snapshots
 *.heapsnapshot
+
+# Runtime sqlite stores (e.g. otto serve session store)
+*.db
+*.db-shm
+*.db-wal
