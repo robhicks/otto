@@ -52,9 +52,11 @@ struct ServeState {
     token: String,
     capabilities: CapabilitiesManifest,
     /// `Some` when `--promote-loopback` is set; enables the handover commands.
+    #[allow(dead_code)]
     promote: Option<PromoteConfig>,
     /// Provisioned engines, retained so they outlive the local connection that created them
     /// (a dropped `RemoteHandle` aborts its engine task).
+    #[allow(dead_code)]
     remotes: Mutex<HashMap<SessionId, RemoteHandle>>,
 }
 
