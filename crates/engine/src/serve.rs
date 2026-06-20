@@ -459,6 +459,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::Resume { .. } => {
                 pause_state.resume_all();
             }
+            // Handled between turns only; routing added in a later task.
+            Command::PromoteToRemote { .. } | Command::DemoteToLocal { .. } => {}
         }
     }
 }
