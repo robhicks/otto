@@ -671,6 +671,174 @@ async fn streams_a_turn_over_wss() {
     assert!(saw_turn_complete, "expected a TurnComplete event over wss");
 }
 
+/// Start a serve app with `--promote-loopback` enabled. Returns the bound port and the tempdir.
+async fn start_promote_server() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep the workspace root separate from the DB so workspace snapshots don't capture binary
+    // SQLite WAL files (s.db-shm etc.) and fail the UTF-8 restore check in promote().
+    let ws_root = dir.path().join("workspace");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "hi add a greeting"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(&ws_root));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(&ws_root));
+    let tools = Arc::new(build_tool_registry(tools_ws, ws_root.clone()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
+    let promote = Some(otto_engine::PromoteConfig {
+        token: TOKEN.to_string(),
+        base_dir: dir.path().join("remotes"),
+    });
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), promote);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
+/// Build an authed client request to an absolute `ws://…` endpoint (the promoted target), with a
+/// session + last_seq query for replay.
+fn authed_endpoint_request(
+    endpoint: &str,
+    session: &str,
+    last_seq: u64,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let url = format!("{endpoint}/ws?session={session}&last_seq={last_seq}");
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    req
+}
+
+#[tokio::test]
+async fn promote_without_flag_replies_error() {
+    let (port, _dir) = start_server().await; // no promote config
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_error = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "error" {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "promote without --promote-loopback must reply error");
+}
+
+#[tokio::test]
+async fn promote_then_demote_round_trip_preserves_session() {
+    let (port, _dir) = start_promote_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect local");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    // Run a turn on the local engine; track the highest seq seen.
+    let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+    let mut last_seq = 0u64;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" {
+            last_seq = frame["event"]["seq"].as_u64().unwrap_or(last_seq);
+        }
+        // Stop once the turn is done: TurnComplete is the last emitted event.
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            break;
+        }
+    }
+
+    // Promote.
+    let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+    let mut remote_endpoint = String::new();
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "promoted" {
+            remote_endpoint = frame["endpoint"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+    assert!(remote_endpoint.starts_with("ws://"), "got endpoint {remote_endpoint}");
+
+    // Reconnect to the remote; it must report engine_remote = true and replay the session.
+    let (mut ws_r, _) = tokio_tungstenite::connect_async(authed_endpoint_request(
+        &remote_endpoint,
+        &session,
+        last_seq,
+    ))
+    .await
+    .expect("connect remote");
+    let ready_r: Value = next_json(&mut ws_r).await;
+    assert_eq!(ready_r["type"], "ready");
+    assert_eq!(ready_r["capabilities"]["engine_remote"], true);
+
+    // Demote back to local.
+    let cmd = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws_r.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+    let mut local_endpoint = String::new();
+    while let Some(frame) = next_json_opt(&mut ws_r).await {
+        if frame["type"] == "demoted" {
+            local_endpoint = frame["endpoint"].as_str().unwrap().to_string();
+            break;
+        }
+    }
+    assert!(local_endpoint.starts_with("ws://"), "got endpoint {local_endpoint}");
+
+    // Reconnect to the demoted-local engine; it must report engine_remote = false.
+    let (mut ws_l, _) = tokio_tungstenite::connect_async(authed_endpoint_request(
+        &local_endpoint,
+        &session,
+        0,
+    ))
+    .await
+    .expect("connect demoted-local");
+    let ready_l: Value = next_json(&mut ws_l).await;
+    assert_eq!(ready_l["capabilities"]["engine_remote"], false);
+    // Continuity: replaying from seq 0 yields the original session's events.
+    let mut saw_event = false;
+    while let Some(frame) = next_json_opt(&mut ws_l).await {
+        if frame["type"] == "event" {
+            saw_event = true;
+            break;
+        }
+    }
+    assert!(saw_event, "demoted-local engine should replay the session history");
+}
+
 /// Receive the next text frame as JSON (panics on close/non-text or stream end).
 async fn next_json(
     ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
