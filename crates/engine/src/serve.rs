@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use crate::remote::{PromoteConfig, RemoteHandle};
+use crate::remote::{LoopbackTarget, PromoteConfig, RemoteHandle, promote};
 use crate::service::{EngineService, EventSink, TurnControls};
 
 #[derive(Deserialize, Default)]
@@ -52,11 +52,9 @@ struct ServeState {
     token: String,
     capabilities: CapabilitiesManifest,
     /// `Some` when `--promote-loopback` is set; enables the handover commands.
-    #[allow(dead_code)]
     promote: Option<PromoteConfig>,
     /// Provisioned engines, retained so they outlive the local connection that created them
     /// (a dropped `RemoteHandle` aborts its engine task).
-    #[allow(dead_code)]
     remotes: Mutex<HashMap<SessionId, RemoteHandle>>,
 }
 
@@ -470,10 +468,60 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::Resume { .. } => {
                 pause_state.resume_all();
             }
-            // Handled between turns only; routing added in a later task.
-            Command::PromoteToRemote { .. } | Command::DemoteToLocal { .. } => {}
+            Command::PromoteToRemote { .. } => {
+                handle_handover(&state, &mut writer, session, true).await;
+            }
+            Command::DemoteToLocal { .. } => {
+                handle_handover(&state, &mut writer, session, false).await;
+            }
         }
     }
+}
+
+/// Provision the session onto a fresh engine (remote for promote, local for demote), retain the
+/// handle so it outlives this connection, and tell the client where to reconnect. A no-op error
+/// reply when promotion is not enabled (the `UnsupportedTarget` posture). Handled between turns.
+async fn handle_handover(
+    state: &ServeState,
+    writer: &mut WsWriter,
+    session: SessionId,
+    to_remote: bool,
+) {
+    let Some(cfg) = state.promote.as_ref() else {
+        let _ = send_msg(
+            writer,
+            &ServerMessage::Error {
+                message: "remote provisioning unavailable (start otto serve with --promote-loopback)"
+                    .to_string(),
+            },
+        )
+        .await;
+        return;
+    };
+    let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
+    let handle = match promote(
+        state.service.store(),
+        state.service.workspace(),
+        session,
+        &target,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = send_msg(writer, &ServerMessage::Error { message: e.to_string() }).await;
+            return;
+        }
+    };
+    let endpoint = handle.endpoint.clone();
+    // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
+    state.remotes.lock().unwrap().insert(session, handle);
+    let msg = if to_remote {
+        ServerMessage::Promoted { session, endpoint }
+    } else {
+        ServerMessage::Demoted { session, endpoint }
+    };
+    let _ = send_msg(writer, &msg).await;
 }
 
 async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::Result<SessionId> {
