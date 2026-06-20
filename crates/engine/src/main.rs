@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
-//! `otto serve [--root <path>] [--port <p>]` — serve the engine over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--approve-edits]` — serve over WebSocket (needs OTTO_TOKEN).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => cmd_serve(rest).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>]"
+                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits]"
             );
             std::process::exit(2);
         }
@@ -76,8 +76,13 @@ fn mcp_bash_bin() -> String {
 async fn build_tools_preferring_mcp(
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
+    approve_edits: bool,
 ) -> (ToolRegistry, Vec<McpConnection>) {
-    let mut registry = build_tool_registry(tools_workspace, root.clone());
+    let mut registry = if approve_edits {
+        otto_engine::build_tool_registry_approving(tools_workspace, root.clone())
+    } else {
+        build_tool_registry(tools_workspace, root.clone())
+    };
     let mut conns = Vec::new();
 
     // fs: prefer mcp-fs, fall back to the in-process fs tools already in the registry.
@@ -141,7 +146,8 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    let (tools, _mcp_conns) =
+        build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
@@ -166,6 +172,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         .unwrap_or(7878);
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
+    let mut approve_edits = false;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -190,6 +197,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             },
+            "--approve-edits" => approve_edits = true,
             _ => {}
         }
     }
@@ -206,7 +214,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(tools_workspace, root.clone()).await;
+    let (tools, _mcp_conns) =
+        build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);

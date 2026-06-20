@@ -4,10 +4,12 @@
 //! behind this same `Tool` trait later.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// A callable tool: a stable name and a JSON-in / JSON-out call.
 #[async_trait]
@@ -40,6 +42,26 @@ pub struct DenyAsk;
 
 impl AskResolver for DenyAsk {
     fn resolve(&self, _tool: &str, _args: &Value) -> bool {
+        false
+    }
+}
+
+/// Resolves an interactive approval for a proposed edit (the `Ask`-on-`fs.write` path).
+/// Async because the verdict is a round-trip to a human/UI. Implementations MUST fail closed
+/// (return `false`) when they cannot obtain an answer (e.g. a closed channel on disconnect).
+#[async_trait]
+pub trait Approver: Send + Sync {
+    /// `true` = apply the edit, `false` = skip it. `old` is the file's current contents
+    /// (`None` if the file does not exist yet); `new` is the proposed contents.
+    async fn request(&self, id: Uuid, path: &Path, old: Option<&str>, new: &str) -> bool;
+}
+
+/// Headless default: never approve (≙ the orchestrator's prior `Ask → skip` behavior).
+pub struct DenyApprover;
+
+#[async_trait]
+impl Approver for DenyApprover {
+    async fn request(&self, _id: Uuid, _path: &Path, _old: Option<&str>, _new: &str) -> bool {
         false
     }
 }
@@ -112,6 +134,8 @@ impl ToolRegistry {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
+    use uuid::Uuid;
 
     struct EchoTool;
     #[async_trait]
@@ -191,6 +215,19 @@ mod tests {
         let r = AllowListAskResolver::new(vec![]);
         assert!(!r.resolve("bash", &json!({})));
         assert!(!r.resolve("fs.write", &json!({})));
+    }
+
+    #[tokio::test]
+    async fn deny_approver_always_rejects() {
+        let a = DenyApprover;
+        assert!(
+            !a.request(Uuid::from_u128(0), Path::new("x.rs"), None, "new")
+                .await
+        );
+        assert!(
+            !a.request(Uuid::from_u128(1), Path::new("y.rs"), Some("old"), "new")
+                .await
+        );
     }
 
     #[test]

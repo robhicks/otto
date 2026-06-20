@@ -22,6 +22,88 @@ fn row(class: &'static str, text: String) -> LogRow {
     LogRow { class, text }
 }
 
+/// The role of a line in a rendered diff.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DiffKind {
+    Context,
+    Add,
+    Del,
+}
+
+/// One line in a rendered diff.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+/// Line diff of `old` → `new`: a common prefix and suffix render as `Context`; the divergent
+/// middle renders as `Del` (old) then `Add` (new). `old == None` means a new file (all `Add`).
+/// A minimal, dependency-free diff sufficient for the diff-first approval surface.
+pub fn diff_lines(old: Option<&str>, new: &str) -> Vec<DiffLine> {
+    let old_lines: Vec<&str> = old.map(|s| s.lines().collect()).unwrap_or_default();
+    let new_lines: Vec<&str> = new.lines().collect();
+
+    // Common prefix.
+    let mut start = 0;
+    while start < old_lines.len() && start < new_lines.len() && old_lines[start] == new_lines[start]
+    {
+        start += 1;
+    }
+    // Common suffix (not overlapping the prefix).
+    let mut end_old = old_lines.len();
+    let mut end_new = new_lines.len();
+    while end_old > start && end_new > start && old_lines[end_old - 1] == new_lines[end_new - 1] {
+        end_old -= 1;
+        end_new -= 1;
+    }
+
+    let mut out = Vec::new();
+    for line in &old_lines[..start] {
+        out.push(DiffLine {
+            kind: DiffKind::Context,
+            text: (*line).to_string(),
+        });
+    }
+    for line in &old_lines[start..end_old] {
+        out.push(DiffLine {
+            kind: DiffKind::Del,
+            text: (*line).to_string(),
+        });
+    }
+    for line in &new_lines[start..end_new] {
+        out.push(DiffLine {
+            kind: DiffKind::Add,
+            text: (*line).to_string(),
+        });
+    }
+    for line in &new_lines[end_new..] {
+        out.push(DiffLine {
+            kind: DiffKind::Context,
+            text: (*line).to_string(),
+        });
+    }
+
+    // `.lines()` discards a trailing newline (and `\r`), so a change confined to the final newline
+    // would otherwise render as an all-context, visually-identical diff — and the user could
+    // approve a file that differs from what's shown. If the rendered diff is pure context but the
+    // raw contents differ, surface the change so it is never invisible.
+    if let Some(old) = old {
+        if old != new && out.iter().all(|l| l.kind == DiffKind::Context) {
+            let (kind, text) = if new.ends_with('\n') {
+                (DiffKind::Add, "(trailing newline added)")
+            } else {
+                (DiffKind::Del, "(trailing newline removed)")
+            };
+            out.push(DiffLine {
+                kind,
+                text: text.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// One capability segment in the status strip: a label, its current value, and whether it
 /// represents a degraded/lost capability (rendered in the warning style).
 #[derive(Clone, PartialEq, Debug)]
@@ -105,6 +187,10 @@ pub fn describe_event(kind: &EventKind) -> LogRow {
         EventKind::TurnComplete { ok } => row(
             "row-turn",
             format!("● TurnComplete {}", if *ok { "ok" } else { "failed" }),
+        ),
+        EventKind::ApprovalRequest { path, .. } => row(
+            "row-approval",
+            format!("⏸ approval needed: {}", path.display()),
         ),
     }
 }
@@ -241,5 +327,68 @@ mod tests {
         let engine = segs.iter().find(|s| s.label == "engine").unwrap();
         assert_eq!(engine.value, "remote");
         assert!(!engine.degraded);
+    }
+
+    #[test]
+    fn diff_new_file_is_all_adds() {
+        let d = diff_lines(None, "a\nb\n");
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|l| l.kind == DiffKind::Add));
+        assert_eq!(d[0].text, "a");
+        assert_eq!(d[1].text, "b");
+    }
+
+    #[test]
+    fn diff_identical_is_all_context() {
+        let d = diff_lines(Some("a\nb\n"), "a\nb\n");
+        assert!(d.iter().all(|l| l.kind == DiffKind::Context));
+        assert_eq!(d.len(), 2);
+    }
+
+    #[test]
+    fn diff_middle_change_keeps_context_head_and_tail() {
+        let d = diff_lines(Some("a\nB\nc\n"), "a\nX\nc\n");
+        // a = context, B = del, X = add, c = context
+        assert_eq!(d[0].kind, DiffKind::Context);
+        assert_eq!(d[0].text, "a");
+        assert_eq!(d[1].kind, DiffKind::Del);
+        assert_eq!(d[1].text, "B");
+        assert_eq!(d[2].kind, DiffKind::Add);
+        assert_eq!(d[2].text, "X");
+        assert_eq!(d[3].kind, DiffKind::Context);
+        assert_eq!(d[3].text, "c");
+    }
+
+    #[test]
+    fn diff_pure_append() {
+        let d = diff_lines(Some("a\n"), "a\nb\n");
+        assert_eq!(d[0].kind, DiffKind::Context);
+        assert_eq!(d[1].kind, DiffKind::Add);
+        assert_eq!(d[1].text, "b");
+    }
+
+    #[test]
+    fn diff_trailing_newline_removed_is_visible() {
+        // Same line content, only the final newline differs — must not render as an empty diff.
+        let d = diff_lines(Some("a\nb\n"), "a\nb");
+        assert!(d.iter().any(|l| l.kind == DiffKind::Del));
+    }
+
+    #[test]
+    fn diff_trailing_newline_added_is_visible() {
+        let d = diff_lines(Some("a\nb"), "a\nb\n");
+        assert!(d.iter().any(|l| l.kind == DiffKind::Add));
+    }
+
+    #[test]
+    fn describe_approval_request_row() {
+        let r = describe_event(&EventKind::ApprovalRequest {
+            id: uuid::Uuid::from_u128(0),
+            path: PathBuf::from("src/main.rs"),
+            old: None,
+            new: "x".into(),
+        });
+        assert_eq!(r.class, "row-approval");
+        assert!(r.text.contains("src/main.rs"));
     }
 }

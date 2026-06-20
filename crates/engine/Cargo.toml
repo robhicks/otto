@@ -28,6 +28,7 @@ axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid.workspace = true
+futures-util = "0.3"
 
 [dev-dependencies]
 escargot = "0.5"

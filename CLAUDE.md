@@ -49,8 +49,16 @@ the served workspace via the bearer-authed `POST /workspace` RPC — unblocked b
 CORS layer** on the engine (the one engine change; not a protocol change) — renders a collapsible
 file tree, and opens files into a **`kode-leptos`** editor (native Leptos CSR, syntax-highlighted)
 with a local, unsaved buffer; persistence stays deferred to sub-project D. `kode-leptos`/`gloo-net`
-are UI-only deps and the `ui/` crate still depends only on `protocol`. The roadmap and per-slice
-spec/plan live in `docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects D–F are pending.
+are UI-only deps and the `ui/` crate still depends only on `protocol`. **Sub-project D then shipped**
+(diff approval): the opt-in `otto serve --approve-edits` flag wires an `ApprovalModeGate` that
+upgrades ordinary (non-sensitive) `fs.write` from Allow to `Ask`, and the orchestrator's per-edit
+`Ask` branch emits an `ApprovalRequest{id,path,old,new}` event, awaits an async `Approver`, and
+applies the edit only on an explicit `ApproveDiff` command (fail-closed on reject/disconnect; the
+sensitive floor still Denies first; the headless `DenyApprover` default denies). `serve.rs` now reads
+the socket concurrently with the running turn (`split` + `select!`), routing `ApproveDiff` frames
+through a per-connection `ApprovalRegistry`/`InteractiveApprover`, and the UI renders the diff with
+Approve/Reject buttons. The roadmap and per-slice
+spec/plan live in `docs/superpowers/specs/2026-06-17-ui-roadmap.md`; sub-projects E–F are pending.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`mcp-lsp`, `retrieval`, `extensions`, `cli`, etc.), the rest of the UI

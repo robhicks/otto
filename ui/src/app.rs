@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use leptos::prelude::*;
-use otto_protocol::{CapabilitiesManifest, Command, ServerMessage, SessionId};
+use otto_protocol::{CapabilitiesManifest, Command, EventKind, ServerMessage, SessionId};
 use uuid::Uuid;
 use web_sys::WebSocket;
 
-use crate::components::{ConnectionForm, EditorPane, EventLog, FileTree, PromptBar, StatusLine};
+use crate::components::{
+    ApprovalPanel, ConnectionForm, EditorPane, EventLog, FileTree, PromptBar, StatusLine,
+};
 use crate::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
@@ -34,6 +36,7 @@ pub fn App() -> impl IntoView {
     let open_file = RwSignal::new(None::<(PathBuf, FileBody)>);
     let editor_seed = RwSignal::new(String::new()); // file text set once at open time
     let editor_dirty = RwSignal::new(false);
+    let pending_approval = RwSignal::new(None::<crate::components::PendingApproval>);
 
     // Connect (also used for reconnect: session/last_seq are appended when present).
     let connect = move || {
@@ -55,6 +58,7 @@ pub fn App() -> impl IntoView {
         }
         conn.set(ConnState::Connecting);
         capabilities.set(None);
+        pending_approval.set(None);
 
         let on_msg = move |incoming: Result<ServerMessage, String>| match incoming {
             Ok(ServerMessage::Ready {
@@ -69,6 +73,16 @@ pub fn App() -> impl IntoView {
             Ok(ServerMessage::Event { event }) => {
                 if should_apply(last_seq.get_untracked(), event.seq) {
                     last_seq.set(advance_last_seq(last_seq.get_untracked(), event.seq));
+                    if let EventKind::ApprovalRequest { id, path, old, new } = &event.kind {
+                        pending_approval.set(Some((*id, path.clone(), old.clone(), new.clone())));
+                    }
+                    // The turn ending resolves any outstanding approval (the orchestrator parks on
+                    // the approval *before* emitting TurnComplete, so this never clears a genuinely
+                    // pending one). On reconnect this also clears a replayed-but-stale request whose
+                    // turn already finished fail-closed.
+                    if let EventKind::TurnComplete { .. } = &event.kind {
+                        pending_approval.set(None);
+                    }
                     rows.update(|v| v.push(describe_event(&event.kind)));
                 }
             }
@@ -81,11 +95,13 @@ pub fn App() -> impl IntoView {
         };
         let on_close = move || {
             capabilities.set(None);
+            pending_approval.set(None);
             conn.set(ConnState::Disconnected);
         };
         let on_error = move || {
             rows.update(|v| v.push(client_error_row("connection rejected — check URL/token")));
             capabilities.set(None);
+            pending_approval.set(None);
             conn.set(ConnState::Disconnected);
         };
 
@@ -104,6 +120,7 @@ pub fn App() -> impl IntoView {
         }
         socket.set(None);
         capabilities.set(None);
+        pending_approval.set(None);
         conn.set(ConnState::Disconnected);
     };
 
@@ -136,6 +153,27 @@ pub fn App() -> impl IntoView {
                     session: SessionId(uuid),
                 },
             );
+        }
+    };
+
+    let decide = move |(id, approved): (Uuid, bool)| {
+        let (Some(ws), Some(sid)) = (socket.get(), session.get()) else {
+            return;
+        };
+        let Ok(uuid) = Uuid::parse_str(&sid) else {
+            return;
+        };
+        let cmd = Command::ApproveDiff {
+            session: SessionId(uuid),
+            id,
+            approved,
+        };
+        // Only dismiss the panel once the verdict is actually on the wire. If the send fails the
+        // orchestrator is still blocked on this approval, so keep the panel up for a retry rather
+        // than silently dropping the diff.
+        match send_command(&ws, &cmd) {
+            Ok(()) => pending_approval.set(None),
+            Err(e) => rows.update(|v| v.push(client_error_row(&e))),
         }
     };
 
@@ -214,6 +252,10 @@ pub fn App() -> impl IntoView {
                     dirty=editor_dirty
                 />
             </div>
+            <ApprovalPanel
+                pending=pending_approval.into()
+                on_decide=Callback::new(decide)
+            />
             <EventLog rows=rows />
             <PromptBar
                 conn=conn

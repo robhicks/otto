@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine_core::tool::{Decision, ToolRegistry};
+use otto_engine_core::tool::{Approver, Decision, DenyApprover, ToolRegistry};
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Router, TurnOutcome};
@@ -84,15 +84,31 @@ impl EngineService {
         self.store.set_status(session, SessionStatus::Aborted).await
     }
 
-    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
-    /// (after persisting it, fail-closed), then recording the turn and updating status
-    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
-    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    /// Run one turn with the headless default approver (`DenyApprover`): an `Ask` edit is
+    /// skipped (fail-closed). (≙ `Command::SendPrompt` from a non-interactive caller.)
     pub async fn run_prompt(
         &self,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.run_prompt_with_approver(session, goal, sink, Arc::new(DenyApprover))
+            .await
+    }
+
+    /// As `run_prompt`, but resolves `Ask` edits through `approver` (the serve layer supplies an
+    /// interactive one). The approver is moved into the spawned turn task.
+    ///
+    /// Run one orchestrator turn for `goal`, streaming each event to `sink` as it is emitted
+    /// (after persisting it, fail-closed), then recording the turn and updating status
+    /// (`Done`/`Failed`; an orchestrator error also sets `Failed`). The seq sequence
+    /// continues from the store. Serialized: one turn at a time. (≙ `Command::SendPrompt`.)
+    pub async fn run_prompt_with_approver(
+        &self,
+        session: SessionId,
+        goal: &str,
+        sink: &mut dyn EventSink,
+        approver: Arc<dyn Approver>,
     ) -> anyhow::Result<TurnOutcome> {
         let _guard = self.turn_lock.lock().await;
 
@@ -110,16 +126,20 @@ impl EngineService {
             let tools = Arc::clone(&self.tools);
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
+            let approver = Arc::clone(&approver);
             tokio::spawn(async move {
                 let sink_fn = move |kind: EventKind| {
                     let seq = counter.fetch_add(1, Ordering::SeqCst);
                     let _ = tx.send(Event { seq, session, kind });
                 };
+                let next_id = || uuid::Uuid::new_v4();
                 let orchestrator = Orchestrator {
                     registry: &registry,
                     router: &*router,
                     workspace: &*workspace,
                     tools: &tools,
+                    approver: &*approver,
+                    next_id: &next_id,
                 };
                 orchestrator.run_turn(session, &goal, &sink_fn).await
             })
@@ -212,10 +232,16 @@ impl EngineService {
                 },
             },
             WorkspaceRequest::ApplyEdit { path, contents } => {
+                // A direct workspace write is the client's own explicit action (editor save /
+                // promote), not an agent edit, so it needs no interactive approval: reject only on
+                // an outright `Deny`. This matters under `--approve-edits`, where the gate upgrades
+                // benign `fs.write` to `Ask` — treating `Ask` as denial here would silently break
+                // every direct write while approval mode is on. The inviolable sensitive-path floor
+                // still returns `Deny` and stays blocked.
                 if self
                     .tools
                     .check("fs.write", &json!({ "path": path.to_string_lossy() }))
-                    != Decision::Allow
+                    == Decision::Deny
                 {
                     return WorkspaceResponse::Error {
                         message: format!("write denied by permission gate: {}", path.display()),
@@ -433,6 +459,51 @@ mod tests {
             service
                 .workspace_rpc(WorkspaceRequest::Read {
                     path: std::path::PathBuf::from(".env"),
+                })
+                .await,
+            WorkspaceResponse::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_rpc_apply_edit_ok_under_approval_mode() {
+        // Under `--approve-edits` the gate upgrades benign `fs.write` Allow->Ask. A direct
+        // workspace RPC write is the client's explicit action and must still succeed (Ask is not
+        // a denial here); only the sensitive floor (Deny) blocks.
+        use otto_protocol::{WorkspaceRequest, WorkspaceResponse};
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteStore::open(dir.path().join("s.db")).await.unwrap());
+        let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = Arc::new(crate::build_tool_registry_approving(
+            tools_ws,
+            dir.path().to_path_buf(),
+        ));
+        let service = EngineService::new(
+            store,
+            Arc::new(crate::build_default_registry()),
+            scripted_router(),
+            workspace,
+            tools,
+        );
+
+        match service
+            .workspace_rpc(WorkspaceRequest::ApplyEdit {
+                path: std::path::PathBuf::from("a.txt"),
+                contents: "hi".to_string(),
+            })
+            .await
+        {
+            WorkspaceResponse::ApplyEdit { bytes_written } => assert_eq!(bytes_written, 2),
+            other => panic!("benign write should succeed under approval mode, got: {other:?}"),
+        }
+        // The sensitive floor still denies even in approval mode.
+        assert!(matches!(
+            service
+                .workspace_rpc(WorkspaceRequest::ApplyEdit {
+                    path: std::path::PathBuf::from(".env"),
+                    contents: "SECRET=x".to_string(),
                 })
                 .await,
             WorkspaceResponse::Error { .. }
