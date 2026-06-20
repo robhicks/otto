@@ -111,6 +111,12 @@ pub fn App() -> impl IntoView {
             }
             Ok(ServerMessage::Error { message }) => {
                 rows.update(|v| v.push(error_row(&message)));
+                // An Error frame is turn-terminal (the orchestrator emits TurnComplete only on
+                // success), so clear turn-scoped state — otherwise Promote/Demote/Pause stay
+                // disabled until reconnect. (No-op when the Error arrived between turns.)
+                turn_running.set(false);
+                paused.set(false);
+                pending_approval.set(None);
             }
             Ok(ServerMessage::Promoted { endpoint, .. })
             | Ok(ServerMessage::Demoted { endpoint, .. }) => {

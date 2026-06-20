@@ -54,8 +54,10 @@ struct ServeState {
     /// `Some` when `--promote-loopback` is set; enables the handover commands.
     promote: Option<PromoteConfig>,
     /// Provisioned engines, retained so they outlive the local connection that created them
-    /// (a dropped `RemoteHandle` aborts its engine task).
-    remotes: Mutex<HashMap<SessionId, RemoteHandle>>,
+    /// (a dropped `RemoteHandle` aborts its engine task). Keyed by `(session, to_remote)` so a
+    /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
+    /// by a malformed client sequence that flips the direction on a repeat call.
+    remotes: Mutex<HashMap<(SessionId, bool), RemoteHandle>>,
 }
 
 /// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
@@ -506,7 +508,7 @@ async fn handle_handover(
         .remotes
         .lock()
         .unwrap()
-        .get(&session)
+        .get(&(session, to_remote))
         .map(|h| h.endpoint.clone());
     let endpoint = match existing {
         Some(endpoint) => endpoint,
@@ -534,7 +536,11 @@ async fn handle_handover(
             };
             let endpoint = handle.endpoint.clone();
             // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
-            state.remotes.lock().unwrap().insert(session, handle);
+            state
+                .remotes
+                .lock()
+                .unwrap()
+                .insert((session, to_remote), handle);
             endpoint
         }
     };
