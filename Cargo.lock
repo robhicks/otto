@@ -1337,6 +1337,7 @@ dependencies = [
  "otto-tools",
  "otto-workspace",
  "rcgen",
+ "reqwest",
  "rmcp",
  "rustls",
  "serde",

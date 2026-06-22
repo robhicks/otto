@@ -51,8 +51,10 @@ struct ServeState {
     service: EngineService,
     token: String,
     capabilities: CapabilitiesManifest,
-    /// `Some` when `--promote-loopback` is set; enables the handover commands.
+    /// `Some` when `--promote-loopback`/`--promote-vps` is set; enables the handover commands.
     promote: Option<PromoteConfig>,
+    /// `true` when `--accept-promotions` is set; enables the inbound `POST /promote` restore RPC.
+    accept_promotions: bool,
     /// Provisioned engines, retained so they outlive the local connection that created them
     /// (a dropped `RemoteHandle` aborts its engine task). Keyed by `(session, to_remote)` so a
     /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
@@ -94,6 +96,7 @@ pub fn app(
     token: String,
     capabilities: CapabilitiesManifest,
     promote: Option<PromoteConfig>,
+    accept_promotions: bool,
 ) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
@@ -101,6 +104,7 @@ pub fn app(
         token,
         capabilities,
         promote,
+        accept_promotions,
         remotes: Mutex::new(HashMap::new()),
     });
     // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
@@ -117,6 +121,7 @@ pub fn app(
     AxumRouter::new()
         .route("/ws", get(ws_handler))
         .route("/workspace", post(workspace_handler))
+        .route("/promote", post(promote_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -170,6 +175,40 @@ async fn workspace_handler(
     };
     let resp = state.service.workspace_rpc(req).await;
     axum::Json(resp).into_response()
+}
+
+/// Inbound restore RPC (receiver role). Fail-closed: `403` unless `--accept-promotions`, `401`
+/// without a valid bearer. Restores the bundle into this engine's store + workspace (gated).
+async fn promote_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<ServeState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.accept_promotions {
+        return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
+    }
+    if !authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    let bundle: crate::remote::PromoteBundle = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
+    };
+    match state.service.accept_promotion(&bundle).await {
+        Ok(session) => {
+            axum::Json(serde_json::json!({ "session": session.0.to_string() })).into_response()
+        }
+        Err(crate::service::AcceptError::AlreadyExists) => {
+            (StatusCode::CONFLICT, "session already exists").into_response()
+        }
+        Err(crate::service::AcceptError::Refused(msg)) => {
+            // Hostile/malformed bundle — a client fault, not a receiver failure.
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
+        Err(crate::service::AcceptError::Failed(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }
 
 /// The writer half of a split WebSocket — what events and frames are sent through.
@@ -494,13 +533,27 @@ async fn handle_handover(
             writer,
             &ServerMessage::Error {
                 message:
-                    "remote provisioning unavailable (start otto serve with --promote-loopback)"
+                    "remote provisioning unavailable (start otto serve with --promote-loopback or --promote-vps)"
                         .to_string(),
             },
         )
         .await;
         return;
     };
+
+    // Vps mode cannot demote: pulling a session back off the operator's server is a separate,
+    // larger piece (a reverse snapshot-export RPC). Refuse honestly. Loopback demote is unchanged.
+    if !to_remote && matches!(cfg.mode, crate::remote::PromoteMode::Vps { .. }) {
+        let _ = send_msg(
+            writer,
+            &ServerMessage::Error {
+                message: "demote-from-remote not supported in vps mode".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+
     // Reuse an existing handover for this session (idempotent): provisioning again would drop the
     // prior RemoteHandle and abort an engine a client may still be connected to. Bind the lookup
     // to a local so the Mutex guard is released at the `;` — never held across the await below.
@@ -513,12 +566,20 @@ async fn handle_handover(
     let endpoint = match existing {
         Some(endpoint) => endpoint,
         None => {
-            let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
+            let target: Box<dyn crate::remote::RemoteTarget> =
+                match &cfg.mode {
+                    crate::remote::PromoteMode::Loopback { base_dir } => Box::new(
+                        LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
+                    ),
+                    crate::remote::PromoteMode::Vps { endpoint } => Box::new(
+                        crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
+                    ),
+                };
             let handle = match promote(
                 state.service.store(),
                 state.service.workspace(),
                 session,
-                &target,
+                &*target,
             )
             .await
             {
@@ -535,7 +596,8 @@ async fn handle_handover(
                 }
             };
             let endpoint = handle.endpoint.clone();
-            // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
+            // Retain BEFORE replying: for loopback, dropping the handle aborts the provisioned
+            // engine; for vps the handle's shutdown is None, so retention is cheap and harmless.
             state
                 .remotes
                 .lock()

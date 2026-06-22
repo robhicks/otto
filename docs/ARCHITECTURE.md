@@ -210,7 +210,15 @@ trait RemoteTarget {
 }
 ```
 
-`vps` impl (long-lived server) is v1-ready; `microvm` impl (ephemeral, per-session) is v2.
+`vps` impl (long-lived server) is **shipped**: `VpsTarget` (in `crates/engine/src/remote.rs`,
+alongside `LoopbackTarget`) promotes a session onto an already-running, bearer-authed
+`otto serve --accept-promotions` by POSTing the `PromoteBundle` to its `POST /promote` restore RPC;
+the client then reconnects to the receiver and resumes via `Last-Event-ID`. `teardown` is a no-op
+(the target does not own the operator's server). The receiver restore is **gated** — workspace
+files land through the permission floor, so a bundle carrying `.env`/`.ssh`/keys is refused.
+The residual `UnsupportedTarget` boundary is now only **machine provisioning** (SSH / cloud-SDK VM
+creation stays external and manual); **demote-from-remote** (a reverse snapshot-export RPC) is the
+next follow-up. `microvm` impl (ephemeral, per-session) is v2.
 
 ## Protocol message catalog
 

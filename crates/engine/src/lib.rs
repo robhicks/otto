@@ -30,11 +30,11 @@ pub use mcp::{
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
 };
 pub use remote::{
-    LoopbackTarget, PromoteBundle, PromoteConfig, RemoteHandle, RemoteTarget, UnsupportedTarget,
-    promote,
+    LoopbackTarget, PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget,
+    UnsupportedTarget, VpsTarget, promote,
 };
 pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
-pub use service::{CollectingSink, EngineService, EventSink, TurnControls};
+pub use service::{AcceptError, CollectingSink, EngineService, EventSink, TurnControls};
 
 /// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by
 /// both `build_router` (selection) and `session_config` (recording the effective model).

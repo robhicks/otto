@@ -17,16 +17,26 @@ use otto_workspace::LocalWorkspace;
 use crate::service::EngineService;
 use crate::{build_default_registry, build_router, build_tool_registry};
 
-/// Enables session handover on a served engine. `token` is the bearer the provisioned engine
-/// requires (reused from the source, by design); `base_dir` is where restored stores/workspaces
-/// are written. `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback`.
+/// Enables session handover on a served engine. `token` is the bearer the target requires (reused
+/// from the source, by design); `mode` selects which `RemoteTarget` a handover provisions onto.
+/// `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback` or `--promote-vps`.
 #[derive(Clone)]
 pub struct PromoteConfig {
     pub token: String,
-    pub base_dir: PathBuf,
+    pub mode: PromoteMode,
+}
+
+/// Which kind of remote a promote provisions onto.
+#[derive(Clone)]
+pub enum PromoteMode {
+    /// Provision a fresh in-process engine, restoring under `base_dir` (loopback round-trip).
+    Loopback { base_dir: PathBuf },
+    /// Push to an already-running remote `otto serve` at `endpoint` (`ws://…` / `wss://…`).
+    Vps { endpoint: String },
 }
 
 /// A captured session ready to move to another engine: persisted session state + workspace files.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PromoteBundle {
     pub session: SessionState,
     pub workspace: WorkspaceSnapshot,
@@ -146,9 +156,11 @@ impl RemoteTarget for LoopbackTarget {
         };
         let promote = Some(PromoteConfig {
             token: self.token.clone(),
-            base_dir: dir.join("promote"),
+            mode: PromoteMode::Loopback {
+                base_dir: dir.join("promote"),
+            },
         });
-        let app = crate::serve::app(service, self.token.clone(), capabilities, promote);
+        let app = crate::serve::app(service, self.token.clone(), capabilities, promote, false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -167,6 +179,73 @@ impl RemoteTarget for LoopbackTarget {
         if let Some(task) = handle.shutdown.take() {
             task.abort();
         }
+        Ok(())
+    }
+}
+
+/// A `RemoteTarget` that promotes onto an already-running, operator-managed `otto serve` over the
+/// network. Unlike `LoopbackTarget`, it does not create or own the receiver — `teardown` is a
+/// no-op so it never aborts the operator's long-lived server.
+pub struct VpsTarget {
+    /// `ws://host:port` or `wss://host:port` — what the client reconnects to after promote.
+    endpoint: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl VpsTarget {
+    /// `endpoint` is the receiver's `ws://`/`wss://` base; `token` is its bearer (reused from the
+    /// source, by design — source and receiver share a trust domain in v1).
+    pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+
+    /// Map the ws endpoint to the HTTP base for the `/promote` POST (`ws→http`, `wss→https`).
+    fn http_base(&self) -> String {
+        if let Some(rest) = self.endpoint.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = self.endpoint.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            self.endpoint.clone()
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteTarget for VpsTarget {
+    async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+        let url = format!("{}/promote", self.http_base());
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(bundle)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Surface the receiver's reason (e.g. "restore refused sensitive path: …",
+            // "session already exists") instead of a bare status, for operator diagnostics.
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("promote rejected by remote: HTTP {status}: {body}");
+        }
+        Ok(RemoteHandle {
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            shutdown: None,
+        })
+    }
+
+    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
+        // No-op: VpsTarget does not own the operator's server, so it must never abort it.
         Ok(())
     }
 }
@@ -190,5 +269,23 @@ mod tests {
             workspace: WorkspaceSnapshot { files: vec![] },
         };
         assert!(UnsupportedTarget.provision(&bundle).await.is_err());
+    }
+
+    #[test]
+    fn vps_http_base_maps_ws_schemes() {
+        // wss → https (the production path; otherwise the promote POST silently downgrades to
+        // plaintext), ws → http (loopback), and an unrecognized scheme passes through verbatim.
+        assert_eq!(
+            VpsTarget::new("wss://host:9000", "t").http_base(),
+            "https://host:9000"
+        );
+        assert_eq!(
+            VpsTarget::new("ws://127.0.0.1:7878", "t").http_base(),
+            "http://127.0.0.1:7878"
+        );
+        assert_eq!(
+            VpsTarget::new("http://host:1", "t").http_base(),
+            "http://host:1"
+        );
     }
 }
