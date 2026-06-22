@@ -122,6 +122,7 @@ pub fn app(
         .route("/ws", get(ws_handler))
         .route("/workspace", post(workspace_handler))
         .route("/promote", post(promote_handler))
+        .route("/export", post(export_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -208,6 +209,39 @@ async fn promote_handler(
         Err(crate::service::AcceptError::Failed(e)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+    }
+}
+
+/// Outbound export RPC (receiver role): returns a session's `PromoteBundle` so a demoting source
+/// can pull it back. Same gate as `/promote`: `403` unless `--accept-promotions`, `401` without a
+/// valid bearer. The bundle's workspace snapshot is gate-filtered (secrets never leave here).
+async fn export_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<ServeState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.accept_promotions {
+        return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
+    }
+    if !authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    #[derive(serde::Deserialize)]
+    struct ExportRequest {
+        session: String,
+    }
+    let req: ExportRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
+    };
+    let session = match uuid::Uuid::parse_str(&req.session) {
+        Ok(u) => SessionId(u),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad session id: {e}")).into_response(),
+    };
+    match state.service.export_promotion(session).await {
+        Ok(bundle) => axum::Json(bundle).into_response(),
+        // Unknown session (snapshot errors when the row is absent) → 404, not a 500.
+        Err(_) => (StatusCode::NOT_FOUND, "unknown session").into_response(),
     }
 }
 

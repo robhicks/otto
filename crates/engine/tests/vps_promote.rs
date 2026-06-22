@@ -88,6 +88,53 @@ async fn post_promote(base: &str, token: Option<&str>, body: &PromoteBundle) -> 
     req.send().await.unwrap()
 }
 
+async fn post_export(base: &str, token: Option<&str>, session: &str) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(format!("{base}/export"))
+        .json(&serde_json::json!({ "session": session }));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn export_without_accept_flag_is_forbidden() {
+    let (base, _w, _d) = start_receiver(false).await;
+    let resp = post_export(&base, Some(TOKEN), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn export_without_bearer_is_unauthorized() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, None, &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn export_unknown_session_is_not_found() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some(TOKEN), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn export_existing_session_returns_a_bundle() {
+    // Promote a session onto the receiver, then export it back out.
+    let (base, _w, _d) = start_receiver(true).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![("out.txt", b"HI")]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), &body).await.status(),
+        reqwest::StatusCode::OK
+    );
+    let resp = post_export(&base, Some(TOKEN), &id.0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let bundle: PromoteBundle = resp.json().await.unwrap();
+    assert_eq!(bundle.session.id, id);
+}
+
 #[tokio::test]
 async fn promote_without_accept_flag_is_forbidden() {
     let (base, _w, _d) = start_receiver(false).await;
