@@ -43,6 +43,7 @@ async fn build_app() -> (axum::Router, tempfile::TempDir) {
             sandbox: false,
         },
         None,
+        false,
     );
     (app, dir)
 }

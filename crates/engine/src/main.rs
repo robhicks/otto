@@ -238,7 +238,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     } else {
         None
     };
-    let app = serve_app(service, token, capabilities, promote);
+    let app = serve_app(service, token, capabilities, promote, false);
 
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
     let tls = match resolve_tls_paths(tls_cert, tls_key) {

@@ -58,7 +58,7 @@ async fn start_server() -> (u16, tempfile::TempDir) {
         tools,
     );
 
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None);
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -98,7 +98,7 @@ async fn start_approval_server() -> (u16, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None);
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -136,7 +136,7 @@ async fn start_metering_server() -> (u16, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None);
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -598,7 +598,7 @@ async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None);
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
 
     // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
     // rcgen 0.13 uses CertifiedKey { cert, key_pair }.
@@ -707,7 +707,7 @@ async fn start_promote_server() -> (u16, tempfile::TempDir) {
             base_dir: dir.path().join("remotes"),
         },
     });
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), promote);
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), promote, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();

@@ -160,7 +160,7 @@ impl RemoteTarget for LoopbackTarget {
                 base_dir: dir.join("promote"),
             },
         });
-        let app = crate::serve::app(service, self.token.clone(), capabilities, promote);
+        let app = crate::serve::app(service, self.token.clone(), capabilities, promote, false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
