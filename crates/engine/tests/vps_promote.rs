@@ -204,6 +204,96 @@ async fn promote_malformed_body_is_bad_request() {
 }
 
 #[tokio::test]
+async fn export_with_wrong_bearer_is_unauthorized() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some("nope"), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn export_malformed_body_is_bad_request() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/export"))
+        .bearer_auth(TOKEN)
+        .body("{ not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_malformed_session_id_is_bad_request() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some(TOKEN), "not-a-uuid").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn demote_without_promote_config_is_unavailable() {
+    let (recv_http, _w, _d) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{recv_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            assert!(
+                f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("remote provisioning unavailable"),
+                "{f:?}"
+            );
+            break;
+        }
+        assert_ne!(
+            f["type"], "demoted",
+            "demote must not succeed without promote config"
+        );
+    }
+}
+
+#[tokio::test]
+async fn demote_with_rejected_export_surfaces_error() {
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, _sw, _sd) = start_source_vps(recv_ws).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // NOTE: session was created on the source but never promoted, so the receiver has no copy.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            break;
+        }
+        assert_ne!(
+            f["type"], "demoted",
+            "demote must not succeed when the receiver has no copy: {f:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vps_target_provisions_against_a_receiver() {
     let (http_base, _w, _d) = start_receiver(true).await;
     let ws_endpoint = http_base.replace("http://", "ws://");
@@ -460,6 +550,10 @@ async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
     let ready2 = next_json(&mut ws2).await.unwrap();
     assert_eq!(ready2["type"], "ready");
     assert_eq!(ready2["session"].as_str().unwrap(), session);
+
+    // Copy semantics: demote is non-destructive — the receiver still holds the session.
+    let resp = post_export(&recv_http, Some(TOKEN), &session).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]

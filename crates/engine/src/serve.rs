@@ -56,8 +56,9 @@ struct ServeState {
     /// `true` when `--accept-promotions` is set; enables the inbound `POST /promote` restore RPC.
     accept_promotions: bool,
     /// This server's own public ws base (e.g. `ws://host:port`), reported as the reconnect
-    /// target on a vps `Demoted`. Empty when handover isn't configured (never read then).
-    public_ws_base: String,
+    /// target on a vps `Demoted`. `Some(base)` when this serve can be demoted-back-to; `None`
+    /// for servers never demoted-from.
+    public_ws_base: Option<String>,
     /// Provisioned engines, retained so they outlive the local connection that created them
     /// (a dropped `RemoteHandle` aborts its engine task). Keyed by `(session, to_remote)` so a
     /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
@@ -101,18 +102,18 @@ pub fn app(
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
 ) -> AxumRouter {
-    app_with_base(
+    app_inner(
         service,
         token,
         capabilities,
         promote,
         accept_promotions,
-        String::new(),
+        None,
     )
 }
 
 /// Build the axum app, specifying this server's own public ws base (the vps-demote reconnect
-/// target). `app` is the same with an empty base, for servers that are never demoted-from.
+/// target). `app` is the same with no base, for servers that are never demoted-from.
 pub fn app_with_base(
     service: EngineService,
     token: String,
@@ -120,6 +121,24 @@ pub fn app_with_base(
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
     public_ws_base: String,
+) -> AxumRouter {
+    app_inner(
+        service,
+        token,
+        capabilities,
+        promote,
+        accept_promotions,
+        Some(public_ws_base),
+    )
+}
+
+fn app_inner(
+    service: EngineService,
+    token: String,
+    capabilities: CapabilitiesManifest,
+    promote: Option<PromoteConfig>,
+    accept_promotions: bool,
+    public_ws_base: Option<String>,
 ) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
@@ -622,6 +641,7 @@ async fn handle_handover(
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
+                    // unreachable: accept_demotion uses restore_over (overwrite), never AlreadyExists
                     crate::service::AcceptError::AlreadyExists => {
                         "demote restore conflict".to_string()
                     }
@@ -629,14 +649,28 @@ async fn handle_handover(
                 let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
                 return;
             }
-            let _ = send_msg(
-                writer,
-                &ServerMessage::Demoted {
-                    session,
-                    endpoint: state.public_ws_base.clone(),
-                },
-            )
-            .await;
+            match &state.public_ws_base {
+                Some(base) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Demoted {
+                            session,
+                            endpoint: base.clone(),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    // Misconfiguration: a vps-demotable serve must be built via serve_app_with_base.
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: "demote target has no public ws base configured".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
             return;
         }
     }
