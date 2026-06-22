@@ -407,24 +407,45 @@ impl EngineService {
                     },
                 }
             }
-            WorkspaceRequest::Snapshot => match self.workspace.snapshot().await {
-                Ok(snap) => {
-                    let files: Vec<_> = snap
-                        .files
-                        .into_iter()
-                        .filter(|(p, _)| {
-                            self.tools
-                                .check("fs.read", &json!({ "path": p.to_string_lossy() }))
-                                == Decision::Allow
-                        })
-                        .collect();
-                    WorkspaceResponse::Snapshot { files }
-                }
+            WorkspaceRequest::Snapshot => match self.filtered_workspace_snapshot().await {
+                Ok(snap) => WorkspaceResponse::Snapshot { files: snap.files },
                 Err(e) => WorkspaceResponse::Error {
                     message: e.to_string(),
                 },
             },
         }
+    }
+
+    /// The workspace snapshot with gate-denied paths removed: any path the read gate denies (the
+    /// inviolable sensitive-path floor) is omitted, so secrets never leave this engine. Shared by
+    /// the `/workspace` Snapshot RPC and `export_promotion`.
+    async fn filtered_workspace_snapshot(
+        &self,
+    ) -> anyhow::Result<otto_engine_core::types::WorkspaceSnapshot> {
+        let snap = self.workspace.snapshot().await?;
+        let files = snap
+            .files
+            .into_iter()
+            .filter(|(p, _)| {
+                self.tools
+                    .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                    == Decision::Allow
+            })
+            .collect();
+        Ok(otto_engine_core::types::WorkspaceSnapshot { files })
+    }
+
+    /// Build a `PromoteBundle` for `session` so a demoting source can pull it back. The workspace
+    /// snapshot is gate-filtered (sensitive paths excluded — secrets never leave this engine).
+    /// Errors if the session is unknown.
+    pub async fn export_promotion(
+        &self,
+        session: SessionId,
+    ) -> anyhow::Result<crate::remote::PromoteBundle> {
+        Ok(crate::remote::PromoteBundle {
+            session: self.store.snapshot(session).await?,
+            workspace: self.filtered_workspace_snapshot().await?,
+        })
     }
 }
 
@@ -453,6 +474,40 @@ mod tests {
             workspace,
             tools,
         )
+    }
+
+    #[tokio::test]
+    async fn export_promotion_returns_bundle_without_sensitive_files() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        // Put a normal file and a sensitive file on disk in the workspace.
+        std::fs::write(ws.path().join("out.txt"), b"KEEP").unwrap();
+        std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let bundle = service.export_promotion(id).await.unwrap();
+        assert_eq!(bundle.session.id, id);
+        let paths: Vec<_> = bundle
+            .workspace
+            .files
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(paths.contains(&std::path::PathBuf::from("out.txt")));
+        // The sensitive-path floor filtered .env out of the export — it never leaves the receiver.
+        assert!(!paths.contains(&std::path::PathBuf::from(".env")));
+    }
+
+    #[tokio::test]
+    async fn export_promotion_unknown_session_is_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+        assert!(service.export_promotion(SessionId::new()).await.is_err());
     }
 
     #[tokio::test]
