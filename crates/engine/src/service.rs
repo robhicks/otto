@@ -707,30 +707,25 @@ mod tests {
 
     #[tokio::test]
     async fn accept_demotion_refuses_sensitive_workspace_entry() {
-        use crate::remote::PromoteBundle;
-        use otto_engine_core::types::WorkspaceSnapshot;
-        use otto_persistence::SessionState;
-
         let ws = tempfile::tempdir().unwrap();
         let db = tempfile::tempdir().unwrap();
         let service = build_test_service(ws.path(), db.path().join("s.db")).await;
-        let bundle = PromoteBundle {
-            session: SessionState {
-                id: SessionId::new(),
-                goal: "g".to_string(),
-                status: otto_persistence::SessionStatus::Active,
-                config: serde_json::json!({}),
-                events: vec![],
-                turns: vec![],
-            },
-            workspace: WorkspaceSnapshot {
-                files: vec![(std::path::PathBuf::from(".env"), b"SECRET=1".to_vec())],
-            },
-        };
+
+        let id = SessionId::new();
+        let bundle = bundle_with(id, std::path::PathBuf::from(".env"), b"SECRET=1".to_vec());
         assert!(matches!(
             service.accept_demotion(&bundle).await,
             Err(crate::service::AcceptError::Refused(_))
         ));
+        // Fail-closed: nothing landed — neither the file nor the session.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new(".env"))
+                .await
+                .is_err()
+        );
+        assert!(service.store().session_status(id).await.is_err());
     }
 
     fn scripted_router() -> Arc<dyn Router> {
