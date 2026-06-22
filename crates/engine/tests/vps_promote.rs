@@ -88,6 +88,53 @@ async fn post_promote(base: &str, token: Option<&str>, body: &PromoteBundle) -> 
     req.send().await.unwrap()
 }
 
+async fn post_export(base: &str, token: Option<&str>, session: &str) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(format!("{base}/export"))
+        .json(&serde_json::json!({ "session": session }));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    req.send().await.unwrap()
+}
+
+#[tokio::test]
+async fn export_without_accept_flag_is_forbidden() {
+    let (base, _w, _d) = start_receiver(false).await;
+    let resp = post_export(&base, Some(TOKEN), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn export_without_bearer_is_unauthorized() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, None, &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn export_unknown_session_is_not_found() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some(TOKEN), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn export_existing_session_returns_a_bundle() {
+    // Promote a session onto the receiver, then export it back out.
+    let (base, _w, _d) = start_receiver(true).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![("out.txt", b"HI")]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), &body).await.status(),
+        reqwest::StatusCode::OK
+    );
+    let resp = post_export(&base, Some(TOKEN), &id.0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let bundle: PromoteBundle = resp.json().await.unwrap();
+    assert_eq!(bundle.session.id, id);
+}
+
 #[tokio::test]
 async fn promote_without_accept_flag_is_forbidden() {
     let (base, _w, _d) = start_receiver(false).await;
@@ -154,6 +201,96 @@ async fn promote_malformed_body_is_bad_request() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_with_wrong_bearer_is_unauthorized() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some("nope"), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn export_malformed_body_is_bad_request() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/export"))
+        .bearer_auth(TOKEN)
+        .body("{ not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn export_malformed_session_id_is_bad_request() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = post_export(&base, Some(TOKEN), "not-a-uuid").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn demote_without_promote_config_is_unavailable() {
+    let (recv_http, _w, _d) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{recv_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            assert!(
+                f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("remote provisioning unavailable"),
+                "{f:?}"
+            );
+            break;
+        }
+        assert_ne!(
+            f["type"], "demoted",
+            "demote must not succeed without promote config"
+        );
+    }
+}
+
+#[tokio::test]
+async fn demote_with_rejected_export_surfaces_error() {
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, _sw, _sd) = start_source_vps(recv_ws).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // NOTE: session was created on the source but never promoted, so the receiver has no copy.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            break;
+        }
+        assert_ne!(
+            f["type"], "demoted",
+            "demote must not succeed when the receiver has no copy: {f:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -236,14 +373,22 @@ async fn start_source_vps(vps_endpoint: String) -> (String, tempfile::TempDir, t
             endpoint: vps_endpoint,
         },
     });
-    let app = serve_app(service, TOKEN.to_string(), caps(), promote, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let base = format!("ws://127.0.0.1:{port}");
+    let app = otto_engine::serve_app_with_base(
+        service,
+        TOKEN.to_string(),
+        caps(),
+        promote,
+        false,
+        base.clone(),
+    );
     tokio::spawn(async move {
         serve_run(listener, app, None).await.unwrap();
     });
-    (format!("ws://127.0.0.1:{port}"), ws_dir, db_dir)
+    (base, ws_dir, db_dir)
 }
 
 #[tokio::test]
@@ -277,10 +422,14 @@ async fn handover_vps_promote_points_at_receiver() {
 }
 
 #[tokio::test]
-async fn handover_vps_demote_is_unsupported() {
+async fn handover_vps_demote_pulls_session_back_to_source() {
+    use otto_engine_core::traits::Workspace as _;
+    use otto_workspace::RemoteWorkspace;
+
+    // Receiver accepts promotions; source promotes to it in vps mode.
     let (recv_http, _rw, _rd) = start_receiver(true).await;
     let recv_ws = recv_http.replace("http://", "ws://");
-    let (src_ws, _sw, _sd) = start_source_vps(recv_ws).await;
+    let (src_ws, src_w, _sd) = start_source_vps(recv_ws.clone()).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
@@ -288,26 +437,123 @@ async fn handover_vps_demote_is_unsupported() {
     let ready = next_json(&mut ws).await.unwrap();
     let session = ready["session"].as_str().unwrap().to_string();
 
-    let cmd = serde_json::json!({ "DemoteToLocal": { "session": session } });
-    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+    // Promote to the receiver.
+    let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
         .await
         .unwrap();
     loop {
         let frame = next_json(&mut ws).await.expect("a frame");
-        if frame["type"] == "error" {
-            assert!(
-                frame["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("demote-from-remote not supported")
-            );
+        if frame["type"] == "promoted" {
             break;
         }
-        assert_ne!(
-            frame["type"], "demoted",
-            "demote must not succeed in vps mode"
-        );
+        assert_ne!(frame["type"], "error", "promote must not error: {frame:?}");
     }
+
+    // Advance the session on the RECEIVER: write a file via its /workspace RPC.
+    let recv_remote_ws = RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    recv_remote_ws
+        .apply_edit(&otto_engine_core::types::Edit {
+            path: std::path::PathBuf::from("remote_only.txt"),
+            new_contents: "FROM_RECEIVER".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Demote: the source pulls the session + workspace back to local.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut ws).await.expect("a frame");
+        if frame["type"] == "demoted" {
+            assert_eq!(frame["endpoint"].as_str().unwrap(), src_ws);
+            break;
+        }
+        assert_ne!(frame["type"], "error", "demote must not error: {frame:?}");
+    }
+
+    // The receiver-only file now exists in the SOURCE's on-disk workspace.
+    assert_eq!(
+        std::fs::read(src_w.path().join("remote_only.txt")).unwrap(),
+        b"FROM_RECEIVER"
+    );
+}
+
+#[tokio::test]
+async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
+    use otto_engine_core::traits::Workspace as _;
+
+    // Receiver, acceptance enabled; source serve in vps mode pointed at it.
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, src_w, _sd) = start_source_vps(recv_ws.clone()).await;
+
+    // Connect to the source, create + promote a session.
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "promoted" {
+            break;
+        }
+        assert_ne!(f["type"], "error", "{f:?}");
+    }
+
+    // Advance the session ON THE RECEIVER: write a file via its /workspace RPC.
+    let recv_remote_ws = otto_workspace::RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    recv_remote_ws
+        .apply_edit(&otto_engine_core::types::Edit {
+            path: std::path::PathBuf::from("advanced.txt"),
+            new_contents: "ADVANCED_ON_RECEIVER".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Demote back to the source.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "demoted" {
+            break;
+        }
+        assert_ne!(f["type"], "error", "{f:?}");
+    }
+    drop(ws);
+
+    // The source's on-disk workspace now has the receiver's advanced file.
+    assert_eq!(
+        std::fs::read(src_w.path().join("advanced.txt")).unwrap(),
+        b"ADVANCED_ON_RECEIVER"
+    );
+
+    // INCREMENTAL VALUE: the source can reconnect to its now-local session — a fresh /ws connection
+    // with the id yields a Ready for the same session (it lives in the source store again).
+    let (mut ws2, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
+        "{src_ws}/ws?session={session}&last_seq=0"
+    )))
+    .await
+    .unwrap();
+    let ready2 = next_json(&mut ws2).await.unwrap();
+    assert_eq!(ready2["type"], "ready");
+    assert_eq!(ready2["session"].as_str().unwrap(), session);
+
+    // Copy semantics: demote is non-destructive — the receiver still holds the session.
+    let resp = post_export(&recv_http, Some(TOKEN), &session).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]

@@ -55,6 +55,10 @@ struct ServeState {
     promote: Option<PromoteConfig>,
     /// `true` when `--accept-promotions` is set; enables the inbound `POST /promote` restore RPC.
     accept_promotions: bool,
+    /// This server's own public ws base (e.g. `ws://host:port`), reported as the reconnect
+    /// target on a vps `Demoted`. `Some(base)` when this serve can be demoted-back-to; `None`
+    /// for servers never demoted-from.
+    public_ws_base: Option<String>,
     /// Provisioned engines, retained so they outlive the local connection that created them
     /// (a dropped `RemoteHandle` aborts its engine task). Keyed by `(session, to_remote)` so a
     /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
@@ -98,6 +102,44 @@ pub fn app(
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
 ) -> AxumRouter {
+    app_inner(
+        service,
+        token,
+        capabilities,
+        promote,
+        accept_promotions,
+        None,
+    )
+}
+
+/// Build the axum app, specifying this server's own public ws base (the vps-demote reconnect
+/// target). `app` is the same with no base, for servers that are never demoted-from.
+pub fn app_with_base(
+    service: EngineService,
+    token: String,
+    capabilities: CapabilitiesManifest,
+    promote: Option<PromoteConfig>,
+    accept_promotions: bool,
+    public_ws_base: String,
+) -> AxumRouter {
+    app_inner(
+        service,
+        token,
+        capabilities,
+        promote,
+        accept_promotions,
+        Some(public_ws_base),
+    )
+}
+
+fn app_inner(
+    service: EngineService,
+    token: String,
+    capabilities: CapabilitiesManifest,
+    promote: Option<PromoteConfig>,
+    accept_promotions: bool,
+    public_ws_base: Option<String>,
+) -> AxumRouter {
     assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
         service,
@@ -105,6 +147,7 @@ pub fn app(
         capabilities,
         promote,
         accept_promotions,
+        public_ws_base,
         remotes: Mutex::new(HashMap::new()),
     });
     // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
@@ -122,6 +165,7 @@ pub fn app(
         .route("/ws", get(ws_handler))
         .route("/workspace", post(workspace_handler))
         .route("/promote", post(promote_handler))
+        .route("/export", post(export_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -208,6 +252,39 @@ async fn promote_handler(
         Err(crate::service::AcceptError::Failed(e)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+    }
+}
+
+/// Outbound export RPC (receiver role): returns a session's `PromoteBundle` so a demoting source
+/// can pull it back. Same gate as `/promote`: `403` unless `--accept-promotions`, `401` without a
+/// valid bearer. The bundle's workspace snapshot is gate-filtered (secrets never leave here).
+async fn export_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<ServeState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.accept_promotions {
+        return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
+    }
+    if !authorized(&headers, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
+    #[derive(serde::Deserialize)]
+    struct ExportRequest {
+        session: String,
+    }
+    let req: ExportRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
+    };
+    let session = match uuid::Uuid::parse_str(&req.session) {
+        Ok(u) => SessionId(u),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad session id: {e}")).into_response(),
+    };
+    match state.service.export_promotion(session).await {
+        Ok(bundle) => axum::Json(bundle).into_response(),
+        // Unknown session (snapshot errors when the row is absent) → 404, not a 500.
+        Err(_) => (StatusCode::NOT_FOUND, "unknown session").into_response(),
     }
 }
 
@@ -541,17 +618,61 @@ async fn handle_handover(
         return;
     };
 
-    // Vps mode cannot demote: pulling a session back off the operator's server is a separate,
-    // larger piece (a reverse snapshot-export RPC). Refuse honestly. Loopback demote is unchanged.
-    if !to_remote && matches!(cfg.mode, crate::remote::PromoteMode::Vps { .. }) {
-        let _ = send_msg(
-            writer,
-            &ServerMessage::Error {
-                message: "demote-from-remote not supported in vps mode".to_string(),
-            },
-        )
-        .await;
-        return;
+    // Vps demote: pull the session's current bundle back off the receiver and restore it into THIS
+    // (source) engine, overwriting our own stale copy. Symmetric inverse of the promote push. The
+    // client reconnects to us (the session is local again), so we report our own public ws base.
+    if !to_remote {
+        if let crate::remote::PromoteMode::Vps { endpoint } = &cfg.mode {
+            let target = crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone());
+            let bundle = match target.export(session).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(e) = state.service.accept_demotion(&bundle).await {
+                let msg = match e {
+                    crate::service::AcceptError::Refused(m) => m,
+                    crate::service::AcceptError::Failed(err) => err.to_string(),
+                    // unreachable: accept_demotion uses restore_over (overwrite), never AlreadyExists
+                    crate::service::AcceptError::AlreadyExists => {
+                        "demote restore conflict".to_string()
+                    }
+                };
+                let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
+                return;
+            }
+            match &state.public_ws_base {
+                Some(base) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Demoted {
+                            session,
+                            endpoint: base.clone(),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    // Misconfiguration: a vps-demotable serve must be built via serve_app_with_base.
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: "demote target has no public ws base configured".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
     }
 
     // Reuse an existing handover for this session (idempotent): provisioning again would drop the

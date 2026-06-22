@@ -231,27 +231,14 @@ impl EngineService {
         Ok(outcome)
     }
 
-    /// Restore a promoted bundle into this (receiver) engine: write each workspace file through
-    /// the permission gate, then restore the session into the store. Fail-closed and validated
-    /// up front — a sensitive-path entry (`.env`/`.ssh`/…) is refused before anything is written,
-    /// and a duplicate session id is reported (never overwritten).
-    pub async fn accept_promotion(
+    /// Validate every workspace file in `bundle` through the permission gate and return the edits
+    /// to apply. The inviolable sensitive-path floor is enforced here (fail-closed): a non-UTF-8
+    /// path, a path escaping the root, a sensitive path, or non-UTF-8 contents aborts with nothing
+    /// applied. Shared by `accept_promotion` (receiver restore) and `accept_demotion` (source pull).
+    fn validate_workspace_edits(
         &self,
         bundle: &crate::remote::PromoteBundle,
-    ) -> Result<SessionId, AcceptError> {
-        let id = bundle.session.id;
-
-        // Duplicate probe: a present session is a 409, not a silent overwrite. This is only a
-        // fast-path label — the real guard is `store.restore`'s atomic INSERT, which fails the
-        // primary-key constraint on a duplicate, so a probe that errors for any other reason
-        // (and falls through here) still cannot overwrite an existing session.
-        if self.store.session_status(id).await.is_ok() {
-            return Err(AcceptError::AlreadyExists);
-        }
-
-        // Validate the WHOLE workspace snapshot through the gate before writing anything: a
-        // sensitive-path entry is refused (fail-closed) and nothing lands. This is where the
-        // inviolable sensitive-path floor is enforced on restore.
+    ) -> Result<Vec<Edit>, AcceptError> {
         let mut edits = Vec::with_capacity(bundle.workspace.files.len());
         for (path, bytes) in &bundle.workspace.files {
             // The gate is the sensitive-path defense here (`apply_edit` only checks containment),
@@ -292,10 +279,58 @@ impl EngineService {
                 new_contents,
             });
         }
+        Ok(edits)
+    }
+
+    /// Restore a promoted bundle into this (receiver) engine: write each workspace file through
+    /// the permission gate, then restore the session into the store. Fail-closed and validated
+    /// up front — a sensitive-path entry (`.env`/`.ssh`/…) is refused before anything is written,
+    /// and a duplicate session id is reported (never overwritten).
+    pub async fn accept_promotion(
+        &self,
+        bundle: &crate::remote::PromoteBundle,
+    ) -> Result<SessionId, AcceptError> {
+        let id = bundle.session.id;
+
+        // Duplicate probe: a present session is a 409, not a silent overwrite. This is only a
+        // fast-path label — the real guard is `store.restore`'s atomic INSERT, which fails the
+        // primary-key constraint on a duplicate, so a probe that errors for any other reason
+        // (and falls through here) still cannot overwrite an existing session.
+        if self.store.session_status(id).await.is_ok() {
+            return Err(AcceptError::AlreadyExists);
+        }
+
+        // Validate the WHOLE workspace snapshot through the gate before writing anything: a
+        // sensitive-path entry is refused (fail-closed) and nothing lands.
+        let edits = self.validate_workspace_edits(bundle)?;
 
         // Session first, then the pre-validated workspace files.
         self.store
             .restore(&bundle.session)
+            .await
+            .map_err(AcceptError::Failed)?;
+        for edit in &edits {
+            self.workspace
+                .apply_edit(edit)
+                .await
+                .map_err(AcceptError::Failed)?;
+        }
+        Ok(id)
+    }
+
+    /// Restore a bundle pulled back FROM a remote (demote) into this (source) engine, OVERWRITING
+    /// this engine's own prior copy of the session. Unlike `accept_promotion`, a present session id
+    /// is expected (the source kept its copy when it promoted) and is replaced via `restore_over`.
+    /// The sensitive-path floor is still enforced up front (fail-closed) before anything is written.
+    pub async fn accept_demotion(
+        &self,
+        bundle: &crate::remote::PromoteBundle,
+    ) -> Result<SessionId, AcceptError> {
+        let id = bundle.session.id;
+        let edits = self.validate_workspace_edits(bundle)?;
+        // Overwrite the source's own (stale) session row, then the pre-validated workspace files.
+        self.store
+            .restore_over(&bundle.session)
             .await
             .map_err(AcceptError::Failed)?;
         for edit in &edits {
@@ -372,24 +407,45 @@ impl EngineService {
                     },
                 }
             }
-            WorkspaceRequest::Snapshot => match self.workspace.snapshot().await {
-                Ok(snap) => {
-                    let files: Vec<_> = snap
-                        .files
-                        .into_iter()
-                        .filter(|(p, _)| {
-                            self.tools
-                                .check("fs.read", &json!({ "path": p.to_string_lossy() }))
-                                == Decision::Allow
-                        })
-                        .collect();
-                    WorkspaceResponse::Snapshot { files }
-                }
+            WorkspaceRequest::Snapshot => match self.filtered_workspace_snapshot().await {
+                Ok(snap) => WorkspaceResponse::Snapshot { files: snap.files },
                 Err(e) => WorkspaceResponse::Error {
                     message: e.to_string(),
                 },
             },
         }
+    }
+
+    /// The workspace snapshot with gate-denied paths removed: any path the read gate denies (the
+    /// inviolable sensitive-path floor) is omitted, so secrets never leave this engine. Shared by
+    /// the `/workspace` Snapshot RPC and `export_promotion`.
+    async fn filtered_workspace_snapshot(
+        &self,
+    ) -> anyhow::Result<otto_engine_core::types::WorkspaceSnapshot> {
+        let snap = self.workspace.snapshot().await?;
+        let files = snap
+            .files
+            .into_iter()
+            .filter(|(p, _)| {
+                self.tools
+                    .check("fs.read", &json!({ "path": p.to_string_lossy() }))
+                    == Decision::Allow
+            })
+            .collect();
+        Ok(otto_engine_core::types::WorkspaceSnapshot { files })
+    }
+
+    /// Build a `PromoteBundle` for `session` so a demoting source can pull it back. The workspace
+    /// snapshot is gate-filtered (sensitive paths excluded — secrets never leave this engine).
+    /// Errors if the session is unknown.
+    pub async fn export_promotion(
+        &self,
+        session: SessionId,
+    ) -> anyhow::Result<crate::remote::PromoteBundle> {
+        Ok(crate::remote::PromoteBundle {
+            session: self.store.snapshot(session).await?,
+            workspace: self.filtered_workspace_snapshot().await?,
+        })
     }
 }
 
@@ -418,6 +474,40 @@ mod tests {
             workspace,
             tools,
         )
+    }
+
+    #[tokio::test]
+    async fn export_promotion_returns_bundle_without_sensitive_files() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        // Put a normal file and a sensitive file on disk in the workspace.
+        std::fs::write(ws.path().join("out.txt"), b"KEEP").unwrap();
+        std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let bundle = service.export_promotion(id).await.unwrap();
+        assert_eq!(bundle.session.id, id);
+        let paths: Vec<_> = bundle
+            .workspace
+            .files
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(paths.contains(&std::path::PathBuf::from("out.txt")));
+        // The sensitive-path floor filtered .env out of the export — it never leaves the receiver.
+        assert!(!paths.contains(&std::path::PathBuf::from(".env")));
+    }
+
+    #[tokio::test]
+    async fn export_promotion_unknown_session_is_error() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+        assert!(service.export_promotion(SessionId::new()).await.is_err());
     }
 
     #[tokio::test]
@@ -623,6 +713,74 @@ mod tests {
             service.accept_promotion(&bundle).await,
             Err(AcceptError::AlreadyExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn accept_demotion_overwrites_an_existing_session() {
+        use crate::remote::PromoteBundle;
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        // Seed S with an original copy of the session.
+        let id = service
+            .create_session("old", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // A bundle for the SAME id carrying advanced state + a new workspace file.
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                goal: "advanced".to_string(),
+                status: otto_persistence::SessionStatus::Done,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot {
+                files: vec![(std::path::PathBuf::from("out.txt"), b"PULLED".to_vec())],
+            },
+        };
+
+        // accept_demotion overwrites S's stale row (no AlreadyExists), and writes the file.
+        let restored = service.accept_demotion(&bundle).await.unwrap();
+        assert_eq!(restored, id);
+        assert_eq!(service.store().snapshot(id).await.unwrap().goal, "advanced");
+        assert_eq!(
+            service
+                .workspace()
+                .read(std::path::Path::new("out.txt"))
+                .await
+                .unwrap(),
+            b"PULLED"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_demotion_refuses_sensitive_workspace_entry() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        let id = SessionId::new();
+        let bundle = bundle_with(id, std::path::PathBuf::from(".env"), b"SECRET=1".to_vec());
+        assert!(matches!(
+            service.accept_demotion(&bundle).await,
+            Err(crate::service::AcceptError::Refused(_))
+        ));
+        // Fail-closed: nothing landed — neither the file nor the session.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new(".env"))
+                .await
+                .is_err()
+        );
+        assert!(service.store().session_status(id).await.is_err());
     }
 
     fn scripted_router() -> Arc<dyn Router> {

@@ -33,7 +33,9 @@ pub use remote::{
     LoopbackTarget, PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget,
     UnsupportedTarget, VpsTarget, promote,
 };
-pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
+pub use serve::{
+    app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,
+};
 pub use service::{AcceptError, CollectingSink, EngineService, EventSink, TurnControls};
 
 /// Default model ids when the corresponding `OTTO_*_MODEL` env var is unset. Referenced by

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use otto_engine::{
     McpConnection, build_router, build_tool_registry, mcp_connect_bash, mcp_connect_fs,
-    mcp_connect_git, mcp_connect_grep, resolve_tls_paths, run_goal, serve_app, serve_run,
+    mcp_connect_git, mcp_connect_grep, resolve_tls_paths, run_goal, serve_app_with_base, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
@@ -255,9 +255,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         }),
         (false, None) => None,
     };
-    let app = serve_app(service, token, capabilities, promote, accept_promotions);
-
-    // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
+    // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed). Resolved before
+    // building the app so the scheme (and thus our own public ws base) is known up front.
     let tls = match resolve_tls_paths(tls_cert, tls_key) {
         Ok(Some((cert, key))) => {
             // The rustls crypto provider is supplied at compile time by axum-server's tls-rustls (aws-lc-rs); no explicit install_default() is needed here.
@@ -271,10 +270,20 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         }
     };
 
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    let public_ws_base = format!("{scheme}://127.0.0.1:{port}");
+    let app = serve_app_with_base(
+        service,
+        token,
+        capabilities,
+        promote,
+        accept_promotions,
+        public_ws_base,
+    );
+
     let addr = format!("127.0.0.1:{port}");
     let listener = std::net::TcpListener::bind(&addr)?;
     listener.set_nonblocking(true)?;
-    let scheme = if tls.is_some() { "wss" } else { "ws" };
     eprintln!("otto serve listening on {scheme}://{addr}/ws");
     serve_run(listener, app, tls).await?;
     Ok(())

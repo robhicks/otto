@@ -293,6 +293,69 @@ impl crate::SessionStore for SqliteStore {
         tx.commit().await?;
         Ok(state.id)
     }
+
+    async fn restore_over(
+        &self,
+        state: &crate::SessionState,
+    ) -> anyhow::Result<otto_protocol::SessionId> {
+        // Atomic overwrite: delete any prior rows for this id, then re-insert the whole session.
+        // Either the replacement lands completely or nothing changes. Timestamps regenerated.
+        let now = now_millis();
+        let mut tx = self.pool.begin().await?;
+
+        let id = state.id.0.to_string();
+        sqlx::query("DELETE FROM events WHERE session_id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM turns WHERE session_id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM sessions WHERE id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&id)
+        .bind(&state.goal)
+        .bind(state.status.as_db_str())
+        .bind(now)
+        .bind(now)
+        .bind(serde_json::to_string(&state.config)?)
+        .execute(&mut *tx)
+        .await?;
+
+        for event in &state.events {
+            sqlx::query("INSERT INTO events (session_id, seq, kind) VALUES (?1, ?2, ?3)")
+                .bind(&id)
+                .bind(event.seq as i64)
+                .bind(serde_json::to_string(&event.kind)?)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        for turn in &state.turns {
+            sqlx::query(
+                "INSERT INTO turns (session_id, turn_index, goal, outcome, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .bind(&id)
+            .bind(turn.turn_index as i64)
+            .bind(&turn.goal)
+            .bind(serde_json::to_string(&turn.outcome)?)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(state.id)
+    }
 }
 
 /// Milliseconds since the Unix epoch, for `created_at`/`updated_at`/`started_at`.
@@ -591,6 +654,48 @@ mod tests {
         let snap = store.snapshot(id).await.unwrap();
         // Restoring into the same store collides on the sessions primary key.
         assert!(store.restore(&snap).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_over_overwrites_an_existing_session() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("old goal", &serde_json::json!({}))
+            .await
+            .unwrap();
+        // A different snapshot for the SAME id: new goal, fresh event, Done status.
+        let advanced = SessionState {
+            id,
+            goal: "new goal".to_string(),
+            status: SessionStatus::Done,
+            config: serde_json::json!({ "m": "y" }),
+            events: vec![log_event(id, 0, "fresh")],
+            turns: vec![turn(0, true)],
+        };
+        let returned = store.restore_over(&advanced).await.unwrap();
+        assert_eq!(returned, id);
+        // The stale row was replaced, not duplicated or rejected.
+        assert_eq!(store.snapshot(id).await.unwrap(), advanced);
+        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn restore_over_into_a_fresh_store_inserts() {
+        let (source, _d1) = temp_store().await;
+        let id = source
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        source
+            .append_event(id, &log_event(id, 0, "a"))
+            .await
+            .unwrap();
+        let snap = source.snapshot(id).await.unwrap();
+
+        let (target, _d2) = temp_store().await;
+        // No existing row: restore_over behaves like restore (insert).
+        assert_eq!(target.restore_over(&snap).await.unwrap(), id);
+        assert_eq!(target.snapshot(id).await.unwrap(), snap);
     }
 
     #[tokio::test]

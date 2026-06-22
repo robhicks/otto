@@ -216,9 +216,14 @@ alongside `LoopbackTarget`) promotes a session onto an already-running, bearer-a
 the client then reconnects to the receiver and resumes via `Last-Event-ID`. `teardown` is a no-op
 (the target does not own the operator's server). The receiver restore is **gated** — workspace
 files land through the permission floor, so a bundle carrying `.env`/`.ssh`/keys is refused.
-The residual `UnsupportedTarget` boundary is now only **machine provisioning** (SSH / cloud-SDK VM
-creation stays external and manual); **demote-from-remote** (a reverse snapshot-export RPC) is the
-next follow-up. `microvm` impl (ephemeral, per-session) is v2.
+**demote-from-remote** is **shipped** too: a client on the source serve issues `DemoteToLocal`; the
+source pulls the session back via a gated `POST /export` on the receiver and restores it locally with
+`accept_demotion` (overwriting its own stale copy via `SessionStore::restore_over`), then replies
+`Demoted` and the client reconnects to the source. The export is gated by the same
+`--accept-promotions` flag and its workspace snapshot is gate-filtered (secrets never leave the
+receiver); the receiver keeps its copy. The residual `UnsupportedTarget` boundary is now only
+**machine provisioning** (SSH / cloud-SDK VM creation stays external and manual). `microvm` impl
+(ephemeral, per-session) is v2.
 
 ## Protocol message catalog
 
