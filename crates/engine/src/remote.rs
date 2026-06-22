@@ -217,6 +217,26 @@ impl VpsTarget {
             self.endpoint.clone()
         }
     }
+
+    /// Pull a session's `PromoteBundle` back from the receiver (the demote primitive). POSTs the
+    /// session id to `/export`; surfaces the receiver's status + body on a non-2xx, symmetric with
+    /// how `provision` reports a rejected push.
+    pub async fn export(&self, session: SessionId) -> anyhow::Result<PromoteBundle> {
+        let url = format!("{}/export", self.http_base());
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "session": session.0.to_string() }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("export rejected by remote: HTTP {status}: {body}");
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 #[async_trait]
