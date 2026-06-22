@@ -703,7 +703,9 @@ async fn start_promote_server() -> (u16, tempfile::TempDir) {
     );
     let promote = Some(otto_engine::PromoteConfig {
         token: TOKEN.to_string(),
-        base_dir: dir.path().join("remotes"),
+        mode: otto_engine::PromoteMode::Loopback {
+            base_dir: dir.path().join("remotes"),
+        },
     });
     let app = serve_app(service, TOKEN.to_string(), test_capabilities(), promote);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -30,8 +30,8 @@ pub use mcp::{
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
 };
 pub use remote::{
-    LoopbackTarget, PromoteBundle, PromoteConfig, RemoteHandle, RemoteTarget, UnsupportedTarget,
-    promote,
+    LoopbackTarget, PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget,
+    UnsupportedTarget, promote,
 };
 pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
 pub use service::{CollectingSink, EngineService, EventSink, TurnControls};

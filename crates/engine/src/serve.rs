@@ -513,7 +513,11 @@ async fn handle_handover(
     let endpoint = match existing {
         Some(endpoint) => endpoint,
         None => {
-            let target = LoopbackTarget::new(cfg.token.clone(), cfg.base_dir.clone(), to_remote);
+            let base_dir = match &cfg.mode {
+                crate::remote::PromoteMode::Loopback { base_dir } => base_dir.clone(),
+                crate::remote::PromoteMode::Vps { .. } => unreachable!("vps wired in Task 5"),
+            };
+            let target = LoopbackTarget::new(cfg.token.clone(), base_dir, to_remote);
             let handle = match promote(
                 state.service.store(),
                 state.service.workspace(),

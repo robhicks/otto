@@ -17,16 +17,26 @@ use otto_workspace::LocalWorkspace;
 use crate::service::EngineService;
 use crate::{build_default_registry, build_router, build_tool_registry};
 
-/// Enables session handover on a served engine. `token` is the bearer the provisioned engine
-/// requires (reused from the source, by design); `base_dir` is where restored stores/workspaces
-/// are written. `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback`.
+/// Enables session handover on a served engine. `token` is the bearer the target requires (reused
+/// from the source, by design); `mode` selects which `RemoteTarget` a handover provisions onto.
+/// `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback` or `--promote-vps`.
 #[derive(Clone)]
 pub struct PromoteConfig {
     pub token: String,
-    pub base_dir: PathBuf,
+    pub mode: PromoteMode,
+}
+
+/// Which kind of remote a promote provisions onto.
+#[derive(Clone)]
+pub enum PromoteMode {
+    /// Provision a fresh in-process engine, restoring under `base_dir` (loopback round-trip).
+    Loopback { base_dir: PathBuf },
+    /// Push to an already-running remote `otto serve` at `endpoint` (`ws://…` / `wss://…`).
+    Vps { endpoint: String },
 }
 
 /// A captured session ready to move to another engine: persisted session state + workspace files.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PromoteBundle {
     pub session: SessionState,
     pub workspace: WorkspaceSnapshot,
@@ -146,7 +156,9 @@ impl RemoteTarget for LoopbackTarget {
         };
         let promote = Some(PromoteConfig {
             token: self.token.clone(),
-            base_dir: dir.join("promote"),
+            mode: PromoteMode::Loopback {
+                base_dir: dir.join("promote"),
+            },
         });
         let app = crate::serve::app(service, self.token.clone(), capabilities, promote);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

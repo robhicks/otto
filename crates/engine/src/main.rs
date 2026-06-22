@@ -227,11 +227,13 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let capabilities = otto_engine::build_capabilities();
     let promote = if promote_loopback {
         Some(otto_engine::PromoteConfig {
+            token: token.clone(),
             // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
             // provisioned engine's restored store/workspace under here is never recursively
             // captured by a later `workspace.snapshot()`. Do not rename without that guarantee.
-            token: token.clone(),
-            base_dir: root.join(".otto-remotes"),
+            mode: otto_engine::PromoteMode::Loopback {
+                base_dir: root.join(".otto-remotes"),
+            },
         })
     } else {
         None
