@@ -189,6 +189,12 @@ workspace; the live copy is on `S`. The two can diverge if `R` is reused. This m
 export also retiring/aborting `R`'s session, with a partial-failure window between exported and
 restored) is a deliberate non-goal.
 
+**Additive overlay → deleted-on-`R` files linger on `S`.** `accept_demotion` applies `R`'s
+snapshot file-by-file through `apply_edit` (like `accept_promotion`/`Workspace::restore`); it
+overlays rather than mirrors, so a file *deleted* on `R` after promote is not removed from `S` on
+demote. This is identical to the existing promote behavior and accepted for v1; a true mirroring
+restore (delete-then-write the whole tree) is out of scope.
+
 ## Spec coverage check
 
 | Requirement | Component |
