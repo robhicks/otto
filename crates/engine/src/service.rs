@@ -60,7 +60,10 @@ impl Default for TurnControls {
 pub enum AcceptError {
     /// The session id already exists in the receiver store → `409 Conflict` (no silent overwrite).
     AlreadyExists,
-    /// Any other failure (sensitive-path refusal, non-UTF-8 entry, store/IO error) → `500`.
+    /// The bundle is hostile or malformed (sensitive-path entry, non-UTF-8 path/contents) → `400`.
+    /// A client fault: the receiver is fine, so it must not read as a server error or be retried.
+    Refused(String),
+    /// A genuine receiver-side failure (store/IO error) → `500`.
     Failed(anyhow::Error),
 }
 
@@ -228,12 +231,6 @@ impl EngineService {
         Ok(outcome)
     }
 
-    /// Handle one unary workspace RPC against this service's workspace. `read` and
-    /// `apply_edit` are routed through the permission gate (Allow-only), so the
-    /// network-exposed primitive cannot read/write sensitive paths even though it bypasses
-    /// the orchestrator. `list` and `snapshot` are ALSO gate-filtered: any path the read
-    /// gate denies is omitted from the result, so a sensitive non-dotfile (e.g. `id_rsa`)
-    /// cannot appear in a listing or snapshot even if the workspace walk includes it.
     /// Restore a promoted bundle into this (receiver) engine: write each workspace file through
     /// the permission gate, then restore the session into the store. Fail-closed and validated
     /// up front — a sensitive-path entry (`.env`/`.ssh`/…) is refused before anything is written,
@@ -244,7 +241,10 @@ impl EngineService {
     ) -> Result<SessionId, AcceptError> {
         let id = bundle.session.id;
 
-        // Duplicate probe: a present session is a 409, not a silent overwrite.
+        // Duplicate probe: a present session is a 409, not a silent overwrite. This is only a
+        // fast-path label — the real guard is `store.restore`'s atomic INSERT, which fails the
+        // primary-key constraint on a duplicate, so a probe that errors for any other reason
+        // (and falls through here) still cannot overwrite an existing session.
         if self.store.session_status(id).await.is_ok() {
             return Err(AcceptError::AlreadyExists);
         }
@@ -254,21 +254,38 @@ impl EngineService {
         // inviolable sensitive-path floor is enforced on restore.
         let mut edits = Vec::with_capacity(bundle.workspace.files.len());
         for (path, bytes) in &bundle.workspace.files {
-            if self
-                .tools
-                .check("fs.write", &json!({ "path": path.to_string_lossy() }))
-                == Decision::Deny
-            {
-                return Err(AcceptError::Failed(anyhow::anyhow!(
-                    "restore refused sensitive path: {}",
+            // The gate is the sensitive-path defense here (`apply_edit` only checks containment),
+            // so feed it the LOSSLESS path string — never `to_string_lossy`, whose U+FFFD
+            // substitution could let a non-UTF-8 path slip a sensitive marker past the gate.
+            // A non-UTF-8 path is itself untrusted input: reject it outright.
+            let Some(path_str) = path.to_str() else {
+                return Err(AcceptError::Refused(format!(
+                    "restore refused non-UTF-8 path: {}",
                     path.display()
+                )));
+            };
+            // Reject path-escape (`..`, absolute, drive prefix) BEFORE restoring the session, so a
+            // traversal entry aborts with nothing landing (otherwise `apply_edit`'s containment
+            // check would fire only after `store.restore`, leaving an orphaned session row).
+            if path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                return Err(AcceptError::Refused(format!(
+                    "restore refused path escaping workspace root: {path_str}"
+                )));
+            }
+            if self.tools.check("fs.write", &json!({ "path": path_str })) == Decision::Deny {
+                return Err(AcceptError::Refused(format!(
+                    "restore refused sensitive path: {path_str}"
                 )));
             }
             let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
-                AcceptError::Failed(anyhow::anyhow!(
-                    "restore: non-UTF-8 contents for {}",
-                    path.display()
-                ))
+                AcceptError::Refused(format!("restore: non-UTF-8 contents for {path_str}"))
             })?;
             edits.push(Edit {
                 path: path.clone(),
@@ -290,6 +307,12 @@ impl EngineService {
         Ok(id)
     }
 
+    /// Handle one unary workspace RPC against this service's workspace. `read` and
+    /// `apply_edit` are routed through the permission gate (Allow-only), so the
+    /// network-exposed primitive cannot read/write sensitive paths even though it bypasses
+    /// the orchestrator. `list` and `snapshot` are ALSO gate-filtered: any path the read
+    /// gate denies is omitted from the result, so a sensitive non-dotfile (e.g. `id_rsa`)
+    /// cannot appear in a listing or snapshot even if the workspace walk includes it.
     pub async fn workspace_rpc(&self, req: WorkspaceRequest) -> WorkspaceResponse {
         match req {
             WorkspaceRequest::Read { path } => {
@@ -463,12 +486,114 @@ mod tests {
         };
 
         let err = service.accept_promotion(&bundle).await;
-        assert!(matches!(err, Err(AcceptError::Failed(_))));
+        // A sensitive entry is a client fault (Refused → 400), not a receiver error.
+        assert!(matches!(err, Err(AcceptError::Refused(_))));
         // Fail-closed: nothing landed — neither the file nor the session.
         assert!(
             service
                 .workspace()
                 .read(std::path::Path::new(".env"))
+                .await
+                .is_err()
+        );
+        assert!(service.store().session_status(id).await.is_err());
+    }
+
+    /// Build a one-file bundle for the edge-case restore tests below.
+    fn bundle_with(
+        id: SessionId,
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+    ) -> crate::remote::PromoteBundle {
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        crate::remote::PromoteBundle {
+            session: SessionState {
+                id,
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot {
+                files: vec![(path, bytes)],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_refuses_parent_dir_escape() {
+        use std::path::PathBuf;
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        let bundle = bundle_with(id, PathBuf::from("../escape.txt"), b"x".to_vec());
+        // A traversal path is refused up front (400) — nothing lands outside the root, and the
+        // session is NOT restored (rejected before `store.restore`).
+        assert!(matches!(
+            service.accept_promotion(&bundle).await,
+            Err(AcceptError::Refused(_))
+        ));
+        assert!(!ws_dir.path().parent().unwrap().join("escape.txt").exists());
+        assert!(service.store().session_status(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_refuses_absolute_path() {
+        use std::path::PathBuf;
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        let bundle = bundle_with(id, PathBuf::from("/tmp/otto-escape.txt"), b"x".to_vec());
+        assert!(matches!(
+            service.accept_promotion(&bundle).await,
+            Err(AcceptError::Refused(_))
+        ));
+        assert!(service.store().session_status(id).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accept_promotion_refuses_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        // A path with non-UTF-8 bytes is untrusted input: it must be refused outright, never
+        // gate-checked via a lossy string (which could mask a sensitive marker).
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"weird\xFFname"));
+        let bundle = bundle_with(id, path, b"x".to_vec());
+        assert!(matches!(
+            service.accept_promotion(&bundle).await,
+            Err(AcceptError::Refused(_))
+        ));
+        assert!(service.store().session_status(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_refuses_non_utf8_contents() {
+        use std::path::PathBuf;
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        let bundle = bundle_with(id, PathBuf::from("bin.dat"), vec![0xFF, 0xFE]);
+        let err = service.accept_promotion(&bundle).await;
+        assert!(matches!(err, Err(AcceptError::Refused(_))));
+        // Fail-closed: the validation loop runs before any write, so nothing landed.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new("bin.dat"))
                 .await
                 .is_err()
         );

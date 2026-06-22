@@ -230,8 +230,12 @@ impl RemoteTarget for VpsTarget {
             .json(bundle)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("promote rejected by remote: HTTP {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            // Surface the receiver's reason (e.g. "restore refused sensitive path: …",
+            // "session already exists") instead of a bare status, for operator diagnostics.
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("promote rejected by remote: HTTP {status}: {body}");
         }
         Ok(RemoteHandle {
             endpoint: self.endpoint.clone(),
@@ -265,5 +269,23 @@ mod tests {
             workspace: WorkspaceSnapshot { files: vec![] },
         };
         assert!(UnsupportedTarget.provision(&bundle).await.is_err());
+    }
+
+    #[test]
+    fn vps_http_base_maps_ws_schemes() {
+        // wss → https (the production path; otherwise the promote POST silently downgrades to
+        // plaintext), ws → http (loopback), and an unrecognized scheme passes through verbatim.
+        assert_eq!(
+            VpsTarget::new("wss://host:9000", "t").http_base(),
+            "https://host:9000"
+        );
+        assert_eq!(
+            VpsTarget::new("ws://127.0.0.1:7878", "t").http_base(),
+            "http://127.0.0.1:7878"
+        );
+        assert_eq!(
+            VpsTarget::new("http://host:1", "t").http_base(),
+            "http://host:1"
+        );
     }
 }

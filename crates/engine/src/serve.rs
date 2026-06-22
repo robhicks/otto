@@ -201,6 +201,10 @@ async fn promote_handler(
         Err(crate::service::AcceptError::AlreadyExists) => {
             (StatusCode::CONFLICT, "session already exists").into_response()
         }
+        Err(crate::service::AcceptError::Refused(msg)) => {
+            // Hostile/malformed bundle — a client fault, not a receiver failure.
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
         Err(crate::service::AcceptError::Failed(e)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }

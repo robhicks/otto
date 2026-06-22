@@ -125,10 +125,11 @@ async fn promote_valid_bundle_is_ok_and_restores() {
 
 #[tokio::test]
 async fn promote_sensitive_entry_is_refused() {
+    // A hostile/malformed bundle is a client fault → 400, not a receiver error (500).
     let (base, _w, _d) = start_receiver(true).await;
     let body = sample_bundle(SessionId::new(), vec![(".env", b"SECRET=1")]);
     let resp = post_promote(&base, Some(TOKEN), &body).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
