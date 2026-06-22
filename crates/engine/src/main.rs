@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
-//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint>] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => cmd_serve(rest).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback]"
+                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint>] [--accept-promotions]"
             );
             std::process::exit(2);
         }
@@ -174,6 +174,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut tls_key: Option<PathBuf> = None;
     let mut approve_edits = false;
     let mut promote_loopback = false;
+    let mut accept_promotions = false;
+    let mut promote_vps: Option<String> = None;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -200,6 +202,14 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             },
             "--approve-edits" => approve_edits = true,
             "--promote-loopback" => promote_loopback = true,
+            "--accept-promotions" => accept_promotions = true,
+            "--promote-vps" => match it.next() {
+                Some(e) => promote_vps = Some(e.clone()),
+                None => {
+                    eprintln!("error: --promote-vps requires a ws://… endpoint");
+                    std::process::exit(2);
+                }
+            },
             _ => {}
         }
     }
@@ -225,8 +235,12 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
     let capabilities = otto_engine::build_capabilities();
-    let promote = if promote_loopback {
-        Some(otto_engine::PromoteConfig {
+    let promote = match (promote_loopback, promote_vps) {
+        (true, Some(_)) => {
+            eprintln!("error: --promote-loopback and --promote-vps are mutually exclusive");
+            std::process::exit(2);
+        }
+        (true, None) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
             // provisioned engine's restored store/workspace under here is never recursively
@@ -234,11 +248,14 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             mode: otto_engine::PromoteMode::Loopback {
                 base_dir: root.join(".otto-remotes"),
             },
-        })
-    } else {
-        None
+        }),
+        (false, Some(endpoint)) => Some(otto_engine::PromoteConfig {
+            token: token.clone(),
+            mode: otto_engine::PromoteMode::Vps { endpoint },
+        }),
+        (false, None) => None,
     };
-    let app = serve_app(service, token, capabilities, promote, false);
+    let app = serve_app(service, token, capabilities, promote, accept_promotions);
 
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed).
     let tls = match resolve_tls_paths(tls_cert, tls_key) {
