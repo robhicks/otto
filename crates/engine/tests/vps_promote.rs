@@ -283,14 +283,22 @@ async fn start_source_vps(vps_endpoint: String) -> (String, tempfile::TempDir, t
             endpoint: vps_endpoint,
         },
     });
-    let app = serve_app(service, TOKEN.to_string(), caps(), promote, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let base = format!("ws://127.0.0.1:{port}");
+    let app = otto_engine::serve_app_with_base(
+        service,
+        TOKEN.to_string(),
+        caps(),
+        promote,
+        false,
+        base.clone(),
+    );
     tokio::spawn(async move {
         serve_run(listener, app, None).await.unwrap();
     });
-    (format!("ws://127.0.0.1:{port}"), ws_dir, db_dir)
+    (base, ws_dir, db_dir)
 }
 
 #[tokio::test]
@@ -324,10 +332,14 @@ async fn handover_vps_promote_points_at_receiver() {
 }
 
 #[tokio::test]
-async fn handover_vps_demote_is_unsupported() {
+async fn handover_vps_demote_pulls_session_back_to_source() {
+    use otto_engine_core::traits::Workspace as _;
+    use otto_workspace::RemoteWorkspace;
+
+    // Receiver accepts promotions; source promotes to it in vps mode.
     let (recv_http, _rw, _rd) = start_receiver(true).await;
     let recv_ws = recv_http.replace("http://", "ws://");
-    let (src_ws, _sw, _sd) = start_source_vps(recv_ws).await;
+    let (src_ws, src_w, _sd) = start_source_vps(recv_ws.clone()).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
@@ -335,26 +347,48 @@ async fn handover_vps_demote_is_unsupported() {
     let ready = next_json(&mut ws).await.unwrap();
     let session = ready["session"].as_str().unwrap().to_string();
 
-    let cmd = serde_json::json!({ "DemoteToLocal": { "session": session } });
-    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+    // Promote to the receiver.
+    let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
         .await
         .unwrap();
     loop {
         let frame = next_json(&mut ws).await.expect("a frame");
-        if frame["type"] == "error" {
-            assert!(
-                frame["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("demote-from-remote not supported")
-            );
+        if frame["type"] == "promoted" {
             break;
         }
-        assert_ne!(
-            frame["type"], "demoted",
-            "demote must not succeed in vps mode"
-        );
+        assert_ne!(frame["type"], "error", "promote must not error: {frame:?}");
     }
+
+    // Advance the session on the RECEIVER: write a file via its /workspace RPC.
+    let recv_remote_ws = RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    recv_remote_ws
+        .apply_edit(&otto_engine_core::types::Edit {
+            path: std::path::PathBuf::from("remote_only.txt"),
+            new_contents: "FROM_RECEIVER".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Demote: the source pulls the session + workspace back to local.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut ws).await.expect("a frame");
+        if frame["type"] == "demoted" {
+            assert_eq!(frame["endpoint"].as_str().unwrap(), src_ws);
+            break;
+        }
+        assert_ne!(frame["type"], "error", "demote must not error: {frame:?}");
+    }
+
+    // The receiver-only file now exists in the SOURCE's on-disk workspace.
+    assert_eq!(
+        std::fs::read(src_w.path().join("remote_only.txt")).unwrap(),
+        b"FROM_RECEIVER"
+    );
 }
 
 #[tokio::test]
