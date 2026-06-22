@@ -379,7 +379,10 @@ mod tests {
     use otto_workspace::LocalWorkspace;
 
     /// A receiver-style service over a fresh empty store + temp workspace, offline router.
-    async fn build_test_service(ws_root: &std::path::Path, db_path: std::path::PathBuf) -> EngineService {
+    async fn build_test_service(
+        ws_root: &std::path::Path,
+        db_path: std::path::PathBuf,
+    ) -> EngineService {
         let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_root));
         let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_root));
         let tools = Arc::new(crate::build_tool_registry(tools_ws, ws_root.to_path_buf()));

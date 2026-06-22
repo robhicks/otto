@@ -562,14 +562,15 @@ async fn handle_handover(
     let endpoint = match existing {
         Some(endpoint) => endpoint,
         None => {
-            let target: Box<dyn crate::remote::RemoteTarget> = match &cfg.mode {
-                crate::remote::PromoteMode::Loopback { base_dir } => Box::new(
-                    LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
-                ),
-                crate::remote::PromoteMode::Vps { endpoint } => {
-                    Box::new(crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()))
-                }
-            };
+            let target: Box<dyn crate::remote::RemoteTarget> =
+                match &cfg.mode {
+                    crate::remote::PromoteMode::Loopback { base_dir } => Box::new(
+                        LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
+                    ),
+                    crate::remote::PromoteMode::Vps { endpoint } => Box::new(
+                        crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
+                    ),
+                };
             let handle = match promote(
                 state.service.store(),
                 state.service.workspace(),

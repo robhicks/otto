@@ -302,7 +302,10 @@ async fn handover_vps_demote_is_unsupported() {
             );
             break;
         }
-        assert_ne!(frame["type"], "demoted", "demote must not succeed in vps mode");
+        assert_ne!(
+            frame["type"], "demoted",
+            "demote must not succeed in vps mode"
+        );
     }
 }
 

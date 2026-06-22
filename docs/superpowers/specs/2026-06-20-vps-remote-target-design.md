@@ -1,7 +1,11 @@
 # `vps` RemoteTarget — promote a session to a real remote engine
 
 **Date:** 2026-06-20
-**Status:** Approved design — ready for implementation plan
+**Status:** Shipped 2026-06-22 (plan: `docs/superpowers/plans/2026-06-22-vps-remote-target.md`).
+Component #1 was implemented as a **gated `EngineService::accept_promotion`** restore rather than a
+`Workspace::restore` trait move: `LocalWorkspace::apply_edit` does **not** enforce the sensitive-path
+floor (that lives in the `PermissionGate`/`ToolRegistry`), so the receiver restores workspace files
+through the gate to keep the floor real. The `Workspace` trait was not modified.
 **Depends on:** the remote axis (`RemoteTarget`, `promote()`, `LoopbackTarget`,
 `UnsupportedTarget` in `crates/engine/src/remote.rs`) and the promote-to-remote handover
 (sub-project F — `PromoteToRemote`/`DemoteToLocal`, `PromoteConfig`, `handle_handover`).

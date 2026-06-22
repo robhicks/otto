@@ -707,7 +707,13 @@ async fn start_promote_server() -> (u16, tempfile::TempDir) {
             base_dir: dir.path().join("remotes"),
         },
     });
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), promote, false);
+    let app = serve_app(
+        service,
+        TOKEN.to_string(),
+        test_capabilities(),
+        promote,
+        false,
+    );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
