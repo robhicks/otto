@@ -1,7 +1,7 @@
 # vps demote-from-remote — pull a session back off a running receiver
 
 **Date:** 2026-06-22
-**Status:** Approved design — implementation plan pending.
+**Status:** Shipped 2026-06-22 (plan: docs/superpowers/plans/2026-06-22-vps-demote-from-remote.md).
 **Depends on:** the `vps` `RemoteTarget` (`VpsTarget`, `PromoteConfig`/`PromoteMode::Vps`,
 `accept_promotion`, `POST /promote`) shipped 2026-06-22
 (`docs/superpowers/specs/2026-06-20-vps-remote-target-design.md`), and the promote-to-remote
