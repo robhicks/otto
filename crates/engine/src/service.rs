@@ -55,6 +55,15 @@ impl Default for TurnControls {
     }
 }
 
+/// Outcome of a failed `accept_promotion`, mapped to HTTP status by the `/promote` handler.
+#[derive(Debug)]
+pub enum AcceptError {
+    /// The session id already exists in the receiver store → `409 Conflict` (no silent overwrite).
+    AlreadyExists,
+    /// Any other failure (sensitive-path refusal, non-UTF-8 entry, store/IO error) → `500`.
+    Failed(anyhow::Error),
+}
+
 /// Runs sessions against a store and a fixed set of engine deps. One turn at a time
 /// (`turn_lock`), because the workspace is shared mutable state.
 pub struct EngineService {
@@ -225,6 +234,62 @@ impl EngineService {
     /// the orchestrator. `list` and `snapshot` are ALSO gate-filtered: any path the read
     /// gate denies is omitted from the result, so a sensitive non-dotfile (e.g. `id_rsa`)
     /// cannot appear in a listing or snapshot even if the workspace walk includes it.
+    /// Restore a promoted bundle into this (receiver) engine: write each workspace file through
+    /// the permission gate, then restore the session into the store. Fail-closed and validated
+    /// up front — a sensitive-path entry (`.env`/`.ssh`/…) is refused before anything is written,
+    /// and a duplicate session id is reported (never overwritten).
+    pub async fn accept_promotion(
+        &self,
+        bundle: &crate::remote::PromoteBundle,
+    ) -> Result<SessionId, AcceptError> {
+        let id = bundle.session.id;
+
+        // Duplicate probe: a present session is a 409, not a silent overwrite.
+        if self.store.session_status(id).await.is_ok() {
+            return Err(AcceptError::AlreadyExists);
+        }
+
+        // Validate the WHOLE workspace snapshot through the gate before writing anything: a
+        // sensitive-path entry is refused (fail-closed) and nothing lands. This is where the
+        // inviolable sensitive-path floor is enforced on restore.
+        let mut edits = Vec::with_capacity(bundle.workspace.files.len());
+        for (path, bytes) in &bundle.workspace.files {
+            if self
+                .tools
+                .check("fs.write", &json!({ "path": path.to_string_lossy() }))
+                == Decision::Deny
+            {
+                return Err(AcceptError::Failed(anyhow::anyhow!(
+                    "restore refused sensitive path: {}",
+                    path.display()
+                )));
+            }
+            let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
+                AcceptError::Failed(anyhow::anyhow!(
+                    "restore: non-UTF-8 contents for {}",
+                    path.display()
+                ))
+            })?;
+            edits.push(Edit {
+                path: path.clone(),
+                new_contents,
+            });
+        }
+
+        // Session first, then the pre-validated workspace files.
+        self.store
+            .restore(&bundle.session)
+            .await
+            .map_err(AcceptError::Failed)?;
+        for edit in &edits {
+            self.workspace
+                .apply_edit(edit)
+                .await
+                .map_err(AcceptError::Failed)?;
+        }
+        Ok(id)
+    }
+
     pub async fn workspace_rpc(&self, req: WorkspaceRequest) -> WorkspaceResponse {
         match req {
             WorkspaceRequest::Read { path } => {
@@ -312,6 +377,125 @@ mod tests {
     use otto_providers::ScriptedProvider;
     use otto_router::SingleProviderRouter;
     use otto_workspace::LocalWorkspace;
+
+    /// A receiver-style service over a fresh empty store + temp workspace, offline router.
+    async fn build_test_service(ws_root: &std::path::Path, db_path: std::path::PathBuf) -> EngineService {
+        let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_root));
+        let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_root));
+        let tools = Arc::new(crate::build_tool_registry(tools_ws, ws_root.to_path_buf()));
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteStore::open(db_path).await.unwrap());
+        let router: Arc<dyn Router> = Arc::from(crate::build_router());
+        EngineService::new(
+            store,
+            Arc::new(crate::build_default_registry()),
+            router,
+            workspace,
+            tools,
+        )
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_restores_session_and_workspace() {
+        use crate::remote::PromoteBundle;
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use std::path::PathBuf;
+
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot {
+                files: vec![(PathBuf::from("out.txt"), b"HELLO".to_vec())],
+            },
+        };
+
+        let restored = service.accept_promotion(&bundle).await.unwrap();
+        assert_eq!(restored, id);
+        assert!(service.store().session_status(id).await.is_ok());
+        assert_eq!(
+            service
+                .workspace()
+                .read(std::path::Path::new("out.txt"))
+                .await
+                .unwrap(),
+            b"HELLO"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_refuses_sensitive_workspace_entry() {
+        use crate::remote::PromoteBundle;
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use std::path::PathBuf;
+
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = SessionId::new();
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot {
+                files: vec![(PathBuf::from(".env"), b"SECRET=1".to_vec())],
+            },
+        };
+
+        let err = service.accept_promotion(&bundle).await;
+        assert!(matches!(err, Err(AcceptError::Failed(_))));
+        // Fail-closed: nothing landed — neither the file nor the session.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new(".env"))
+                .await
+                .is_err()
+        );
+        assert!(service.store().session_status(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_promotion_duplicate_session_is_already_exists() {
+        use crate::remote::PromoteBundle;
+        use otto_engine_core::types::WorkspaceSnapshot;
+
+        let ws_dir = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
+
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let state = service.store().snapshot(id).await.unwrap();
+        let bundle = PromoteBundle {
+            session: state,
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        assert!(matches!(
+            service.accept_promotion(&bundle).await,
+            Err(AcceptError::AlreadyExists)
+        ));
+    }
 
     fn scripted_router() -> Arc<dyn Router> {
         let provider = ScriptedProvider::new("{}")
