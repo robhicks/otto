@@ -59,4 +59,10 @@ pub trait SessionStore: Send + Sync {
     /// status, config, and turn history. Intended for a fresh store (e.g. a remote engine);
     /// errors if the session id already exists. Returns the (preserved) session id.
     async fn restore(&self, state: &SessionState) -> anyhow::Result<SessionId>;
+
+    /// Like `restore`, but overwrites any existing rows for the session id (delete-then-insert in
+    /// one transaction) instead of failing on a duplicate. This is the demote primitive: the source
+    /// engine refreshes its own stale copy with the advanced state pulled back from the receiver.
+    /// `restore` stays fail-on-conflict — only an explicit demote uses this.
+    async fn restore_over(&self, state: &SessionState) -> anyhow::Result<SessionId>;
 }
