@@ -392,6 +392,77 @@ async fn handover_vps_demote_pulls_session_back_to_source() {
 }
 
 #[tokio::test]
+async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
+    use otto_engine_core::traits::Workspace as _;
+
+    // Receiver, acceptance enabled; source serve in vps mode pointed at it.
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, src_w, _sd) = start_source_vps(recv_ws.clone()).await;
+
+    // Connect to the source, create + promote a session.
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "promoted" {
+            break;
+        }
+        assert_ne!(f["type"], "error", "{f:?}");
+    }
+
+    // Advance the session ON THE RECEIVER: write a file via its /workspace RPC.
+    let recv_remote_ws = otto_workspace::RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    recv_remote_ws
+        .apply_edit(&otto_engine_core::types::Edit {
+            path: std::path::PathBuf::from("advanced.txt"),
+            new_contents: "ADVANCED_ON_RECEIVER".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // Demote back to the source.
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "demoted" {
+            break;
+        }
+        assert_ne!(f["type"], "error", "{f:?}");
+    }
+    drop(ws);
+
+    // The source's on-disk workspace now has the receiver's advanced file.
+    assert_eq!(
+        std::fs::read(src_w.path().join("advanced.txt")).unwrap(),
+        b"ADVANCED_ON_RECEIVER"
+    );
+
+    // INCREMENTAL VALUE: the source can reconnect to its now-local session — a fresh /ws connection
+    // with the id yields a Ready for the same session (it lives in the source store again).
+    let (mut ws2, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
+        "{src_ws}/ws?session={session}&last_seq=0"
+    )))
+    .await
+    .unwrap();
+    let ready2 = next_json(&mut ws2).await.unwrap();
+    assert_eq!(ready2["type"], "ready");
+    assert_eq!(ready2["session"].as_str().unwrap(), session);
+}
+
+#[tokio::test]
 async fn vps_promote_resumes_session_and_workspace_on_receiver() {
     use otto_engine::CollectingSink;
     use otto_engine_core::traits::WorkspaceRead;
