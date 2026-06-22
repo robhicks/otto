@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use otto_engine::{
-    EngineService, PromoteBundle, build_default_registry, build_tool_registry, serve_app, serve_run,
+    EngineService, PromoteBundle, RemoteTarget, VpsTarget, build_default_registry,
+    build_tool_registry, serve_app, serve_run,
 };
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::WorkspaceSnapshot;
@@ -146,4 +147,42 @@ async fn promote_malformed_body_is_bad_request() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn vps_target_provisions_against_a_receiver() {
+    let (http_base, _w, _d) = start_receiver(true).await;
+    let ws_endpoint = http_base.replace("http://", "ws://");
+
+    let bundle = sample_bundle(SessionId::new(), vec![("out.txt", b"HI")]);
+    let target = VpsTarget::new(ws_endpoint.clone(), TOKEN);
+    let handle = target.provision(&bundle).await.unwrap();
+    // The handle points back at the ws endpoint the client reconnects to.
+    assert_eq!(handle.endpoint, ws_endpoint);
+}
+
+#[tokio::test]
+async fn vps_target_teardown_does_not_stop_the_receiver() {
+    let (http_base, _w, _d) = start_receiver(true).await;
+    let ws_endpoint = http_base.replace("http://", "ws://");
+
+    let bundle = sample_bundle(SessionId::new(), vec![]);
+    let target = VpsTarget::new(ws_endpoint, TOKEN);
+    let handle = target.provision(&bundle).await.unwrap();
+    target.teardown(handle).await.unwrap();
+
+    // The receiver is still up: a second valid POST /promote (new session id) succeeds.
+    let body = sample_bundle(SessionId::new(), vec![]);
+    let resp = post_promote(&http_base, Some(TOKEN), &body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn vps_target_provision_errors_on_non_2xx() {
+    // Receiver with acceptance DISABLED → /promote returns 403 → provision must Err.
+    let (http_base, _w, _d) = start_receiver(false).await;
+    let ws_endpoint = http_base.replace("http://", "ws://");
+    let bundle = sample_bundle(SessionId::new(), vec![]);
+    let target = VpsTarget::new(ws_endpoint, TOKEN);
+    assert!(target.provision(&bundle).await.is_err());
 }

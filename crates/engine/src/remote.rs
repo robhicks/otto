@@ -183,6 +183,69 @@ impl RemoteTarget for LoopbackTarget {
     }
 }
 
+/// A `RemoteTarget` that promotes onto an already-running, operator-managed `otto serve` over the
+/// network. Unlike `LoopbackTarget`, it does not create or own the receiver — `teardown` is a
+/// no-op so it never aborts the operator's long-lived server.
+pub struct VpsTarget {
+    /// `ws://host:port` or `wss://host:port` — what the client reconnects to after promote.
+    endpoint: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl VpsTarget {
+    /// `endpoint` is the receiver's `ws://`/`wss://` base; `token` is its bearer (reused from the
+    /// source, by design — source and receiver share a trust domain in v1).
+    pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+
+    /// Map the ws endpoint to the HTTP base for the `/promote` POST (`ws→http`, `wss→https`).
+    fn http_base(&self) -> String {
+        if let Some(rest) = self.endpoint.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = self.endpoint.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            self.endpoint.clone()
+        }
+    }
+}
+
+#[async_trait]
+impl RemoteTarget for VpsTarget {
+    async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+        let url = format!("{}/promote", self.http_base());
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(bundle)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("promote rejected by remote: HTTP {}", resp.status());
+        }
+        Ok(RemoteHandle {
+            endpoint: self.endpoint.clone(),
+            token: self.token.clone(),
+            shutdown: None,
+        })
+    }
+
+    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
+        // No-op: VpsTarget does not own the operator's server, so it must never abort it.
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,7 +31,7 @@ pub use mcp::{
 };
 pub use remote::{
     LoopbackTarget, PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget,
-    UnsupportedTarget, promote,
+    UnsupportedTarget, VpsTarget, promote,
 };
 pub use serve::{app as serve_app, resolve_tls_paths, run as serve_run};
 pub use service::{AcceptError, CollectingSink, EngineService, EventSink, TurnControls};
