@@ -529,13 +529,27 @@ async fn handle_handover(
             writer,
             &ServerMessage::Error {
                 message:
-                    "remote provisioning unavailable (start otto serve with --promote-loopback)"
+                    "remote provisioning unavailable (start otto serve with --promote-loopback or --promote-vps)"
                         .to_string(),
             },
         )
         .await;
         return;
     };
+
+    // Vps mode cannot demote: pulling a session back off the operator's server is a separate,
+    // larger piece (a reverse snapshot-export RPC). Refuse honestly. Loopback demote is unchanged.
+    if !to_remote && matches!(cfg.mode, crate::remote::PromoteMode::Vps { .. }) {
+        let _ = send_msg(
+            writer,
+            &ServerMessage::Error {
+                message: "demote-from-remote not supported in vps mode".to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+
     // Reuse an existing handover for this session (idempotent): provisioning again would drop the
     // prior RemoteHandle and abort an engine a client may still be connected to. Bind the lookup
     // to a local so the Mutex guard is released at the `;` — never held across the await below.
@@ -548,16 +562,19 @@ async fn handle_handover(
     let endpoint = match existing {
         Some(endpoint) => endpoint,
         None => {
-            let base_dir = match &cfg.mode {
-                crate::remote::PromoteMode::Loopback { base_dir } => base_dir.clone(),
-                crate::remote::PromoteMode::Vps { .. } => unreachable!("vps wired in Task 5"),
+            let target: Box<dyn crate::remote::RemoteTarget> = match &cfg.mode {
+                crate::remote::PromoteMode::Loopback { base_dir } => Box::new(
+                    LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
+                ),
+                crate::remote::PromoteMode::Vps { endpoint } => {
+                    Box::new(crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()))
+                }
             };
-            let target = LoopbackTarget::new(cfg.token.clone(), base_dir, to_remote);
             let handle = match promote(
                 state.service.store(),
                 state.service.workspace(),
                 session,
-                &target,
+                &*target,
             )
             .await
             {
@@ -574,7 +591,8 @@ async fn handle_handover(
                 }
             };
             let endpoint = handle.endpoint.clone();
-            // Retain BEFORE replying: dropping the handle aborts the provisioned engine.
+            // Retain BEFORE replying: for loopback, dropping the handle aborts the provisioned
+            // engine; for vps the handle's shutdown is None, so retention is cheap and harmless.
             state
                 .remotes
                 .lock()

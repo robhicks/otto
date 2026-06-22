@@ -14,6 +14,10 @@ use otto_protocol::{CapabilitiesManifest, SessionId};
 use otto_workspace::LocalWorkspace;
 use std::path::PathBuf;
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
 const TOKEN: &str = "vps-token";
 
 /// Build a `PromoteBundle` with the given session id and workspace files (typed → serialized,
@@ -185,4 +189,117 @@ async fn vps_target_provision_errors_on_non_2xx() {
     let bundle = sample_bundle(SessionId::new(), vec![]);
     let target = VpsTarget::new(ws_endpoint, TOKEN);
     assert!(target.provision(&bundle).await.is_err());
+}
+
+async fn next_json(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Option<serde_json::Value> {
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => return Some(serde_json::from_str(t.as_str()).unwrap()),
+            Some(Ok(Message::Close(_))) | None => return None,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => return None,
+        }
+    }
+}
+
+fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut req = url.to_string().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    req
+}
+
+/// Start a SOURCE serve configured to promote in vps mode at `vps_endpoint`. Returns its ws base.
+async fn start_source_vps(vps_endpoint: String) -> (String, tempfile::TempDir, tempfile::TempDir) {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, ws_dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> =
+        Arc::new(SqliteStore::open(db_dir.path().join("s.db")).await.unwrap());
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        Arc::from(otto_engine::build_router()),
+        workspace,
+        tools,
+    );
+    let promote = Some(otto_engine::PromoteConfig {
+        token: TOKEN.to_string(),
+        mode: otto_engine::PromoteMode::Vps {
+            endpoint: vps_endpoint,
+        },
+    });
+    let app = serve_app(service, TOKEN.to_string(), caps(), promote, false);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (format!("ws://127.0.0.1:{port}"), ws_dir, db_dir)
+}
+
+#[tokio::test]
+async fn handover_vps_promote_points_at_receiver() {
+    // Receiver accepts promotions; source promotes to it in vps mode.
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, _sw, _sd) = start_source_vps(recv_ws.clone()).await;
+
+    // Connect to the source, which creates a fresh session on connect.
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let ready = next_json(&mut ws).await.unwrap();
+    assert_eq!(ready["type"], "ready");
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    // Send PromoteToRemote (externally tagged) and expect a Promoted frame at the receiver.
+    let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut ws).await.expect("a frame");
+        if frame["type"] == "promoted" {
+            assert_eq!(frame["endpoint"].as_str().unwrap(), recv_ws);
+            break;
+        }
+        assert_ne!(frame["type"], "error", "promote must not error: {frame:?}");
+    }
+}
+
+#[tokio::test]
+async fn handover_vps_demote_is_unsupported() {
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+    let (src_ws, _sw, _sd) = start_source_vps(recv_ws).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let ready = next_json(&mut ws).await.unwrap();
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+    loop {
+        let frame = next_json(&mut ws).await.expect("a frame");
+        if frame["type"] == "error" {
+            assert!(
+                frame["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("demote-from-remote not supported")
+            );
+            break;
+        }
+        assert_ne!(frame["type"], "demoted", "demote must not succeed in vps mode");
+    }
 }
