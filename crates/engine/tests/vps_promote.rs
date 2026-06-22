@@ -11,6 +11,8 @@ use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::WorkspaceSnapshot;
 use otto_persistence::{SessionState, SessionStatus, SqliteStore};
 use otto_protocol::{CapabilitiesManifest, SessionId};
+use otto_providers::ScriptedProvider;
+use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
 use std::path::PathBuf;
 
@@ -302,4 +304,103 @@ async fn handover_vps_demote_is_unsupported() {
         }
         assert_ne!(frame["type"], "demoted", "demote must not succeed in vps mode");
     }
+}
+
+#[tokio::test]
+async fn vps_promote_resumes_session_and_workspace_on_receiver() {
+    use otto_engine::CollectingSink;
+    use otto_engine_core::traits::WorkspaceRead;
+    use otto_workspace::RemoteWorkspace;
+
+    // --- Receiver serve B, acceptance enabled. ---
+    let (recv_http, _rw, _rd) = start_receiver(true).await;
+    let recv_ws = recv_http.replace("http://", "ws://");
+
+    // --- Source engine A: run a turn that writes out.txt. ---
+    let src_ws_dir = tempfile::tempdir().unwrap();
+    let src_db_dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "PROMOTED"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_ws_dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(src_ws_dir.path()));
+    let tools = Arc::new(build_tool_registry(
+        tools_ws,
+        src_ws_dir.path().to_path_buf(),
+    ));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        SqliteStore::open(src_db_dir.path().join("a.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store.clone(),
+        Arc::new(build_default_registry()),
+        router,
+        workspace.clone(),
+        tools,
+    );
+
+    let session = service
+        .create_session("g", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let mut sink = CollectingSink::default();
+    service
+        .run_prompt(session, "add a greeting", &mut sink)
+        .await
+        .unwrap();
+    let src_events = store.replay_since(session, None).await.unwrap();
+    let last_seq = src_events.last().unwrap().seq;
+
+    // --- Promote to the receiver via VpsTarget. ---
+    let target = VpsTarget::new(recv_ws.clone(), TOKEN);
+    let handle = otto_engine::promote(&*store, &*workspace, session, &target)
+        .await
+        .unwrap();
+    assert_eq!(handle.endpoint, recv_ws);
+
+    // --- Reconnect to the receiver: same session, replayed gap after seq 0. ---
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
+        "{recv_ws}/ws?session={}&last_seq=0",
+        session.0
+    )))
+    .await
+    .unwrap();
+    let ready = next_json(&mut ws).await.unwrap();
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["session"].as_str().unwrap(), session.0.to_string());
+
+    let mut replayed = Vec::new();
+    while let Some(frame) = next_json(&mut ws).await {
+        if frame["type"] == "event" {
+            let seq = frame["event"]["seq"].as_u64().unwrap();
+            replayed.push(seq);
+            if seq == last_seq {
+                break;
+            }
+        }
+    }
+    let expected: Vec<u64> = src_events
+        .iter()
+        .map(|e| e.seq)
+        .filter(|s| *s > 0)
+        .collect();
+    assert_eq!(replayed, expected);
+    drop(ws);
+
+    // --- The workspace transferred: read out.txt via the receiver's /workspace RPC. ---
+    let remote_ws = RemoteWorkspace::new(recv_http, TOKEN);
+    assert_eq!(
+        remote_ws
+            .read(std::path::Path::new("out.txt"))
+            .await
+            .unwrap(),
+        b"PROMOTED"
+    );
 }
