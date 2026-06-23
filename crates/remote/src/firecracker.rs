@@ -108,12 +108,25 @@ impl Provisioner for FirecrackerProvisioner {
     async fn provision(&self) -> anyhow::Result<ProvisionedMachine> {
         validate_prereqs(&self.config)?;
 
-        // Per-machine scratch dir + config file.
+        // Per-machine scratch dir + config file. The config JSON embeds the bearer token in the
+        // guest cmdline, so it is owner-only: the dir is created `0o700` and the file `0o600`,
+        // keeping the credential out of reach of other local users in the shared temp dir.
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
         let jail_dir = std::env::temp_dir().join(format!("otto-fc-{}-{}", self.config.guest_ip, self.config.port));
-        std::fs::create_dir_all(&jail_dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&jail_dir)?;
         let cfg_path = jail_dir.join("vm-config.json");
         let cfg = fc_config_json(&self.config, &self.token);
-        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg)?)?;
+        let mut cfg_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&cfg_path)?;
+        cfg_file.write_all(&serde_json::to_vec_pretty(&cfg)?)?;
 
         // Spawn firecracker with the config file.
         let child = std::process::Command::new(&self.config.fc_bin)
