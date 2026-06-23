@@ -31,8 +31,8 @@ pub use mcp::{
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
 };
 pub use otto_remote::{
-    PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget, UnsupportedTarget,
-    VpsTarget, promote,
+    MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode, ProvisionedMachine,
+    Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget, promote,
 };
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,

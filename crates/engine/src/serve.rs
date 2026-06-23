@@ -599,7 +599,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
 
 /// Provision the session onto a fresh engine (remote for promote, local for demote), retain the
 /// handle so it outlives this connection, and tell the client where to reconnect. A no-op error
-/// reply when promotion is not enabled (the `UnsupportedTarget` posture). Handled between turns.
+/// reply when promotion is not enabled (the promotion-disabled posture). Handled between turns.
 async fn handle_handover(
     state: &ServeState,
     writer: &mut WsWriter,
@@ -674,6 +674,18 @@ async fn handle_handover(
             }
             return;
         }
+        if let otto_remote::PromoteMode::Microvm { .. } = &cfg.mode {
+            // microVMs are ephemeral; pulling a session back off a torn-down guest is a follow-up.
+            let _ = send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: "demote-from-remote not supported in microvm mode (ephemeral)"
+                        .to_string(),
+                },
+            )
+            .await;
+            return;
+        }
     }
 
     // Reuse an existing handover for this session (idempotent): provisioning again would drop the
@@ -696,6 +708,20 @@ async fn handle_handover(
                     otto_remote::PromoteMode::Vps { endpoint } => Box::new(
                         otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
                     ),
+                    otto_remote::PromoteMode::Microvm { config } => {
+                        #[cfg(feature = "firecracker")]
+                        let provisioner: std::sync::Arc<dyn otto_remote::Provisioner> =
+                            std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
+                                config.clone(),
+                                cfg.token.clone(),
+                            ));
+                        #[cfg(not(feature = "firecracker"))]
+                        let provisioner: std::sync::Arc<dyn otto_remote::Provisioner> = {
+                            let _ = config; // unused without the firecracker feature
+                            std::sync::Arc::new(otto_remote::UnsupportedProvisioner)
+                        };
+                        Box::new(otto_remote::MicrovmTarget::new(provisioner))
+                    }
                 };
             let handle = match promote(
                 state.service.store(),
