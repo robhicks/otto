@@ -77,7 +77,8 @@ pub fn walk(root: &Path) -> Vec<WalkEntry> {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Use symlink_metadata so we never follow symlinks (and never index their targets).
+            // `DirEntry::metadata()` does not traverse symlinks (unlike `fs::metadata`), so we
+            // see the link itself and skip it below — never following it to index its target.
             let Ok(meta) = entry.metadata() else { continue };
             if meta.file_type().is_symlink() {
                 continue;
