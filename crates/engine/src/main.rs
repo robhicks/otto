@@ -54,6 +54,26 @@ fn open_db_path() -> String {
     std::env::var("OTTO_DB").unwrap_or_else(|_| "otto-sessions.db".to_string())
 }
 
+/// Read Firecracker microVM parameters from `OTTO_FC_*` env vars. Defaults match common Firecracker
+/// quickstart values; required paths default to empty (validated later by the provisioner). Env
+/// reading lives here at the CLI edge, never in `otto-remote`, mirroring how `build_router` reads env.
+fn microvm_config_from_env() -> otto_engine::MicrovmConfig {
+    let num = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    otto_engine::MicrovmConfig {
+        kernel: PathBuf::from(std::env::var("OTTO_FC_KERNEL").unwrap_or_default()),
+        rootfs: PathBuf::from(std::env::var("OTTO_FC_ROOTFS").unwrap_or_default()),
+        fc_bin: PathBuf::from(
+            std::env::var("OTTO_FC_BIN").unwrap_or_else(|_| "firecracker".to_string()),
+        ),
+        tap: std::env::var("OTTO_FC_TAP").unwrap_or_else(|_| "fc-tap0".to_string()),
+        guest_ip: std::env::var("OTTO_FC_GUEST_IP").unwrap_or_else(|_| "172.16.0.2".to_string()),
+        port: num("OTTO_FC_PORT", 7878) as u16,
+        vcpus: num("OTTO_FC_VCPUS", 2),
+        mem_mib: num("OTTO_FC_MEM_MIB", 1024),
+        boot_timeout: std::time::Duration::from_secs(num("OTTO_FC_BOOT_TIMEOUT_SECS", 30) as u64),
+    }
+}
+
 fn mcp_fs_bin() -> String {
     std::env::var("OTTO_MCP_FS_BIN").unwrap_or_else(|_| "mcp-fs".to_string())
 }
@@ -176,6 +196,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut promote_loopback = false;
     let mut accept_promotions = false;
     let mut promote_vps: Option<String> = None;
+    let mut promote_microvm = false;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -210,6 +231,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             },
+            "--promote-microvm" => promote_microvm = true,
             _ => {}
         }
     }
@@ -235,12 +257,14 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
     let capabilities = otto_engine::build_capabilities();
-    let promote = match (promote_loopback, promote_vps) {
-        (true, Some(_)) => {
-            eprintln!("error: --promote-loopback and --promote-vps are mutually exclusive");
+    let promote = match (promote_loopback, promote_vps, promote_microvm) {
+        (l, v, m) if (l as u8) + (v.is_some() as u8) + (m as u8) > 1 => {
+            eprintln!(
+                "error: --promote-loopback, --promote-vps, and --promote-microvm are mutually exclusive"
+            );
             std::process::exit(2);
         }
-        (true, None) => Some(otto_engine::PromoteConfig {
+        (true, _, _) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
             // provisioned engine's restored store/workspace under here is never recursively
@@ -249,11 +273,17 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                 base_dir: root.join(".otto-remotes"),
             },
         }),
-        (false, Some(endpoint)) => Some(otto_engine::PromoteConfig {
+        (_, Some(endpoint), _) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             mode: otto_engine::PromoteMode::Vps { endpoint },
         }),
-        (false, None) => None,
+        (_, _, true) => Some(otto_engine::PromoteConfig {
+            token: token.clone(),
+            mode: otto_engine::PromoteMode::Microvm {
+                config: microvm_config_from_env(),
+            },
+        }),
+        (false, None, false) => None,
     };
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed). Resolved before
     // building the app so the scheme (and thus our own public ws base) is known up front.
