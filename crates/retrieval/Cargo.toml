@@ -1,0 +1,17 @@
+[package]
+name = "otto-retrieval"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+otto-engine-core = { path = "../engine-core" }
+async-trait.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
