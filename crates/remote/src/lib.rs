@@ -90,6 +90,24 @@ pub trait RemoteTarget: Send + Sync {
     async fn teardown(&self, handle: RemoteHandle) -> anyhow::Result<()>;
 }
 
+/// Boots a reachable `otto serve --accept-promotions` and reports how to reach it. This is the step
+/// `VpsTarget` assumed already done; `MicrovmTarget` composes a `Provisioner` with the bundle-push.
+#[async_trait]
+pub trait Provisioner: Send + Sync {
+    /// Boot a reachable serve and return the machine. Disposal rides `ProvisionedMachine::task`:
+    /// aborting/dropping it stops the in-process serve or kills the microVM. No separate teardown —
+    /// this mirrors `RemoteHandle::with_task` and serve.rs's drop-based handover lifecycle.
+    async fn provision(&self) -> anyhow::Result<ProvisionedMachine>;
+}
+
+/// A booted, reachable `otto serve`. `endpoint` is its `ws://host:port` base; `token` the bearer it
+/// requires; `task` owns disposal (the serve task itself, or a guardian whose `Drop` kills a microVM).
+pub struct ProvisionedMachine {
+    pub endpoint: String,
+    pub token: String,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// Snapshot `session` and its `workspace` and provision the result onto `target`. Does not stop
 /// the source engine — handover (drop local, reconnect remote) is a client concern.
 pub async fn promote(
