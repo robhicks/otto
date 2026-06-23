@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
-//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint>] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => cmd_serve(rest).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint>] [--accept-promotions]"
+                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]"
             );
             std::process::exit(2);
         }
@@ -67,7 +67,10 @@ fn microvm_config_from_env() -> otto_engine::MicrovmConfig {
         ),
         tap: std::env::var("OTTO_FC_TAP").unwrap_or_else(|_| "fc-tap0".to_string()),
         guest_ip: std::env::var("OTTO_FC_GUEST_IP").unwrap_or_else(|_| "172.16.0.2".to_string()),
-        port: num("OTTO_FC_PORT", 7878) as u16,
+        port: std::env::var("OTTO_FC_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7878),
         vcpus: num("OTTO_FC_VCPUS", 2),
         mem_mib: num("OTTO_FC_MEM_MIB", 1024),
         boot_timeout: std::time::Duration::from_secs(num("OTTO_FC_BOOT_TIMEOUT_SECS", 30) as u64),
