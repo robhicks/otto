@@ -229,7 +229,14 @@ feature) boots an ephemeral per-session microVM and restores the bundle into it 
 `POST /promote`. `UnsupportedProvisioner` (which replaced the old unsupported-target stub) is the single
 honest boundary — "no hypervisor / kernel / rootfs in-tree." The seam is proven end-to-end in CI
 against an in-process serve; the real VM boot needs operator-supplied images and a host hypervisor.
-**demote-from-microvm** (pulling an ephemeral session back) is the next follow-up.
+**demote-from-microvm** is **shipped** too, mirroring vps demote with two differences: the receiver
+endpoint comes from the live `RemoteHandle` (the in-memory promote handle, not static config), and a
+successful demote disposes the ephemeral VM by dropping that handle. A client on a `--promote-microvm`
+source issues `DemoteToLocal`; the source pulls the session's current bundle off the running microVM
+via the shared `export_bundle` (`POST /export`) and restores it locally with `accept_demotion`
+(overwriting its own copy via `SessionStore::restore_over`, sensitive-floor first); pull/restore
+failures leave the VM running. Without the `firecracker` feature the serve-level happy path is not
+CI-able (same boundary as microVM promote), but the seam-level pull+dispose is tested in-process.
 
 ## Protocol message catalog
 

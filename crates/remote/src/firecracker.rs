@@ -62,14 +62,23 @@ fn validate_prereqs(config: &MicrovmConfig) -> anyhow::Result<()> {
         ("rootfs image", &config.rootfs),
     ] {
         if !path.exists() {
-            anyhow::bail!("microVM prerequisite missing: {label} not found at {}", path.display());
+            anyhow::bail!(
+                "microVM prerequisite missing: {label} not found at {}",
+                path.display()
+            );
         }
     }
     // The kernel/rootfs paths are serialized into the JSON config; reject non-UTF-8 early with a
     // clear error rather than letting `to_string_lossy` mangle them into an opaque boot failure.
-    for (label, path) in [("kernel image", &config.kernel), ("rootfs image", &config.rootfs)] {
+    for (label, path) in [
+        ("kernel image", &config.kernel),
+        ("rootfs image", &config.rootfs),
+    ] {
         if path.to_str().is_none() {
-            anyhow::bail!("microVM {label} path is not valid UTF-8: {}", path.display());
+            anyhow::bail!(
+                "microVM {label} path is not valid UTF-8: {}",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -99,7 +108,10 @@ pub struct FirecrackerProvisioner {
 
 impl FirecrackerProvisioner {
     pub fn new(config: MicrovmConfig, token: impl Into<String>) -> Self {
-        Self { config, token: token.into() }
+        Self {
+            config,
+            token: token.into(),
+        }
     }
 }
 
@@ -113,7 +125,10 @@ impl Provisioner for FirecrackerProvisioner {
         // keeping the credential out of reach of other local users in the shared temp dir.
         use std::io::Write as _;
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-        let jail_dir = std::env::temp_dir().join(format!("otto-fc-{}-{}", self.config.guest_ip, self.config.port));
+        let jail_dir = std::env::temp_dir().join(format!(
+            "otto-fc-{}-{}",
+            self.config.guest_ip, self.config.port
+        ));
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

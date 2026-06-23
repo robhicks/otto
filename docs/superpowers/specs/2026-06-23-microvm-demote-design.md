@@ -1,7 +1,7 @@
 # demote-from-microvm
 
 **Date:** 2026-06-23
-**Status:** Design — pending implementation plan.
+**Status:** Shipped 2026-06-23 (plan: docs/superpowers/plans/2026-06-23-microvm-demote.md).
 **Depends on:** the `microvm` axis (`MicrovmTarget` + `Provisioner` seam +
 `FirecrackerProvisioner`/`UnsupportedProvisioner` in `crates/remote`, shipped
 2026-06-23), the restore-over-the-wire RPCs (`POST /promote` +

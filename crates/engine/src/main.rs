@@ -58,7 +58,12 @@ fn open_db_path() -> String {
 /// quickstart values; required paths default to empty (validated later by the provisioner). Env
 /// reading lives here at the CLI edge, never in `otto-remote`, mirroring how `build_router` reads env.
 fn microvm_config_from_env() -> otto_engine::MicrovmConfig {
-    let num = |k: &str, d: u32| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let num = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
     otto_engine::MicrovmConfig {
         kernel: PathBuf::from(std::env::var("OTTO_FC_KERNEL").unwrap_or_default()),
         rootfs: PathBuf::from(std::env::var("OTTO_FC_ROOTFS").unwrap_or_default()),
