@@ -340,8 +340,10 @@ mod tests {
         );
 
         let abort = provisioner.abort.lock().unwrap().take().expect("provisioned");
-        // Allow the abort to take effect (no `time` feature, so yield instead of sleep).
-        for _ in 0..50 {
+        // Allow the abort to take effect (no `time` feature, so yield instead of sleep). The bound
+        // is generous: abort of a `pending()` task resolves in ≤1 scheduler turn on a healthy
+        // runtime, so a high cap only guards against a saturated CI runner without ever hanging.
+        for _ in 0..2000 {
             if abort.is_finished() {
                 break;
             }
