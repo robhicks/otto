@@ -6,6 +6,7 @@
 //! `RemoteTarget`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use otto_engine_core::traits::Workspace;
@@ -139,6 +140,40 @@ impl Provisioner for UnsupportedProvisioner {
     }
 }
 
+/// A `RemoteTarget` that provisions an ephemeral machine, then pushes the bundle to it. It is
+/// provisioner-generic: `FirecrackerProvisioner` (v2) or an in-process test serve both fit. Disposal
+/// rides the provisioned machine's task, so the returned `RemoteHandle::with_task` aborts the serve
+/// (or kills the microVM) on drop — matching serve.rs's existing handover lifecycle.
+pub struct MicrovmTarget {
+    provisioner: Arc<dyn Provisioner>,
+}
+
+impl MicrovmTarget {
+    pub fn new(provisioner: Arc<dyn Provisioner>) -> Self {
+        Self { provisioner }
+    }
+}
+
+#[async_trait]
+impl RemoteTarget for MicrovmTarget {
+    async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+        // Boot the machine. If the push below fails, `machine` is dropped here, aborting its task —
+        // so a microVM that booted but rejected the bundle is killed, never leaked.
+        let machine = self.provisioner.provision().await?;
+        push_promote_bundle(&machine.endpoint, &machine.token, bundle).await?;
+        Ok(RemoteHandle::with_task(
+            machine.endpoint,
+            machine.token,
+            machine.task,
+        ))
+    }
+
+    async fn teardown(&self, mut handle: RemoteHandle) -> anyhow::Result<()> {
+        handle.abort();
+        Ok(())
+    }
+}
+
 /// The reqwest client used for promote/export RPCs (30s timeout, rustls). Built per call — these
 /// RPCs are rare (a handover), so caching buys nothing.
 fn build_promote_client() -> reqwest::Client {
@@ -241,6 +276,7 @@ impl RemoteTarget for VpsTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otto_persistence::SessionStatus;
 
     #[tokio::test]
     async fn unsupported_provisioner_refuses() {
@@ -254,5 +290,22 @@ mod tests {
         assert_eq!(http_base("wss://host:9000"), "https://host:9000");
         assert_eq!(http_base("ws://127.0.0.1:7878"), "http://127.0.0.1:7878");
         assert_eq!(http_base("http://host:1"), "http://host:1");
+    }
+
+    #[tokio::test]
+    async fn microvm_target_over_unsupported_provisioner_errs() {
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id: SessionId::new(),
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+        let target = MicrovmTarget::new(Arc::new(UnsupportedProvisioner));
+        assert!(target.provision(&bundle).await.is_err());
     }
 }
