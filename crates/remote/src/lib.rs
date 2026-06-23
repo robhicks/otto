@@ -240,6 +240,30 @@ pub(crate) async fn push_promote_bundle(
     Ok(())
 }
 
+/// POST a session id to `{http_base(endpoint)}/export` with `Bearer token` and deserialize the
+/// returned `PromoteBundle` (the demote pull). On a non-2xx, bail with the receiver's status +
+/// body (operator diagnostics). Shared by `VpsTarget::export` (vps demote) and the microVM demote
+/// pull (whose endpoint comes from the live `RemoteHandle`, not a static config).
+pub async fn export_bundle(
+    endpoint: &str,
+    token: &str,
+    session: SessionId,
+) -> anyhow::Result<PromoteBundle> {
+    let url = format!("{}/export", http_base(endpoint));
+    let resp = build_promote_client()
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "session": session.0.to_string() }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("export rejected by remote: HTTP {status}: {body}");
+    }
+    Ok(resp.json().await?)
+}
+
 /// A `RemoteTarget` that promotes onto an already-running, operator-managed `otto serve` over the
 /// network. Unlike `LoopbackTarget`, it does not create or own the receiver — `teardown` is a
 /// no-op so it never aborts the operator's long-lived server.
@@ -247,7 +271,6 @@ pub struct VpsTarget {
     /// `ws://host:port` or `wss://host:port` — what the client reconnects to after promote.
     endpoint: String,
     token: String,
-    client: reqwest::Client,
 }
 
 impl VpsTarget {
@@ -257,28 +280,13 @@ impl VpsTarget {
         Self {
             endpoint: endpoint.into(),
             token: token.into(),
-            client: build_promote_client(),
         }
     }
 
-    /// Pull a session's `PromoteBundle` back from the receiver (the demote primitive). POSTs the
-    /// session id to `/export`; surfaces the receiver's status + body on a non-2xx, symmetric with
-    /// how `provision` reports a rejected push.
+    /// Pull a session's `PromoteBundle` back from the receiver (the demote primitive). Delegates to
+    /// the shared `export_bundle` so vps and microVM demote use the identical gated pull.
     pub async fn export(&self, session: SessionId) -> anyhow::Result<PromoteBundle> {
-        let url = format!("{}/export", http_base(&self.endpoint));
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "session": session.0.to_string() }))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("export rejected by remote: HTTP {status}: {body}");
-        }
-        Ok(resp.json().await?)
+        export_bundle(&self.endpoint, &self.token, session).await
     }
 }
 
@@ -364,7 +372,12 @@ mod tests {
             "push to a closed port must fail"
         );
 
-        let abort = provisioner.abort.lock().unwrap().take().expect("provisioned");
+        let abort = provisioner
+            .abort
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provisioned");
         // Allow the abort to take effect (no `time` feature, so yield instead of sleep). The bound
         // is generous: abort of a `pending()` task resolves in ≤1 scheduler turn on a healthy
         // runtime, so a high cap only guards against a saturated CI runner without ever hanging.
