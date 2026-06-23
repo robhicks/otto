@@ -34,7 +34,7 @@ otto-next/
 │   ├── retrieval        # Tree-sitter chunking, git-history, grep selection (vector index = v2).
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
-│   ├── remote           # RemoteTarget impls: vps (v1-ready), microvm (v2).
+│   ├── remote           # RemoteTarget seam + vps (shipped) / microvm (v2). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
