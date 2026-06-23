@@ -18,6 +18,7 @@ otto-router = { path = "../router" }
 otto-agents = { path = "../agents" }
 otto-tools = { path = "../tools" }
 otto-persistence = { path = "../persistence" }
+otto-remote = { path = "../remote" }
 rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 anyhow.workspace = true
 serde_json.workspace = true

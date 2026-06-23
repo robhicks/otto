@@ -237,7 +237,7 @@ impl EngineService {
     /// applied. Shared by `accept_promotion` (receiver restore) and `accept_demotion` (source pull).
     fn validate_workspace_edits(
         &self,
-        bundle: &crate::remote::PromoteBundle,
+        bundle: &otto_remote::PromoteBundle,
     ) -> Result<Vec<Edit>, AcceptError> {
         let mut edits = Vec::with_capacity(bundle.workspace.files.len());
         for (path, bytes) in &bundle.workspace.files {
@@ -288,7 +288,7 @@ impl EngineService {
     /// and a duplicate session id is reported (never overwritten).
     pub async fn accept_promotion(
         &self,
-        bundle: &crate::remote::PromoteBundle,
+        bundle: &otto_remote::PromoteBundle,
     ) -> Result<SessionId, AcceptError> {
         let id = bundle.session.id;
 
@@ -324,7 +324,7 @@ impl EngineService {
     /// The sensitive-path floor is still enforced up front (fail-closed) before anything is written.
     pub async fn accept_demotion(
         &self,
-        bundle: &crate::remote::PromoteBundle,
+        bundle: &otto_remote::PromoteBundle,
     ) -> Result<SessionId, AcceptError> {
         let id = bundle.session.id;
         let edits = self.validate_workspace_edits(bundle)?;
@@ -441,8 +441,8 @@ impl EngineService {
     pub async fn export_promotion(
         &self,
         session: SessionId,
-    ) -> anyhow::Result<crate::remote::PromoteBundle> {
-        Ok(crate::remote::PromoteBundle {
+    ) -> anyhow::Result<otto_remote::PromoteBundle> {
+        Ok(otto_remote::PromoteBundle {
             session: self.store.snapshot(session).await?,
             workspace: self.filtered_workspace_snapshot().await?,
         })
@@ -512,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_restores_session_and_workspace() {
-        use crate::remote::PromoteBundle;
+        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
         use std::path::PathBuf;
@@ -551,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_refuses_sensitive_workspace_entry() {
-        use crate::remote::PromoteBundle;
+        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
         use std::path::PathBuf;
@@ -594,10 +594,10 @@ mod tests {
         id: SessionId,
         path: std::path::PathBuf,
         bytes: Vec<u8>,
-    ) -> crate::remote::PromoteBundle {
+    ) -> otto_remote::PromoteBundle {
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
-        crate::remote::PromoteBundle {
+        otto_remote::PromoteBundle {
             session: SessionState {
                 id,
                 goal: "g".to_string(),
@@ -692,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_duplicate_session_is_already_exists() {
-        use crate::remote::PromoteBundle;
+        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
 
         let ws_dir = tempfile::tempdir().unwrap();
@@ -717,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_demotion_overwrites_an_existing_session() {
-        use crate::remote::PromoteBundle;
+        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
 
