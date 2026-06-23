@@ -19,19 +19,20 @@ use otto_tools::{
 };
 
 mod approval;
+mod loopback;
 mod mcp;
-mod remote;
 mod serve;
 mod service;
 
 pub use approval::ApprovalModeGate;
+pub use loopback::LoopbackTarget;
 pub use mcp::{
     McpConnection, connect_bash as mcp_connect_bash, connect_fs as mcp_connect_fs,
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
 };
-pub use remote::{
-    LoopbackTarget, PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget,
-    UnsupportedTarget, VpsTarget, promote,
+pub use otto_remote::{
+    PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget, UnsupportedTarget,
+    VpsTarget, promote,
 };
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,

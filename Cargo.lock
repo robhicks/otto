@@ -1333,6 +1333,7 @@ dependencies = [
  "otto-persistence",
  "otto-protocol",
  "otto-providers",
+ "otto-remote",
  "otto-router",
  "otto-tools",
  "otto-workspace",
@@ -1457,6 +1458,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "wiremock",
+]
+
+[[package]]
+name = "otto-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "otto-persistence",
+ "otto-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

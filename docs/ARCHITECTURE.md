@@ -34,7 +34,7 @@ otto-next/
 │   ├── retrieval        # Tree-sitter chunking, git-history, grep selection (vector index = v2).
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
-│   ├── remote           # RemoteTarget impls: vps (v1-ready), microvm (v2).
+│   ├── remote           # RemoteTarget seam + vps (shipped) / microvm (v2). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
@@ -210,8 +210,8 @@ trait RemoteTarget {
 }
 ```
 
-`vps` impl (long-lived server) is **shipped**: `VpsTarget` (in `crates/engine/src/remote.rs`,
-alongside `LoopbackTarget`) promotes a session onto an already-running, bearer-authed
+`vps` impl (long-lived server) is **shipped**: `VpsTarget` (in the `remote` crate, alongside the
+`RemoteTarget` seam; `LoopbackTarget` stays in `engine`) promotes a session onto an already-running, bearer-authed
 `otto serve --accept-promotions` by POSTing the `PromoteBundle` to its `POST /promote` restore RPC;
 the client then reconnects to the receiver and resumes via `Last-Event-ID`. `teardown` is a no-op
 (the target does not own the operator's server). The receiver restore is **gated** — workspace

@@ -9,6 +9,7 @@ members = [
     "crates/tools",
     "crates/agents",
     "crates/engine",
+    "crates/remote",
     "crates/persistence",
     "crates/mcp-fs",
     "crates/mcp-grep",

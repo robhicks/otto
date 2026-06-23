@@ -30,8 +30,9 @@ use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use crate::remote::{LoopbackTarget, PromoteConfig, RemoteHandle, promote};
+use crate::loopback::LoopbackTarget;
 use crate::service::{EngineService, EventSink, TurnControls};
+use otto_remote::{PromoteConfig, RemoteHandle, promote};
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {
@@ -234,7 +235,7 @@ async fn promote_handler(
     if !authorized(&headers, &state.token) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
-    let bundle: crate::remote::PromoteBundle = match serde_json::from_slice(&body) {
+    let bundle: otto_remote::PromoteBundle = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
     };
@@ -622,8 +623,8 @@ async fn handle_handover(
     // (source) engine, overwriting our own stale copy. Symmetric inverse of the promote push. The
     // client reconnects to us (the session is local again), so we report our own public ws base.
     if !to_remote {
-        if let crate::remote::PromoteMode::Vps { endpoint } = &cfg.mode {
-            let target = crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone());
+        if let otto_remote::PromoteMode::Vps { endpoint } = &cfg.mode {
+            let target = otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone());
             let bundle = match target.export(session).await {
                 Ok(b) => b,
                 Err(e) => {
@@ -687,13 +688,13 @@ async fn handle_handover(
     let endpoint = match existing {
         Some(endpoint) => endpoint,
         None => {
-            let target: Box<dyn crate::remote::RemoteTarget> =
+            let target: Box<dyn otto_remote::RemoteTarget> =
                 match &cfg.mode {
-                    crate::remote::PromoteMode::Loopback { base_dir } => Box::new(
+                    otto_remote::PromoteMode::Loopback { base_dir } => Box::new(
                         LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
                     ),
-                    crate::remote::PromoteMode::Vps { endpoint } => Box::new(
-                        crate::remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
+                    otto_remote::PromoteMode::Vps { endpoint } => Box::new(
+                        otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
                     ),
                 };
             let handle = match promote(
