@@ -157,19 +157,16 @@ impl MicrovmTarget {
 #[async_trait]
 impl RemoteTarget for MicrovmTarget {
     async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
-        // Boot the machine. If the push below fails, `machine` is dropped here, aborting its task —
-        // so a microVM that booted but rejected the bundle is killed, never leaked.
+        // Boot the machine, then wrap it in a RemoteHandle immediately. The handle's Drop aborts the
+        // task, so if the push below fails the `?` returns, `handle` drops, and the booted machine
+        // (in-process serve or microVM) is torn down — never leaked.
         let machine = self.provisioner.provision().await?;
-        push_promote_bundle(&machine.endpoint, &machine.token, bundle).await?;
-        Ok(RemoteHandle::with_task(
-            machine.endpoint,
-            machine.token,
-            machine.task,
-        ))
+        let handle = RemoteHandle::with_task(machine.endpoint, machine.token, machine.task);
+        push_promote_bundle(&handle.endpoint, &handle.token, bundle).await?;
+        Ok(handle)
     }
 
-    async fn teardown(&self, mut handle: RemoteHandle) -> anyhow::Result<()> {
-        handle.abort();
+    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -290,6 +287,70 @@ mod tests {
         assert_eq!(http_base("wss://host:9000"), "https://host:9000");
         assert_eq!(http_base("ws://127.0.0.1:7878"), "http://127.0.0.1:7878");
         assert_eq!(http_base("http://host:1"), "http://host:1");
+    }
+
+    #[tokio::test]
+    async fn microvm_target_aborts_machine_when_push_fails() {
+        // A provisioner that boots a never-ending task pointed at a closed port, so the bundle-push
+        // fails. We keep the task's AbortHandle to prove the task is aborted (not detached/leaked)
+        // once provision() returns Err.
+        struct DeadEndpointProvisioner {
+            abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+            endpoint: String,
+        }
+
+        #[async_trait]
+        impl Provisioner for DeadEndpointProvisioner {
+            async fn provision(&self) -> anyhow::Result<ProvisionedMachine> {
+                let task = tokio::spawn(std::future::pending::<()>());
+                *self.abort.lock().unwrap() = Some(task.abort_handle());
+                Ok(ProvisionedMachine {
+                    endpoint: self.endpoint.clone(),
+                    token: "t".to_string(),
+                    task,
+                })
+            }
+        }
+
+        // Bind then drop a listener to obtain a definitely-closed local port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let provisioner = std::sync::Arc::new(DeadEndpointProvisioner {
+            abort: std::sync::Mutex::new(None),
+            endpoint: format!("ws://127.0.0.1:{port}"),
+        });
+        let target = MicrovmTarget::new(provisioner.clone());
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id: SessionId::new(),
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        assert!(
+            target.provision(&bundle).await.is_err(),
+            "push to a closed port must fail"
+        );
+
+        let abort = provisioner.abort.lock().unwrap().take().expect("provisioned");
+        // Allow the abort to take effect (no `time` feature, so yield instead of sleep).
+        for _ in 0..50 {
+            if abort.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            abort.is_finished(),
+            "machine task must be aborted when push fails (no leak)"
+        );
     }
 
     #[tokio::test]
