@@ -30,6 +30,26 @@ pub enum PromoteMode {
     Loopback { base_dir: PathBuf },
     /// Push to an already-running remote `otto serve` at `endpoint` (`ws://…` / `wss://…`).
     Vps { endpoint: String },
+    /// Provision an ephemeral microVM (Firecracker), restore the bundle into it, then dispose it on
+    /// drop. `config` is read from `OTTO_FC_*` by the CLI; without the `firecracker` feature the
+    /// handover builds `UnsupportedProvisioner` and refuses honestly.
+    Microvm { config: MicrovmConfig },
+}
+
+/// Firecracker microVM parameters, read from `OTTO_FC_*` at the CLI edge (never in this crate) and
+/// carried as plain data in `PromoteMode::Microvm`. Always compiled; only `FirecrackerProvisioner`
+/// (behind the `firecracker` feature) consumes it.
+#[derive(Clone)]
+pub struct MicrovmConfig {
+    pub kernel: PathBuf,
+    pub rootfs: PathBuf,
+    pub fc_bin: PathBuf,
+    pub tap: String,
+    pub guest_ip: String,
+    pub port: u16,
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub boot_timeout: std::time::Duration,
 }
 
 /// A captured session ready to move to another engine: persisted session state + workspace files.
