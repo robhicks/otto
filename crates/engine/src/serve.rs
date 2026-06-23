@@ -675,15 +675,85 @@ async fn handle_handover(
             return;
         }
         if let otto_remote::PromoteMode::Microvm { .. } = &cfg.mode {
-            // microVMs are ephemeral; pulling a session back off a torn-down guest is a follow-up.
-            let _ = send_msg(
-                writer,
-                &ServerMessage::Error {
-                    message: "demote-from-remote not supported in microvm mode (ephemeral)"
-                        .to_string(),
-                },
-            )
-            .await;
+            // Source the live microVM endpoint+token from the handle a prior promote stored under
+            // (session, true). No handle ⟹ nothing to pull from. Take the lock only to clone the
+            // endpoint/token, releasing it at the `;` before any await.
+            let live = state
+                .remotes
+                .lock()
+                .unwrap()
+                .get(&(session, true))
+                .map(|h| (h.endpoint.clone(), h.token.clone()));
+            let Some((endpoint, token)) = live else {
+                let _ = send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: "no active microvm handover for this session; promote first"
+                            .to_string(),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Pull the current bundle off the microVM. On failure, leave the VM running (a transient
+            // pull error must not lose the session) and report the error.
+            let bundle = match otto_remote::export_bundle(&endpoint, &token, session).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            // Restore into THIS engine, overwriting our stale pre-promote copy (fail-closed
+            // sensitive-path floor first). On failure, leave the VM running and report.
+            if let Err(e) = state.service.accept_demotion(&bundle).await {
+                let msg = match e {
+                    crate::service::AcceptError::Refused(m) => m,
+                    crate::service::AcceptError::Failed(err) => err.to_string(),
+                    // unreachable: accept_demotion uses restore_over (overwrite), never AlreadyExists
+                    crate::service::AcceptError::AlreadyExists => {
+                        "demote restore conflict".to_string()
+                    }
+                };
+                let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
+                return;
+            }
+
+            // Success only: drop the handle to dispose the microVM, then tell the client to
+            // reconnect to us (the session is local again).
+            state.remotes.lock().unwrap().remove(&(session, true));
+            match &state.public_ws_base {
+                Some(base) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Demoted {
+                            session,
+                            endpoint: base.clone(),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    // Misconfiguration: a demotable serve must be built via serve_app_with_base.
+                    // The session is already local (restore committed) and the VM disposed; this
+                    // only signals the operator's missing public ws base.
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: "demote target has no public ws base configured".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
             return;
         }
     }
@@ -710,13 +780,16 @@ async fn handle_handover(
                     ),
                     otto_remote::PromoteMode::Microvm { config } => {
                         #[cfg(feature = "firecracker")]
-                        let provisioner: std::sync::Arc<dyn otto_remote::Provisioner> =
-                            std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
-                                config.clone(),
-                                cfg.token.clone(),
-                            ));
+                        let provisioner: std::sync::Arc<
+                            dyn otto_remote::Provisioner,
+                        > = std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
+                            config.clone(),
+                            cfg.token.clone(),
+                        ));
                         #[cfg(not(feature = "firecracker"))]
-                        let provisioner: std::sync::Arc<dyn otto_remote::Provisioner> = {
+                        let provisioner: std::sync::Arc<
+                            dyn otto_remote::Provisioner,
+                        > = {
                             let _ = config; // unused without the firecracker feature
                             std::sync::Arc::new(otto_remote::UnsupportedProvisioner)
                         };

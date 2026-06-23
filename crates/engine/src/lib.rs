@@ -32,7 +32,8 @@ pub use mcp::{
 };
 pub use otto_remote::{
     MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode, ProvisionedMachine,
-    Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget, promote,
+    Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget, export_bundle,
+    promote,
 };
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,
