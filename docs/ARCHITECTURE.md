@@ -210,8 +210,8 @@ trait RemoteTarget {
 }
 ```
 
-`vps` impl (long-lived server) is **shipped**: `VpsTarget` (in `crates/engine/src/remote.rs`,
-alongside `LoopbackTarget`) promotes a session onto an already-running, bearer-authed
+`vps` impl (long-lived server) is **shipped**: `VpsTarget` (in the `remote` crate, alongside the
+`RemoteTarget` seam; `LoopbackTarget` stays in `engine`) promotes a session onto an already-running, bearer-authed
 `otto serve --accept-promotions` by POSTing the `PromoteBundle` to its `POST /promote` restore RPC;
 the client then reconnects to the receiver and resumes via `Last-Event-ID`. `teardown` is a no-op
 (the target does not own the operator's server). The receiver restore is **gated** — workspace
