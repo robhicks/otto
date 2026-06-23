@@ -3,5 +3,8 @@
 //! scores content for every indexed file, removing the ContextFinder's per-turn read budget.
 
 mod index;
+mod retriever;
 mod tokenize;
 mod walk;
+
+pub use retriever::IndexedRetriever;
