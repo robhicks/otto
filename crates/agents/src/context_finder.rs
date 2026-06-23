@@ -123,64 +123,68 @@ impl Agent for ContextFinder {
             anyhow::bail!("ContextFinder received a non-FindContext request");
         };
 
-        // Enumerate the workspace recursively.
-        let files: Vec<String> = match ctx.tools().call("fs.list", json!({ "glob": "**" })).await {
-            Ok(Value::Object(map)) => map
-                .get("paths")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-
-        let kws = keywords(&goal);
-
-        // Path-only score every non-binary file (free, no read), dropping binary/non-text files
-        // so they neither consume read budget nor appear as context.
-        let mut by_path: Vec<(String, u64)> = files
-            .into_iter()
-            .filter(|p| !is_skippable(p))
-            .map(|p| {
-                let path_score = score_file(&p, None, &kws);
-                (p, path_score)
-            })
-            .collect();
-        // Read content only for the most path-relevant files, bounding per-turn read cost. Sort
-        // by path score desc, path asc (deterministic) and take the top READ_BUDGET to read.
-        by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let read_set: HashSet<String> = by_path
-            .iter()
-            .take(READ_BUDGET)
-            .map(|(p, _)| p.clone())
-            .collect();
-
-        // Final scoring: read content for the budgeted set (full 5·path + 1·content score),
-        // path-only for the rest.
-        let mut scored: Vec<(String, u64)> = Vec::new();
-        for (path, path_score) in &by_path {
-            let score = if read_set.contains(path) {
-                let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
+        // Produce the scored candidate set: from the retriever when wired, else the inline
+        // lexical pipeline (the deterministic offline fallback).
+        let scored: Vec<(String, u64)> = if let Some(retriever) = ctx.retriever() {
+            retriever
+                .search(&goal, CANDIDATE_LIMIT)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.path.to_string_lossy().into_owned(), c.score))
+                .collect()
+        } else {
+            // ---- existing inline lexical pipeline (unchanged) ----
+            let files: Vec<String> =
+                match ctx.tools().call("fs.list", json!({ "glob": "**" })).await {
                     Ok(Value::Object(map)) => map
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    _ => None,
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
                 };
-                score_file(path, content.as_deref(), &kws)
-            } else {
-                *path_score
-            };
-            if score > 0 {
-                scored.push((path.clone(), score));
+            let kws = keywords(&goal);
+            let mut by_path: Vec<(String, u64)> = files
+                .into_iter()
+                .filter(|p| !is_skippable(p))
+                .map(|p| {
+                    let path_score = score_file(&p, None, &kws);
+                    (p, path_score)
+                })
+                .collect();
+            by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let read_set: HashSet<String> = by_path
+                .iter()
+                .take(READ_BUDGET)
+                .map(|(p, _)| p.clone())
+                .collect();
+            let mut scored: Vec<(String, u64)> = Vec::new();
+            for (path, path_score) in &by_path {
+                let score = if read_set.contains(path) {
+                    let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
+                        Ok(Value::Object(map)) => map
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        _ => None,
+                    };
+                    score_file(path, content.as_deref(), &kws)
+                } else {
+                    *path_score
+                };
+                if score > 0 {
+                    scored.push((path.clone(), score));
+                }
             }
-        }
-        // Rank by score desc, tie-broken by path asc (deterministic), keep the top candidates.
-        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(CANDIDATE_LIMIT);
+            scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            scored.truncate(CANDIDATE_LIMIT);
+            scored
+        };
 
         if scored.is_empty() {
             return Ok(AgentOutput::Context { files: Vec::new() });
@@ -236,6 +240,7 @@ mod tests {
     use otto_engine_core::tool::{DenyAsk, Tool, ToolRegistry};
     use otto_engine_core::traits::{Workspace, WorkspaceRead};
     use otto_engine_core::types::Edit;
+    use otto_engine_core::{Candidate, Retriever};
     use otto_providers::{LocalProvider, ScriptedProvider};
     use otto_router::SingleProviderRouter;
     use otto_tools::{DefaultPermissionGate, FsListTool, FsReadTool};
@@ -409,5 +414,47 @@ mod tests {
             !files.contains(&PathBuf::from("zzz_only.txt")),
             "a content-only match beyond the read budget is missed: {files:?}"
         );
+    }
+
+    struct StubRetriever(Vec<Candidate>);
+    #[async_trait::async_trait]
+    impl Retriever for StubRetriever {
+        async fn search(&self, _goal: &str, _limit: usize) -> anyhow::Result<Vec<Candidate>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn retriever_candidates_supersede_the_lexical_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        // The lexical pipeline would rank `auth.rs` first (path + content hit on "login")
+        // and would DROP `from_retriever.rs` entirely (no "login" match → score 0).
+        seed(&ws, "auth.rs", "fn login() {}").await;
+        seed(&ws, "from_retriever.rs", "totally unrelated prose").await;
+        let tools = registry(dir.path());
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        // Retriever returns ONLY the file the lexical scan would never pick.
+        let retriever = StubRetriever(vec![Candidate {
+            path: PathBuf::from("from_retriever.rs"),
+            score: 99,
+        }]);
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
+        let out = ContextFinder
+            .run(
+                AgentRequest::FindContext {
+                    goal: "login".into(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let AgentOutput::Context { files } = out else {
+            panic!("expected Context")
+        };
+        // Proves candidates came from the retriever, not the lexical scan:
+        // `from_retriever.rs` is present, and the lexically-superior `auth.rs` is absent.
+        assert_eq!(files, vec![PathBuf::from("from_retriever.rs")]);
+        assert!(!files.contains(&PathBuf::from("auth.rs")));
     }
 }
