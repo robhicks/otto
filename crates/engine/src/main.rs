@@ -181,7 +181,9 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
 
-    let (events, outcome) = run_goal(&goal, store, router, orch_workspace, tools).await?;
+    let retriever = otto_engine::build_retriever(&root).await;
+    let (events, outcome) =
+        run_goal(&goal, store, router, orch_workspace, tools, retriever).await?;
     for event in &events {
         println!("[{:>3}] {:?}", event.seq, event.kind);
     }
@@ -263,7 +265,9 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
     let registry = Arc::new(otto_engine::build_default_registry());
 
-    let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools);
+    let retriever = otto_engine::build_retriever(&root).await;
+    let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools)
+        .with_retriever(retriever);
     let capabilities = otto_engine::build_capabilities();
     let promote = match (promote_loopback, promote_vps, promote_microvm) {
         (l, v, m) if (l as u8) + (v.is_some() as u8) + (m as u8) > 1 => {

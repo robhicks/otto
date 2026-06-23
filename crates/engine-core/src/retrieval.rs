@@ -23,7 +23,10 @@ mod tests {
 
     #[test]
     fn candidate_holds_path_and_score() {
-        let c = Candidate { path: PathBuf::from("src/main.rs"), score: 7 };
+        let c = Candidate {
+            path: PathBuf::from("src/main.rs"),
+            score: 7,
+        };
         assert_eq!(c.path, PathBuf::from("src/main.rs"));
         assert_eq!(c.score, 7);
     }
