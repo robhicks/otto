@@ -1,1 +1,245 @@
-//! The engine-axis remote seam, split out of `otto-engine`.
+//! The engine-axis remote seam, split out of `otto-engine`. `promote()` snapshots a session + its
+//! workspace into a `PromoteBundle` and hands it to a `RemoteTarget`. `VpsTarget` pushes the bundle
+//! to an already-running `otto serve --accept-promotions`; `UnsupportedTarget` honestly refuses,
+//! marking the machine-provisioning boundary. The in-process `LoopbackTarget` lives in `otto-engine`
+//! (it boots an engine), implementing this crate's `RemoteTarget`.
+
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use otto_engine_core::traits::Workspace;
+use otto_engine_core::types::WorkspaceSnapshot;
+use otto_persistence::{SessionState, SessionStore};
+use otto_protocol::SessionId;
+
+/// Enables session handover on a served engine. `token` is the bearer the target requires (reused
+/// from the source, by design); `mode` selects which `RemoteTarget` a handover provisions onto.
+/// `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback` or `--promote-vps`.
+#[derive(Clone)]
+pub struct PromoteConfig {
+    pub token: String,
+    pub mode: PromoteMode,
+}
+
+/// Which kind of remote a promote provisions onto.
+#[derive(Clone)]
+pub enum PromoteMode {
+    /// Provision a fresh in-process engine, restoring under `base_dir` (loopback round-trip).
+    Loopback { base_dir: PathBuf },
+    /// Push to an already-running remote `otto serve` at `endpoint` (`ws://…` / `wss://…`).
+    Vps { endpoint: String },
+}
+
+/// A captured session ready to move to another engine: persisted session state + workspace files.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PromoteBundle {
+    pub session: SessionState,
+    pub workspace: WorkspaceSnapshot,
+}
+
+/// A reachable, provisioned remote engine. `endpoint` is a `ws://host:port` base; `token` is the
+/// bearer token it requires. An impl-private `shutdown` task tears down an in-process engine on
+/// `teardown`/drop (set via `with_task`); network targets that own no task use `new`.
+pub struct RemoteHandle {
+    pub endpoint: String,
+    pub token: String,
+    shutdown: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RemoteHandle {
+    /// A handle to a remote this process does not own (e.g. `VpsTarget`): nothing to abort.
+    pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+            shutdown: None,
+        }
+    }
+
+    /// A handle to an in-process provisioned engine (`LoopbackTarget`): `task` is aborted on
+    /// `teardown`/drop.
+    pub fn with_task(
+        endpoint: impl Into<String>,
+        token: impl Into<String>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+            shutdown: Some(task),
+        }
+    }
+
+    /// Abort the backing task if any (idempotent). `Drop` also calls this.
+    pub fn abort(&mut self) {
+        if let Some(task) = self.shutdown.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for RemoteHandle {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[async_trait]
+pub trait RemoteTarget: Send + Sync {
+    async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle>;
+    async fn teardown(&self, handle: RemoteHandle) -> anyhow::Result<()>;
+}
+
+/// Snapshot `session` and its `workspace` and provision the result onto `target`. Does not stop
+/// the source engine — handover (drop local, reconnect remote) is a client concern.
+pub async fn promote(
+    store: &dyn SessionStore,
+    workspace: &dyn Workspace,
+    session: SessionId,
+    target: &dyn RemoteTarget,
+) -> anyhow::Result<RemoteHandle> {
+    let bundle = PromoteBundle {
+        session: store.snapshot(session).await?,
+        workspace: workspace.snapshot().await?,
+    };
+    target.provision(&bundle).await
+}
+
+/// A `RemoteTarget` that refuses to provision: a real cloud/VPS provisioner needs external
+/// infrastructure (a machine, SSH, a deployed engine) and cannot run in-tree or in CI.
+pub struct UnsupportedTarget;
+
+#[async_trait]
+impl RemoteTarget for UnsupportedTarget {
+    async fn provision(&self, _bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+        anyhow::bail!(
+            "real VPS provisioning requires external infrastructure; not available in-tree"
+        )
+    }
+    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// A `RemoteTarget` that promotes onto an already-running, operator-managed `otto serve` over the
+/// network. Unlike `LoopbackTarget`, it does not create or own the receiver — `teardown` is a
+/// no-op so it never aborts the operator's long-lived server.
+pub struct VpsTarget {
+    /// `ws://host:port` or `wss://host:port` — what the client reconnects to after promote.
+    endpoint: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl VpsTarget {
+    /// `endpoint` is the receiver's `ws://`/`wss://` base; `token` is its bearer (reused from the
+    /// source, by design — source and receiver share a trust domain in v1).
+    pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            token: token.into(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+
+    /// Map the ws endpoint to the HTTP base for the `/promote` POST (`ws→http`, `wss→https`).
+    fn http_base(&self) -> String {
+        if let Some(rest) = self.endpoint.strip_prefix("wss://") {
+            format!("https://{rest}")
+        } else if let Some(rest) = self.endpoint.strip_prefix("ws://") {
+            format!("http://{rest}")
+        } else {
+            self.endpoint.clone()
+        }
+    }
+
+    /// Pull a session's `PromoteBundle` back from the receiver (the demote primitive). POSTs the
+    /// session id to `/export`; surfaces the receiver's status + body on a non-2xx, symmetric with
+    /// how `provision` reports a rejected push.
+    pub async fn export(&self, session: SessionId) -> anyhow::Result<PromoteBundle> {
+        let url = format!("{}/export", self.http_base());
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "session": session.0.to_string() }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("export rejected by remote: HTTP {status}: {body}");
+        }
+        Ok(resp.json().await?)
+    }
+}
+
+#[async_trait]
+impl RemoteTarget for VpsTarget {
+    async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+        let url = format!("{}/promote", self.http_base());
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(bundle)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Surface the receiver's reason (e.g. "restore refused sensitive path: …",
+            // "session already exists") instead of a bare status, for operator diagnostics.
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("promote rejected by remote: HTTP {status}: {body}");
+        }
+        Ok(RemoteHandle::new(self.endpoint.clone(), self.token.clone()))
+    }
+
+    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
+        // No-op: VpsTarget does not own the operator's server, so it must never abort it.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otto_persistence::SessionStatus;
+
+    #[tokio::test]
+    async fn unsupported_target_refuses_to_provision() {
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id: SessionId::new(),
+                goal: "g".to_string(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+        assert!(UnsupportedTarget.provision(&bundle).await.is_err());
+    }
+
+    #[test]
+    fn vps_http_base_maps_ws_schemes() {
+        // wss → https (the production path; otherwise the promote POST silently downgrades to
+        // plaintext), ws → http (loopback), and an unrecognized scheme passes through verbatim.
+        assert_eq!(
+            VpsTarget::new("wss://host:9000", "t").http_base(),
+            "https://host:9000"
+        );
+        assert_eq!(
+            VpsTarget::new("ws://127.0.0.1:7878", "t").http_base(),
+            "http://127.0.0.1:7878"
+        );
+        assert_eq!(
+            VpsTarget::new("http://host:1", "t").http_base(),
+            "http://host:1"
+        );
+    }
+}
