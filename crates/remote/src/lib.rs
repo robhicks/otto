@@ -121,6 +121,50 @@ impl RemoteTarget for UnsupportedTarget {
     }
 }
 
+/// The reqwest client used for promote/export RPCs (30s timeout, rustls). Built per call — these
+/// RPCs are rare (a handover), so caching buys nothing.
+fn build_promote_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client")
+}
+
+/// Map a `ws://`/`wss://` endpoint to its HTTP base for the promote/export POSTs
+/// (`ws→http`, `wss→https`); an unrecognized scheme passes through verbatim.
+fn http_base(endpoint: &str) -> String {
+    if let Some(rest) = endpoint.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = endpoint.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        endpoint.to_string()
+    }
+}
+
+/// POST a serialized `PromoteBundle` to `{http_base(endpoint)}/promote` with `Bearer token`. On a
+/// non-2xx, bail with the receiver's status + body (operator diagnostics). Shared by `VpsTarget`
+/// and `MicrovmTarget` so both use the identical gated restore-push.
+pub(crate) async fn push_promote_bundle(
+    endpoint: &str,
+    token: &str,
+    bundle: &PromoteBundle,
+) -> anyhow::Result<()> {
+    let url = format!("{}/promote", http_base(endpoint));
+    let resp = build_promote_client()
+        .post(&url)
+        .bearer_auth(token)
+        .json(bundle)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("promote rejected by remote: HTTP {status}: {body}");
+    }
+    Ok(())
+}
+
 /// A `RemoteTarget` that promotes onto an already-running, operator-managed `otto serve` over the
 /// network. Unlike `LoopbackTarget`, it does not create or own the receiver — `teardown` is a
 /// no-op so it never aborts the operator's long-lived server.
@@ -138,21 +182,7 @@ impl VpsTarget {
         Self {
             endpoint: endpoint.into(),
             token: token.into(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("build reqwest client"),
-        }
-    }
-
-    /// Map the ws endpoint to the HTTP base for the `/promote` POST (`ws→http`, `wss→https`).
-    fn http_base(&self) -> String {
-        if let Some(rest) = self.endpoint.strip_prefix("wss://") {
-            format!("https://{rest}")
-        } else if let Some(rest) = self.endpoint.strip_prefix("ws://") {
-            format!("http://{rest}")
-        } else {
-            self.endpoint.clone()
+            client: build_promote_client(),
         }
     }
 
@@ -160,7 +190,7 @@ impl VpsTarget {
     /// session id to `/export`; surfaces the receiver's status + body on a non-2xx, symmetric with
     /// how `provision` reports a rejected push.
     pub async fn export(&self, session: SessionId) -> anyhow::Result<PromoteBundle> {
-        let url = format!("{}/export", self.http_base());
+        let url = format!("{}/export", http_base(&self.endpoint));
         let resp = self
             .client
             .post(&url)
@@ -180,21 +210,7 @@ impl VpsTarget {
 #[async_trait]
 impl RemoteTarget for VpsTarget {
     async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
-        let url = format!("{}/promote", self.http_base());
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.token)
-            .json(bundle)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Surface the receiver's reason (e.g. "restore refused sensitive path: …",
-            // "session already exists") instead of a bare status, for operator diagnostics.
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("promote rejected by remote: HTTP {status}: {body}");
-        }
+        push_promote_bundle(&self.endpoint, &self.token, bundle).await?;
         Ok(RemoteHandle::new(self.endpoint.clone(), self.token.clone()))
     }
 
@@ -226,20 +242,11 @@ mod tests {
     }
 
     #[test]
-    fn vps_http_base_maps_ws_schemes() {
+    fn http_base_maps_ws_schemes() {
         // wss → https (the production path; otherwise the promote POST silently downgrades to
         // plaintext), ws → http (loopback), and an unrecognized scheme passes through verbatim.
-        assert_eq!(
-            VpsTarget::new("wss://host:9000", "t").http_base(),
-            "https://host:9000"
-        );
-        assert_eq!(
-            VpsTarget::new("ws://127.0.0.1:7878", "t").http_base(),
-            "http://127.0.0.1:7878"
-        );
-        assert_eq!(
-            VpsTarget::new("http://host:1", "t").http_base(),
-            "http://host:1"
-        );
+        assert_eq!(http_base("wss://host:9000"), "https://host:9000");
+        assert_eq!(http_base("ws://127.0.0.1:7878"), "http://127.0.0.1:7878");
+        assert_eq!(http_base("http://host:1"), "http://host:1");
     }
 }
