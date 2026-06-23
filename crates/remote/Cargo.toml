@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Compiles the real Firecracker microVM provisioner. Off by default: default builds and CI never
 # compile hypervisor-specific code. Needs no extra deps (uses std::process + the existing reqwest).
-firecracker = []
+firecracker = ["tokio/time"]
 
 [dependencies]
 otto-protocol = { path = "../protocol" }

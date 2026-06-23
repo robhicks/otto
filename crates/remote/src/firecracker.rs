@@ -65,6 +65,13 @@ fn validate_prereqs(config: &MicrovmConfig) -> anyhow::Result<()> {
             anyhow::bail!("microVM prerequisite missing: {label} not found at {}", path.display());
         }
     }
+    // The kernel/rootfs paths are serialized into the JSON config; reject non-UTF-8 early with a
+    // clear error rather than letting `to_string_lossy` mangle them into an opaque boot failure.
+    for (label, path) in [("kernel image", &config.kernel), ("rootfs image", &config.rootfs)] {
+        if path.to_str().is_none() {
+            anyhow::bail!("microVM {label} path is not valid UTF-8: {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -102,7 +109,7 @@ impl Provisioner for FirecrackerProvisioner {
         validate_prereqs(&self.config)?;
 
         // Per-machine scratch dir + config file.
-        let jail_dir = std::env::temp_dir().join(format!("otto-fc-{}", self.config.guest_ip));
+        let jail_dir = std::env::temp_dir().join(format!("otto-fc-{}-{}", self.config.guest_ip, self.config.port));
         std::fs::create_dir_all(&jail_dir)?;
         let cfg_path = jail_dir.join("vm-config.json");
         let cfg = fc_config_json(&self.config, &self.token);
@@ -133,9 +140,10 @@ impl Provisioner for FirecrackerProvisioner {
                 // `guard` drops here → VM killed, scratch removed. Nothing leaks on timeout.
                 anyhow::bail!("microVM did not become reachable within boot timeout");
             }
-            // No tokio `time` feature available; yield and re-poll. The 2s reqwest timeout paces the
-            // loop so this is not a busy-spin in the common (still-booting) case.
-            tokio::task::yield_now().await;
+            // Sleep between polls. `ConnectionRefused` (the common early-boot case) returns
+            // immediately from reqwest, so without this sleep the loop would busy-spin a worker
+            // thread for the whole boot window. ~150 attempts over a 30s default boot_timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // Guardian task: owns the guard, parks until aborted; abort → guard Drop → VM disposed.
