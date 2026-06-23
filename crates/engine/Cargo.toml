@@ -30,7 +30,6 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid.workspace = true
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 escargot = "0.5"
@@ -40,3 +39,5 @@ tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpk
 futures-util = "0.3"
 rcgen = "0.13"
 rustls = "0.23"
+# Used only by tests/vps_promote.rs (VpsTarget moved to the otto-remote crate).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

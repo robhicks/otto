@@ -71,7 +71,7 @@ source serve issues `DemoteToLocal`; the source pulls the session back via a gat
 the receiver and restores it locally with `accept_demotion` (overwriting its own copy via
 `SessionStore::restore_over`, sensitive-floor first; the export is gate-filtered so secrets never
 leave the receiver). So the `UnsupportedTarget` boundary now marks only **machine provisioning** (SSH
-/ cloud-SDK VM creation); a `microvm` `RemoteTarget` and a split-out `remote` crate are still ahead. Treat it as the destination, not
+/ cloud-SDK VM creation); the `remote` crate split is **shipped** (the seam + `VpsTarget`/`UnsupportedTarget` live in `remote`; `LoopbackTarget` stays in `engine`), and a `microvm` `RemoteTarget` is still ahead. Treat it as the destination, not
 the current state. The per-plan specs in `docs/superpowers/plans/` and the design spec in
 `docs/superpowers/specs/` record what was built and why; check the latest plan to see where
 the build currently stands.
