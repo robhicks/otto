@@ -5,6 +5,11 @@
 //! `LoopbackTarget` lives in `otto-engine` (it boots an engine), implementing this crate's
 //! `RemoteTarget`.
 
+#[cfg(feature = "firecracker")]
+mod firecracker;
+#[cfg(feature = "firecracker")]
+pub use firecracker::FirecrackerProvisioner;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

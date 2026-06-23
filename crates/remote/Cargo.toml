@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Compiles the real Firecracker microVM provisioner. Off by default: default builds and CI never
+# compile hypervisor-specific code. Needs no extra deps (uses std::process + the existing reqwest).
+firecracker = []
+
 [dependencies]
 otto-protocol = { path = "../protocol" }
 otto-engine-core = { path = "../engine-core" }
@@ -15,3 +20,6 @@ serde = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
