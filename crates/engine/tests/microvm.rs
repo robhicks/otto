@@ -347,7 +347,10 @@ async fn handover_microvm_promote_is_unsupported_without_feature() {
 }
 
 #[tokio::test]
-async fn handover_microvm_demote_is_unsupported() {
+async fn handover_microvm_demote_without_prior_promote_errs() {
+    // No promote has run, so there is no live microVM handle to pull from: demote errors honestly
+    // instead of provisioning anything. (With the firecracker feature a real promote would create
+    // the handle; that round-trip is not CI-able, same boundary as the promote-unsupported test.)
     let (src_ws, _w, _d) = start_source_microvm().await;
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
@@ -365,14 +368,17 @@ async fn handover_microvm_demote_is_unsupported() {
         let f = next_json(&mut ws).await.expect("frame");
         if f["type"] == "error" {
             assert!(
-                f["message"].as_str().unwrap().contains("microvm mode"),
+                f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no active microvm handover"),
                 "{f:?}"
             );
             break;
         }
         assert_ne!(
             f["type"], "demoted",
-            "demote must not succeed in microvm mode: {f:?}"
+            "demote must not succeed with no prior promote: {f:?}"
         );
     }
 }
