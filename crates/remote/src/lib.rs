@@ -1,8 +1,9 @@
 //! The engine-axis remote seam, split out of `otto-engine`. `promote()` snapshots a session + its
 //! workspace into a `PromoteBundle` and hands it to a `RemoteTarget`. `VpsTarget` pushes the bundle
-//! to an already-running `otto serve --accept-promotions`; `UnsupportedTarget` honestly refuses,
-//! marking the machine-provisioning boundary. The in-process `LoopbackTarget` lives in `otto-engine`
-//! (it boots an engine), implementing this crate's `RemoteTarget`.
+//! to an already-running `otto serve --accept-promotions`; `UnsupportedProvisioner` honestly refuses
+//! at the provisioner layer, marking the machine-provisioning boundary. The in-process
+//! `LoopbackTarget` lives in `otto-engine` (it boots an engine), implementing this crate's
+//! `RemoteTarget`.
 
 use std::path::PathBuf;
 
@@ -123,19 +124,18 @@ pub async fn promote(
     target.provision(&bundle).await
 }
 
-/// A `RemoteTarget` that refuses to provision: a real cloud/VPS provisioner needs external
-/// infrastructure (a machine, SSH, a deployed engine) and cannot run in-tree or in CI.
-pub struct UnsupportedTarget;
+/// A `Provisioner` that refuses to provision: a real microVM needs a hypervisor + kernel/rootfs and
+/// cannot run in-tree or in CI. This is the single machine-provisioning boundary (it replaced
+/// `UnsupportedTarget`). `MicrovmTarget` over it surfaces this error honestly.
+pub struct UnsupportedProvisioner;
 
 #[async_trait]
-impl RemoteTarget for UnsupportedTarget {
-    async fn provision(&self, _bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+impl Provisioner for UnsupportedProvisioner {
+    async fn provision(&self) -> anyhow::Result<ProvisionedMachine> {
         anyhow::bail!(
-            "real VPS provisioning requires external infrastructure; not available in-tree"
+            "real microVM provisioning requires a hypervisor + kernel/rootfs; not available \
+             in-tree (build with --features firecracker and supply OTTO_FC_*)"
         )
-    }
-    async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
-        Ok(())
     }
 }
 
@@ -241,22 +241,10 @@ impl RemoteTarget for VpsTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otto_persistence::SessionStatus;
 
     #[tokio::test]
-    async fn unsupported_target_refuses_to_provision() {
-        let bundle = PromoteBundle {
-            session: SessionState {
-                id: SessionId::new(),
-                goal: "g".to_string(),
-                status: SessionStatus::Active,
-                config: serde_json::json!({}),
-                events: vec![],
-                turns: vec![],
-            },
-            workspace: WorkspaceSnapshot { files: vec![] },
-        };
-        assert!(UnsupportedTarget.provision(&bundle).await.is_err());
+    async fn unsupported_provisioner_refuses() {
+        assert!(UnsupportedProvisioner.provision().await.is_err());
     }
 
     #[test]
