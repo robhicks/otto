@@ -742,6 +742,9 @@ async fn handle_handover(
                     .await;
                 }
                 None => {
+                    // Misconfiguration: a demotable serve must be built via serve_app_with_base.
+                    // The session is already local (restore committed) and the VM disposed; this
+                    // only signals the operator's missing public ws base.
                     let _ = send_msg(
                         writer,
                         &ServerMessage::Error {
