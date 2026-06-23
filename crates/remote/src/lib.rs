@@ -151,8 +151,8 @@ pub async fn promote(
 }
 
 /// A `Provisioner` that refuses to provision: a real microVM needs a hypervisor + kernel/rootfs and
-/// cannot run in-tree or in CI. This is the single machine-provisioning boundary (it replaced
-/// `UnsupportedTarget`). `MicrovmTarget` over it surfaces this error honestly.
+/// cannot run in-tree or in CI. This is the single machine-provisioning boundary.
+/// `MicrovmTarget` over it surfaces this error honestly.
 pub struct UnsupportedProvisioner;
 
 #[async_trait]

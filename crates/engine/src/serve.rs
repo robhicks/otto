@@ -599,7 +599,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
 
 /// Provision the session onto a fresh engine (remote for promote, local for demote), retain the
 /// handle so it outlives this connection, and tell the client where to reconnect. A no-op error
-/// reply when promotion is not enabled (the `UnsupportedTarget` posture). Handled between turns.
+/// reply when promotion is not enabled (the promotion-disabled posture). Handled between turns.
 async fn handle_handover(
     state: &ServeState,
     writer: &mut WsWriter,

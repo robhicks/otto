@@ -34,7 +34,7 @@ otto-next/
 │   ├── retrieval        # Tree-sitter chunking, git-history, grep selection (vector index = v2).
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
-│   ├── remote           # RemoteTarget seam + vps (shipped) / microvm (v2). LoopbackTarget stays in engine.
+│   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
@@ -221,9 +221,15 @@ source pulls the session back via a gated `POST /export` on the receiver and res
 `accept_demotion` (overwriting its own stale copy via `SessionStore::restore_over`), then replies
 `Demoted` and the client reconnects to the source. The export is gated by the same
 `--accept-promotions` flag and its workspace snapshot is gate-filtered (secrets never leave the
-receiver); the receiver keeps its copy. The residual `UnsupportedTarget` boundary is now only
-**machine provisioning** (SSH / cloud-SDK VM creation stays external and manual). `microvm` impl
-(ephemeral, per-session) is v2.
+receiver); the receiver keeps its copy. The machine-provisioning step now lives behind a **`Provisioner` seam** (`provision()` boots a
+reachable `otto serve --accept-promotions`; disposal rides the returned task). `MicrovmTarget`
+composes any `Provisioner` with the shared `push_promote_bundle` restore-push, and the `microvm`
+provisioner is **shipped**: `FirecrackerProvisioner` (behind the default-off `firecracker` cargo
+feature) boots an ephemeral per-session microVM and restores the bundle into it via the same gated
+`POST /promote`. `UnsupportedProvisioner` (which replaced the old unsupported-target stub) is the single
+honest boundary — "no hypervisor / kernel / rootfs in-tree." The seam is proven end-to-end in CI
+against an in-process serve; the real VM boot needs operator-supplied images and a host hypervisor.
+**demote-from-microvm** (pulling an ephemeral session back) is the next follow-up.
 
 ## Protocol message catalog
 

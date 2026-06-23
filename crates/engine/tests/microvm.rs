@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use otto_engine::{
     EngineService, MicrovmTarget, PromoteBundle, ProvisionedMachine, Provisioner, RemoteTarget,
     UnsupportedProvisioner, build_default_registry, build_tool_registry, serve_app, serve_run,
@@ -162,4 +165,115 @@ async fn microvm_target_over_unsupported_provisioner_errs() {
         Ok(_) => panic!("provision should fail with UnsupportedProvisioner"),
     };
     assert!(err.contains("microVM provisioning requires"), "{err}");
+}
+
+fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let mut req = url.to_string().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    req
+}
+
+async fn next_json(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Option<serde_json::Value> {
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => return Some(serde_json::from_str(t.as_str()).unwrap()),
+            Some(Ok(Message::Close(_))) | None => return None,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => return None,
+        }
+    }
+}
+
+/// Start a source serve in Microvm promote mode (config paths are dummy: without the firecracker
+/// feature the provisioner is Unsupported and never reads them). Returns its ws base.
+async fn start_source_microvm() -> (String, tempfile::TempDir, tempfile::TempDir) {
+    let ws_dir = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws_dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, ws_dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> =
+        Arc::new(SqliteStore::open(db_dir.path().join("s.db")).await.unwrap());
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        Arc::from(otto_engine::build_router()),
+        workspace,
+        tools,
+    );
+    let config = otto_engine::MicrovmConfig {
+        kernel: PathBuf::from("/nonexistent/vmlinux"),
+        rootfs: PathBuf::from("/nonexistent/rootfs"),
+        fc_bin: PathBuf::from("/nonexistent/firecracker"),
+        tap: "fc-tap0".to_string(),
+        guest_ip: "172.16.0.2".to_string(),
+        port: 7878,
+        vcpus: 2,
+        mem_mib: 1024,
+        boot_timeout: std::time::Duration::from_secs(5),
+    };
+    let promote = Some(otto_engine::PromoteConfig {
+        token: TOKEN.to_string(),
+        mode: otto_engine::PromoteMode::Microvm { config },
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("ws://127.0.0.1:{port}");
+    let app = otto_engine::serve_app_with_base(
+        service, TOKEN.to_string(), caps(), promote, false, base.clone(),
+    );
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (base, ws_dir, db_dir)
+}
+
+#[cfg(not(feature = "firecracker"))]
+#[tokio::test]
+async fn handover_microvm_promote_is_unsupported_without_feature() {
+    let (src_ws, _w, _d) = start_source_microvm().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let ready = next_json(&mut ws).await.unwrap();
+    assert_eq!(ready["type"], "ready");
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&promote).unwrap())).await.unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            assert!(
+                f["message"].as_str().unwrap().contains("microVM provisioning requires"),
+                "{f:?}"
+            );
+            break;
+        }
+        assert_ne!(f["type"], "promoted", "promote must not succeed without firecracker: {f:?}");
+    }
+}
+
+#[tokio::test]
+async fn handover_microvm_demote_is_unsupported() {
+    let (src_ws, _w, _d) = start_source_microvm().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
+        .await
+        .unwrap();
+    let session = next_json(&mut ws).await.unwrap()["session"].as_str().unwrap().to_string();
+
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    ws.send(Message::Text(serde_json::to_string(&demote).unwrap())).await.unwrap();
+    loop {
+        let f = next_json(&mut ws).await.expect("frame");
+        if f["type"] == "error" {
+            assert!(f["message"].as_str().unwrap().contains("microvm mode"), "{f:?}");
+            break;
+        }
+        assert_ne!(f["type"], "demoted", "demote must not succeed in microvm mode: {f:?}");
+    }
 }
