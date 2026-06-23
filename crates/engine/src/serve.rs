@@ -31,8 +31,8 @@ use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 use crate::loopback::LoopbackTarget;
-use otto_remote::{PromoteConfig, RemoteHandle, promote};
 use crate::service::{EngineService, EventSink, TurnControls};
+use otto_remote::{PromoteConfig, RemoteHandle, promote};
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {

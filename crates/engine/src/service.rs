@@ -512,9 +512,9 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_restores_session_and_workspace() {
-        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
         use std::path::PathBuf;
 
         let ws_dir = tempfile::tempdir().unwrap();
@@ -551,9 +551,9 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_refuses_sensitive_workspace_entry() {
-        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
         use std::path::PathBuf;
 
         let ws_dir = tempfile::tempdir().unwrap();
@@ -692,8 +692,8 @@ mod tests {
 
     #[tokio::test]
     async fn accept_promotion_duplicate_session_is_already_exists() {
-        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_remote::PromoteBundle;
 
         let ws_dir = tempfile::tempdir().unwrap();
         let db_dir = tempfile::tempdir().unwrap();
@@ -717,9 +717,9 @@ mod tests {
 
     #[tokio::test]
     async fn accept_demotion_overwrites_an_existing_session() {
-        use otto_remote::PromoteBundle;
         use otto_engine_core::types::WorkspaceSnapshot;
         use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
 
         let ws = tempfile::tempdir().unwrap();
         let db = tempfile::tempdir().unwrap();
