@@ -3,3 +3,4 @@
 //! scores content for every indexed file, removing the ContextFinder's per-turn read budget.
 
 mod tokenize;
+mod walk;
