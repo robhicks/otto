@@ -33,6 +33,8 @@ pub struct Orchestrator<'a> {
     pub router: &'a dyn Router,
     pub workspace: &'a dyn Workspace,
     pub tools: &'a ToolRegistry,
+    /// Optional candidate source for the ContextFinder. `None` → the lexical fallback path.
+    pub retriever: Option<&'a dyn crate::retrieval::Retriever>,
     /// Resolves an `Ask` verdict on a proposed edit to apply/skip (interactive approval).
     pub approver: &'a dyn Approver,
     /// Mints the correlation id for an `ApprovalRequest`. Injected by the engine layer so the
@@ -81,7 +83,13 @@ impl<'a> Orchestrator<'a> {
         goal: &str,
         emit: &dyn Emitter,
     ) -> anyhow::Result<TurnOutcome> {
-        let ctx = AgentCtx::new(self.router, self.workspace, self.tools);
+        let ctx = {
+            let base = AgentCtx::new(self.router, self.workspace, self.tools);
+            match self.retriever {
+                Some(r) => base.with_retriever(r),
+                None => base,
+            }
+        };
 
         // --- Plan ---
         self.checkpoint(emit).await;
@@ -413,6 +421,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -484,6 +493,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -509,6 +519,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -550,6 +561,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -623,6 +635,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -668,6 +681,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -736,6 +750,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &approver,
             next_id: &test_id,
             meter: &meter,
@@ -785,6 +800,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &approver,
             next_id: &test_id,
             meter: &meter,
@@ -830,6 +846,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -863,6 +880,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
@@ -910,6 +928,7 @@ mod tests {
             router: &router,
             workspace: &workspace,
             tools: &tools,
+            retriever: None,
             approver: &DenyApprover,
             next_id: &test_id,
             meter: &meter,
