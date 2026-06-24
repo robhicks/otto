@@ -1,8 +1,9 @@
 //! The canonical sensitive-path floor: substrings that mark a path as holding secrets. This is
 //! the single source of truth shared by the permission gate (`DefaultPermissionGate`) and any
-//! component that must independently refuse to touch secret files — notably the retrieval index
-//! walk, which reads files directly (bypassing the gated `fs.read`) and so must apply this same
-//! floor itself. Keeping one list here makes drift between those enforcers impossible.
+//! component that must independently refuse to touch secret files — the retrieval index walk,
+//! which reads files directly (bypassing the gated `fs.read`), and the standalone `mcp-grep`
+//! server, which must never return secret file contents. Keeping one list here makes drift
+//! between those enforcers impossible.
 
 /// Lowercase substrings that mark a path as sensitive. Matching is case-insensitive (see
 /// `is_sensitive`). NOTE: symlink-to-secret escapes are a known open item handled by the

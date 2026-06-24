@@ -2,10 +2,9 @@
 //! sensitive paths (the inviolable floor); allows everything else for now.
 //!
 //! NOTE: The canonical sensitive-path marker list now lives in `otto_engine_core::SENSITIVE_MARKERS`
-//! (see `crates/engine-core/src/sensitive.rs`). Add new markers there — not here. `crates/mcp-grep`
-//! keeps an independent copy (`SENSITIVE_SKIP`) because it is a standalone binary that cannot
-//! depend on `engine-core`; keep it in sync manually when adding markers. NOTE: symlink-to-secret
-//! escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
+//! (see `crates/engine-core/src/sensitive.rs`). Add new markers there — not here. The gate, the
+//! retrieval index walk, and `crates/mcp-grep` all consume that single list, so they cannot drift.
+//! NOTE: symlink-to-secret escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
 //! symlinks; they are addressed by the sandboxed mcp-fs/mcp-bash layer in a later plan, not this
 //! string gate.
 

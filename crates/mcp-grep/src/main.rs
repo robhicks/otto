@@ -18,17 +18,6 @@ use serde::{Deserialize, Serialize};
 /// Max matches returned before the search stops and reports truncation.
 const MAX_MATCHES: usize = 1000;
 
-/// Substrings (lowercase) that mark a path as sensitive — MIRRORS the engine gate's
-/// `SENSITIVE_MARKERS` in `crates/tools/src/gate.rs`. A standalone `mcp-grep` keeps its own copy
-/// so it never returns secret file contents (incl. the non-dotfile `id_rsa`). KEEP IN SYNC: any
-/// marker added to the gate's list MUST be added here too, or mcp-grep stops protecting it.
-const SENSITIVE_SKIP: &[&str] = &[".env", ".ssh", ".git", "id_rsa", ".aws"];
-
-fn is_sensitive(rel: &str) -> bool {
-    let lower = rel.to_ascii_lowercase();
-    SENSITIVE_SKIP.iter().any(|m| lower.contains(m))
-}
-
 /// One match: workspace-relative path, 1-based line number, the matched line (trailing newline trimmed).
 #[derive(Debug, Clone, Serialize)]
 pub struct Match {
@@ -75,8 +64,10 @@ pub fn search(
         }
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
         let rel_str = rel.to_string_lossy().into_owned();
-        if is_sensitive(&rel_str) {
-            continue; // never search secret files (incl. non-dotfile id_rsa)
+        // Never search secret files (incl. the non-dotfile `id_rsa`). Uses the single canonical
+        // sensitive-path floor in `engine-core`, shared with the permission gate and the index walk.
+        if otto_engine_core::is_sensitive(&rel_str) {
+            continue;
         }
         if let Some(gm) = &glob_matcher {
             if !gm.is_match(rel) {
