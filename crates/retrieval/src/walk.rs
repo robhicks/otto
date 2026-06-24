@@ -4,6 +4,10 @@
 //! follow symlinks, and caps enumeration. Large files are enumerated so they are path-scored;
 //! `index.rs` bounds the content read to 1 MiB per file. Returns relative paths with their stat
 //! (mtime nanos, size) for stat-based staleness.
+//!
+//! The sensitive-path floor is now `otto_engine_core::is_sensitive` — the same function the
+//! permission gate (`DefaultPermissionGate`) enforces — so the index walk and the gate share one
+//! canonical list and cannot drift.
 
 use std::path::{Path, PathBuf};
 
@@ -16,19 +20,6 @@ pub struct WalkEntry {
     pub path: PathBuf, // relative to root
     pub mtime_ns: i64,
     pub size: i64,
-}
-
-/// Sensitive-path markers mirroring `crates/tools/src/gate.rs` SENSITIVE_MARKERS. Because the
-/// indexed retriever reads file contents directly (bypassing the gated `fs.read`), the walk is
-/// the sole defense against indexing secrets — so it must apply the SAME case-insensitive
-/// substring floor the permission gate enforces. Keep this list in sync with the gate.
-const SENSITIVE_MARKERS: &[&str] = &[".env", ".ssh", ".git", "id_rsa", ".aws"];
-
-/// True if `rel` (a workspace-relative path string) names a sensitive path under the gate's
-/// floor. Case-insensitive substring match, identical to the gate's `is_sensitive`.
-fn is_sensitive(rel: &str) -> bool {
-    let lower = rel.to_lowercase();
-    SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// True if a path component should be pruned from the walk.
@@ -95,7 +86,7 @@ pub fn walk(root: &Path) -> Vec<WalkEntry> {
                 continue;
             };
             let rel_str = rel.to_string_lossy();
-            if is_sensitive(&rel_str) {
+            if otto_engine_core::is_sensitive(&rel_str) {
                 continue;
             }
             let mtime_ns = meta

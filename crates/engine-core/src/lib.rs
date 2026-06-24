@@ -5,6 +5,7 @@ pub mod orchestrator;
 pub mod registry;
 pub mod retrieval;
 pub mod router;
+pub mod sensitive;
 pub mod tool;
 pub mod traits;
 pub mod types;
@@ -14,6 +15,7 @@ pub use orchestrator::{Emitter, Orchestrator, TurnOutcome};
 pub use registry::AgentRegistry;
 pub use retrieval::{Candidate, Retriever};
 pub use router::{RouteHints, Router, TaskKind};
+pub use sensitive::{SENSITIVE_MARKERS, is_sensitive};
 pub use tool::{
     AllowListAskResolver, Approver, AskResolver, Decision, DenyApprover, DenyAsk, NeverPause,
     PauseController, PermissionGate, Tool, ToolRegistry,
