@@ -31,7 +31,7 @@ otto-next/
 │   ├── mcp-grep         # MCP stdio server: ripgrep-style search.
 │   ├── mcp-bash         # MCP stdio server: shell exec with per-call network + OS sandbox policy.
 │   ├── mcp-lsp          # MCP stdio server: LSP bridge (deferred to v2).
-│   ├── retrieval        # Persistent inverted index behind the Retriever seam (shipped). Tree-sitter chunking, git-history selection, vector index = later/v2.
+│   ├── retrieval        # Persistent inverted index + tree-sitter symbol chunking behind the Retriever seam (shipped). git-history selection, vector index = later/v2.
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
 │   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated). LoopbackTarget stays in engine.
