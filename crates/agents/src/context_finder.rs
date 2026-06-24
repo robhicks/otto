@@ -116,6 +116,62 @@ fn select_prompt(goal: &str, candidates: &[(String, u64)]) -> String {
     )
 }
 
+impl ContextFinder {
+    /// The deterministic lexical candidate pipeline: enumerate via fs.list, path-score, read the
+    /// top READ_BUDGET files' contents, final-score, and keep the top CANDIDATE_LIMIT. This is the
+    /// offline fallback used when no retriever is wired AND when a wired retriever errors.
+    async fn lexical_candidates(&self, goal: &str, ctx: &AgentCtx<'_>) -> Vec<(String, u64)> {
+        let files: Vec<String> = match ctx.tools().call("fs.list", json!({ "glob": "**" })).await {
+            Ok(Value::Object(map)) => map
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let kws = keywords(goal);
+        let mut by_path: Vec<(String, u64)> = files
+            .into_iter()
+            .filter(|p| !is_skippable(p))
+            .map(|p| {
+                let path_score = score_file(&p, None, &kws);
+                (p, path_score)
+            })
+            .collect();
+        by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let read_set: HashSet<String> = by_path
+            .iter()
+            .take(READ_BUDGET)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut scored: Vec<(String, u64)> = Vec::new();
+        for (path, path_score) in &by_path {
+            let score = if read_set.contains(path) {
+                let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
+                    Ok(Value::Object(map)) => map
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                };
+                score_file(path, content.as_deref(), &kws)
+            } else {
+                *path_score
+            };
+            if score > 0 {
+                scored.push((path.clone(), score));
+            }
+        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(CANDIDATE_LIMIT);
+        scored
+    }
+}
+
 #[async_trait]
 impl Agent for ContextFinder {
     async fn run(&self, req: AgentRequest, ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
@@ -123,67 +179,26 @@ impl Agent for ContextFinder {
             anyhow::bail!("ContextFinder received a non-FindContext request");
         };
 
-        // Produce the scored candidate set: from the retriever when wired, else the inline
-        // lexical pipeline (the deterministic offline fallback).
-        let scored: Vec<(String, u64)> = if let Some(retriever) = ctx.retriever() {
-            retriever
-                .search(&goal, CANDIDATE_LIMIT)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|c| (c.path.to_string_lossy().into_owned(), c.score))
-                .collect()
-        } else {
-            // ---- existing inline lexical pipeline (unchanged) ----
-            let files: Vec<String> =
-                match ctx.tools().call("fs.list", json!({ "glob": "**" })).await {
-                    Ok(Value::Object(map)) => map
-                        .get("paths")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
-                };
-            let kws = keywords(&goal);
-            let mut by_path: Vec<(String, u64)> = files
-                .into_iter()
-                .filter(|p| !is_skippable(p))
-                .map(|p| {
-                    let path_score = score_file(&p, None, &kws);
-                    (p, path_score)
-                })
-                .collect();
-            by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            let read_set: HashSet<String> = by_path
-                .iter()
-                .take(READ_BUDGET)
-                .map(|(p, _)| p.clone())
-                .collect();
-            let mut scored: Vec<(String, u64)> = Vec::new();
-            for (path, path_score) in &by_path {
-                let score = if read_set.contains(path) {
-                    let content = match ctx.tools().call("fs.read", json!({ "path": path })).await {
-                        Ok(Value::Object(map)) => map
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        _ => None,
-                    };
-                    score_file(path, content.as_deref(), &kws)
-                } else {
-                    *path_score
-                };
-                if score > 0 {
-                    scored.push((path.clone(), score));
+        // Produce the scored candidate set: from the retriever when wired, else the deterministic
+        // lexical pipeline. A retriever ERROR also falls back to the lexical pipeline — retrieval
+        // is an optimization, never a gate. Only Ok(vec![]) (a valid empty result) is respected
+        // as-is without triggering fallback.
+        let scored: Vec<(String, u64)> = match ctx.retriever() {
+            Some(retriever) => match retriever.search(&goal, CANDIDATE_LIMIT).await {
+                Ok(candidates) => candidates
+                    .into_iter()
+                    .map(|c| (c.path.to_string_lossy().into_owned(), c.score))
+                    .collect(),
+                Err(e) => {
+                    // Retrieval is an optimization, never a gate: a search error degrades to the
+                    // deterministic lexical pipeline rather than blanking out the turn's context.
+                    eprintln!(
+                        "warning: retriever search failed ({e}); falling back to lexical scan"
+                    );
+                    self.lexical_candidates(&goal, ctx).await
                 }
-            }
-            scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            scored.truncate(CANDIDATE_LIMIT);
-            scored
+            },
+            None => self.lexical_candidates(&goal, ctx).await,
         };
 
         if scored.is_empty() {
@@ -424,6 +439,14 @@ mod tests {
         }
     }
 
+    struct FailingRetriever;
+    #[async_trait::async_trait]
+    impl Retriever for FailingRetriever {
+        async fn search(&self, _goal: &str, _limit: usize) -> anyhow::Result<Vec<Candidate>> {
+            anyhow::bail!("simulated index failure")
+        }
+    }
+
     #[tokio::test]
     async fn retriever_candidates_supersede_the_lexical_scan() {
         let dir = tempfile::tempdir().unwrap();
@@ -456,5 +479,32 @@ mod tests {
         // `from_retriever.rs` is present, and the lexically-superior `auth.rs` is absent.
         assert_eq!(files, vec![PathBuf::from("from_retriever.rs")]);
         assert!(!files.contains(&PathBuf::from("auth.rs")));
+    }
+
+    #[tokio::test]
+    async fn retriever_error_falls_back_to_lexical_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed(&ws, "auth.rs", "fn login() {}").await; // lexical would find this on "login"
+        let tools = registry(dir.path());
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        let retriever = FailingRetriever;
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
+        let out = ContextFinder
+            .run(
+                AgentRequest::FindContext {
+                    goal: "login".into(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let AgentOutput::Context { files } = out else {
+            panic!("expected Context")
+        };
+        assert!(
+            files.contains(&PathBuf::from("auth.rs")),
+            "a retriever error must degrade to the lexical scan, not empty context: {files:?}"
+        );
     }
 }
