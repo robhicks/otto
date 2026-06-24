@@ -1,19 +1,16 @@
 //! `DefaultPermissionGate`: otto's built-in guardrail. Denies tool calls that touch
 //! sensitive paths (the inviolable floor); allows everything else for now.
+//!
+//! NOTE: The canonical sensitive-path marker list now lives in `otto_engine_core::SENSITIVE_MARKERS`
+//! (see `crates/engine-core/src/sensitive.rs`). Add new markers there — not here. `crates/mcp-grep`
+//! keeps an independent copy (`SENSITIVE_SKIP`) because it is a standalone binary that cannot
+//! depend on `engine-core`; keep it in sync manually when adding markers. NOTE: symlink-to-secret
+//! escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
+//! symlinks; they are addressed by the sandboxed mcp-fs/mcp-bash layer in a later plan, not this
+//! string gate.
 
 use otto_engine_core::tool::{Decision, PermissionGate};
 use serde_json::Value;
-
-// NOTE: `crates/mcp-grep` mirrors this list (its `SENSITIVE_SKIP`) so a tree-wide grep never
-// returns secret contents. Add any new marker there too.
-/// Substrings (lowercase) that mark a path as sensitive. A tool-call argument naming such a
-/// path is denied. Matching is case-insensitive (see `is_sensitive`). NOTE: symlink-to-secret
-/// escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
-/// symlinks; they are addressed by the sandboxed mcp-fs/mcp-bash layer in a later plan, not this
-/// string gate.
-const SENSITIVE_MARKERS: &[&str] = &[
-    ".env", ".ssh/", ".ssh", ".git/", ".git", "id_rsa", ".aws/", ".aws",
-];
 
 pub struct DefaultPermissionGate;
 
@@ -22,11 +19,9 @@ impl DefaultPermissionGate {
         Self
     }
 
-    /// True if `s` names a sensitive path. Case-insensitive so `.ENV` / `.AWS/...` can't
-    /// slip past on case-insensitive filesystems (macOS/Windows).
+    /// True if `s` names a sensitive path. Delegates to the canonical floor in `engine-core`.
     fn is_sensitive(s: &str) -> bool {
-        let lower = s.to_ascii_lowercase();
-        SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
+        otto_engine_core::is_sensitive(s)
     }
 
     /// Collect candidate path strings from common arg shapes: `path`, `paths[]`.

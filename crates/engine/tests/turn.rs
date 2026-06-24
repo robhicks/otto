@@ -42,9 +42,16 @@ async fn full_turn_writes_parsed_edit_and_completes_ok() {
             .unwrap(),
     );
 
-    let (events, outcome) = run_goal("add a greeting", store, router, workspace.clone(), tools)
-        .await
-        .unwrap();
+    let (events, outcome) = run_goal(
+        "add a greeting",
+        store,
+        router,
+        workspace.clone(),
+        tools,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(outcome.ok);
     assert_eq!(

@@ -116,14 +116,11 @@ fn select_prompt(goal: &str, candidates: &[(String, u64)]) -> String {
     )
 }
 
-#[async_trait]
-impl Agent for ContextFinder {
-    async fn run(&self, req: AgentRequest, ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
-        let AgentRequest::FindContext { goal } = req else {
-            anyhow::bail!("ContextFinder received a non-FindContext request");
-        };
-
-        // Enumerate the workspace recursively.
+impl ContextFinder {
+    /// The deterministic lexical candidate pipeline: enumerate via fs.list, path-score, read the
+    /// top READ_BUDGET files' contents, final-score, and keep the top CANDIDATE_LIMIT. This is the
+    /// offline fallback used when no retriever is wired AND when a wired retriever errors.
+    async fn lexical_candidates(&self, goal: &str, ctx: &AgentCtx<'_>) -> Vec<(String, u64)> {
         let files: Vec<String> = match ctx.tools().call("fs.list", json!({ "glob": "**" })).await {
             Ok(Value::Object(map)) => map
                 .get("paths")
@@ -136,11 +133,7 @@ impl Agent for ContextFinder {
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
-
-        let kws = keywords(&goal);
-
-        // Path-only score every non-binary file (free, no read), dropping binary/non-text files
-        // so they neither consume read budget nor appear as context.
+        let kws = keywords(goal);
         let mut by_path: Vec<(String, u64)> = files
             .into_iter()
             .filter(|p| !is_skippable(p))
@@ -149,17 +142,12 @@ impl Agent for ContextFinder {
                 (p, path_score)
             })
             .collect();
-        // Read content only for the most path-relevant files, bounding per-turn read cost. Sort
-        // by path score desc, path asc (deterministic) and take the top READ_BUDGET to read.
         by_path.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let read_set: HashSet<String> = by_path
             .iter()
             .take(READ_BUDGET)
             .map(|(p, _)| p.clone())
             .collect();
-
-        // Final scoring: read content for the budgeted set (full 5·path + 1·content score),
-        // path-only for the rest.
         let mut scored: Vec<(String, u64)> = Vec::new();
         for (path, path_score) in &by_path {
             let score = if read_set.contains(path) {
@@ -178,9 +166,40 @@ impl Agent for ContextFinder {
                 scored.push((path.clone(), score));
             }
         }
-        // Rank by score desc, tie-broken by path asc (deterministic), keep the top candidates.
         scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(CANDIDATE_LIMIT);
+        scored
+    }
+}
+
+#[async_trait]
+impl Agent for ContextFinder {
+    async fn run(&self, req: AgentRequest, ctx: &AgentCtx) -> anyhow::Result<AgentOutput> {
+        let AgentRequest::FindContext { goal } = req else {
+            anyhow::bail!("ContextFinder received a non-FindContext request");
+        };
+
+        // Produce the scored candidate set: from the retriever when wired, else the deterministic
+        // lexical pipeline. A retriever ERROR also falls back to the lexical pipeline — retrieval
+        // is an optimization, never a gate. Only Ok(vec![]) (a valid empty result) is respected
+        // as-is without triggering fallback.
+        let scored: Vec<(String, u64)> = match ctx.retriever() {
+            Some(retriever) => match retriever.search(&goal, CANDIDATE_LIMIT).await {
+                Ok(candidates) => candidates
+                    .into_iter()
+                    .map(|c| (c.path.to_string_lossy().into_owned(), c.score))
+                    .collect(),
+                Err(e) => {
+                    // Retrieval is an optimization, never a gate: a search error degrades to the
+                    // deterministic lexical pipeline rather than blanking out the turn's context.
+                    eprintln!(
+                        "warning: retriever search failed ({e}); falling back to lexical scan"
+                    );
+                    self.lexical_candidates(&goal, ctx).await
+                }
+            },
+            None => self.lexical_candidates(&goal, ctx).await,
+        };
 
         if scored.is_empty() {
             return Ok(AgentOutput::Context { files: Vec::new() });
@@ -236,6 +255,7 @@ mod tests {
     use otto_engine_core::tool::{DenyAsk, Tool, ToolRegistry};
     use otto_engine_core::traits::{Workspace, WorkspaceRead};
     use otto_engine_core::types::Edit;
+    use otto_engine_core::{Candidate, Retriever};
     use otto_providers::{LocalProvider, ScriptedProvider};
     use otto_router::SingleProviderRouter;
     use otto_tools::{DefaultPermissionGate, FsListTool, FsReadTool};
@@ -408,6 +428,83 @@ mod tests {
         assert!(
             !files.contains(&PathBuf::from("zzz_only.txt")),
             "a content-only match beyond the read budget is missed: {files:?}"
+        );
+    }
+
+    struct StubRetriever(Vec<Candidate>);
+    #[async_trait::async_trait]
+    impl Retriever for StubRetriever {
+        async fn search(&self, _goal: &str, _limit: usize) -> anyhow::Result<Vec<Candidate>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingRetriever;
+    #[async_trait::async_trait]
+    impl Retriever for FailingRetriever {
+        async fn search(&self, _goal: &str, _limit: usize) -> anyhow::Result<Vec<Candidate>> {
+            anyhow::bail!("simulated index failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn retriever_candidates_supersede_the_lexical_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        // The lexical pipeline would rank `auth.rs` first (path + content hit on "login")
+        // and would DROP `from_retriever.rs` entirely (no "login" match → score 0).
+        seed(&ws, "auth.rs", "fn login() {}").await;
+        seed(&ws, "from_retriever.rs", "totally unrelated prose").await;
+        let tools = registry(dir.path());
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        // Retriever returns ONLY the file the lexical scan would never pick.
+        let retriever = StubRetriever(vec![Candidate {
+            path: PathBuf::from("from_retriever.rs"),
+            score: 99,
+        }]);
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
+        let out = ContextFinder
+            .run(
+                AgentRequest::FindContext {
+                    goal: "login".into(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let AgentOutput::Context { files } = out else {
+            panic!("expected Context")
+        };
+        // Proves candidates came from the retriever, not the lexical scan:
+        // `from_retriever.rs` is present, and the lexically-superior `auth.rs` is absent.
+        assert_eq!(files, vec![PathBuf::from("from_retriever.rs")]);
+        assert!(!files.contains(&PathBuf::from("auth.rs")));
+    }
+
+    #[tokio::test]
+    async fn retriever_error_falls_back_to_lexical_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed(&ws, "auth.rs", "fn login() {}").await; // lexical would find this on "login"
+        let tools = registry(dir.path());
+        let router = SingleProviderRouter::new(Arc::new(LocalProvider::new()));
+        let retriever = FailingRetriever;
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
+        let out = ContextFinder
+            .run(
+                AgentRequest::FindContext {
+                    goal: "login".into(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let AgentOutput::Context { files } = out else {
+            panic!("expected Context")
+        };
+        assert!(
+            files.contains(&PathBuf::from("auth.rs")),
+            "a retriever error must degrade to the lexical scan, not empty context: {files:?}"
         );
     }
 }

@@ -12,7 +12,7 @@ use otto_engine_core::tool::{
 };
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
-use otto_engine_core::{AgentRegistry, Orchestrator, Router, TokenMeter, TurnOutcome};
+use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
 use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
 use otto_router::MeteringRouter;
@@ -75,6 +75,7 @@ pub struct EngineService {
     router: Arc<dyn Router>,
     workspace: Arc<dyn Workspace>,
     tools: Arc<ToolRegistry>,
+    retriever: Option<Arc<dyn Retriever>>,
     turn_lock: tokio::sync::Mutex<()>,
 }
 
@@ -92,8 +93,15 @@ impl EngineService {
             router,
             workspace,
             tools,
+            retriever: None,
             turn_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach a retriever (the indexed candidate source). `None` keeps the lexical fallback.
+    pub fn with_retriever(mut self, retriever: Option<Arc<dyn Retriever>>) -> Self {
+        self.retriever = retriever;
+        self
     }
 
     /// The session store, for reads the serve layer needs (e.g. replay on reconnect).
@@ -156,6 +164,7 @@ impl EngineService {
             let router = Arc::clone(&self.router);
             let workspace = Arc::clone(&self.workspace);
             let tools = Arc::clone(&self.tools);
+            let retriever = self.retriever.clone();
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
             let approver = Arc::clone(&controls.approver);
@@ -174,6 +183,7 @@ impl EngineService {
                     router: &metering_router,
                     workspace: &*workspace,
                     tools: &tools,
+                    retriever: retriever.as_deref(),
                     approver: &*approver,
                     next_id: &next_id,
                     meter: &meter,

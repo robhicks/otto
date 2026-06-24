@@ -66,7 +66,8 @@ impl RemoteTarget for LoopbackTarget {
             router,
             workspace,
             tools,
-        );
+        )
+        .with_retriever(crate::build_retriever(&ws_dir).await);
 
         // This provisioned engine reports the configured capability and is itself promote-capable
         // (so the round-trip — demote, re-promote — works), rooted at a nested base dir.

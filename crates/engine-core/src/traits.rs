@@ -53,6 +53,7 @@ pub struct AgentCtx<'a> {
     router: &'a dyn Router,
     workspace: &'a dyn WorkspaceRead,
     tools: &'a ToolRegistry,
+    retriever: Option<&'a dyn crate::retrieval::Retriever>,
 }
 
 impl<'a> AgentCtx<'a> {
@@ -65,6 +66,7 @@ impl<'a> AgentCtx<'a> {
             router,
             workspace,
             tools,
+            retriever: None,
         }
     }
 
@@ -82,5 +84,94 @@ impl<'a> AgentCtx<'a> {
     /// The tool registry; calls made through it are gated by the permission gate before dispatch.
     pub fn tools(&self) -> &ToolRegistry {
         self.tools
+    }
+
+    /// Attach a retriever (the indexed candidate source). Absent → agents use their fallback.
+    pub fn with_retriever(mut self, retriever: &'a dyn crate::retrieval::Retriever) -> Self {
+        self.retriever = Some(retriever);
+        self
+    }
+
+    /// The retriever, if one is wired. `None` keeps the deterministic offline fallback path.
+    pub fn retriever(&self) -> Option<&dyn crate::retrieval::Retriever> {
+        self.retriever
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::retrieval::Candidate;
+    use crate::router::{RouteHints, Router};
+    use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
+    use crate::types::{CompleteRequest, CompleteResponse};
+
+    struct StubRouter;
+    #[async_trait]
+    impl Router for StubRouter {
+        async fn complete(
+            &self,
+            _req: CompleteRequest,
+            _hints: RouteHints,
+        ) -> anyhow::Result<CompleteResponse> {
+            Ok(CompleteResponse {
+                text: String::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct StubWorkspace;
+    #[async_trait]
+    impl WorkspaceRead for StubWorkspace {
+        async fn read(&self, _path: &Path) -> anyhow::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn list(&self, _glob: &str) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct AllowGate;
+    impl PermissionGate for AllowGate {
+        fn evaluate(&self, _tool: &str, _args: &serde_json::Value) -> Decision {
+            Decision::Allow
+        }
+    }
+
+    fn stub_tools() -> ToolRegistry {
+        ToolRegistry::new(Arc::new(AllowGate), Arc::new(DenyAsk))
+    }
+
+    struct NoopRetriever;
+    #[async_trait]
+    impl crate::retrieval::Retriever for NoopRetriever {
+        async fn search(&self, _goal: &str, _limit: usize) -> anyhow::Result<Vec<Candidate>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn retriever_defaults_to_none() {
+        let router = StubRouter;
+        let ws = StubWorkspace;
+        let tools = stub_tools();
+        let ctx = AgentCtx::new(&router, &ws, &tools);
+        assert!(ctx.retriever().is_none());
+    }
+
+    #[test]
+    fn with_retriever_sets_some() {
+        let router = StubRouter;
+        let ws = StubWorkspace;
+        let tools = stub_tools();
+        let noop = NoopRetriever;
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&noop);
+        assert!(ctx.retriever().is_some());
     }
 }

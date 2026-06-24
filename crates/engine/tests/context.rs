@@ -51,6 +51,7 @@ async fn context_flows_from_finder_to_coder() {
         router,
         workspace.clone(),
         tools,
+        None,
     )
     .await
     .unwrap();

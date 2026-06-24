@@ -198,6 +198,48 @@ pub fn build_capabilities() -> CapabilitiesManifest {
     )
 }
 
+/// Build the persistent retriever for `root`, or `None` (logged) on any failure — retrieval is
+/// an optimization, never a gate, so a missing cache dir or open error degrades to the lexical
+/// fallback. The index DB lives in the OS cache dir, keyed by the canonical root so each repo
+/// gets its own, reused across `otto run` invocations and serve restarts.
+pub async fn build_retriever(
+    root: &std::path::Path,
+) -> Option<Arc<dyn otto_engine_core::Retriever>> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(cache) = dirs::cache_dir() else {
+        eprintln!("warning: no OS cache dir; retrieval index disabled (lexical fallback)");
+        return None;
+    };
+    // Stable FNV-1a-64 over the canonical path bytes — unlike DefaultHasher, its output is
+    // fixed across Rust toolchains, so a compiler upgrade does not orphan the on-disk index.
+    let key = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in canonical.as_os_str().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x00000100000001B3);
+        }
+        h
+    };
+    let db = cache
+        .join("otto")
+        .join("index")
+        .join(format!("{key:016x}.sqlite"));
+    if let Some(parent) = db.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("warning: cannot create retrieval cache dir ({e}); lexical fallback");
+            return None;
+        }
+    }
+    match otto_retrieval::IndexedRetriever::open(canonical, db).await {
+        Ok(r) => Some(Arc::new(r) as Arc<dyn otto_engine_core::Retriever>),
+        Err(e) => {
+            eprintln!("warning: retrieval index unavailable ({e}); lexical fallback");
+            None
+        }
+    }
+}
+
 /// Run one turn for `goal` through an `EngineService` backed by `store`, returning the
 /// sequenced events and the outcome. A thin wrapper: build the service, create a session,
 /// run one prompt with a collecting sink.
@@ -207,6 +249,7 @@ pub async fn run_goal(
     router: Arc<dyn Router>,
     workspace: Arc<dyn Workspace>,
     tools: Arc<ToolRegistry>,
+    retriever: Option<Arc<dyn otto_engine_core::Retriever>>,
 ) -> anyhow::Result<(Vec<Event>, TurnOutcome)> {
     let service = EngineService::new(
         store,
@@ -214,7 +257,8 @@ pub async fn run_goal(
         router,
         workspace,
         tools,
-    );
+    )
+    .with_retriever(retriever);
     let session = service.create_session(goal, &session_config()).await?;
     let mut sink = CollectingSink::default();
     let outcome = service.run_prompt(session, goal, &mut sink).await?;
