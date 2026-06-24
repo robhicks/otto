@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod sensitive;
+pub use sensitive::{SENSITIVE_MARKERS, is_sensitive};
+
 /// Identifies a single agent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
