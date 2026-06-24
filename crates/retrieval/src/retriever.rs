@@ -1,6 +1,8 @@
 //! `IndexedRetriever`: the `Retriever` impl backed by the persistent inverted index. On each
 //! `search` it refreshes the index (stat-incremental), then ranks every walked file by
-//! `5*path_hits + content_score + 8*symbol_name_hits`. The PATH weighting (5×) matches the
+//! `5*path_hits + content_score + 8*symbol_name_hits`, plus a bounded git-history recency boost
+//! added only to files that already match (a precision re-ranker, never a recall source). The PATH
+//! weighting (5×) matches the
 //! lexical ContextFinder, but content scores come from token-equality postings in the index
 //! (not substring counts), so results can differ from the lexical fallback for
 //! substring-of-token matches (e.g. "auth" inside "authenticate"). Content covers ALL files
@@ -51,6 +53,14 @@ impl Retriever for IndexedRetriever {
         let name_hits = self.index.symbol_name_hits(&terms).await?;
         let mut matched = self.index.matched_symbols(&terms, SYMBOLS_PER_FILE).await?;
 
+        // Git-history recency boost (empty off-git). Run the bounded `git log` off the async
+        // executor; a join failure degrades to no boost (graceful no-op).
+        let root = self.root.clone();
+        let git_boost =
+            tokio::task::spawn_blocking(move || crate::git_history::recency_boosts(&root))
+                .await
+                .unwrap_or_default();
+
         // Path scores computed from the entries returned by refresh (no second walk).
         // Score: 5*path_hits + whole_file_content + 8*name_hits. The first two terms are slice 1
         // unchanged (the recall floor); the name boost is strictly additive, so no file that
@@ -64,10 +74,14 @@ impl Retriever for IndexedRetriever {
                     .map(|t| path_str.matches(t.as_str()).count() as u64)
                     .sum();
                 let key = e.path.to_string_lossy().into_owned();
-                let score = 5 * path_hits
+                let base = 5 * path_hits
                     + content.get(&key).copied().unwrap_or(0)
                     + 8 * name_hits.get(&key).copied().unwrap_or(0);
-                (score > 0).then(|| {
+                // Recency is a precision re-ranker, not a recall source: the boost is added ONLY for
+                // files that already matched (base > 0), so a recent-but-unmatched file is never
+                // constructed and the no-recall-regression invariant holds (boost >= 0).
+                (base > 0).then(|| {
+                    let score = base + git_boost.get(&key).copied().unwrap_or(0);
                     let symbols = matched.remove(&key).unwrap_or_default();
                     Candidate {
                         path: e.path,
@@ -247,5 +261,127 @@ mod tests {
             .map(|c| c.path)
             .collect();
         assert!(files.contains(&PathBuf::from("notes.md")), "{files:?}");
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(root: &Path) {
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_path(root: &Path, rel: &str, msg: &str) {
+        git(root, &["add", rel]);
+        git(root, &["commit", "-q", "-m", msg]);
+    }
+
+    #[tokio::test]
+    async fn recent_file_outranks_equally_scored_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap(); // keep the index DB out of the git repo
+        init_repo(root);
+
+        // Both files have an identical base score (one content hit on "login", no path hit). Names
+        // are chosen so the NEWEST file sorts alphabetically LAST: without the recency boost the
+        // deterministic `path asc` tiebreak would rank `aaa.rs` first, so this test genuinely fails
+        // if the boost wiring is removed.
+        seed(root, "aaa.rs", b"login");
+        commit_path(root, "aaa.rs", "older"); // oldest commit -> highest rank
+        for i in 0..6 {
+            let rel = format!("filler{i}.txt");
+            seed(root, &rel, b"filler");
+            commit_path(root, &rel, "filler");
+        }
+        seed(root, "zzz.rs", b"login");
+        commit_path(root, "zzz.rs", "newer"); // newest commit -> rank 0
+
+        let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
+            .await
+            .unwrap();
+        let cands = r.search("login", 8).await.unwrap();
+        // Equal base (content=1 each); zzz.rs gets tier 4 (rank 0), aaa.rs tier 3 (rank 7). Without
+        // the boost, `path asc` would rank aaa.rs first — so asserting zzz.rs first is a real
+        // regression guard for the boost wiring.
+        assert_eq!(
+            cands.first().map(|c| c.path.clone()),
+            Some(PathBuf::from("zzz.rs")),
+            "recent file should win despite sorting alphabetically last: {cands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_but_unmatched_file_is_not_surfaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        init_repo(root);
+
+        seed(root, "match.rs", b"login");
+        commit_path(root, "match.rs", "match"); // older, but matches "login"
+        seed(root, "recent.rs", b"totally unrelated content");
+        commit_path(root, "recent.rs", "recent"); // newest, but no "login" anywhere
+
+        let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
+            .await
+            .unwrap();
+        let files: Vec<_> = r
+            .search("login", 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert!(files.contains(&PathBuf::from("match.rs")));
+        assert!(
+            !files.contains(&PathBuf::from("recent.rs")),
+            "git recency must not surface an unmatched file: {files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_sensitive_file_never_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        init_repo(root);
+
+        // .env is committed to git (so it's in `git log`) but excluded by the walk — the boost is a
+        // lookup keyed on walked entries, so it can never be surfaced.
+        seed(root, ".env", b"login=secret");
+        git(root, &["add", "-f", ".env"]);
+        git(root, &["commit", "-q", "-m", "secret"]);
+        seed(root, "real.rs", b"login");
+        commit_path(root, "real.rs", "real");
+
+        let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
+            .await
+            .unwrap();
+        let files: Vec<_> = r
+            .search("login", 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert!(
+            !files.iter().any(|p| p.to_string_lossy().contains(".env")),
+            "sensitive file must never appear even when committed: {files:?}"
+        );
+        assert!(files.contains(&PathBuf::from("real.rs")));
     }
 }
