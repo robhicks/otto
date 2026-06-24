@@ -332,6 +332,106 @@ impl Index {
             })
             .collect())
     }
+
+    /// Per file: how many DISTINCT query terms matched at least one symbol NAME in that file.
+    /// Drives the name/definition boost. Returns (relative-path-string, distinct-term-hits).
+    pub async fn symbol_name_hits(
+        &self,
+        terms: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, u64>> {
+        if terms.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = terms.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT f.path AS path, COUNT(DISTINCT cn.token) AS hits
+             FROM chunk_names cn
+             JOIN chunks c ON c.chunk_id = cn.chunk_id
+             JOIN files f ON f.file_id = c.file_id
+             WHERE cn.token IN ({placeholders})
+             GROUP BY f.file_id",
+        );
+        let mut q = sqlx::query(&sql);
+        for t in terms {
+            q = q.bind(t);
+        }
+        Ok(q.fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("path"),
+                    r.get::<i64, _>("hits").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// Per file: matched symbol names — those whose NAME matched a term first (alphabetical), then
+    /// those whose BODY matched (by descending body score), de-duplicated and capped per file.
+    pub async fn matched_symbols(
+        &self,
+        terms: &[String],
+        cap_per_file: usize,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+        use std::collections::HashMap;
+        if terms.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = terms.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+        // Name-hit symbols (alphabetical, deterministic).
+        let name_sql = format!(
+            "SELECT DISTINCT f.path AS path, c.symbol AS symbol
+             FROM chunk_names cn
+             JOIN chunks c ON c.chunk_id = cn.chunk_id
+             JOIN files f ON f.file_id = c.file_id
+             WHERE cn.token IN ({placeholders})
+             ORDER BY f.path, c.symbol",
+        );
+        // Body-hit symbols (by descending summed body count, then symbol for ties).
+        let body_sql = format!(
+            "SELECT f.path AS path, c.symbol AS symbol, SUM(cp.count) AS sc
+             FROM chunk_postings cp
+             JOIN chunks c ON c.chunk_id = cp.chunk_id
+             JOIN files f ON f.file_id = c.file_id
+             WHERE cp.token IN ({placeholders})
+             GROUP BY c.chunk_id
+             ORDER BY f.path, sc DESC, c.symbol",
+        );
+
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Name-hit pass.
+        let mut q = sqlx::query(&name_sql);
+        for t in terms {
+            q = q.bind(t);
+        }
+        for row in q.fetch_all(&self.pool).await? {
+            let path: String = row.get("path");
+            let symbol: String = row.get("symbol");
+            let v = out.entry(path).or_default();
+            if v.len() < cap_per_file && !v.contains(&symbol) {
+                v.push(symbol);
+            }
+        }
+
+        // Body-hit pass.
+        let mut q = sqlx::query(&body_sql);
+        for t in terms {
+            q = q.bind(t);
+        }
+        for row in q.fetch_all(&self.pool).await? {
+            let path: String = row.get("path");
+            let symbol: String = row.get("symbol");
+            let v = out.entry(path).or_default();
+            if v.len() < cap_per_file && !v.contains(&symbol) {
+                v.push(symbol);
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -476,5 +576,33 @@ mod tests {
                 .get("n");
             assert_eq!(n, 0, "{tbl} cascaded on file removal");
         }
+    }
+
+    #[tokio::test]
+    async fn symbol_name_hits_and_matched_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        // defines `fn login` (name hit) + body mentions "session"
+        seed(root, "auth.rs", b"fn login() {\n    let session = 1;\n}\n");
+        // only a body mention of "login" inside `fn helper`
+        seed(root, "util.rs", b"fn helper() {\n    let login = 1;\n}\n");
+        let idx = Index::open(dbdir.path().join("idx.sqlite")).await.unwrap();
+        idx.refresh(root).await.unwrap();
+
+        let hits = idx.symbol_name_hits(&["login".to_string()]).await.unwrap();
+        assert_eq!(hits.get("auth.rs"), Some(&1), "auth.rs defines fn login");
+        assert!(
+            !hits.contains_key("util.rs"),
+            "util.rs only mentions login in a body"
+        );
+
+        let syms = idx
+            .matched_symbols(&["login".to_string()], 5)
+            .await
+            .unwrap();
+        assert_eq!(syms.get("auth.rs"), Some(&vec!["login".to_string()]));
+        // util.rs matched by body -> its enclosing symbol `helper` is listed.
+        assert_eq!(syms.get("util.rs"), Some(&vec!["helper".to_string()]));
     }
 }
