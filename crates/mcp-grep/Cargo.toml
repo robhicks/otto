@@ -10,7 +10,7 @@ name = "mcp-grep"
 path = "src/main.rs"
 
 [dependencies]
-otto-engine-core = { path = "../engine-core" }
+otto-protocol = { path = "../protocol" }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 grep-searcher = "0.1"

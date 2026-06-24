@@ -1,9 +1,10 @@
 //! `DefaultPermissionGate`: otto's built-in guardrail. Denies tool calls that touch
 //! sensitive paths (the inviolable floor); allows everything else for now.
 //!
-//! NOTE: The canonical sensitive-path marker list now lives in `otto_engine_core::SENSITIVE_MARKERS`
-//! (see `crates/engine-core/src/sensitive.rs`). Add new markers there — not here. The gate, the
-//! retrieval index walk, and `crates/mcp-grep` all consume that single list, so they cannot drift.
+//! NOTE: The canonical sensitive-path marker list lives in `otto_protocol::SENSITIVE_MARKERS`
+//! (see `crates/protocol/src/sensitive.rs`), re-exported as `otto_engine_core::SENSITIVE_MARKERS`.
+//! Add new markers there — not here. The gate, the retrieval index walk, and `crates/mcp-grep`
+//! all consume that single list, so they cannot drift.
 //! NOTE: symlink-to-secret escapes are a KNOWN OPEN ITEM — `LocalWorkspace` containment is lexical and does not resolve
 //! symlinks; they are addressed by the sandboxed mcp-fs/mcp-bash layer in a later plan, not this
 //! string gate.

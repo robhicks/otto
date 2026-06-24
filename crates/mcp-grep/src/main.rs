@@ -65,8 +65,8 @@ pub fn search(
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
         let rel_str = rel.to_string_lossy().into_owned();
         // Never search secret files (incl. the non-dotfile `id_rsa`). Uses the single canonical
-        // sensitive-path floor in `engine-core`, shared with the permission gate and the index walk.
-        if otto_engine_core::is_sensitive(&rel_str) {
+        // sensitive-path floor in `protocol`, shared with the permission gate and the index walk.
+        if otto_protocol::is_sensitive(&rel_str) {
             continue;
         }
         if let Some(gm) = &glob_matcher {

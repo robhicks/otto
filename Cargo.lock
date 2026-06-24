@@ -1453,7 +1453,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
- "otto-engine-core",
+ "otto-protocol",
  "rmcp",
  "schemars",
  "serde",
