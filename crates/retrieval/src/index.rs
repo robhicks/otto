@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 /// Bump when the schema changes; a mismatch drops and recreates the index.
-const FORMAT_VERSION: &str = "1";
+const FORMAT_VERSION: &str = "2";
 
 /// Max bytes read per file for indexing — bounds I/O on large files (only the head is indexed,
 /// consistent with the lexical path's content-scan cap) while still letting large files be
@@ -55,12 +55,17 @@ impl Index {
             .await?
             .map(|r| r.get::<String, _>("value"));
         if stored.as_deref() != Some(FORMAT_VERSION) {
-            sqlx::query("DROP TABLE IF EXISTS postings")
-                .execute(&self.pool)
-                .await?;
-            sqlx::query("DROP TABLE IF EXISTS files")
-                .execute(&self.pool)
-                .await?;
+            for tbl in [
+                "chunk_postings",
+                "chunk_names",
+                "chunks",
+                "postings",
+                "files",
+            ] {
+                sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
+                    .execute(&self.pool)
+                    .await?;
+            }
         }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS files (
@@ -83,6 +88,46 @@ impl Index {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS postings_token ON postings(token)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chunk_postings (
+                token TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                count INTEGER NOT NULL,
+                PRIMARY KEY (token, chunk_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS chunk_postings_token ON chunk_postings(token)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chunk_names (
+                token TEXT NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                PRIMARY KEY (token, chunk_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS chunk_names_token ON chunk_names(token)")
             .execute(&self.pool)
             .await?;
         sqlx::query("INSERT OR REPLACE INTO meta (key, value) VALUES ('format', ?1)")
@@ -251,6 +296,21 @@ mod tests {
         let a = scores.iter().find(|(p, _)| p == "a.rs").map(|(_, s)| *s);
         assert_eq!(a, Some(2));
         assert!(!scores.iter().any(|(p, _)| p == "b.rs"));
+    }
+
+    #[tokio::test]
+    async fn schema_has_chunk_tables_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = Index::open(dir.path().join("idx.sqlite")).await.unwrap();
+        // The three chunk tables exist (querying an empty table returns 0 rows, not an error).
+        for tbl in ["chunks", "chunk_postings", "chunk_names"] {
+            let n: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {tbl}"))
+                .fetch_one(&idx.pool)
+                .await
+                .unwrap()
+                .get("n");
+            assert_eq!(n, 0, "{tbl} should exist and be empty");
+        }
     }
 
     #[tokio::test]
