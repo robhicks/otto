@@ -11,6 +11,12 @@ async-trait.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tree-sitter = "0.26.9"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
 
 [dev-dependencies]
 tempfile.workspace = true

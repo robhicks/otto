@@ -59,6 +59,7 @@ impl Retriever for IndexedRetriever {
                 (score > 0).then_some(Candidate {
                     path: e.path,
                     score,
+                    symbols: Vec::new(),
                 })
             })
             .collect();
