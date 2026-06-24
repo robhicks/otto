@@ -50,6 +50,9 @@ fn parse_log(stdout: &str) -> HashMap<String, u64> {
 
 /// Relative-path-string -> recency boost for every file touched within the recent window. Empty
 /// when `root` is not a git repository, `git` is unavailable, or the log is empty.
+/// Keys are git's forward-slash paths; they string-match the retriever's walk-derived path keys on
+/// the Unix targets otto supports (on Windows the OS-separated walk keys would differ, making the
+/// boost a silent no-op for nested paths — acceptable, but noted to prevent a future regression).
 pub fn recency_boosts(root: &Path) -> HashMap<String, u64> {
     // Fixed argv, rooted via `-C`: the search goal is never passed, so there is no agent-input
     // argv-injection surface. `core.quotePath=false` keeps non-ASCII paths un-escaped so they
