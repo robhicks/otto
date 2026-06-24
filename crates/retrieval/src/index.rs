@@ -137,6 +137,31 @@ impl Index {
         Ok(())
     }
 
+    /// Delete all chunk rows (chunks + their postings + name tokens) for one file. Used both when
+    /// a file vanishes and before re-chunking a changed file.
+    async fn delete_chunks<'e, E>(executor: E, file_id: i64) -> anyhow::Result<()>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite> + Copy,
+    {
+        sqlx::query(
+            "DELETE FROM chunk_postings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE file_id = ?1)",
+        )
+        .bind(file_id)
+        .execute(executor)
+        .await?;
+        sqlx::query(
+            "DELETE FROM chunk_names WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE file_id = ?1)",
+        )
+        .bind(file_id)
+        .execute(executor)
+        .await?;
+        sqlx::query("DELETE FROM chunks WHERE file_id = ?1")
+            .bind(file_id)
+            .execute(executor)
+            .await?;
+        Ok(())
+    }
+
     /// Bring the index in line with the on-disk workspace: re-tokenize new/changed files, drop
     /// rows for vanished files. `root` is the workspace root; entries come from `walk::walk`.
     /// Returns the walked entries so callers can reuse them (avoiding a second walk).
@@ -164,6 +189,7 @@ impl Index {
         // Delete rows for files no longer present (handles deletions/renames).
         for (path, (file_id, _, _)) in &existing {
             if !present.contains_key(path) {
+                Self::delete_chunks(&self.pool, *file_id).await?;
                 sqlx::query("DELETE FROM postings WHERE file_id = ?1")
                     .bind(file_id)
                     .execute(&self.pool)
@@ -222,6 +248,56 @@ impl Index {
                     .execute(&mut *tx)
                     .await?;
             }
+
+            // Replace any prior chunks for this file (inlined deletes: &mut *tx is not Copy, so it
+            // can't use the delete_chunks helper, which requires a Copy executor like &self.pool).
+            sqlx::query("DELETE FROM chunk_postings WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE file_id = ?1)")
+                .bind(file_id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM chunk_names WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE file_id = ?1)")
+                .bind(file_id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM chunks WHERE file_id = ?1")
+                .bind(file_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Chunk the file (best-effort). `None` (unsupported language or no symbols) leaves only
+            // the whole-file postings above — identical to slice 1.
+            if let Some(chunks) = crate::chunk::chunk_file(&entry.path, &content) {
+                for ch in chunks {
+                    let chunk_id: i64 = sqlx::query(
+                        "INSERT INTO chunks (file_id, symbol, kind, start_line, end_line)
+                         VALUES (?1, ?2, ?3, ?4, ?5) RETURNING chunk_id",
+                    )
+                    .bind(file_id)
+                    .bind(&ch.symbol)
+                    .bind(ch.kind.as_str())
+                    .bind(ch.start_line as i64)
+                    .bind(ch.end_line as i64)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .get("chunk_id");
+                    for (token, count) in crate::tokenize::index_tokens(&ch.text) {
+                        sqlx::query(
+                            "INSERT INTO chunk_postings (token, chunk_id, count) VALUES (?1, ?2, ?3)",
+                        )
+                        .bind(token)
+                        .bind(chunk_id)
+                        .bind(count)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    for token in crate::tokenize::name_tokens(&ch.symbol) {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO chunk_names (token, chunk_id) VALUES (?1, ?2)",
+                        )
+                        .bind(token)
+                        .bind(chunk_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+
             tx.commit().await?;
         }
         drop(present); // release the borrow on `entries` before returning it
@@ -337,5 +413,68 @@ mod tests {
             !scores.iter().any(|(p, _)| p == "gone.rs"),
             "deleted file dropped: {scores:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_populates_and_updates_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        seed(root, "auth.rs", b"fn login() {}\nstruct Session {}\n");
+        seed(root, "notes.md", b"login notes here"); // unsupported -> no chunks
+        let idx = Index::open(dbdir.path().join("idx.sqlite")).await.unwrap();
+        idx.refresh(root).await.unwrap();
+
+        // auth.rs produced chunk rows; notes.md did not.
+        let auth_chunks: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM chunks c JOIN files f ON f.file_id=c.file_id WHERE f.path='auth.rs'",
+        )
+        .fetch_one(&idx.pool).await.unwrap().get("n");
+        assert_eq!(auth_chunks, 2, "fn login + struct Session");
+        let md_chunks: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM chunks c JOIN files f ON f.file_id=c.file_id WHERE f.path='notes.md'",
+        )
+        .fetch_one(&idx.pool).await.unwrap().get("n");
+        assert_eq!(md_chunks, 0);
+
+        // Edit auth.rs to rename the function; re-chunk replaces old rows (no "login" name left).
+        seed(root, "auth.rs", b"fn logout() {}\nstruct Session {}\n");
+        idx.refresh(root).await.unwrap();
+        let login_names: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM chunk_names WHERE token='login'")
+                .fetch_one(&idx.pool)
+                .await
+                .unwrap()
+                .get("n");
+        assert_eq!(login_names, 0, "renamed-away symbol name is gone");
+    }
+
+    #[tokio::test]
+    async fn refresh_cascades_chunk_deletion_on_file_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        seed(root, "gone.rs", b"fn login() {}\n");
+        let idx = Index::open(dbdir.path().join("idx.sqlite")).await.unwrap();
+        idx.refresh(root).await.unwrap();
+        assert!(
+            sqlx::query("SELECT COUNT(*) AS n FROM chunks")
+                .fetch_one(&idx.pool)
+                .await
+                .unwrap()
+                .get::<i64, _>("n")
+                > 0
+        );
+
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        idx.refresh(root).await.unwrap();
+        for tbl in ["chunks", "chunk_postings", "chunk_names"] {
+            let n: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM {tbl}"))
+                .fetch_one(&idx.pool)
+                .await
+                .unwrap()
+                .get("n");
+            assert_eq!(n, 0, "{tbl} cascaded on file removal");
+        }
     }
 }
