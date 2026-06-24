@@ -52,6 +52,45 @@ pub fn query_terms(goal: &str) -> Vec<String> {
     out
 }
 
+/// Split a symbol name into match tokens: break on non-alphanumeric AND on lower/digit->upper case
+/// boundaries, lowercase, keep length >= 3, de-duplicate. So `loginHandler` and `login_handler`
+/// both yield ["login","handler"], letting a plain goal term like "login" match a symbol name that
+/// the content tokenizer (which does not case-split) would store as one token. Names only; the
+/// query side stays `query_terms`, so this never breaks parity.
+pub fn name_tokens(symbol: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for word in symbol.split(|c: char| !c.is_alphanumeric()) {
+        for piece in split_case(word) {
+            let t = piece.to_lowercase();
+            if t.len() >= 3 && seen.insert(t.clone()) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Split a single alphanumeric word at lower/digit -> upper transitions (camelCase / PascalCase).
+fn split_case(word: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in word.chars() {
+        if let Some(p) = prev {
+            if c.is_uppercase() && (p.is_lowercase() || p.is_numeric()) {
+                parts.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +113,18 @@ mod tests {
         assert!(!t.contains(&"the".to_string())); // stopword
         assert!(!t.contains(&"io".to_string())); // length < 3
         assert_eq!(t.iter().filter(|k| *k == "login").count(), 1); // deduped
+    }
+
+    #[test]
+    fn name_tokens_splits_snake_and_camel() {
+        assert_eq!(name_tokens("login_handler"), vec!["login", "handler"]);
+        assert_eq!(name_tokens("loginHandler"), vec!["login", "handler"]);
+    }
+
+    #[test]
+    fn name_tokens_drops_short_and_dedupes() {
+        // "V2" -> "v2" (len 2) dropped; repeated "Login" de-duplicated to one.
+        assert_eq!(name_tokens("LoginV2"), vec!["login"]);
+        assert_eq!(name_tokens("LoginLogin"), vec!["login"]);
     }
 }
