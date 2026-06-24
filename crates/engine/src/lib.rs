@@ -205,19 +205,26 @@ pub fn build_capabilities() -> CapabilitiesManifest {
 pub async fn build_retriever(
     root: &std::path::Path,
 ) -> Option<Arc<dyn otto_engine_core::Retriever>> {
-    use std::hash::{Hash, Hasher};
-
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let Some(cache) = dirs::cache_dir() else {
         eprintln!("warning: no OS cache dir; retrieval index disabled (lexical fallback)");
         return None;
     };
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
+    // Stable FNV-1a-64 over the canonical path bytes — unlike DefaultHasher, its output is
+    // fixed across Rust toolchains, so a compiler upgrade does not orphan the on-disk index.
+    let key = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in canonical.as_os_str().as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x00000100000001B3);
+        }
+        h
+    };
     let db = cache
         .join("otto")
         .join("index")
-        .join(format!("{:016x}.sqlite", hasher.finish()));
+        .join(format!("{key:016x}.sqlite"));
     if let Some(parent) = db.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("warning: cannot create retrieval cache dir ({e}); lexical fallback");
