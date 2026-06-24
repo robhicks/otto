@@ -3,6 +3,7 @@
 //! scores content for every indexed file, removing the ContextFinder's per-turn read budget.
 
 mod chunk;
+mod git_history;
 mod index;
 mod retriever;
 mod tokenize;
