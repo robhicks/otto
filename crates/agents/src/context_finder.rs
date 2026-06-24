@@ -120,8 +120,10 @@ fn select_prompt(
          files most relevant to the goal, most relevant first.\n\
          Goal: {goal}\n\
          Candidates:\n{listed}\n\
-         Respond ONLY with valid JSON: an object with a string-array field named files, each an \
-         exact path copied from the candidates."
+         Each candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; \
+         the path is only the part before ` (score`.\n\
+         Respond ONLY with valid JSON: an object with a string-array field named files, each the \
+         exact path (without the score or symbols) copied from a candidate line."
     )
 }
 
@@ -191,6 +193,8 @@ impl Agent for ContextFinder {
         // Produce the scored candidate set (+ matched symbol names) from the retriever when wired,
         // else the deterministic lexical pipeline. A retriever ERROR falls back to the lexical
         // pipeline — retrieval is an optimization, never a gate. The lexical path has no symbols.
+        // Only Ok(vec![]) (a valid empty result, e.g. an empty workspace) is respected as-is
+        // without triggering fallback.
         let mut symbols_by_path: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         let scored: Vec<(String, u64)> = match ctx.retriever() {

@@ -98,10 +98,6 @@ mod tests {
         f.write_all(bytes).unwrap();
     }
 
-    fn seed_in(root: &Path, rel: &str, bytes: &[u8]) {
-        seed(root, rel, bytes);
-    }
-
     async fn retriever(root: &Path) -> IndexedRetriever {
         IndexedRetriever::open(root.to_path_buf(), root.join("idx.sqlite"))
             .await
@@ -207,9 +203,9 @@ mod tests {
         let root = dir.path();
         let dbdir = tempfile::tempdir().unwrap();
         // auth.rs DEFINES `fn login` (name hit, no "login" in the path).
-        seed_in(root, "auth.rs", b"fn login() {}\n");
+        seed(root, "auth.rs", b"fn login() {}\n");
         // mentions.rs only mentions login in a comment-ish body.
-        seed_in(
+        seed(
             root,
             "mentions.rs",
             b"fn handle() {\n    let login = 1;\n}\n",
@@ -239,7 +235,7 @@ mod tests {
         let root = dir.path();
         let dbdir = tempfile::tempdir().unwrap();
         // No chunks for .md, but whole-file content still indexes "login" (no-regression).
-        seed_in(root, "notes.md", b"login instructions live here");
+        seed(root, "notes.md", b"login instructions live here");
         let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
             .await
             .unwrap();
