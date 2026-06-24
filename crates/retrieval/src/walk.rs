@@ -1,15 +1,14 @@
 //! Recursive workspace walk for indexing. Mirrors the `fs.list` recursive walk and the
 //! permission gate's sensitive-path floor: skips `.git`/`target`/`node_modules` and ANY
 //! dot-prefixed component (covers `.env`/`.ssh`/`.aws`), skips binary/lockfile names, does not
-//! follow symlinks, caps enumeration, and skips oversized files. Returns relative paths with
-//! their stat (mtime nanos, size) for stat-based staleness.
+//! follow symlinks, and caps enumeration. Large files are enumerated so they are path-scored;
+//! `index.rs` bounds the content read to 1 MiB per file. Returns relative paths with their stat
+//! (mtime nanos, size) for stat-based staleness.
 
 use std::path::{Path, PathBuf};
 
 /// Max files enumerated per walk (bounds cost on huge trees).
 pub const ENUMERATE_CAP: usize = 5000;
-/// Files larger than this are skipped during indexing (closes the size-skipping gap).
-pub const MAX_FILE_BYTES: u64 = 1_048_576; // 1 MiB
 
 /// One enumerated file: workspace-relative path + stat used for staleness.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +77,7 @@ pub fn walk(root: &Path) -> Vec<WalkEntry> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             // `DirEntry::metadata()` does not traverse symlinks (unlike `fs::metadata`), so we
-            // see the link itself and skip it below — never following it to index its target.
+            // see the link itself and skip it below.
             let Ok(meta) = entry.metadata() else { continue };
             if meta.file_type().is_symlink() {
                 continue;
@@ -90,9 +89,6 @@ pub fn walk(root: &Path) -> Vec<WalkEntry> {
                 continue;
             }
             if !meta.is_file() || excluded_component(&name) || skippable_file(&name) {
-                continue;
-            }
-            if meta.len() > MAX_FILE_BYTES {
                 continue;
             }
             let Ok(rel) = entry.path().strip_prefix(root).map(Path::to_path_buf) else {
@@ -132,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_includes_source_excludes_sensitive_binary_and_oversized() {
+    fn walk_includes_source_excludes_sensitive_and_binary() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         seed(root, "src/main.rs", b"fn main() {}");
@@ -140,7 +136,8 @@ mod tests {
         seed(root, ".git/config", b"[core]");
         seed(root, "node_modules/x/index.js", b"x");
         seed(root, "logo.png", b"\x89PNG");
-        seed(root, "big.txt", &vec![b'a'; (MAX_FILE_BYTES + 1) as usize]);
+        // Large files are now enumerated (content is bounded in index.rs, not here).
+        seed(root, "big.txt", &vec![b'a'; 1_100_000]);
 
         let paths: Vec<_> = walk(root).into_iter().map(|e| e.path).collect();
         assert!(paths.contains(&PathBuf::from("src/main.rs")));
@@ -155,8 +152,8 @@ mod tests {
             "binaries excluded"
         );
         assert!(
-            !paths.contains(&PathBuf::from("big.txt")),
-            "oversized excluded"
+            paths.contains(&PathBuf::from("big.txt")),
+            "large files are now enumerated (path-scored): {paths:?}"
         );
     }
 

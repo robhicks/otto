@@ -1,7 +1,9 @@
 //! `IndexedRetriever`: the `Retriever` impl backed by the persistent inverted index. On each
 //! `search` it refreshes the index (stat-incremental), then ranks every walked file by
-//! `5*path_hits + content_score` — the same weighting the lexical ContextFinder uses, but with
-//! content scores drawn from the index for ALL files (no read budget).
+//! `5*path_hits + content_score`. The PATH weighting (5×) matches the lexical ContextFinder,
+//! but content scores come from token-equality postings in the index (not substring counts), so
+//! results can differ from the lexical fallback for substring-of-token matches (e.g. "auth"
+//! inside "authenticate"). Content covers ALL files with no read budget.
 
 use std::path::PathBuf;
 
@@ -10,7 +12,6 @@ use otto_engine_core::{Candidate, Retriever};
 
 use crate::index::Index;
 use crate::tokenize::query_terms;
-use crate::walk::walk;
 
 pub struct IndexedRetriever {
     root: PathBuf,
@@ -28,7 +29,8 @@ impl IndexedRetriever {
 #[async_trait]
 impl Retriever for IndexedRetriever {
     async fn search(&self, goal: &str, limit: usize) -> anyhow::Result<Vec<Candidate>> {
-        self.index.refresh(&self.root).await?;
+        // refresh returns the walked entries — reuse them for path scoring (single walk).
+        let entries = self.index.refresh(&self.root).await?;
         let terms = query_terms(goal);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -42,8 +44,9 @@ impl Retriever for IndexedRetriever {
             .into_iter()
             .collect();
 
-        // Path scores computed live over the current walk (free). Combine 5*path + content.
-        let mut scored: Vec<Candidate> = walk(&self.root)
+        // Path scores computed from the entries returned by refresh (no second walk).
+        // Combine 5*path_hits + content_score; 5× path weight mirrors the lexical ContextFinder.
+        let mut scored: Vec<Candidate> = entries
             .into_iter()
             .filter_map(|e| {
                 let path_str = e.path.to_string_lossy().to_lowercase();
@@ -156,5 +159,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = retriever(dir.path()).await;
         assert!(r.search("login", 8).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn large_file_is_still_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A >1 MiB file whose name matches the goal — previously excluded by the size cap.
+        let big = vec![b'x'; 1_100_000];
+        seed(root, "login_huge.rs", &big);
+        let r = retriever(root).await;
+        let files: Vec<_> = r
+            .search("login", 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert!(
+            files.contains(&PathBuf::from("login_huge.rs")),
+            "large file still a candidate: {files:?}"
+        );
     }
 }

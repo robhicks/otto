@@ -1,6 +1,14 @@
 //! Tokenization for the index and the query, kept in lock-step so indexed tokens and goal
 //! keywords align. Rules mirror `ContextFinder::keywords`: split on non-alphanumeric, lowercase,
 //! keep tokens of length >= 3. The query side additionally drops stopwords and de-duplicates.
+//!
+//! Note on parity with the lexical ContextFinder: query terms and indexed tokens use identical
+//! tokenization rules so they align with each other. PATH scoring uses the same 5× weighting as
+//! the lexical path. However, CONTENT scoring differs: the index matches by whole-token equality
+//! (an inverted-index lookup), whereas the lexical fallback counts substring occurrences. As a
+//! deliberate tradeoff (whole-token equality is what makes the index possible), a goal term that
+//! only appears as a substring of a larger token (e.g. "auth" inside "authenticate") scores in
+//! the lexical content path but not in the index.
 
 use std::collections::HashMap;
 use std::collections::HashSet;

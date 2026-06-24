@@ -12,6 +12,21 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 /// Bump when the schema changes; a mismatch drops and recreates the index.
 const FORMAT_VERSION: &str = "1";
 
+/// Max bytes read per file for indexing — bounds I/O on large files (only the head is indexed,
+/// consistent with the lexical path's content-scan cap) while still letting large files be
+/// enumerated and path-scored.
+const MAX_READ_BYTES: u64 = 1_048_576; // 1 MiB
+
+/// Read at most `MAX_READ_BYTES` of `path` and lossily decode to text. Lossy decoding means a
+/// non-UTF-8 file never errors here, so it still gets a stat row and is not re-read every refresh.
+fn read_capped(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(MAX_READ_BYTES).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub struct Index {
     pool: SqlitePool,
 }
@@ -22,6 +37,7 @@ impl Index {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
+            .busy_timeout(std::time::Duration::from_secs(5))
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let index = Self { pool };
@@ -78,7 +94,8 @@ impl Index {
 
     /// Bring the index in line with the on-disk workspace: re-tokenize new/changed files, drop
     /// rows for vanished files. `root` is the workspace root; entries come from `walk::walk`.
-    pub async fn refresh(&self, root: &Path) -> anyhow::Result<()> {
+    /// Returns the walked entries so callers can reuse them (avoiding a second walk).
+    pub async fn refresh(&self, root: &Path) -> anyhow::Result<Vec<crate::walk::WalkEntry>> {
         use std::collections::HashMap;
 
         let entries = crate::walk::walk(root);
@@ -120,8 +137,12 @@ impl Index {
                     continue; // unchanged — the amortization win
                 }
             }
-            let Ok(content) = std::fs::read_to_string(root.join(&entry.path)) else {
-                continue;
+            // Bounded + lossy: large files index only their head; non-UTF-8 files don't error, so
+            // they still get a stat row (no re-read every refresh). A true I/O error skips this
+            // file for now and retries next refresh.
+            let content = match read_capped(&root.join(&entry.path)) {
+                Ok(c) => c,
+                Err(_) => continue,
             };
             let tokens = crate::tokenize::index_tokens(&content);
 
@@ -158,7 +179,8 @@ impl Index {
             }
             tx.commit().await?;
         }
-        Ok(())
+        drop(present); // release the borrow on `entries` before returning it
+        Ok(entries)
     }
 
     /// Content score per file: SUM(count) over `terms`, across ALL indexed files (no read
