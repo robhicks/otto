@@ -100,10 +100,19 @@ fn score_file(path: &str, content: Option<&str>, kws: &[String]) -> u64 {
     total
 }
 
-fn select_prompt(goal: &str, candidates: &[(String, u64)]) -> String {
+fn select_prompt(
+    goal: &str,
+    candidates: &[(String, u64)],
+    symbols_by_path: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
     let listed = candidates
         .iter()
-        .map(|(p, s)| format!("- {p} (score {s})"))
+        .map(|(p, s)| match symbols_by_path.get(p) {
+            Some(syms) if !syms.is_empty() => {
+                format!("- {p} (score {s}) [symbols: {}]", syms.join(", "))
+            }
+            _ => format!("- {p} (score {s})"),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
@@ -111,8 +120,10 @@ fn select_prompt(goal: &str, candidates: &[(String, u64)]) -> String {
          files most relevant to the goal, most relevant first.\n\
          Goal: {goal}\n\
          Candidates:\n{listed}\n\
-         Respond ONLY with valid JSON: an object with a string-array field named files, each an \
-         exact path copied from the candidates."
+         Each candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; \
+         the path is only the part before ` (score`.\n\
+         Respond ONLY with valid JSON: an object with a string-array field named files, each the \
+         exact path (without the score or symbols) copied from a candidate line."
     )
 }
 
@@ -179,15 +190,24 @@ impl Agent for ContextFinder {
             anyhow::bail!("ContextFinder received a non-FindContext request");
         };
 
-        // Produce the scored candidate set: from the retriever when wired, else the deterministic
-        // lexical pipeline. A retriever ERROR also falls back to the lexical pipeline — retrieval
-        // is an optimization, never a gate. Only Ok(vec![]) (a valid empty result) is respected
-        // as-is without triggering fallback.
+        // Produce the scored candidate set (+ matched symbol names) from the retriever when wired,
+        // else the deterministic lexical pipeline. A retriever ERROR falls back to the lexical
+        // pipeline — retrieval is an optimization, never a gate. The lexical path has no symbols.
+        // Only Ok(vec![]) (a valid empty result, e.g. an empty workspace) is respected as-is
+        // without triggering fallback.
+        let mut symbols_by_path: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let scored: Vec<(String, u64)> = match ctx.retriever() {
             Some(retriever) => match retriever.search(&goal, CANDIDATE_LIMIT).await {
                 Ok(candidates) => candidates
                     .into_iter()
-                    .map(|c| (c.path.to_string_lossy().into_owned(), c.score))
+                    .map(|c| {
+                        let p = c.path.to_string_lossy().into_owned();
+                        if !c.symbols.is_empty() {
+                            symbols_by_path.insert(p.clone(), c.symbols);
+                        }
+                        (p, c.score)
+                    })
                     .collect(),
                 Err(e) => {
                     // Retrieval is an optimization, never a gate: a search error degrades to the
@@ -217,7 +237,7 @@ impl Agent for ContextFinder {
             .router()
             .complete(
                 CompleteRequest {
-                    prompt: select_prompt(&goal, &scored),
+                    prompt: select_prompt(&goal, &scored, &symbols_by_path),
                 },
                 RouteHints {
                     task_kind: TaskKind::Architecture,
@@ -461,6 +481,7 @@ mod tests {
         let retriever = StubRetriever(vec![Candidate {
             path: PathBuf::from("from_retriever.rs"),
             score: 99,
+            symbols: Vec::new(),
         }]);
         let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
         let out = ContextFinder
@@ -505,6 +526,67 @@ mod tests {
         assert!(
             files.contains(&PathBuf::from("auth.rs")),
             "a retriever error must degrade to the lexical scan, not empty context: {files:?}"
+        );
+    }
+
+    #[test]
+    fn select_prompt_lists_symbols_only_when_present() {
+        let cands = vec![("a.rs".to_string(), 10u64), ("b.rs".to_string(), 5u64)];
+        let mut syms = std::collections::HashMap::new();
+        syms.insert(
+            "a.rs".to_string(),
+            vec!["login".to_string(), "logout".to_string()],
+        );
+        let p = select_prompt("goal", &cands, &syms);
+        assert!(
+            p.contains("- a.rs (score 10) [symbols: login, logout]"),
+            "{p}"
+        );
+        assert!(p.contains("- b.rs (score 5)"), "{p}");
+        assert!(!p.contains("- b.rs (score 5) [symbols"), "{p}");
+    }
+
+    #[tokio::test]
+    async fn select_prompt_symbols_reach_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+        seed(&ws, "a.rs", "fn x() {}").await;
+        seed(&ws, "b.rs", "fn y() {}").await;
+        let tools = registry(dir.path());
+        // The retriever ranks a.rs first; only a.rs carries a symbol. The scripted provider picks
+        // b.rs ONLY if the prompt contained "[symbols: alpha]" — distinguishing it from the
+        // lexical-top fallback (which would be [a.rs, b.rs]).
+        let retriever = StubRetriever(vec![
+            Candidate {
+                path: PathBuf::from("a.rs"),
+                score: 10,
+                symbols: vec!["alpha".to_string()],
+            },
+            Candidate {
+                path: PathBuf::from("b.rs"),
+                score: 5,
+                symbols: Vec::new(),
+            },
+        ]);
+        let provider = ScriptedProvider::new("{}").on("[symbols: alpha]", r#"{"files": ["b.rs"]}"#);
+        let router = SingleProviderRouter::new(Arc::new(provider));
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&retriever);
+        let out = ContextFinder
+            .run(
+                AgentRequest::FindContext {
+                    goal: "anything".into(),
+                },
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let AgentOutput::Context { files } = out else {
+            panic!("expected Context")
+        };
+        assert_eq!(
+            files,
+            vec![PathBuf::from("b.rs")],
+            "symbol-enriched prompt drove the pick"
         );
     }
 }

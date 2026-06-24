@@ -1,9 +1,10 @@
 //! `IndexedRetriever`: the `Retriever` impl backed by the persistent inverted index. On each
 //! `search` it refreshes the index (stat-incremental), then ranks every walked file by
-//! `5*path_hits + content_score`. The PATH weighting (5×) matches the lexical ContextFinder,
-//! but content scores come from token-equality postings in the index (not substring counts), so
-//! results can differ from the lexical fallback for substring-of-token matches (e.g. "auth"
-//! inside "authenticate"). Content covers ALL files with no read budget.
+//! `5*path_hits + content_score + 8*symbol_name_hits`. The PATH weighting (5×) matches the
+//! lexical ContextFinder, but content scores come from token-equality postings in the index
+//! (not substring counts), so results can differ from the lexical fallback for
+//! substring-of-token matches (e.g. "auth" inside "authenticate"). Content covers ALL files
+//! with no read budget.
 
 use std::path::PathBuf;
 
@@ -12,6 +13,9 @@ use otto_engine_core::{Candidate, Retriever};
 
 use crate::index::Index;
 use crate::tokenize::query_terms;
+
+/// Max symbol names attached to a single candidate (for the select prompt).
+const SYMBOLS_PER_FILE: usize = 5;
 
 pub struct IndexedRetriever {
     root: PathBuf,
@@ -36,16 +40,21 @@ impl Retriever for IndexedRetriever {
             return Ok(Vec::new());
         }
 
-        // Content scores from the index (all files), keyed by relative path string.
+        // Content scores from the index (all files), keyed by relative path string (slice 1).
         let content: std::collections::HashMap<String, u64> = self
             .index
             .content_scores(&terms)
             .await?
             .into_iter()
             .collect();
+        // NEW: symbol-name definition hits (distinct terms per file) and matched symbol names.
+        let name_hits = self.index.symbol_name_hits(&terms).await?;
+        let mut matched = self.index.matched_symbols(&terms, SYMBOLS_PER_FILE).await?;
 
         // Path scores computed from the entries returned by refresh (no second walk).
-        // Combine 5*path_hits + content_score; 5× path weight mirrors the lexical ContextFinder.
+        // Score: 5*path_hits + whole_file_content + 8*name_hits. The first two terms are slice 1
+        // unchanged (the recall floor); the name boost is strictly additive, so no file that
+        // previously scored > 0 can drop out.
         let mut scored: Vec<Candidate> = entries
             .into_iter()
             .filter_map(|e| {
@@ -55,10 +64,16 @@ impl Retriever for IndexedRetriever {
                     .map(|t| path_str.matches(t.as_str()).count() as u64)
                     .sum();
                 let key = e.path.to_string_lossy().into_owned();
-                let score = 5 * path_hits + content.get(&key).copied().unwrap_or(0);
-                (score > 0).then_some(Candidate {
-                    path: e.path,
-                    score,
+                let score = 5 * path_hits
+                    + content.get(&key).copied().unwrap_or(0)
+                    + 8 * name_hits.get(&key).copied().unwrap_or(0);
+                (score > 0).then(|| {
+                    let symbols = matched.remove(&key).unwrap_or_default();
+                    Candidate {
+                        path: e.path,
+                        score,
+                        symbols,
+                    }
                 })
             })
             .collect();
@@ -180,5 +195,57 @@ mod tests {
             files.contains(&PathBuf::from("login_huge.rs")),
             "large file still a candidate: {files:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn definition_outranks_mention_and_lists_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        // auth.rs DEFINES `fn login` (name hit, no "login" in the path).
+        seed(root, "auth.rs", b"fn login() {}\n");
+        // mentions.rs only mentions login in a comment-ish body.
+        seed(
+            root,
+            "mentions.rs",
+            b"fn handle() {\n    let login = 1;\n}\n",
+        );
+        let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
+            .await
+            .unwrap();
+        let cands = r.search("login", 8).await.unwrap();
+        assert_eq!(
+            cands.first().map(|c| c.path.clone()),
+            Some(PathBuf::from("auth.rs"))
+        );
+        let auth = cands
+            .iter()
+            .find(|c| c.path == std::path::Path::new("auth.rs"))
+            .unwrap();
+        assert!(
+            auth.symbols.contains(&"login".to_string()),
+            "{:?}",
+            auth.symbols
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_language_content_match_still_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dbdir = tempfile::tempdir().unwrap();
+        // No chunks for .md, but whole-file content still indexes "login" (no-regression).
+        seed(root, "notes.md", b"login instructions live here");
+        let r = IndexedRetriever::open(root.to_path_buf(), dbdir.path().join("idx.sqlite"))
+            .await
+            .unwrap();
+        let files: Vec<_> = r
+            .search("login", 8)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path)
+            .collect();
+        assert!(files.contains(&PathBuf::from("notes.md")), "{files:?}");
     }
 }
