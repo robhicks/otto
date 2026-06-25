@@ -214,6 +214,17 @@ async fn build_tools_preferring_mcp(
     (registry, conns)
 }
 
+/// Register the built-in `skill` tool when any skills were discovered. No-op otherwise, so a
+/// workspace with no `.claude/skills/` leaves the spine's tool set byte-for-byte unchanged.
+fn register_skills(
+    registry: &mut otto_engine_core::tool::ToolRegistry,
+    skills: &[otto_extensions::CustomSkillDef],
+) {
+    if !skills.is_empty() {
+        registry.register(Arc::new(otto_extensions::SkillTool::new(skills)));
+    }
+}
+
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let (root, after_root) = parse_root(&args);
     let (command_name, after_cmd) = parse_command_flag(&after_root);
@@ -240,9 +251,12 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) =
+    let (mut tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
+    // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
+    let ext = otto_extensions::discover(&root, &home_dir());
+    register_skills(&mut tools, &ext.skills);
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -628,5 +642,40 @@ mod tests {
         .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("no command named"));
+    }
+
+    #[test]
+    fn register_skills_adds_skill_tool_when_present() {
+        use std::fs;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global skills
+        let skill = proj.path().join(".claude").join("skills").join("greeter");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        let mut reg = otto_engine::build_tool_registry(
+            Arc::new(LocalWorkspace::new(proj.path().to_path_buf())),
+            proj.path().to_path_buf(),
+        );
+        register_skills(&mut reg, &ext.skills);
+        assert!(reg.tool_names().iter().any(|n| n == "skill"));
+    }
+
+    #[test]
+    fn register_skills_is_noop_when_absent() {
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        let mut reg = otto_engine::build_tool_registry(
+            Arc::new(LocalWorkspace::new(proj.path().to_path_buf())),
+            proj.path().to_path_buf(),
+        );
+        register_skills(&mut reg, &ext.skills);
+        assert!(!reg.tool_names().iter().any(|n| n == "skill"));
     }
 }
