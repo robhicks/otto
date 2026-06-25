@@ -9,12 +9,14 @@ mod agent_def;
 mod command_def;
 mod command_expand;
 mod markdown_agent;
+mod skill_def;
 mod task_tool;
 
 pub use agent_def::{CustomAgentDef, parse_agent_md};
 pub use command_def::{CustomCommandDef, parse_command_md};
 pub use command_expand::{expand_args, resolve_injections};
 pub use markdown_agent::MarkdownAgent;
+pub use skill_def::{CustomSkillDef, parse_skill_md};
 pub use task_tool::TaskTool;
 
 use std::path::Path;
