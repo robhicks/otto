@@ -8,11 +8,39 @@ use serde_json::json;
 /// Substitute `$ARGUMENTS` (all args joined by a single space) and `$1`..`$9` (1-based
 /// positional; a missing positional becomes the empty string). Pure — runs before injection so a
 /// substituted arg may appear inside an injection target (e.g. `@$1`).
+///
+/// Single left-to-right pass so substituted text is never re-scanned: an argument value that
+/// itself contains `$2`/`$ARGUMENTS` is emitted literally. Only `$1`..`$9` are defined — a
+/// multi-digit reference like `$10` is left verbatim (the digit run is not a valid placeholder).
 pub fn expand_args(template: &str, args: &[String]) -> String {
-    let mut out = template.replace("$ARGUMENTS", &args.join(" "));
-    for i in 1..=9usize {
-        let val = args.get(i - 1).map(String::as_str).unwrap_or("");
-        out = out.replace(&format!("${i}"), val);
+    let bytes = template.as_bytes();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    while i < template.len() {
+        // `$` is ASCII, so `i` here is always on a char boundary.
+        if bytes[i] == b'$' {
+            if template[i..].starts_with("$ARGUMENTS") {
+                out.push_str(&args.join(" "));
+                i += "$ARGUMENTS".len();
+                continue;
+            }
+            // `$d` where d is 1..9 — but only when not followed by another digit (so `$10`,
+            // `$12` stay literal rather than expanding `$1` and leaving a stray digit).
+            if i + 1 < template.len() {
+                let d = bytes[i + 1];
+                let next_is_digit = i + 2 < template.len() && bytes[i + 2].is_ascii_digit();
+                if (b'1'..=b'9').contains(&d) && !next_is_digit {
+                    let idx = (d - b'0') as usize;
+                    out.push_str(args.get(idx - 1).map(String::as_str).unwrap_or(""));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        // Copy one whole char (advance by its UTF-8 width to stay on boundaries).
+        let ch = template[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -109,6 +137,25 @@ mod tests {
     fn template_without_placeholders_is_verbatim() {
         let args = vec!["ignored".to_string()];
         assert_eq!(expand_args("plain template", &args), "plain template");
+    }
+
+    #[test]
+    fn multi_digit_placeholder_is_left_literal() {
+        // Only $1..$9 are defined; `$10` must NOT be mangled into `<arg1>0`.
+        let args = vec!["a".to_string()];
+        assert_eq!(expand_args("ref $10 here", &args), "ref $10 here");
+        let args2 = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(expand_args("$12", &args2), "$12");
+    }
+
+    #[test]
+    fn arg_value_containing_placeholder_is_not_re_substituted() {
+        // A `$N` that came FROM an argument value must be emitted literally, not re-expanded.
+        let args = vec!["X$2Y".to_string(), "BETA".to_string()];
+        assert_eq!(expand_args("[$1]", &args), "[X$2Y]");
+        // Same hazard via $ARGUMENTS (expanded, then must not be re-scanned).
+        let args2 = vec!["$1".to_string(), "second".to_string()];
+        assert_eq!(expand_args("$ARGUMENTS", &args2), "$1 second");
     }
 
     // ---- resolve_injections tests ----
