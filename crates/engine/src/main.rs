@@ -233,7 +233,7 @@ fn register_hooks(
     hooks: &otto_extensions::HookSet,
     root: &std::path::Path,
 ) {
-    if *hooks == otto_extensions::HookSet::default() || !otto_tools::os_sandbox_available() {
+    if hooks.is_empty() || !otto_tools::os_sandbox_available() {
         return;
     }
     let exec: Arc<dyn otto_extensions::HookExecutor> =
@@ -700,7 +700,8 @@ mod tests {
     async fn discovered_pretooluse_hook_blocks_a_tool_call() {
         use otto_engine_core::tool::ToolRegistry;
         if !otto_tools::os_sandbox_available() {
-            return; // no sandbox backend → hooks fail-closed (not wired); nothing to assert
+            eprintln!("skipping hooks blocking test: no OS sandbox backend");
+            return;
         }
         let proj = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -746,6 +747,9 @@ mod tests {
             .call("fs.read", serde_json::json!({ "path": "target.txt" }))
             .await
             .unwrap();
-        assert!(out.to_string().contains("hi"));
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return file content, got: {out}"
+        );
     }
 }

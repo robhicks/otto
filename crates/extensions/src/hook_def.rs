@@ -27,6 +27,13 @@ pub struct HookSet {
     pub post_tool_use: Vec<HookMatcher>,
 }
 
+impl HookSet {
+    /// True when no tool-dispatch hooks are configured.
+    pub fn is_empty(&self) -> bool {
+        self.pre_tool_use.is_empty() && self.post_tool_use.is_empty()
+    }
+}
+
 /// Parse a `settings.json` document into its tool-dispatch hooks. A missing `hooks` object (or a
 /// settings file with no hooks) yields an empty `HookSet`. Invalid JSON is an error. Individual
 /// hook entries that are not `type: "command"` or that lack a non-empty `command` are skipped; a
@@ -135,5 +142,15 @@ mod tests {
             { "hooks": [ { "type": "command", "command": "hi.sh" } ] } ] } }"#;
         let set = parse_hooks(json).unwrap();
         assert_eq!(set, HookSet::default());
+    }
+
+    #[test]
+    fn is_empty_reflects_presence_of_hooks() {
+        assert!(HookSet::default().is_empty());
+        let set = parse_hooks(
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(!set.is_empty());
     }
 }
