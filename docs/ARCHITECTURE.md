@@ -36,6 +36,7 @@ otto-next/
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
 │   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
+│   │                    #   Slice 1 shipped: custom agents (discover + MarkdownAgent + Task dispatch).
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
 └── ui/                  # Tauri 2 + Leptos frontend (separate build).
