@@ -6,10 +6,12 @@
 //! discovery, so the offline determinism suite is unaffected.
 
 mod agent_def;
+mod command_def;
 mod markdown_agent;
 mod task_tool;
 
 pub use agent_def::{CustomAgentDef, parse_agent_md};
+pub use command_def::{CustomCommandDef, parse_command_md};
 pub use markdown_agent::MarkdownAgent;
 pub use task_tool::TaskTool;
 
