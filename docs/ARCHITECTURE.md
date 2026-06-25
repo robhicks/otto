@@ -36,7 +36,7 @@ otto-next/
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
 │   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
-│   │                    #   Slice 1 shipped: custom agents (discover + MarkdownAgent + Task dispatch).
+│   │                    #   Slice 1 shipped: custom agents; slices 2-3 shipped: commands, skills.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
 └── ui/                  # Tauri 2 + Leptos frontend (separate build).
@@ -327,7 +327,7 @@ format:
 
 - `agents/*.md` → `AgentRegistry` as `Role::Custom(name)` (honors per-agent tool allowlist + model).
 - `commands/*.md` → command registry (recursive, namespaced `git:commit`); expanded (`$ARGUMENTS`/`$1..$9` + gated `!bash`/`@file` injection) and run as a spine turn via `otto run --command`. (`model`/`allowed-tools` preserved, not yet routed/enforced.)
-- `skills` (`SKILL.md` + resources) → loadable skills exposed via a built-in `Skill` tool.
+- `skills` (`SKILL.md` + resources) → discovered one-level (`skills/<name>/SKILL.md`, project overrides user by name) and exposed via a built-in gated `skill` tool returning `instructions` + `resource_dir`; bundled resources read lazily through gated `fs.read`. (`allowed-tools` parsed, inert until the permissions slice.)
 - `settings.json` hooks → `HookRegistry`, fired at the same lifecycle points.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → manifest parsed; each bundled component registered
