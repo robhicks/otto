@@ -143,6 +143,11 @@ impl ToolRegistry {
         }
     }
 
+    /// The names of every registered tool. Lets a dispatcher request "all tools" as a subset.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
     /// Return the gate's `Decision` for a proposed call WITHOUT dispatching. Lets the
     /// orchestrator gate edits it applies directly (via the workspace) through the same
     /// policy that governs tool calls.

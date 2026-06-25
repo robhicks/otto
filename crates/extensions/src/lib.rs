@@ -7,9 +7,11 @@
 
 mod agent_def;
 mod markdown_agent;
+mod task_tool;
 
 pub use agent_def::{CustomAgentDef, parse_agent_md};
 pub use markdown_agent::MarkdownAgent;
+pub use task_tool::TaskTool;
 
 use std::path::Path;
 
