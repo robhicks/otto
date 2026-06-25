@@ -126,6 +126,28 @@ impl ToolRegistry {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
+    /// Returns a new registry containing only the tools whose names appear in `allowed`,
+    /// sharing this registry's permission gate and ask-resolver unchanged (via `Arc::clone`).
+    /// The sensitive-path floor and every gate decision are identical to the parent. Names in
+    /// `allowed` that do not exist in this registry are silently ignored, so the returned subset
+    /// can only be equal to or smaller than the parent — it can never widen capability.
+    pub fn subset(&self, allowed: &[String]) -> ToolRegistry {
+        let tools = allowed
+            .iter()
+            .filter_map(|name| self.tools.get(name).map(|t| (name.clone(), Arc::clone(t))))
+            .collect();
+        ToolRegistry {
+            tools,
+            gate: Arc::clone(&self.gate),
+            ask: Arc::clone(&self.ask),
+        }
+    }
+
+    /// The names of every registered tool. Lets a dispatcher request "all tools" as a subset.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
     /// Return the gate's `Decision` for a proposed call WITHOUT dispatching. Lets the
     /// orchestrator gate edits it applies directly (via the workspace) through the same
     /// policy that governs tool calls.
@@ -188,6 +210,17 @@ mod tests {
     impl PermissionGate for AskGate {
         fn evaluate(&self, _tool: &str, _args: &Value) -> Decision {
             Decision::Ask
+        }
+    }
+
+    struct PingTool;
+    #[async_trait]
+    impl Tool for PingTool {
+        fn name(&self) -> &str {
+            "ping"
+        }
+        async fn call(&self, _args: Value) -> anyhow::Result<Value> {
+            Ok(json!("pong"))
         }
     }
 
@@ -272,5 +305,44 @@ mod tests {
             deny.check("fs.write", &json!({"path": "a.txt"})),
             Decision::Deny
         );
+    }
+
+    #[tokio::test]
+    async fn subset_keeps_only_named_tools() {
+        let mut r = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        r.register(Arc::new(EchoTool));
+        r.register(Arc::new(PingTool));
+
+        let sub = r.subset(&["ping".to_string()]);
+        assert!(sub.call("ping", json!({})).await.is_ok());
+        // "echo" was excluded by the allowlist → no such tool in the subset.
+        assert!(sub.call("echo", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subset_preserves_gate_denials() {
+        let mut r = ToolRegistry::new(Arc::new(DenyAll), Arc::new(DenyAsk));
+        r.register(Arc::new(PingTool));
+        let sub = r.subset(&["ping".to_string()]);
+        // Tool is present in the allowlist, but the shared gate still denies it.
+        assert!(sub.call("ping", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subset_with_unknown_name_yields_empty_registry() {
+        let mut r = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        r.register(Arc::new(PingTool));
+        // A name not registered in the parent is silently dropped — no panic, no widening.
+        let sub = r.subset(&["nonexistent".to_string()]);
+        assert!(sub.call("nonexistent", json!({})).await.is_err());
+        assert!(sub.call("ping", json!({})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn subset_with_empty_allowlist_exposes_no_tools() {
+        let mut r = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        r.register(Arc::new(PingTool));
+        let sub = r.subset(&[]);
+        assert!(sub.call("ping", json!({})).await.is_err());
     }
 }

@@ -12,6 +12,7 @@ members = [
     "crates/remote",
     "crates/persistence",
     "crates/retrieval",
+    "crates/extensions",
     "crates/mcp-fs",
     "crates/mcp-grep",
     "crates/mcp-git",

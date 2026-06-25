@@ -23,6 +23,7 @@ otto-tools = { path = "../tools" }
 otto-persistence = { path = "../persistence" }
 otto-remote = { path = "../remote" }
 otto-retrieval = { path = "../retrieval" }
+otto-extensions = { path = "../extensions" }
 dirs = "5"
 rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 anyhow.workspace = true

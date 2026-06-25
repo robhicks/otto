@@ -70,15 +70,32 @@ pub enum AgentRequest {
         prior_failures: u32,
     },
     Verify,
+    /// A free-form subagent task (custom agents). The fixed spine never constructs this.
+    Task {
+        prompt: String,
+    },
 }
 
 /// The uniform structured output returned by any atomic agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentOutput {
-    Plan { milestones: Vec<Milestone> },
-    Context { files: Vec<PathBuf> },
-    Code { edits: Vec<Edit> },
-    Verify { ok: bool, detail: String },
+    Plan {
+        milestones: Vec<Milestone>,
+    },
+    Context {
+        files: Vec<PathBuf>,
+    },
+    Code {
+        edits: Vec<Edit>,
+    },
+    Verify {
+        ok: bool,
+        detail: String,
+    },
+    /// A free-form subagent result (custom agents).
+    Task {
+        text: String,
+    },
 }
 
 #[cfg(test)]

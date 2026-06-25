@@ -1367,6 +1367,7 @@ dependencies = [
  "futures-util",
  "otto-agents",
  "otto-engine-core",
+ "otto-extensions",
  "otto-persistence",
  "otto-protocol",
  "otto-providers",
@@ -1400,6 +1401,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "otto-extensions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "otto-engine-core",
+ "otto-protocol",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
