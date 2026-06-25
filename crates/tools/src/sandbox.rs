@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 
 /// How to confine a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,8 +167,6 @@ pub async fn run_sandboxed_with_stdin(
     timeout: Duration,
     stdin: Option<&str>,
 ) -> anyhow::Result<Value> {
-    use tokio::io::AsyncWriteExt;
-
     let (program, argv) = build_argv(policy, root, command)?;
 
     let mut cmd = tokio::process::Command::new(program);
@@ -188,10 +187,20 @@ pub async fn run_sandboxed_with_stdin(
 
     let mut child = cmd.spawn()?;
     if let Some(payload) = stdin {
-        if let Some(mut handle) = child.stdin.take() {
-            handle.write_all(payload.as_bytes()).await?;
-            handle.shutdown().await?; // close stdin → child gets EOF
+        // `Stdio::piped()` is set above whenever `stdin.is_some()`, so the handle is present.
+        let mut handle = child
+            .stdin
+            .take()
+            .expect("stdin handle present after Stdio::piped()");
+        // A hook that ignores stdin may exit before we finish writing; a BrokenPipe here is not
+        // a failure — the child's exit code (from wait_with_output) is what we report.
+        if let Err(e) = handle.write_all(payload.as_bytes()).await {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(e.into());
+            }
         }
+        // EOF is delivered when `handle` is dropped at end of scope; shutdown is best-effort.
+        let _ = handle.shutdown().await;
     }
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Err(_) => anyhow::bail!("bash command timed out after {} ms", timeout.as_millis()),
@@ -260,6 +269,23 @@ mod tests {
         .await
         .unwrap();
         assert!(out["stdout"].as_str().unwrap().contains("hello-stdin"));
+        assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_sandboxed_with_stdin_ok_when_command_ignores_stdin() {
+        use std::time::Duration;
+        let root = std::path::PathBuf::from(".");
+        // `true` never reads stdin and exits 0 immediately — must not surface a BrokenPipe error.
+        let out = run_sandboxed_with_stdin(
+            &SandboxPolicy::None,
+            &root,
+            "true",
+            Duration::from_secs(5),
+            Some("payload-the-command-never-reads"),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
     }
 
