@@ -153,7 +153,16 @@ fn read_skills_dir(dir: &Path) -> Vec<CustomSkillDef> {
         let manifest = skill_dir.join("SKILL.md");
         let text = match std::fs::read_to_string(&manifest) {
             Ok(t) => t,
-            Err(_) => continue, // no SKILL.md → not a skill (not an error)
+            // No SKILL.md → this subdir simply isn't a skill (silent, expected).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // SKILL.md exists but couldn't be read → skip with a warning, never fatal.
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping unreadable skill {}: {e}",
+                    manifest.display()
+                );
+                continue;
+            }
         };
         let name = skill_dir
             .file_name()
