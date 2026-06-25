@@ -353,6 +353,10 @@ async fn run_command_in(
     // _mcp_conns is held until end of function so the mcp children stay alive.
     let tools = Arc::new(tools);
 
+    // Args are substituted first, then the whole string is scanned for `!`cmd`/@path`
+    // injections — so a user-supplied arg is intentionally re-scanned (Claude-Code parity).
+    // Its capability ceiling is exactly the gate's: the sandbox + sensitive-path floor still
+    // apply, and any denied/failed injection aborts here (fail-closed) before the spine turn.
     let expanded = expand_args(&def.template, args);
     let goal = resolve_injections(&expanded, tools.as_ref()).await?;
 
