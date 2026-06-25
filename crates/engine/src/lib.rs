@@ -19,12 +19,14 @@ use otto_tools::{
 };
 
 mod approval;
+mod hooks;
 mod loopback;
 mod mcp;
 mod serve;
 mod service;
 
 pub use approval::ApprovalModeGate;
+pub use hooks::SandboxedHookExecutor;
 pub use loopback::LoopbackTarget;
 pub use mcp::{
     McpConnection, connect_bash as mcp_connect_bash, connect_fs as mcp_connect_fs,
