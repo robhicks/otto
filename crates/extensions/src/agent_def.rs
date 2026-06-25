@@ -31,7 +31,7 @@ pub fn parse_agent_md(text: &str) -> anyhow::Result<CustomAgentDef> {
 
     for line in front.lines() {
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let (key, value) = line
@@ -42,6 +42,8 @@ pub fn parse_agent_md(text: &str) -> anyhow::Result<CustomAgentDef> {
             "name" => name = Some(value.to_string()),
             "description" => description = Some(value.to_string()),
             "model" if !value.is_empty() => model = Some(value.to_string()),
+            // `tools` PRESENT (even if empty) → `Some(list)`; an empty list means "no tools".
+            // Only an ABSENT `tools` key stays `None` (= all tools, Claude-Code-compatible).
             "tools" => {
                 let list: Vec<String> = value
                     .trim_matches(['[', ']'])
@@ -49,9 +51,7 @@ pub fn parse_agent_md(text: &str) -> anyhow::Result<CustomAgentDef> {
                     .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                if !list.is_empty() {
-                    tools = Some(list);
-                }
+                tools = Some(list);
             }
             _ => {}
         }
@@ -124,5 +124,28 @@ mod tests {
     fn blank_name_errors() {
         let text = "---\nname:    \ndescription: d\n---\nbody\n";
         assert!(parse_agent_md(text).is_err());
+    }
+
+    #[test]
+    fn empty_tools_value_means_no_tools_not_all() {
+        // Present-but-empty `tools:` must parse to Some(empty), NOT None (which = all tools).
+        let text = "---\nname: a\ndescription: d\ntools:\n---\nbody\n";
+        let def = parse_agent_md(text).unwrap();
+        assert_eq!(def.tools, Some(vec![]));
+    }
+
+    #[test]
+    fn empty_inline_list_tools_means_no_tools() {
+        let text = "---\nname: a\ndescription: d\ntools: []\n---\nbody\n";
+        let def = parse_agent_md(text).unwrap();
+        assert_eq!(def.tools, Some(vec![]));
+    }
+
+    #[test]
+    fn comment_lines_in_frontmatter_are_skipped() {
+        let text = "---\n# this is a comment\nname: a\ndescription: d\n---\nbody\n";
+        let def = parse_agent_md(text).unwrap();
+        assert_eq!(def.name, "a");
+        assert_eq!(def.description, "d");
     }
 }

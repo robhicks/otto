@@ -82,6 +82,7 @@ untouched.
 - `CustomAgentDef` — a parsed agent: `name: String`, `description: String`,
   `tools: Option<Vec<String>>` (None = all available tools; Some = allowlist),
   `model: Option<String>`, `system_prompt: String` (the markdown body).
+  An absent `tools` key parses to `None` (= all tools, Claude-Code-compatible); an explicit empty list (`tools:` or `tools: []`) parses to `Some(vec![])` (= no tools, fail-safe).
 - `parse_agent_md(text) -> Result<CustomAgentDef>` — splits YAML frontmatter from body. The
   frontmatter shape mirrors Claude Code: `name`, `description`, optional `tools` (accepts both a
   comma-separated string and a YAML list), optional `model`. Missing `name`/`description` is an
