@@ -71,6 +71,28 @@ fn parse_agent_flag(args: &[String]) -> (Option<String>, Vec<String>) {
     (name, rest)
 }
 
+/// Parse `--command <name>` from args. Returns (Some(name), remaining) or (None, args). The
+/// remaining args are the command's positional arguments ($1.., $ARGUMENTS).
+fn parse_command_flag(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut name = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--command" {
+            match it.next() {
+                Some(v) => name = Some(v.clone()),
+                None => {
+                    eprintln!("error: --command requires a name");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (name, rest)
+}
+
 /// The user-global `.claude/` base: the OS home directory (empty path if it cannot be
 /// determined → user-global discovery is simply skipped). Uses `dirs::home_dir` so it
 /// works when `$HOME` is unset (Unix `getpwuid` fallback), matching the rest of the crate.
@@ -194,7 +216,18 @@ async fn build_tools_preferring_mcp(
 
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let (root, after_root) = parse_root(&args);
-    let (agent_name, positional) = parse_agent_flag(&after_root);
+    let (command_name, after_cmd) = parse_command_flag(&after_root);
+    let (agent_name, positional) = parse_agent_flag(&after_cmd);
+
+    if command_name.is_some() && agent_name.is_some() {
+        eprintln!("error: --command and --agent are mutually exclusive");
+        std::process::exit(2);
+    }
+
+    if let Some(cmd) = command_name {
+        return run_command_in(&cmd, &positional, root, home_dir()).await;
+    }
+
     let goal = positional.into_iter().next().unwrap_or_else(|| {
         eprintln!("error: missing goal");
         std::process::exit(2);
@@ -287,6 +320,61 @@ async fn run_custom_agent_in(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("task dispatch returned no `text` field"))?;
     println!("{text}");
+    Ok(())
+}
+
+/// Expand a discovered command (`expand_args` then gated `!bash`/`@file` injection) and run the
+/// result as the goal of a normal spine turn. `home` is injected so tests stay hermetic.
+async fn run_command_in(
+    name: &str,
+    args: &[String],
+    root: PathBuf,
+    home: PathBuf,
+) -> anyhow::Result<()> {
+    use otto_extensions::{expand_args, resolve_injections};
+
+    let ext = otto_extensions::discover(&root, &home);
+    let def = ext
+        .commands
+        .into_iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no command named '{name}' in ~/.claude/commands/ or {}/.claude/commands/",
+                root.display()
+            )
+        })?;
+
+    // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
+    // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
+    let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    let (tools, _mcp_conns) =
+        build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
+    // _mcp_conns is held until end of function so the mcp children stay alive.
+    let tools = Arc::new(tools);
+
+    // Args are substituted first, then the whole string is scanned for `!`cmd`/@path`
+    // injections — so a user-supplied arg is intentionally re-scanned (Claude-Code parity).
+    // Its capability ceiling is exactly the gate's: the sandbox + sensitive-path floor still
+    // apply, and any denied/failed injection aborts here (fail-closed) before the spine turn.
+    let expanded = expand_args(&def.template, args);
+    let goal = resolve_injections(&expanded, tools.as_ref()).await?;
+
+    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    let store: Arc<dyn otto_persistence::SessionStore> =
+        Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
+    let retriever = otto_engine::build_retriever(&root).await;
+
+    let (events, outcome) =
+        run_goal(&goal, store, router, orch_workspace, tools, retriever).await?;
+    for event in &events {
+        println!("[{:>3}] {:?}", event.seq, event.kind);
+    }
+    println!("turn ok = {}", outcome.ok);
+    if !outcome.ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -488,5 +576,57 @@ mod tests {
                 .to_string()
                 .contains("no custom agent named")
         );
+    }
+
+    #[test]
+    fn parse_command_flag_extracts_name_and_keeps_args() {
+        let args = vec![
+            "--command".to_string(),
+            "git:commit".to_string(),
+            "fix".to_string(),
+            "parser".to_string(),
+        ];
+        let (name, rest) = parse_command_flag(&args);
+        assert_eq!(name, Some("git:commit".to_string()));
+        assert_eq!(rest, vec!["fix".to_string(), "parser".to_string()]);
+    }
+
+    #[test]
+    fn parse_command_flag_absent_is_none() {
+        let args = vec!["just a goal".to_string()];
+        let (name, rest) = parse_command_flag(&args);
+        assert_eq!(name, None);
+        assert_eq!(rest, vec!["just a goal".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_command_expands_and_runs_spine() {
+        use std::fs;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global commands
+        let cmds = proj.path().join(".claude").join("commands").join("greet");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(cmds.join("hello.md"), "Say hello to $1.\n").unwrap();
+
+        // Known command expands ($1 → "world") and runs an offline, deterministic spine turn.
+        let ok = run_command_in(
+            "greet:hello",
+            &["world".to_string()],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(ok.is_ok(), "expected command run to succeed: {ok:?}");
+
+        // Unknown command name errors.
+        let err = run_command_in(
+            "nope",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("no command named"));
     }
 }
