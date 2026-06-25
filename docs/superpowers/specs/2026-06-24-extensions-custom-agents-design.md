@@ -20,13 +20,15 @@ Build, end to end:
 1. A new `extensions` crate: discovery of `~/.claude/agents/*.md` and `<project>/.claude/agents/*.md`
    (project overrides user by name) + Claude-Code-exact `agents/*.md` frontmatter parsing.
 2. A `MarkdownAgent` (`Agent` impl) that answers a free-form task by running its markdown body as
-   a system prompt through the router, honoring its `model` hint.
+   a system prompt through the router. (`model` is parsed and preserved on the def but not yet
+   threaded into routing — see Non-goals.)
 3. A built-in `TaskTool` that dispatches a named custom agent as a depth-1 sub-turn with a
    tool view filtered to the agent's `tools` allowlist.
 4. A CLI entry — `otto run --agent <name> "<goal>"` — that runs a discovered custom agent through
    the dispatch path (the user-visible, verifiable demonstration).
-5. Wiring in `otto run`/`serve`: discover, register each custom agent as `Role::Custom(name)`,
-   register the `TaskTool`.
+5. Wiring in `otto run --agent`: discover, register each custom agent as `Role::Custom(name)`,
+   construct the `TaskTool`, and dispatch the named agent through it. (Spine registration of `task`
+   is deferred — see Non-goals/Wiring.)
 
 ## Fixed decisions (from brainstorming)
 
@@ -49,6 +51,10 @@ Build, end to end:
   dispatch requires giving spine agents tool-call loops, which is a separate, larger slice.
 - **Nested subagent dispatch (depth > 1).** A dispatched agent's tool view excludes `task`, so it
   cannot re-dispatch. Prevents fork bombs; multi-level dispatch is a later slice.
+- **`model`-hint routing.** The agent's `model` is parsed and preserved on `CustomAgentDef`, but it
+  does not yet influence provider selection — threading it through `RouteHints`/the router (and the
+  provider model config that would have to honor it) is a later slice. A dispatched agent uses the
+  engine's configured router slots, exactly like a spine agent.
 - **The other five artifact types** — commands, skills, hooks, permissions, plugins — each its own
   later slice.
 - **Retrieval/RemoteWorkspace concerns** — unchanged by this slice.
@@ -102,14 +108,15 @@ Lives in `extensions` (it depends only on `engine-core` seams). Constructed from
 `CustomAgentDef`. `run(AgentRequest::Task { prompt }, ctx)`:
 
 1. Compose the completion prompt from `system_prompt` + the task `prompt`.
-2. Call `ctx.router().complete(...)` with route hints carrying the agent's `model` preference
-   (the router maps an unknown/None model to its default slot — no hard failure).
+2. Call `ctx.router().complete(...)` with default route hints. The agent's `model` is held on the
+   def for a later slice; it does not influence routing yet (the dispatched agent uses the engine's
+   configured router slots, exactly like a spine agent).
 3. Return `AgentOutput::Task { text }`.
 
 It reads `ctx.tools()` for any tool use it performs; the dispatcher supplies a filtered registry,
 so the agent can only reach its allowlisted tools.
 
-#### `TaskTool` (built-in `Tool`, in `engine`)
+#### `TaskTool` (built-in `Tool`, in `extensions`)
 
 A `Tool` named `task`, holding `Arc<dyn Router>`, `Arc<dyn WorkspaceRead>`, `Arc<AgentRegistry>`
 (the registered custom agents), and `Arc<ToolRegistry>` (the base tools — fs/grep/git/bash —
@@ -123,20 +130,28 @@ A `Tool` named `task`, holding `Arc<dyn Router>`, `Arc<dyn WorkspaceRead>`, `Arc
    `AgentRequest::Task { prompt }`.
 5. Return `{ "text": output_text }`.
 
-The base tool registry passed to `TaskTool` is constructed **without** `task` to break the
-otherwise-circular `Arc` (main registry holds `task`; `task` holds the base registry).
+The base tool registry passed to `TaskTool` never contains `task` (it holds only fs/grep/git/bash),
+so the dispatched agent cannot re-dispatch and there is no circular `Arc`.
+
+`MarkdownAgent` and `TaskTool` both live in the `extensions` crate — they are pure `engine-core`-seam
+logic (`Agent`, `Tool`, `AgentCtx`, `ToolRegistry`, `Router`, `WorkspaceRead`), unit-testable there
+with stubs. `engine` only does the wiring below.
 
 ### Wiring (in `engine`)
 
-- `otto run`/`serve` call `extensions::discover(root, home_dir)` (using the process `HOME`).
-- For each `CustomAgentDef`, register `Arc::new(MarkdownAgent::new(def))` into the `AgentRegistry`
-  under `Role::Custom(def.name)`.
-- Build the base tool registry as today; construct `TaskTool` over a clone of it (base, no `task`);
-  register `TaskTool` into the registry the spine uses.
-- `otto run --agent <name> "<goal>"`: instead of the fixed spine turn, run the named custom agent
-  directly through the dispatch path (look up `Role::Custom(name)`, build its filtered ctx, run
-  `Task { prompt: goal }`), printing its output. Absent `--agent`, `otto run` is unchanged.
-- All of the above is a no-op when no `.claude/agents/` directory exists.
+- `otto run --agent <name> "<goal>"`:
+  - `extensions::discover(root, home)` (using the process `HOME`); find the named agent (error if
+    absent).
+  - Register each `CustomAgentDef` as `Role::Custom(name) → MarkdownAgent` in an `AgentRegistry`.
+  - Build the base tool registry (fs/grep/git/bash — no `task`) and the router/workspace as today.
+  - Construct `TaskTool` over those and call `task.call({agent: name, prompt: goal})`, printing
+    `text`. This exercises the exact dispatch machinery a future spine caller would use.
+- Absent `--agent`, `otto run` is unchanged (the fixed spine turn).
+- **Spine registration of `task` is deferred.** Because autonomous spine dispatch is a non-goal this
+  slice, nothing in the spine would call `task`; registering it into the spine's registry would be
+  dead wiring (and force a two-registry split to avoid the `task`-holds-its-own-registry cycle). It
+  lands with the autonomous-dispatch slice. The `--agent` entry + unit tests fully exercise
+  `TaskTool` now.
 
 ## Gate classification
 
@@ -154,7 +169,7 @@ otto run --agent reviewer "audit auth.rs"
         └─► AgentRegistry.register(Role::Custom("reviewer"), MarkdownAgent)
         └─► dispatch path: base_tools.subset(["fs.read","grep"]) ─► sub-AgentCtx
               └─► MarkdownAgent.run(Task{prompt:"audit auth.rs"}, ctx)
-                    └─► ctx.router().complete(system_prompt + prompt, model hint)
+                    └─► ctx.router().complete(system_prompt + prompt)   // model preserved, not yet routed
                     └─► (any tool use re-gated; secrets still denied by the floor)
               └─► AgentOutput::Task{ text } ──► printed
 ```
@@ -177,7 +192,9 @@ The in-spine path (a future tool-calling agent calling the `task` tool) reuses t
 - **Allowlist narrows only.** `subset` shares the parent gate/resolver; no allowlist can widen the
   tool set or bypass a gate decision. The sensitive-path floor (`.env*`, `.ssh/`, …) still denies.
 - **Depth 1.** The dispatched agent's tool view excludes `task` — no nested dispatch, no fork bomb.
-- **`model` selects a slot only.** It cannot reach a provider that `build_router` did not wire.
+- **`model` is inert this slice.** It is parsed and stored but does not influence routing yet; when
+  threaded later it will only select among slots `build_router` already wired — never reach a new
+  provider.
 - **Attacker-controlled system prompt** runs under the same sandbox/gate as the spine — a hostile
   `agents/*.md` gains no capability beyond its (gated, allowlisted) tools.
 - **Hermetic discovery.** `home` is an explicit parameter; tests never read the developer's real
@@ -193,8 +210,9 @@ The in-spine path (a future tool-calling agent calling the `task` tool) reuses t
   (a denied/sensitive call is still denied through the subset); `AgentRequest::Task`/`AgentOutput::Task`
   round-trip.
 - **`MarkdownAgent`:** against a `ScriptedProvider`-backed router, `run(Task{..})` returns the
-  scripted text and passes the model hint; with a tempfile workspace + a filtered registry it can
-  reach an allowlisted tool and cannot reach an excluded one.
+  scripted text (the composed prompt includes the system prompt); the parsed `model` is preserved
+  on the def. With a tempfile workspace + a filtered registry it can reach an allowlisted tool and
+  cannot reach an excluded one.
 - **`TaskTool`:** dispatches a registered custom agent end to end (filtered tools applied, output
   returned); unknown-agent name errors; a dispatched agent cannot call `task` (absent from its view).
 - **`engine`:** `otto run --agent <name>` over a tempdir `.claude/agents/` runs the agent and emits
