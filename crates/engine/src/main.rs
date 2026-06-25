@@ -225,6 +225,22 @@ fn register_skills(
     }
 }
 
+/// Wrap every registered tool with hook decorators when hooks were discovered AND an OS sandbox
+/// backend exists. No hooks, or no sandbox backend → no wrapping, so the tool set is unchanged
+/// (fail-closed, mirroring how `bash` is absent without a sandbox).
+fn register_hooks(
+    registry: &mut otto_engine_core::tool::ToolRegistry,
+    hooks: &otto_extensions::HookSet,
+    root: &std::path::Path,
+) {
+    if *hooks == otto_extensions::HookSet::default() || !otto_tools::os_sandbox_available() {
+        return;
+    }
+    let exec: Arc<dyn otto_extensions::HookExecutor> =
+        Arc::new(otto_engine::SandboxedHookExecutor::new(root.to_path_buf()));
+    registry.wrap_each(|t| otto_extensions::HookedTool::wrap(t, hooks, exec.clone()));
+}
+
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let (root, after_root) = parse_root(&args);
     let (command_name, after_cmd) = parse_command_flag(&after_root);
@@ -257,6 +273,7 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
     let ext = otto_extensions::discover(&root, &home_dir());
     register_skills(&mut tools, &ext.skills);
+    register_hooks(&mut tools, &ext.hooks, &root);
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -677,5 +694,58 @@ mod tests {
         );
         register_skills(&mut reg, &ext.skills);
         assert!(!reg.tool_names().iter().any(|n| n == "skill"));
+    }
+
+    #[tokio::test]
+    async fn discovered_pretooluse_hook_blocks_a_tool_call() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            return; // no sandbox backend → hooks fail-closed (not wired); nothing to assert
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_settings_leaves_tools_unwrapped() {
+        use otto_engine_core::tool::ToolRegistry;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(out.to_string().contains("hi"));
     }
 }
