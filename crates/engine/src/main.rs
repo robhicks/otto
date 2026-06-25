@@ -1,4 +1,4 @@
-//! `otto run "<goal>" [--root <path>]` — run a single turn and print the event stream.
+//! `otto run "<goal>" [--root <path>] [--agent <name>]` — run a single turn (or a named custom agent) and print output.
 //! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => cmd_serve(rest).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]"
+                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]"
             );
             std::process::exit(2);
         }
@@ -48,6 +48,34 @@ fn parse_root(args: &[String]) -> (PathBuf, Vec<String>) {
         }
     }
     (root, positional)
+}
+
+/// Parse `--agent <name>` from args. Returns (Some(name), remaining) or (None, args).
+fn parse_agent_flag(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut name = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--agent" {
+            match it.next() {
+                Some(v) => name = Some(v.clone()),
+                None => {
+                    eprintln!("error: --agent requires a name");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (name, rest)
+}
+
+/// The user-global `.claude/` base: the OS home directory (empty path if it cannot be
+/// determined → user-global discovery is simply skipped). Uses `dirs::home_dir` so it
+/// works when `$HOME` is unset (Unix `getpwuid` fallback), matching the rest of the crate.
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default()
 }
 
 fn open_db_path() -> String {
@@ -165,11 +193,16 @@ async fn build_tools_preferring_mcp(
 }
 
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
-    let (root, positional) = parse_root(&args);
+    let (root, after_root) = parse_root(&args);
+    let (agent_name, positional) = parse_agent_flag(&after_root);
     let goal = positional.into_iter().next().unwrap_or_else(|| {
         eprintln!("error: missing goal");
         std::process::exit(2);
     });
+
+    if let Some(name) = agent_name {
+        return run_custom_agent(&name, &goal, root).await;
+    }
 
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
@@ -191,6 +224,58 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     if !outcome.ok {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// Run a discovered custom agent through the `TaskTool` dispatch path and print its output.
+/// Unknown agent name (or no `.claude/agents/`) is a clear error.
+async fn run_custom_agent(name: &str, goal: &str, root: PathBuf) -> anyhow::Result<()> {
+    use otto_engine_core::AgentRegistry;
+    use otto_engine_core::WorkspaceRead;
+    use otto_engine_core::tool::Tool;
+    use otto_extensions::{MarkdownAgent, TaskTool};
+    use otto_protocol::Role;
+    use std::collections::HashMap;
+
+    let ext = otto_extensions::discover(&root, &home_dir());
+
+    let mut registry = AgentRegistry::new();
+    let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    for def in ext.agents {
+        allowlists.insert(def.name.clone(), def.tools.clone());
+        registry.register(
+            Role::Custom(def.name.clone()),
+            Arc::new(MarkdownAgent::new(def)),
+        );
+    }
+
+    if registry.get(&Role::Custom(name.to_string())).is_err() {
+        anyhow::bail!(
+            "no custom agent named '{name}' in ~/.claude/agents/ or {}/.claude/agents/",
+            root.display()
+        );
+    }
+
+    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
+
+    let task = TaskTool::new(
+        router,
+        read_ws,
+        Arc::new(registry),
+        Arc::new(base_tools),
+        allowlists,
+    );
+    let out = task
+        .call(serde_json::json!({ "agent": name, "prompt": goal }))
+        .await?;
+    let text = out
+        .get("text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("task dispatch returned no `text` field"))?;
+    println!("{text}");
     Ok(())
 }
 
@@ -329,4 +414,29 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     eprintln!("otto serve listening on {scheme}://{addr}/ws");
     serve_run(listener, app, tls).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_flag_extracts_name() {
+        let args = vec![
+            "--agent".to_string(),
+            "reviewer".to_string(),
+            "do it".to_string(),
+        ];
+        let (name, rest) = parse_agent_flag(&args);
+        assert_eq!(name, Some("reviewer".to_string()));
+        assert_eq!(rest, vec!["do it".to_string()]);
+    }
+
+    #[test]
+    fn parse_agent_flag_absent_is_none() {
+        let args = vec!["do it".to_string()];
+        let (name, rest) = parse_agent_flag(&args);
+        assert_eq!(name, None);
+        assert_eq!(rest, vec!["do it".to_string()]);
+    }
 }
