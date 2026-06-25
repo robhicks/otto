@@ -153,6 +153,21 @@ pub async fn run_sandboxed(
     command: &str,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
+    run_sandboxed_with_stdin(policy, root, command, timeout, None).await
+}
+
+/// Like [`run_sandboxed`], but optionally pipes `stdin` to the command's standard input (closed
+/// after writing, so the child sees EOF). Used to feed a hook its JSON event on stdin. When
+/// `stdin` is `None` this behaves exactly as before (stdin is `/dev/null`).
+pub async fn run_sandboxed_with_stdin(
+    policy: &SandboxPolicy,
+    root: &Path,
+    command: &str,
+    timeout: Duration,
+    stdin: Option<&str>,
+) -> anyhow::Result<Value> {
+    use tokio::io::AsyncWriteExt;
+
     let (program, argv) = build_argv(policy, root, command)?;
 
     let mut cmd = tokio::process::Command::new(program);
@@ -162,12 +177,22 @@ pub async fn run_sandboxed(
     }
     cmd.env("HOME", root)
         .env("TMPDIR", root)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+    if let Some(payload) = stdin {
+        if let Some(mut handle) = child.stdin.take() {
+            handle.write_all(payload.as_bytes()).await?;
+            handle.shutdown().await?; // close stdin → child gets EOF
+        }
+    }
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Err(_) => anyhow::bail!("bash command timed out after {} ms", timeout.as_millis()),
         Ok(result) => result?,
@@ -219,6 +244,23 @@ mod tests {
         )
         .await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_sandboxed_with_stdin_pipes_payload() {
+        use std::time::Duration;
+        let root = std::path::PathBuf::from(".");
+        let out = run_sandboxed_with_stdin(
+            &SandboxPolicy::None,
+            &root,
+            "cat", // echoes stdin to stdout
+            Duration::from_secs(5),
+            Some("hello-stdin"),
+        )
+        .await
+        .unwrap();
+        assert!(out["stdout"].as_str().unwrap().contains("hello-stdin"));
+        assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
     }
 
     #[test]
