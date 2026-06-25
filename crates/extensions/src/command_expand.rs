@@ -215,4 +215,35 @@ mod tests {
         let err = resolve_injections("run !`echo hi`", &reg).await;
         assert!(err.is_err(), "expected absent bash to fail closed");
     }
+
+    #[tokio::test]
+    async fn adjacent_command_markers_both_resolve() {
+        let reg = registry(Arc::new(AllowAll), vec![Arc::new(StubBash)]);
+        let out = resolve_injections("!`a`!`b`", &reg).await.unwrap();
+        assert_eq!(out, "OUT:aOUT:b");
+    }
+
+    #[tokio::test]
+    async fn at_path_runs_to_whitespace_consuming_inner_at() {
+        // The path token runs until whitespace, so `@a@b` is a single path "a@b".
+        let reg = registry(Arc::new(AllowAll), vec![Arc::new(StubRead)]);
+        let out = resolve_injections("@a@b", &reg).await.unwrap();
+        assert_eq!(out, "FILE:a@b");
+    }
+
+    #[tokio::test]
+    async fn trailing_bang_and_bare_at_are_literal() {
+        // A trailing `!` (no backtick) and a bare `@` at end-of-input resolve to nothing —
+        // they are emitted literally, not treated as (failed) injections. No tools needed.
+        let reg = registry(Arc::new(AllowAll), vec![]);
+        assert_eq!(resolve_injections("done!", &reg).await.unwrap(), "done!");
+        assert_eq!(resolve_injections("see @", &reg).await.unwrap(), "see @");
+    }
+
+    #[tokio::test]
+    async fn at_path_stops_at_backtick() {
+        let reg = registry(Arc::new(AllowAll), vec![Arc::new(StubRead)]);
+        let out = resolve_injections("@file`x", &reg).await.unwrap();
+        assert_eq!(out, "FILE:file`x");
+    }
 }
