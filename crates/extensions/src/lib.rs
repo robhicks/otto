@@ -6,8 +6,10 @@
 //! discovery, so the offline determinism suite is unaffected.
 
 mod agent_def;
+mod markdown_agent;
 
 pub use agent_def::{CustomAgentDef, parse_agent_md};
+pub use markdown_agent::MarkdownAgent;
 
 use std::path::Path;
 
