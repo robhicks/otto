@@ -326,7 +326,7 @@ registers each artifact into an existing otto primitive — there is no parallel
 format:
 
 - `agents/*.md` → `AgentRegistry` as `Role::Custom(name)` (honors per-agent tool allowlist + model).
-- `commands/*.md` → command registry (prompt templates for the palette).
+- `commands/*.md` → command registry (recursive, namespaced `git:commit`); expanded (`$ARGUMENTS`/`$1..$9` + gated `!bash`/`@file` injection) and run as a spine turn via `otto run --command`. (`model`/`allowed-tools` preserved, not yet routed/enforced.)
 - `skills` (`SKILL.md` + resources) → loadable skills exposed via a built-in `Skill` tool.
 - `settings.json` hooks → `HookRegistry`, fired at the same lifecycle points.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
