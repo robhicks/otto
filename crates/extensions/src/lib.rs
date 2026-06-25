@@ -9,33 +9,41 @@ mod agent_def;
 mod command_def;
 mod command_expand;
 mod markdown_agent;
+mod skill_def;
+mod skill_tool;
 mod task_tool;
 
 pub use agent_def::{CustomAgentDef, parse_agent_md};
 pub use command_def::{CustomCommandDef, parse_command_md};
 pub use command_expand::{expand_args, resolve_injections};
 pub use markdown_agent::MarkdownAgent;
+pub use skill_def::{CustomSkillDef, parse_skill_md};
+pub use skill_tool::SkillTool;
 pub use task_tool::TaskTool;
 
 use std::path::Path;
 
 /// Everything discovered from the `.claude/` directories. Slice 1: custom agents.
-/// Slice 2: commands.
+/// Slice 2: commands. Slice 3: skills.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extensions {
     pub agents: Vec<CustomAgentDef>,
     pub commands: Vec<CustomCommandDef>,
+    pub skills: Vec<CustomSkillDef>,
 }
 
 /// Discover `<home>/.claude/agents/*.md` then `<project_root>/.claude/agents/*.md`. Project
 /// agents override user agents of the same `name`. Malformed files are skipped (never fatal).
 /// Missing directories yield no agents. `home` is explicit (never read ambiently) so callers
-/// and tests stay hermetic.
+/// and tests stay hermetic. Also discovers `<base>/.claude/skills/<name>/SKILL.md` (one level;
+/// project overrides user by name).
 pub fn discover(project_root: &Path, home: &Path) -> Extensions {
     // User-global first, then project — so a later project insert overrides by name.
     let mut agents: std::collections::BTreeMap<String, CustomAgentDef> =
         std::collections::BTreeMap::new();
     let mut commands: std::collections::BTreeMap<String, CustomCommandDef> =
+        std::collections::BTreeMap::new();
+    let mut skills: std::collections::BTreeMap<String, CustomSkillDef> =
         std::collections::BTreeMap::new();
     for base in [home, project_root] {
         let claude = base.join(".claude");
@@ -45,10 +53,14 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         for def in read_commands_dir(&claude.join("commands")) {
             commands.insert(def.name.clone(), def);
         }
+        for def in read_skills_dir(&claude.join("skills")) {
+            skills.insert(def.name.clone(), def);
+        }
     }
     Extensions {
         agents: agents.into_values().collect(),
         commands: commands.into_values().collect(),
+        skills: skills.into_values().collect(),
     }
 }
 
@@ -122,6 +134,54 @@ fn collect_commands(base: &Path, dir: &Path, out: &mut Vec<CustomCommandDef>) {
             ),
         }
     }
+}
+
+/// Parse every `<dir>/<skill>/SKILL.md` (one level of skill directories). The skill's fallback
+/// `name` is its directory name; a frontmatter `name` overrides it. `root` is set to the skill
+/// directory (for later resource lookup). Missing `dir` → empty; a skill directory without a
+/// `SKILL.md` is silently not-a-skill; an unreadable/malformed `SKILL.md` is skipped with a
+/// warning, never fatal.
+fn read_skills_dir(dir: &Path) -> Vec<CustomSkillDef> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let skill_dir = entry.path();
+        if !skill_dir.is_dir() {
+            continue;
+        }
+        let manifest = skill_dir.join("SKILL.md");
+        let text = match std::fs::read_to_string(&manifest) {
+            Ok(t) => t,
+            // No SKILL.md → this subdir simply isn't a skill (silent, expected).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // SKILL.md exists but couldn't be read → skip with a warning, never fatal.
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping unreadable skill {}: {e}",
+                    manifest.display()
+                );
+                continue;
+            }
+        };
+        let name = skill_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match parse_skill_md(&name, &text) {
+            Ok(mut def) => {
+                def.root = skill_dir;
+                out.push(def);
+            }
+            Err(e) => eprintln!(
+                "warning: skipping malformed skill {}: {e}",
+                manifest.display()
+            ),
+        }
+    }
+    out
 }
 
 /// Namespaced command name: path relative to `base`, extension stripped, components joined by `:`.
@@ -260,5 +320,90 @@ mod tests {
         );
         let ext = discover(proj.path(), home.path());
         assert!(ext.commands.is_empty());
+    }
+
+    fn write_skill(dir: &Path, name: &str, body: &str) {
+        let skill = dir.join(".claude").join("skills").join(name);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn discovers_skills_one_level_with_root_and_name_default() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_skill(
+            proj.path(),
+            "greeter",
+            "---\ndescription: greets\n---\nSay hi.\n",
+        );
+
+        let ext = discover(proj.path(), home.path());
+        let names: Vec<_> = ext.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["greeter"],
+            "name defaults to the skill dir name"
+        );
+        let greeter = &ext.skills[0];
+        assert_eq!(
+            greeter.root,
+            proj.path().join(".claude").join("skills").join("greeter"),
+            "root points at the skill directory"
+        );
+    }
+
+    #[test]
+    fn skill_frontmatter_name_overrides_dir_name() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_skill(
+            proj.path(),
+            "dir",
+            "---\nname: real\ndescription: d\n---\nbody\n",
+        );
+
+        let ext = discover(proj.path(), home.path());
+        let names: Vec<_> = ext.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    #[test]
+    fn project_skill_overrides_user_by_name() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_skill(home.path(), "dup", "---\ndescription: USER\n---\nu\n");
+        write_skill(proj.path(), "dup", "---\ndescription: PROJECT\n---\np\n");
+
+        let ext = discover(proj.path(), home.path());
+        let dup: Vec<_> = ext.skills.iter().filter(|s| s.name == "dup").collect();
+        assert_eq!(dup.len(), 1, "name collision should collapse to one");
+        assert_eq!(dup[0].description, "PROJECT");
+    }
+
+    #[test]
+    fn missing_skills_dir_and_dir_without_manifest_yield_no_skills() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        // A skill dir with NO SKILL.md is not a skill.
+        let bare = proj.path().join(".claude").join("skills").join("bare");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join("notes.txt"), "ignore me").unwrap();
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.skills.is_empty());
+    }
+
+    #[test]
+    fn malformed_skill_skipped_others_kept() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_skill(proj.path(), "good", "---\ndescription: ok\n---\nbody\n");
+        // Missing description → parse error → skipped.
+        write_skill(proj.path(), "bad", "---\nname: bad\n---\nbody\n");
+
+        let ext = discover(proj.path(), home.path());
+        let names: Vec<_> = ext.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["good"]);
     }
 }
