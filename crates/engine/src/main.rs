@@ -230,6 +230,17 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
 /// Run a discovered custom agent through the `TaskTool` dispatch path and print its output.
 /// Unknown agent name (or no `.claude/agents/`) is a clear error.
 async fn run_custom_agent(name: &str, goal: &str, root: PathBuf) -> anyhow::Result<()> {
+    run_custom_agent_in(name, goal, root, home_dir()).await
+}
+
+/// `run_custom_agent` with the home directory injected (so tests can supply an empty home and
+/// never read the developer's real `~/.claude`). All dispatch logic lives here.
+async fn run_custom_agent_in(
+    name: &str,
+    goal: &str,
+    root: PathBuf,
+    home: PathBuf,
+) -> anyhow::Result<()> {
     use otto_engine_core::AgentRegistry;
     use otto_engine_core::WorkspaceRead;
     use otto_engine_core::tool::Tool;
@@ -237,7 +248,7 @@ async fn run_custom_agent(name: &str, goal: &str, root: PathBuf) -> anyhow::Resu
     use otto_protocol::Role;
     use std::collections::HashMap;
 
-    let ext = otto_extensions::discover(&root, &home_dir());
+    let ext = otto_extensions::discover(&root, &home);
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
@@ -438,5 +449,44 @@ mod tests {
         let (name, rest) = parse_agent_flag(&args);
         assert_eq!(name, None);
         assert_eq!(rest, vec!["do it".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn run_custom_agent_dispatches_and_errors_on_unknown() {
+        use std::fs;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global agents
+        let agents = proj.path().join(".claude").join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("echoer.md"),
+            "---\nname: echoer\ndescription: echoes\ntools: fs.read\n---\nYou are an echo agent.\n",
+        )
+        .unwrap();
+
+        // Known agent dispatches successfully (offline LocalProvider, deterministic).
+        let ok = run_custom_agent_in(
+            "echoer",
+            "hello",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(ok.is_ok(), "expected dispatch to succeed: {ok:?}");
+
+        // Unknown agent name errors.
+        let err = run_custom_agent_in(
+            "nope",
+            "hello",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("no custom agent named")
+        );
     }
 }

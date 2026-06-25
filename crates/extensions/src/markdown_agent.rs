@@ -19,16 +19,6 @@ impl MarkdownAgent {
     pub fn new(def: CustomAgentDef) -> Self {
         Self { def }
     }
-
-    /// The agent's tool allowlist (`None` = all available tools). Read by the dispatcher.
-    pub fn tools(&self) -> Option<&[String]> {
-        self.def.tools.as_deref()
-    }
-
-    /// The agent's name (its `Role::Custom` key).
-    pub fn name(&self) -> &str {
-        &self.def.name
-    }
 }
 
 #[async_trait]
@@ -127,12 +117,5 @@ mod tests {
             }
             other => panic!("expected Task output, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn preserves_model_and_allowlist() {
-        let agent = MarkdownAgent::new(def());
-        assert_eq!(agent.tools(), Some(["fs.read".to_string()].as_slice()));
-        assert_eq!(agent.name(), "reviewer");
     }
 }

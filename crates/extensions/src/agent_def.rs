@@ -57,8 +57,13 @@ pub fn parse_agent_md(text: &str) -> anyhow::Result<CustomAgentDef> {
         }
     }
 
+    let name = name.ok_or_else(|| anyhow::anyhow!("frontmatter missing `name`"))?;
+    if name.trim().is_empty() {
+        anyhow::bail!("frontmatter `name` is empty");
+    }
+
     Ok(CustomAgentDef {
-        name: name.ok_or_else(|| anyhow::anyhow!("frontmatter missing `name`"))?,
+        name,
         description: description
             .ok_or_else(|| anyhow::anyhow!("frontmatter missing `description`"))?,
         tools,
@@ -113,5 +118,11 @@ mod tests {
     #[test]
     fn missing_frontmatter_errors() {
         assert!(parse_agent_md("just a body, no frontmatter").is_err());
+    }
+
+    #[test]
+    fn blank_name_errors() {
+        let text = "---\nname:    \ndescription: d\n---\nbody\n";
+        assert!(parse_agent_md(text).is_err());
     }
 }
