@@ -331,8 +331,8 @@ format:
 - `settings.json` hooks → discovered (`PreToolUse`/`PostToolUse`, concatenated across user+project)
   and fired around tool dispatch via a `HookedTool` decorator, executed through the shared OS
   sandbox; a `PreToolUse` hook may block a call (exit 2), `PostToolUse` observes. Hooks compose
-  *below* the permission gate (deny-only). Lifecycle hooks, JSON-stdout control, and serve-path
-  wiring are pending.
+  *below* the permission gate (deny-only). Lifecycle hooks, JSON-stdout control, the
+  `--command`/`--agent` run subpaths, and serve-path wiring are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → manifest parsed; each bundled component registered
   via the rows above; **bundled MCP servers route straight into otto's MCP client unmodified.**

@@ -731,6 +731,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovered_posttooluse_hook_runs_without_blocking() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping hooks PostToolUse test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        // PostToolUse hook on fs.read drops a marker file in the workspace root (sandbox allows it).
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"touch post_ran.marker"}]}]}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        // PostToolUse must not block: the call returns the file content normally.
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return content, got: {out}"
+        );
+        // And the PostToolUse hook actually fired (marker created in the workspace root).
+        assert!(
+            proj.path().join("post_ran.marker").exists(),
+            "PostToolUse hook did not run"
+        );
+    }
+
+    #[tokio::test]
     async fn no_settings_leaves_tools_unwrapped() {
         use otto_engine_core::tool::ToolRegistry;
         let proj = tempfile::tempdir().unwrap();
