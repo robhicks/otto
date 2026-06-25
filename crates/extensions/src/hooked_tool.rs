@@ -56,19 +56,24 @@ impl HookedTool {
             match self.executor.run(&hook.command, input, timeout).await {
                 Ok(out) if out.exit_code == Some(2) && blocking => {
                     anyhow::bail!(
-                        "tool '{name}' blocked by PreToolUse hook: {}",
+                        "tool '{name}' blocked by PreToolUse hook ({}): {}",
+                        hook.command,
                         out.stderr.trim()
                     );
                 }
                 Ok(out) if out.exit_code != Some(0) => {
                     eprintln!(
-                        "warning: hook for '{name}' exited {:?} (non-blocking): {}",
+                        "warning: hook ({}) for '{name}' exited {:?} (non-blocking): {}",
+                        hook.command,
                         out.exit_code,
                         out.stderr.trim()
                     );
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("warning: hook for '{name}' failed to run (non-blocking): {e}"),
+                Err(e) => eprintln!(
+                    "warning: hook ({}) for '{name}' failed to run (non-blocking): {e}",
+                    hook.command
+                ),
             }
         }
         Ok(())
@@ -87,7 +92,7 @@ impl Tool for HookedTool {
             let input = json!({
                 "hook_event_name": "PreToolUse",
                 "tool_name": name,
-                "tool_input": args.clone(),
+                "tool_input": &args,
             })
             .to_string();
             self.fire(&self.pre, &input, true).await?;
@@ -100,7 +105,7 @@ impl Tool for HookedTool {
                 "hook_event_name": "PostToolUse",
                 "tool_name": name,
                 "tool_input": args,
-                "tool_response": result.clone(),
+                "tool_response": &result,
             })
             .to_string();
             let _ = self.fire(&self.post, &input, false).await;
@@ -152,6 +157,14 @@ mod tests {
                 stdout: String::new(),
                 stderr: "nope".to_string(),
             })
+        }
+    }
+
+    struct ErrExec;
+    #[async_trait]
+    impl HookExecutor for ErrExec {
+        async fn run(&self, _c: &str, _s: &str, _t: Duration) -> anyhow::Result<HookOutcome> {
+            Err(anyhow::anyhow!("spawn failed"))
         }
     }
 
@@ -230,6 +243,20 @@ mod tests {
         });
         let wrapped = HookedTool::wrap(spy.clone(), &pre_set("*", "warn.sh"), exec);
         assert!(wrapped.call(json!({})).await.is_ok());
+        assert_eq!(*spy.called.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_executor_error_is_non_blocking() {
+        let spy = Arc::new(SpyTool {
+            called: Mutex::new(0),
+        });
+        let wrapped = HookedTool::wrap(
+            spy.clone(),
+            &pre_set("fs.read", "boom.sh"),
+            Arc::new(ErrExec),
+        );
+        assert!(wrapped.call(json!({ "path": "a" })).await.is_ok());
         assert_eq!(*spy.called.lock().unwrap(), 1);
     }
 
