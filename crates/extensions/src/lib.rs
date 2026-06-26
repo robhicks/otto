@@ -73,6 +73,14 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         hooks.pre_tool_use.append(&mut base_hooks.pre_tool_use);
         hooks.post_tool_use.append(&mut base_hooks.post_tool_use);
     }
+    fold_plugins(
+        home,
+        project_root,
+        &mut agents,
+        &mut commands,
+        &mut skills,
+        &mut hooks,
+    );
     Extensions {
         agents: agents.into_values().collect(),
         commands: commands.into_values().collect(),
@@ -247,6 +255,166 @@ fn read_settings_hooks(path: &Path) -> HookSet {
                 path.display()
             );
             HookSet::default()
+        }
+    }
+}
+
+/// Read the `enabledPlugins` allowlist from `<base>/.claude/settings.json`. Missing/unreadable →
+/// empty map (never fatal).
+fn read_enabled_plugins(path: &Path) -> std::collections::BTreeMap<String, bool> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => parse_enabled_plugins(&t),
+        Err(_) => std::collections::BTreeMap::new(),
+    }
+}
+
+/// Read a plugin's bundled hooks file (same `{ "hooks": { ... } }` shape as settings.json).
+/// Missing → empty; unreadable/malformed → empty with a warning (reuses the settings reader).
+fn read_plugin_hooks(path: &Path) -> HookSet {
+    read_settings_hooks(path)
+}
+
+/// Resolve a component path: the manifest override (with a leading `./` trimmed) or the convention
+/// default, joined onto the plugin root.
+fn component_dir(plugin_root: &Path, over: &Option<String>, default: &str) -> std::path::PathBuf {
+    let rel = over.as_deref().unwrap_or(default).trim_start_matches("./");
+    plugin_root.join(rel)
+}
+
+/// Fold one enabled plugin's bundled artifacts into the in-progress maps/hook set, namespaced by
+/// `ns` (the plugin name). Existing (user/project, or earlier-plugin) entries win on a name
+/// collision (`or_insert`). Hooks are additive with `${CLAUDE_PLUGIN_ROOT}` expanded.
+fn fold_one_plugin(
+    ns: &str,
+    plugin_root: &Path,
+    agents: &mut std::collections::BTreeMap<String, CustomAgentDef>,
+    commands: &mut std::collections::BTreeMap<String, CustomCommandDef>,
+    skills: &mut std::collections::BTreeMap<String, CustomSkillDef>,
+    hooks: &mut HookSet,
+) {
+    let manifest_path = plugin_root.join(".claude-plugin").join("plugin.json");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => match parse_plugin_json(&t) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping malformed plugin manifest {}: {e}",
+                    manifest_path.display()
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "warning: skipping plugin (unreadable {}): {e}",
+                manifest_path.display()
+            );
+            return;
+        }
+    };
+
+    for mut def in read_agents_dir(&component_dir(plugin_root, &manifest.agents, "agents")) {
+        def.name = format!("{ns}:{}", def.name);
+        agents.entry(def.name.clone()).or_insert(def);
+    }
+    for mut def in read_commands_dir(&component_dir(plugin_root, &manifest.commands, "commands")) {
+        def.name = format!("{ns}:{}", def.name);
+        commands.entry(def.name.clone()).or_insert(def);
+    }
+    for mut def in read_skills_dir(&component_dir(plugin_root, &manifest.skills, "skills")) {
+        def.name = format!("{ns}:{}", def.name);
+        skills.entry(def.name.clone()).or_insert(def);
+    }
+
+    let mut plugin_hooks = read_plugin_hooks(&component_dir(
+        plugin_root,
+        &manifest.hooks,
+        "hooks/hooks.json",
+    ));
+    for m in plugin_hooks
+        .pre_tool_use
+        .iter_mut()
+        .chain(plugin_hooks.post_tool_use.iter_mut())
+    {
+        for h in &mut m.hooks {
+            h.command = expand_plugin_root(&h.command, plugin_root);
+        }
+    }
+    hooks.pre_tool_use.append(&mut plugin_hooks.pre_tool_use);
+    hooks.post_tool_use.append(&mut plugin_hooks.post_tool_use);
+}
+
+/// Discover enabled plugins from on-disk marketplaces under both bases and fold their bundled
+/// artifacts into the maps/hook set. Plugins are lowest precedence (user/project win); only plugins
+/// whose `"<name>@<marketplace>"` key is enabled (`true`) activate. Remote sources and absent local
+/// dirs are skipped with a warning; malformed marketplace/plugin manifests are skipped, never fatal.
+fn fold_plugins(
+    home: &Path,
+    project_root: &Path,
+    agents: &mut std::collections::BTreeMap<String, CustomAgentDef>,
+    commands: &mut std::collections::BTreeMap<String, CustomCommandDef>,
+    skills: &mut std::collections::BTreeMap<String, CustomSkillDef>,
+    hooks: &mut HookSet,
+) {
+    // Merge the enable allowlist (project overrides user for the same key).
+    let mut enabled = std::collections::BTreeMap::new();
+    for base in [home, project_root] {
+        for (k, v) in read_enabled_plugins(&base.join(".claude").join("settings.json")) {
+            enabled.insert(k, v);
+        }
+    }
+
+    for base in [home, project_root] {
+        let mp_root = base.join(".claude").join("plugins").join("marketplaces");
+        let entries = match std::fs::read_dir(&mp_root) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let mp_dir = entry.path();
+            if !mp_dir.is_dir() {
+                continue;
+            }
+            let mp_manifest = mp_dir.join(".claude-plugin").join("marketplace.json");
+            let text = match std::fs::read_to_string(&mp_manifest) {
+                Ok(t) => t,
+                // No marketplace.json → this subdir simply isn't a marketplace (silent).
+                Err(_) => continue,
+            };
+            let mp = match parse_marketplace_json(&text) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "warning: skipping malformed marketplace {}: {e}",
+                        mp_manifest.display()
+                    );
+                    continue;
+                }
+            };
+            for plugin in &mp.plugins {
+                let key = format!("{}@{}", plugin.name, mp.name);
+                if enabled.get(&key).copied() != Some(true) {
+                    continue;
+                }
+                let rel = match &plugin.source {
+                    PluginSource::LocalPath(p) => p,
+                    PluginSource::Remote(_) => {
+                        eprintln!(
+                            "warning: skipping enabled plugin {key}: remote source not materialized on disk"
+                        );
+                        continue;
+                    }
+                };
+                let plugin_root = mp_dir.join(rel.trim_start_matches("./"));
+                if !plugin_root.is_dir() {
+                    eprintln!(
+                        "warning: skipping enabled plugin {key}: source dir {} not found",
+                        plugin_root.display()
+                    );
+                    continue;
+                }
+                fold_one_plugin(&plugin.name, &plugin_root, agents, commands, skills, hooks);
+            }
         }
     }
 }
@@ -516,6 +684,105 @@ mod tests {
         let ext = discover(proj.path(), home.path());
         let names: Vec<_> = ext.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["good"]);
+    }
+
+    /// Lay out, under `<base>/.claude/plugins/marketplaces/<mp>/`, a marketplace offering one
+    /// local plugin `<plugin>` that bundles a command, an agent, a skill, and a PreToolUse hook
+    /// (whose command references ${CLAUDE_PLUGIN_ROOT}).
+    fn write_plugin_marketplace(base: &Path, mp: &str, plugin: &str) {
+        let mp_dir = base
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join(mp);
+        let cp = mp_dir.join(".claude-plugin");
+        fs::create_dir_all(&cp).unwrap();
+        fs::write(
+            cp.join("marketplace.json"),
+            format!(
+                r#"{{"name":"{mp}","plugins":[{{"name":"{plugin}","source":"./plugins/{plugin}"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let proot = mp_dir.join("plugins").join(plugin);
+        let pcp = proot.join(".claude-plugin");
+        fs::create_dir_all(&pcp).unwrap();
+        fs::write(
+            pcp.join("plugin.json"),
+            format!(r#"{{"name":"{plugin}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+
+        let cmds = proot.join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(cmds.join("hello.md"), "Say hi $ARGUMENTS\n").unwrap();
+
+        let agents = proot.join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("helper.md"),
+            "---\nname: helper\ndescription: helps\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skill = proot.join("skills").join("greet");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\ndescription: greets\n---\ninstructions\n",
+        )
+        .unwrap();
+
+        let hooks_dir = proot.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(
+            hooks_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/check.sh"}]}]}}"#,
+        )
+        .unwrap();
+    }
+
+    /// Write `<base>/.claude/settings.json` enabling `key` (e.g. "foo@acme").
+    fn enable_plugin(base: &Path, key: &str) {
+        let claude = base.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            format!(r#"{{"enabledPlugins":{{"{key}":true}}}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn enabled_plugin_contributes_namespaced_artifacts() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_marketplace(proj.path(), "acme", "foo");
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+
+        assert!(
+            ext.commands.iter().any(|c| c.name == "foo:hello"),
+            "commands: {:?}",
+            ext.commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(ext.agents.iter().any(|a| a.name == "foo:helper"));
+        assert!(ext.skills.iter().any(|s| s.name == "foo:greet"));
+
+        // The plugin's PreToolUse hook is appended, with ${CLAUDE_PLUGIN_ROOT} expanded.
+        assert_eq!(ext.hooks.pre_tool_use.len(), 1);
+        let cmd = &ext.hooks.pre_tool_use[0].hooks[0].command;
+        assert!(cmd.ends_with("/check.sh"), "got: {cmd}");
+        assert!(
+            !cmd.contains("${CLAUDE_PLUGIN_ROOT}"),
+            "not expanded: {cmd}"
+        );
+        assert!(
+            cmd.contains("foo"),
+            "expansion should include plugin dir: {cmd}"
+        );
     }
 
     #[test]
