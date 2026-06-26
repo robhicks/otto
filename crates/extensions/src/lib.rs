@@ -807,4 +807,109 @@ mod tests {
         assert_eq!(out, "/abs/plugin/a /abs/plugin/b");
         assert_eq!(expand_plugin_root("no token", root), "no token");
     }
+
+    #[test]
+    fn plugin_not_enabled_contributes_nothing() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_marketplace(proj.path(), "acme", "foo");
+        // No enable_plugin → "foo@acme" is not enabled.
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.commands.iter().all(|c| !c.name.starts_with("foo:")));
+        assert!(ext.agents.iter().all(|a| !a.name.starts_with("foo:")));
+        assert!(ext.skills.is_empty());
+        assert!(ext.hooks.is_empty());
+    }
+
+    #[test]
+    fn enabled_false_contributes_nothing() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_marketplace(proj.path(), "acme", "foo");
+        fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"foo@acme":false}}"#,
+        )
+        .unwrap();
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.skills.is_empty());
+        assert!(ext.commands.iter().all(|c| !c.name.starts_with("foo:")));
+    }
+
+    #[test]
+    fn project_command_wins_over_plugin_namespaced_collision() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        // A project command whose namespaced name is exactly "foo:hello".
+        write_command(proj.path(), "foo/hello.md", "PROJECT WINS\n");
+        write_plugin_marketplace(proj.path(), "acme", "foo"); // plugin command hello → foo:hello
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        let hits: Vec<_> = ext
+            .commands
+            .iter()
+            .filter(|c| c.name == "foo:hello")
+            .collect();
+        assert_eq!(hits.len(), 1, "collision must collapse to one");
+        assert_eq!(hits[0].template.trim(), "PROJECT WINS");
+    }
+
+    #[test]
+    fn remote_source_enabled_is_skipped_not_fatal() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let mp_dir = proj
+            .path()
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("acme");
+        let cp = mp_dir.join(".claude-plugin");
+        fs::create_dir_all(&cp).unwrap();
+        fs::write(
+            cp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"rem","source":{"source":"github","repo":"a/b"}}]}"#,
+        )
+        .unwrap();
+        enable_plugin(proj.path(), "rem@acme");
+
+        // Must not panic; contributes nothing.
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.commands.iter().all(|c| !c.name.starts_with("rem:")));
+        assert!(ext.skills.is_empty());
+    }
+
+    #[test]
+    fn malformed_marketplace_json_skipped_not_fatal() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        let cp = proj
+            .path()
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("acme")
+            .join(".claude-plugin");
+        fs::create_dir_all(&cp).unwrap();
+        fs::write(cp.join("marketplace.json"), "{ not json").unwrap();
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.skills.is_empty());
+    }
+
+    #[test]
+    fn user_marketplace_plugin_enabled_via_user_settings() {
+        // A plugin installed under the HOME base, enabled by HOME settings, must activate.
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_marketplace(home.path(), "acme", "foo");
+        enable_plugin(home.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.skills.iter().any(|s| s.name == "foo:greet"));
+    }
 }
