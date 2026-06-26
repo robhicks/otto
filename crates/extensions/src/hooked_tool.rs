@@ -98,9 +98,16 @@ impl Tool for HookedTool {
             self.fire(&self.pre, &input, true).await?;
         }
 
-        let result = self.inner.call(args.clone()).await?;
+        // Clone the args for the PostToolUse payload only when a post hook will consume them.
+        let args_for_post = if self.post.is_empty() {
+            None
+        } else {
+            Some(args.clone())
+        };
+        // PostToolUse hooks do not fire when the inner tool fails (the `?` returns early here).
+        let result = self.inner.call(args).await?;
 
-        if !self.post.is_empty() {
+        if let Some(args) = args_for_post {
             let input = json!({
                 "hook_event_name": "PostToolUse",
                 "tool_name": name,
@@ -108,9 +115,9 @@ impl Tool for HookedTool {
                 "tool_response": &result,
             })
             .to_string();
+            // `fire(.., blocking=false)` never returns Err; the discard is for clarity.
             let _ = self.fire(&self.post, &input, false).await;
         }
-
         Ok(result)
     }
 }

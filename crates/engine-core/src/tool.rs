@@ -157,6 +157,11 @@ impl ToolRegistry {
         for name in names {
             if let Some(tool) = self.tools.remove(&name) {
                 let wrapped = f(tool);
+                debug_assert_eq!(
+                    wrapped.name(),
+                    name,
+                    "wrap_each closure must preserve the tool name"
+                );
                 self.tools.insert(wrapped.name().to_string(), wrapped);
             }
         }

@@ -334,6 +334,8 @@ async fn run_custom_agent_in(
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
 
     let task = TaskTool::new(
@@ -378,6 +380,8 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
@@ -473,6 +477,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
