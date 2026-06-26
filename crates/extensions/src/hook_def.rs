@@ -44,12 +44,12 @@ pub fn parse_hooks(settings_json: &str) -> anyhow::Result<HookSet> {
         return Ok(HookSet::default());
     };
     Ok(HookSet {
-        pre_tool_use: parse_event(hooks.get("PreToolUse")),
-        post_tool_use: parse_event(hooks.get("PostToolUse")),
+        pre_tool_use: parse_event("PreToolUse", hooks.get("PreToolUse")),
+        post_tool_use: parse_event("PostToolUse", hooks.get("PostToolUse")),
     })
 }
 
-fn parse_event(val: Option<&Value>) -> Vec<HookMatcher> {
+fn parse_event(event: &str, val: Option<&Value>) -> Vec<HookMatcher> {
     let Some(arr) = val.and_then(|v| v.as_array()) else {
         return Vec::new();
     };
@@ -65,6 +65,10 @@ fn parse_event(val: Option<&Value>) -> Vec<HookMatcher> {
                 let is_command = h.get("type").and_then(|t| t.as_str()) == Some("command");
                 let command = h.get("command").and_then(|c| c.as_str()).unwrap_or("");
                 if !is_command || command.is_empty() {
+                    eprintln!(
+                        "warning: skipping a {event} hook entry that is not a non-empty \
+                         type:\"command\" hook (check the `type` and `command` fields)"
+                    );
                     continue;
                 }
                 cmds.push(HookCommand {

@@ -148,10 +148,12 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
-    /// Replace every registered tool with `f(tool)`, keying by the wrapper's `name()` (wrappers
-    /// are expected to preserve the inner name). The gate and ask-resolver are unchanged. This is
-    /// a generic capability — the engine uses it to wrap tools with hook decorators — so the core
-    /// stays free of any concrete decorator type.
+    /// Replace every registered tool with `f(tool)`. The registry is re-keyed by the ORIGINAL
+    /// tool name (a debug assertion flags a non-preserving closure, but a misbehaving closure
+    /// cannot corrupt the registry — it will simply yield an ineffective wrapper rather than
+    /// creating a new entry under a different name). The gate and ask-resolver are unchanged.
+    /// This is a generic capability — the engine uses it to wrap tools with hook decorators —
+    /// so the core stays free of any concrete decorator type.
     pub fn wrap_each(&mut self, mut f: impl FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>) {
         let names: Vec<String> = self.tools.keys().cloned().collect();
         for name in names {
@@ -162,7 +164,9 @@ impl ToolRegistry {
                     name,
                     "wrap_each closure must preserve the tool name"
                 );
-                self.tools.insert(wrapped.name().to_string(), wrapped);
+                // Re-key by the ORIGINAL name: a closure that fails to preserve the name then
+                // simply yields an ineffective wrapper rather than corrupting the registry.
+                self.tools.insert(name, wrapped);
             }
         }
     }
