@@ -366,12 +366,12 @@ fn fold_plugins(
 
     for base in [home, project_root] {
         let mp_root = base.join(".claude").join("plugins").join("marketplaces");
-        let entries = match std::fs::read_dir(&mp_root) {
-            Ok(e) => e,
+        let mut mp_dirs: Vec<std::path::PathBuf> = match std::fs::read_dir(&mp_root) {
+            Ok(e) => e.flatten().map(|entry| entry.path()).collect(),
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
-            let mp_dir = entry.path();
+        mp_dirs.sort();
+        for mp_dir in mp_dirs {
             if !mp_dir.is_dir() {
                 continue;
             }
