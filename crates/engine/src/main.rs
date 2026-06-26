@@ -770,6 +770,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabled_plugin_pretooluse_hook_blocks_a_tool_call() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping plugin hook blocking test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        // A marketplace under the project base offering one local plugin whose bundled hooks.json
+        // blocks fs.read; enabled via project settings.json.
+        let mp_dir = proj
+            .path()
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("acme");
+        let cp = mp_dir.join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(
+            cp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"guard","source":"./plugins/guard"}]}"#,
+        )
+        .unwrap();
+        let proot = mp_dir.join("plugins").join("guard");
+        let pcp = proot.join(".claude-plugin");
+        std::fs::create_dir_all(&pcp).unwrap();
+        std::fs::write(pcp.join("plugin.json"), r#"{"name":"guard"}"#).unwrap();
+        let hooks_dir = proot.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"guard@acme":true}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn discovered_posttooluse_hook_runs_without_blocking() {
         use otto_engine_core::tool::ToolRegistry;
         if !otto_tools::os_sandbox_available() {
