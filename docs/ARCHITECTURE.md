@@ -334,8 +334,12 @@ format:
   *below* the permission gate (deny-only). Lifecycle hooks, JSON-stdout control, the
   `--command`/`--agent` run subpaths, and serve-path wiring are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
-- plugins (`.claude-plugin/plugin.json`) → manifest parsed; each bundled component registered
-  via the rows above; **bundled MCP servers route straight into otto's MCP client unmodified.**
+- plugins (`.claude-plugin/plugin.json`) → discovered from on-disk marketplaces under
+  `.claude/plugins/marketplaces/`, gated by the `enabledPlugins` allowlist in `settings.json`, and
+  each enabled plugin's bundled `agents`/`commands`/`skills`/`hooks` folded into the rows above —
+  **namespaced by plugin name** (`foo:commit`), lowest precedence (user/project win),
+  `${CLAUDE_PLUGIN_ROOT}` expanded in hook commands. Bundled MCP servers (route straight into otto's
+  MCP client) and the network *install action* (marketplace `git clone`, lockfile) are pending.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
