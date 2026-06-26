@@ -839,6 +839,39 @@ mod tests {
     }
 
     #[test]
+    fn hook_order_is_deterministic_across_marketplaces() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        // Two marketplaces whose sorted dir order is aaa < bbb.
+        write_plugin_marketplace(proj.path(), "aaa", "p1");
+        write_plugin_marketplace(proj.path(), "bbb", "p2");
+        // Enable both (single settings.json — enable_plugin would overwrite).
+        fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"p1@aaa":true,"p2@bbb":true}}"#,
+        )
+        .unwrap();
+
+        let ext = discover(proj.path(), home.path());
+        let cmds: Vec<&str> = ext
+            .hooks
+            .pre_tool_use
+            .iter()
+            .flat_map(|m| m.hooks.iter().map(|h| h.command.as_str()))
+            .collect();
+        // Both plugins contributed one PreToolUse hook each, in sorted-marketplace order.
+        assert_eq!(cmds.len(), 2, "expected two plugin hooks, got: {cmds:?}");
+        assert!(
+            cmds[0].contains("/aaa/"),
+            "first hook should be from marketplace aaa: {cmds:?}"
+        );
+        assert!(
+            cmds[1].contains("/bbb/"),
+            "second hook should be from marketplace bbb: {cmds:?}"
+        );
+    }
+
+    #[test]
     fn project_command_wins_over_plugin_namespaced_collision() {
         let home = tempdir().unwrap();
         let proj = tempdir().unwrap();
