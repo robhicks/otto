@@ -81,6 +81,30 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
     }
 }
 
+/// Read the `enabledPlugins` allowlist from a `settings.json` document: a map of
+/// `"<plugin>@<marketplace>"` → bool. A missing object, invalid JSON, or non-bool values yield an
+/// empty map. A plugin activates only when its key maps to `true`.
+pub fn parse_enabled_plugins(settings_json: &str) -> std::collections::BTreeMap<String, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(settings_json) else {
+        return out;
+    };
+    if let Some(obj) = v.get("enabledPlugins").and_then(|e| e.as_object()) {
+        for (k, val) in obj {
+            if let Some(b) = val.as_bool() {
+                out.insert(k.clone(), b);
+            }
+        }
+    }
+    out
+}
+
+/// Replace every literal `${CLAUDE_PLUGIN_ROOT}` in `s` with `plugin_root`'s path. A textual
+/// substitution only — it never reads the environment, preserving hermetic determinism.
+pub fn expand_plugin_root(s: &str, plugin_root: &Path) -> String {
+    s.replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root.to_string_lossy())
+}
+
 /// Parse every `*.md` in `dir` (non-recursive). Missing dir → empty; unreadable/malformed
 /// files are skipped with a warning, never fatal.
 fn read_agents_dir(dir: &Path) -> Vec<CustomAgentDef> {
@@ -492,5 +516,28 @@ mod tests {
         let ext = discover(proj.path(), home.path());
         let names: Vec<_> = ext.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["good"]);
+    }
+
+    #[test]
+    fn parse_enabled_plugins_reads_bool_map() {
+        let map = parse_enabled_plugins(r#"{"enabledPlugins":{"foo@acme":true,"bar@acme":false}}"#);
+        assert_eq!(map.get("foo@acme"), Some(&true));
+        assert_eq!(map.get("bar@acme"), Some(&false));
+    }
+
+    #[test]
+    fn parse_enabled_plugins_missing_is_empty() {
+        assert!(parse_enabled_plugins(r#"{}"#).is_empty());
+        assert!(parse_enabled_plugins("not json").is_empty());
+        // non-bool values are ignored
+        assert!(parse_enabled_plugins(r#"{"enabledPlugins":{"foo@acme":"yes"}}"#).is_empty());
+    }
+
+    #[test]
+    fn expand_plugin_root_substitutes_all_occurrences() {
+        let root = Path::new("/abs/plugin");
+        let out = expand_plugin_root("${CLAUDE_PLUGIN_ROOT}/a ${CLAUDE_PLUGIN_ROOT}/b", root);
+        assert_eq!(out, "/abs/plugin/a /abs/plugin/b");
+        assert_eq!(expand_plugin_root("no token", root), "no token");
     }
 }
