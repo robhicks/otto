@@ -1,9 +1,9 @@
 //! `HookedTool`: a `Tool` decorator that fires matched `PreToolUse` hooks before the inner call
 //! (a `PreToolUse` hook may BLOCK by exiting 2) and `PostToolUse` hooks after (observe-only). It
 //! wraps the inner tool only when at least one hook matches the tool's name — otherwise `wrap`
-//! returns the inner `Arc` unchanged, so un-hooked tools pay zero overhead. The decorator runs
-//! INSIDE the inner tool's `call`, which `ToolRegistry::call` reaches only after the permission
-//! gate allows — so a hook can deny an allowed call but never widen a denied one.
+//! returns the inner `Arc` unchanged, so un-hooked tools pay zero overhead. The decorator's `call`
+//! wraps the inner tool's `call`; `ToolRegistry::call` dispatches to the decorator only after the
+//! permission gate allows — so a hook can deny an allowed call but never widen a denied one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +17,9 @@ use crate::hook_exec::{HookEvent, HookExecutor};
 
 /// Default per-hook timeout when a `HookCommand` does not specify one.
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
+
+/// A `PreToolUse` hook blocks the tool call by exiting with this code (Claude Code convention).
+const BLOCK_EXIT_CODE: i32 = 2;
 
 pub struct HookedTool {
     inner: Arc<dyn Tool>,
@@ -54,7 +57,7 @@ impl HookedTool {
         for hook in hooks {
             let timeout = Duration::from_secs(hook.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
             match self.executor.run(&hook.command, input, timeout).await {
-                Ok(out) if out.exit_code == Some(2) && blocking => {
+                Ok(out) if blocking && out.exit_code == Some(BLOCK_EXIT_CODE) => {
                     anyhow::bail!(
                         "tool '{name}' blocked by PreToolUse hook ({}): {}",
                         hook.command,
@@ -62,18 +65,39 @@ impl HookedTool {
                     );
                 }
                 Ok(out) if out.exit_code != Some(0) => {
-                    eprintln!(
-                        "warning: hook ({}) for '{name}' exited {:?} (non-blocking): {}",
-                        hook.command,
-                        out.exit_code,
-                        out.stderr.trim()
-                    );
+                    if blocking {
+                        eprintln!(
+                            "warning: PreToolUse gate hook ({}) for '{name}' exited {:?} without \
+                             blocking (only exit {BLOCK_EXIT_CODE} blocks); tool will PROCEED \
+                             unguarded: {}",
+                            hook.command,
+                            out.exit_code,
+                            out.stderr.trim()
+                        );
+                    } else {
+                        eprintln!(
+                            "warning: PostToolUse hook ({}) for '{name}' exited {:?}: {}",
+                            hook.command,
+                            out.exit_code,
+                            out.stderr.trim()
+                        );
+                    }
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!(
-                    "warning: hook ({}) for '{name}' failed to run (non-blocking): {e}",
-                    hook.command
-                ),
+                Err(e) => {
+                    if blocking {
+                        eprintln!(
+                            "warning: PreToolUse gate hook ({}) for '{name}' failed to run; tool \
+                             will PROCEED unguarded: {e}",
+                            hook.command
+                        );
+                    } else {
+                        eprintln!(
+                            "warning: PostToolUse hook ({}) for '{name}' failed to run: {e}",
+                            hook.command
+                        );
+                    }
+                }
             }
         }
         Ok(())

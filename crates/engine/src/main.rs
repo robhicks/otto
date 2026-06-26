@@ -225,15 +225,26 @@ fn register_skills(
     }
 }
 
-/// Wrap every registered tool with hook decorators when hooks were discovered AND an OS sandbox
-/// backend exists. No hooks, or no sandbox backend → no wrapping, so the tool set is unchanged
-/// (fail-closed, mirroring how `bash` is absent without a sandbox).
+/// Wrap every registered tool with hook decorators. With no hooks configured, nothing happens.
+/// If hooks ARE configured but no OS sandbox backend is available, the hooks are skipped (their
+/// commands are never run unsandboxed) and a loud warning is printed: a configured blocking
+/// `PreToolUse` hook will NOT fire, so it cannot protect the call — unlike `bash`, the guarded
+/// tools still run. Only when hooks exist AND a sandbox backend is present is every tool wrapped.
 fn register_hooks(
     registry: &mut otto_engine_core::tool::ToolRegistry,
     hooks: &otto_extensions::HookSet,
     root: &std::path::Path,
 ) {
-    if hooks.is_empty() || !otto_tools::os_sandbox_available() {
+    if hooks.is_empty() {
+        return;
+    }
+    if !otto_tools::os_sandbox_available() {
+        eprintln!(
+            "warning: {} hook(s) are configured in settings.json but no OS sandbox backend \
+             (bwrap/sandbox-exec) is available — hooks will NOT run, so tool calls are NOT \
+             guarded by them. Install bwrap (Linux) or sandbox-exec (macOS) to enable hooks.",
+            hooks.pre_tool_use.len() + hooks.post_tool_use.len()
+        );
         return;
     }
     let exec: Arc<dyn otto_extensions::HookExecutor> =
@@ -313,6 +324,12 @@ async fn run_custom_agent_in(
     use std::collections::HashMap;
 
     let ext = otto_extensions::discover(&root, &home);
+    if !ext.hooks.is_empty() {
+        eprintln!(
+            "warning: settings.json hooks are configured but are NOT enforced on this path \
+             (hooks are wired only on the `otto run` spine for now)."
+        );
+    }
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
@@ -367,6 +384,12 @@ async fn run_command_in(
     use otto_extensions::{expand_args, resolve_injections};
 
     let ext = otto_extensions::discover(&root, &home);
+    if !ext.hooks.is_empty() {
+        eprintln!(
+            "warning: settings.json hooks are configured but are NOT enforced on this path \
+             (hooks are wired only on the `otto run` spine for now)."
+        );
+    }
     let def = ext
         .commands
         .into_iter()
@@ -473,6 +496,16 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             std::process::exit(2);
         }
     };
+
+    {
+        let ext = otto_extensions::discover(&root, &home_dir());
+        if !ext.hooks.is_empty() {
+            eprintln!(
+                "warning: settings.json hooks are configured but are NOT enforced on the serve \
+                 path (hooks are wired only on the `otto run` spine for now)."
+            );
+        }
+    }
 
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
