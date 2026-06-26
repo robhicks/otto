@@ -148,6 +148,25 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Replace every registered tool with `f(tool)`, keying by the wrapper's `name()` (wrappers
+    /// are expected to preserve the inner name). The gate and ask-resolver are unchanged. This is
+    /// a generic capability — the engine uses it to wrap tools with hook decorators — so the core
+    /// stays free of any concrete decorator type.
+    pub fn wrap_each(&mut self, mut f: impl FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>) {
+        let names: Vec<String> = self.tools.keys().cloned().collect();
+        for name in names {
+            if let Some(tool) = self.tools.remove(&name) {
+                let wrapped = f(tool);
+                debug_assert_eq!(
+                    wrapped.name(),
+                    name,
+                    "wrap_each closure must preserve the tool name"
+                );
+                self.tools.insert(wrapped.name().to_string(), wrapped);
+            }
+        }
+    }
+
     /// Return the gate's `Decision` for a proposed call WITHOUT dispatching. Lets the
     /// orchestrator gate edits it applies directly (via the workspace) through the same
     /// policy that governs tool calls.
@@ -344,5 +363,28 @@ mod tests {
         r.register(Arc::new(PingTool));
         let sub = r.subset(&[]);
         assert!(sub.call("ping", json!({})).await.is_err());
+    }
+
+    struct PrefixTool {
+        inner: Arc<dyn Tool>,
+    }
+    #[async_trait]
+    impl Tool for PrefixTool {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn call(&self, args: Value) -> anyhow::Result<Value> {
+            let inner = self.inner.call(args).await?;
+            Ok(json!({ "wrapped": inner }))
+        }
+    }
+
+    #[tokio::test]
+    async fn wrap_each_replaces_every_tool_preserving_name() {
+        let mut r = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        r.register(Arc::new(EchoTool));
+        r.wrap_each(|t| Arc::new(PrefixTool { inner: t }));
+        let out = r.call("echo", json!({ "x": 1 })).await.unwrap();
+        assert_eq!(out, json!({ "wrapped": { "echoed": { "x": 1 } } }));
     }
 }

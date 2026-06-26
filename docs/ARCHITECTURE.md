@@ -328,7 +328,11 @@ format:
 - `agents/*.md` → `AgentRegistry` as `Role::Custom(name)` (honors per-agent tool allowlist + model).
 - `commands/*.md` → command registry (recursive, namespaced `git:commit`); expanded (`$ARGUMENTS`/`$1..$9` + gated `!bash`/`@file` injection) and run as a spine turn via `otto run --command`. (`model`/`allowed-tools` preserved, not yet routed/enforced.)
 - `skills` (`SKILL.md` + resources) → discovered one-level (`skills/<name>/SKILL.md`, project overrides user by name) and exposed via a built-in gated `skill` tool returning `instructions` + `resource_dir`; bundled resources read lazily through gated `fs.read`. (`allowed-tools` parsed, inert until the permissions slice.)
-- `settings.json` hooks → `HookRegistry`, fired at the same lifecycle points.
+- `settings.json` hooks → discovered (`PreToolUse`/`PostToolUse`, concatenated across user+project)
+  and fired around tool dispatch via a `HookedTool` decorator, executed through the shared OS
+  sandbox; a `PreToolUse` hook may block a call (exit 2), `PostToolUse` observes. Hooks compose
+  *below* the permission gate (deny-only). Lifecycle hooks, JSON-stdout control, the
+  `--command`/`--agent` run subpaths, and serve-path wiring are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → manifest parsed; each bundled component registered
   via the rows above; **bundled MCP servers route straight into otto's MCP client unmodified.**

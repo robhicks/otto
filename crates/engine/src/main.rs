@@ -225,6 +225,22 @@ fn register_skills(
     }
 }
 
+/// Wrap every registered tool with hook decorators when hooks were discovered AND an OS sandbox
+/// backend exists. No hooks, or no sandbox backend → no wrapping, so the tool set is unchanged
+/// (fail-closed, mirroring how `bash` is absent without a sandbox).
+fn register_hooks(
+    registry: &mut otto_engine_core::tool::ToolRegistry,
+    hooks: &otto_extensions::HookSet,
+    root: &std::path::Path,
+) {
+    if hooks.is_empty() || !otto_tools::os_sandbox_available() {
+        return;
+    }
+    let exec: Arc<dyn otto_extensions::HookExecutor> =
+        Arc::new(otto_engine::SandboxedHookExecutor::new(root.to_path_buf()));
+    registry.wrap_each(|t| otto_extensions::HookedTool::wrap(t, hooks, exec.clone()));
+}
+
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let (root, after_root) = parse_root(&args);
     let (command_name, after_cmd) = parse_command_flag(&after_root);
@@ -257,6 +273,7 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
     let ext = otto_extensions::discover(&root, &home_dir());
     register_skills(&mut tools, &ext.skills);
+    register_hooks(&mut tools, &ext.hooks, &root);
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -317,6 +334,8 @@ async fn run_custom_agent_in(
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
 
     let task = TaskTool::new(
@@ -361,6 +380,8 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
@@ -456,6 +477,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
@@ -677,5 +700,103 @@ mod tests {
         );
         register_skills(&mut reg, &ext.skills);
         assert!(!reg.tool_names().iter().any(|n| n == "skill"));
+    }
+
+    #[tokio::test]
+    async fn discovered_pretooluse_hook_blocks_a_tool_call() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping hooks blocking test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_posttooluse_hook_runs_without_blocking() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping hooks PostToolUse test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        // PostToolUse hook on fs.read drops a marker file in the workspace root (sandbox allows it).
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"touch post_ran.marker"}]}]}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        // PostToolUse must not block: the call returns the file content normally.
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return content, got: {out}"
+        );
+        // And the PostToolUse hook actually fired (marker created in the workspace root).
+        assert!(
+            proj.path().join("post_ran.marker").exists(),
+            "PostToolUse hook did not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_settings_leaves_tools_unwrapped() {
+        use otto_engine_core::tool::ToolRegistry;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return file content, got: {out}"
+        );
     }
 }

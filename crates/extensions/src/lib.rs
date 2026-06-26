@@ -8,6 +8,9 @@
 mod agent_def;
 mod command_def;
 mod command_expand;
+mod hook_def;
+mod hook_exec;
+mod hooked_tool;
 mod markdown_agent;
 mod skill_def;
 mod skill_tool;
@@ -16,6 +19,9 @@ mod task_tool;
 pub use agent_def::{CustomAgentDef, parse_agent_md};
 pub use command_def::{CustomCommandDef, parse_command_md};
 pub use command_expand::{expand_args, resolve_injections};
+pub use hook_def::{HookCommand, HookMatcher, HookSet, parse_hooks};
+pub use hook_exec::{HookEvent, HookExecutor, HookOutcome, matcher_selects};
+pub use hooked_tool::HookedTool;
 pub use markdown_agent::MarkdownAgent;
 pub use skill_def::{CustomSkillDef, parse_skill_md};
 pub use skill_tool::SkillTool;
@@ -24,12 +30,13 @@ pub use task_tool::TaskTool;
 use std::path::Path;
 
 /// Everything discovered from the `.claude/` directories. Slice 1: custom agents.
-/// Slice 2: commands. Slice 3: skills.
+/// Slice 2: commands. Slice 3: skills. Slice 4: hooks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Extensions {
     pub agents: Vec<CustomAgentDef>,
     pub commands: Vec<CustomCommandDef>,
     pub skills: Vec<CustomSkillDef>,
+    pub hooks: HookSet,
 }
 
 /// Discover `<home>/.claude/agents/*.md` then `<project_root>/.claude/agents/*.md`. Project
@@ -45,6 +52,7 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         std::collections::BTreeMap::new();
     let mut skills: std::collections::BTreeMap<String, CustomSkillDef> =
         std::collections::BTreeMap::new();
+    let mut hooks = HookSet::default();
     for base in [home, project_root] {
         let claude = base.join(".claude");
         for def in read_agents_dir(&claude.join("agents")) {
@@ -56,11 +64,16 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         for def in read_skills_dir(&claude.join("skills")) {
             skills.insert(def.name.clone(), def);
         }
+        let mut base_hooks = read_settings_hooks(&claude.join("settings.json"));
+        // Concatenate (user-base first, then project) — hooks are additive, not override-by-name.
+        hooks.pre_tool_use.append(&mut base_hooks.pre_tool_use);
+        hooks.post_tool_use.append(&mut base_hooks.post_tool_use);
     }
     Extensions {
         agents: agents.into_values().collect(),
         commands: commands.into_values().collect(),
         skills: skills.into_values().collect(),
+        hooks,
     }
 }
 
@@ -182,6 +195,32 @@ fn read_skills_dir(dir: &Path) -> Vec<CustomSkillDef> {
         }
     }
     out
+}
+
+/// Read `<base>/.claude/settings.json` and parse its tool-dispatch hooks. A missing file yields
+/// no hooks; an unreadable file or one with invalid JSON is skipped with a warning, never fatal.
+fn read_settings_hooks(path: &Path) -> HookSet {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HookSet::default(),
+        Err(e) => {
+            eprintln!(
+                "warning: skipping unreadable settings {}: {e}",
+                path.display()
+            );
+            return HookSet::default();
+        }
+    };
+    match parse_hooks(&text) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!(
+                "warning: skipping malformed settings {}: {e}",
+                path.display()
+            );
+            HookSet::default()
+        }
+    }
 }
 
 /// Namespaced command name: path relative to `base`, extension stripped, components joined by `:`.
@@ -322,6 +361,12 @@ mod tests {
         assert!(ext.commands.is_empty());
     }
 
+    fn write_settings(dir: &Path, body: &str) {
+        let claude = dir.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("settings.json"), body).unwrap();
+    }
+
     fn write_skill(dir: &Path, name: &str, body: &str) {
         let skill = dir.join(".claude").join("skills").join(name);
         fs::create_dir_all(&skill).unwrap();
@@ -392,6 +437,44 @@ mod tests {
 
         let ext = discover(proj.path(), home.path());
         assert!(ext.skills.is_empty());
+    }
+
+    #[test]
+    fn discovers_and_concatenates_hooks_from_both_bases() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_settings(
+            home.path(),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"user.sh"}]}]}}"#,
+        );
+        write_settings(
+            proj.path(),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"proj.sh"}]}]}}"#,
+        );
+
+        let ext = discover(proj.path(), home.path());
+        let cmds: Vec<_> = ext
+            .hooks
+            .pre_tool_use
+            .iter()
+            .flat_map(|m| m.hooks.iter().map(|h| h.command.clone()))
+            .collect();
+        assert_eq!(cmds, vec!["user.sh", "proj.sh"], "user first, then project");
+    }
+
+    #[test]
+    fn missing_settings_yields_no_hooks() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        assert_eq!(discover(proj.path(), home.path()).hooks, HookSet::default());
+    }
+
+    #[test]
+    fn malformed_settings_skipped_not_fatal() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_settings(proj.path(), "{ not json");
+        assert_eq!(discover(proj.path(), home.path()).hooks, HookSet::default());
     }
 
     #[test]
