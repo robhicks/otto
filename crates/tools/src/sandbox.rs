@@ -186,26 +186,30 @@ pub async fn run_sandboxed_with_stdin(
         .kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
-    if let Some(payload) = stdin {
-        // `Stdio::piped()` is set above whenever `stdin.is_some()`, so the handle is present.
-        let mut handle = child
-            .stdin
-            .take()
-            .expect("stdin handle present after Stdio::piped()");
-        // A hook that ignores stdin may exit before we finish writing; a BrokenPipe here is not
-        // a failure — the child's exit code (from wait_with_output) is what we report.
-        if let Err(e) = handle.write_all(payload.as_bytes()).await {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(e.into());
+    // Wrap the entire write + shutdown + wait in ONE timeout so that a hook that never reads
+    // stdin (and stays alive with a large payload filling the pipe buffer) cannot block forever.
+    // On timeout the future is dropped → `child` is dropped → killed via kill_on_drop.
+    let output = tokio::time::timeout(timeout, async move {
+        if let Some(payload) = stdin {
+            // `Stdio::piped()` is set above whenever `stdin.is_some()`, so the handle is present.
+            let mut handle = child
+                .stdin
+                .take()
+                .expect("stdin handle present after Stdio::piped()");
+            // A hook that ignores stdin may exit before we finish writing; a BrokenPipe here is
+            // not a failure — the child's exit code (from wait_with_output) is what we report.
+            if let Err(e) = handle.write_all(payload.as_bytes()).await {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err::<std::process::Output, anyhow::Error>(e.into());
+                }
             }
+            // EOF is delivered when `handle` is dropped at end of scope; shutdown is best-effort.
+            let _ = handle.shutdown().await;
         }
-        // EOF is delivered when `handle` is dropped at end of scope; shutdown is best-effort.
-        let _ = handle.shutdown().await;
-    }
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Err(_) => anyhow::bail!("bash command timed out after {} ms", timeout.as_millis()),
-        Ok(result) => result?,
-    };
+        child.wait_with_output().await.map_err(Into::into)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("bash command timed out after {} ms", timeout.as_millis()))??;
 
     Ok(json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
@@ -287,6 +291,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["exit_code"].as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_sandboxed_with_stdin_times_out_when_command_never_reads_large_payload() {
+        use std::time::Duration;
+        let root = std::path::PathBuf::from(".");
+        // A long-lived command that never reads stdin. With a payload larger than the OS pipe
+        // buffer (~64 KiB) the stdin write blocks; the overall timeout must still fire rather
+        // than hang forever (regression test for the write-outside-timeout bug).
+        let big = "x".repeat(256 * 1024);
+        let res = run_sandboxed_with_stdin(
+            &SandboxPolicy::None,
+            &root,
+            "sleep 30",
+            Duration::from_millis(300),
+            Some(&big),
+        )
+        .await;
+        assert!(res.is_err(), "expected a timeout error, got: {res:?}");
     }
 
     #[test]
