@@ -351,6 +351,10 @@ fn fold_one_plugin(
     hooks.post_tool_use.append(&mut plugin_hooks.post_tool_use);
 
     // Bundled MCP servers (Plan B): path override, inline object, or the convention `.mcp.json`.
+    // A `Path` override is not root-contained (an absolute or `../` path would escape `plugin_root`),
+    // matching the hook-path posture: the plugin is already user-trusted via `enabledPlugins`, this
+    // only reads a JSON file whose contents become a command the user already trusts the plugin to
+    // supply — so containment here adds no boundary the enable-gate doesn't already own.
     let raw: Option<serde_json::Value> = match &manifest.mcp_servers {
         Some(McpServersField::Inline(v)) => Some(v.clone()),
         Some(McpServersField::Path(p)) => {
