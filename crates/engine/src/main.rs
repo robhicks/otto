@@ -383,7 +383,7 @@ async fn run_custom_agent_in(
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers and permission rules are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(
         tools_ws,
@@ -441,7 +441,7 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers and permission rules are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) = build_tools_preferring_mcp(
@@ -553,7 +553,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers and permission rules are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (tools, _mcp_conns) = build_tools_preferring_mcp(
         tools_workspace,
@@ -785,6 +785,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_path_registry_applies_discovered_permissions() {
+        // NOTE: this mirrors cmd_run's registry-selection logic (discover → build_tool_registry_with_permissions
+        // when rules exist) rather than calling build_tools_preferring_mcp directly, which would spawn MCP
+        // child processes and be environment-dependent. Keep this selection in sync with cmd_run.
         use otto_workspace::LocalWorkspace;
         use serde_json::json;
         use std::sync::Arc;
