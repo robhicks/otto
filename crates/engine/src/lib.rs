@@ -31,6 +31,7 @@ pub use loopback::LoopbackTarget;
 pub use mcp::{
     McpConnection, connect_bash as mcp_connect_bash, connect_fs as mcp_connect_fs,
     connect_git as mcp_connect_git, connect_grep as mcp_connect_grep,
+    connect_plugin_server as mcp_connect_plugin_server,
 };
 pub use otto_remote::{
     MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode, ProvisionedMachine,
