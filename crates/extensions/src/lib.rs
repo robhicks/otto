@@ -368,20 +368,25 @@ fn fold_one_plugin(
         // Accepted Claude-Code-compat heuristic; intentionally not made stricter.
         let servers = v.get("mcpServers").unwrap_or(&v);
         for mut spec in parse_mcp_servers(servers, ns) {
-            spec.command = expand_plugin_root(&spec.command, plugin_root);
-            spec.args = spec
-                .args
-                .iter()
-                .map(|a| expand_plugin_root(a, plugin_root))
-                .collect();
-            spec.env = spec
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), expand_plugin_root(v, plugin_root)))
-                .collect();
-            spec.cwd = spec.cwd.map(|c| expand_plugin_root(&c, plugin_root));
+            expand_mcp_server_root(&mut spec, plugin_root);
             mcp_servers.push(spec);
         }
+    }
+}
+
+/// Expand `${CLAUDE_PLUGIN_ROOT}` in every path-bearing field of a bundled MCP server spec
+/// (`command`/`args`/`env` values/`cwd`), in place. Keeps the substitution in one spot so a new
+/// path-bearing field can't be added to the spawn path without also being expanded.
+fn expand_mcp_server_root(spec: &mut PluginMcpServer, plugin_root: &Path) {
+    spec.command = expand_plugin_root(&spec.command, plugin_root);
+    for a in &mut spec.args {
+        *a = expand_plugin_root(a, plugin_root);
+    }
+    for v in spec.env.values_mut() {
+        *v = expand_plugin_root(v, plugin_root);
+    }
+    if let Some(cwd) = &mut spec.cwd {
+        *cwd = expand_plugin_root(cwd, plugin_root);
     }
 }
 
