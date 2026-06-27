@@ -338,8 +338,12 @@ format:
   `.claude/plugins/marketplaces/`, gated by the `enabledPlugins` allowlist in `settings.json`, and
   each enabled plugin's bundled `agents`/`commands`/`skills`/`hooks` folded into the rows above —
   **namespaced by plugin name** (`foo:commit`), lowest precedence (user/project win),
-  `${CLAUDE_PLUGIN_ROOT}` expanded in hook commands. Bundled MCP servers (route straight into otto's
-  MCP client) and the network *install action* (marketplace `git clone`, lockfile) are pending.
+  `${CLAUDE_PLUGIN_ROOT}` expanded in hook commands. Each enabled plugin's bundled MCP servers
+  (`.mcp.json` or an inline `mcpServers` object) route straight into otto's MCP client: discovery
+  emits `${CLAUDE_PLUGIN_ROOT}`-expanded `PluginMcpServer` specs and the engine spawns + registers
+  them via `connect_plugin_server` under namespaced gate names (`plugin__{ns}__{key}__{tool}`, so a
+  bundled tool can never impersonate a built-in). The network *install action* (marketplace
+  `git clone`, lockfile) is still pending.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
