@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use otto_engine::{
     McpConnection, build_router, build_tool_registry, mcp_connect_bash, mcp_connect_fs,
-    mcp_connect_git, mcp_connect_grep, resolve_tls_paths, run_goal, serve_app_with_base, serve_run,
+    mcp_connect_git, mcp_connect_grep, mcp_connect_plugin_server, resolve_tls_paths, run_goal,
+    serve_app_with_base, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
@@ -278,13 +279,33 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (mut tools, _mcp_conns) =
+    let (mut tools, mut mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
-    // _mcp_conns is held until end of function so the mcp children stay alive.
+    // mcp_conns is held until end of function so the mcp children stay alive.
     // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
     let ext = otto_extensions::discover(&root, &home_dir());
     register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
+    // Bundled plugin MCP servers (Plan B): spawn each enabled plugin's servers through the same
+    // stdio connect path otto uses for its own MCP servers; register the namespaced tools behind the
+    // gate. A server that won't spawn is logged and skipped (additive, never fatal). With no
+    // `.claude/plugins/`, `ext.mcp_servers` is empty and the tool set is byte-for-byte unchanged.
+    // These register after `register_hooks`' `wrap_each`, so plugin MCP tools are gate-guarded but
+    // not hook-wrapped this slice — a `plugin__…` hook matcher would not fire (deferred extension).
+    for spec in &ext.mcp_servers {
+        match mcp_connect_plugin_server(spec).await {
+            Ok((conn, mcp_tools)) => {
+                for t in mcp_tools {
+                    tools.register(t);
+                }
+                mcp_conns.push(conn);
+            }
+            Err(e) => eprintln!(
+                "plugin mcp server {}:{} unavailable ({e}); skipping",
+                spec.namespace, spec.server_key
+            ),
+        }
+    }
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -351,7 +372,7 @@ async fn run_custom_agent_in(
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
 
@@ -403,7 +424,7 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) =
@@ -510,7 +531,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
@@ -750,6 +771,65 @@ mod tests {
         std::fs::write(
             claude.join("settings.json"),
             r#"{"hooks":{"PreToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let mut tools: ToolRegistry =
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf());
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        super::register_hooks(&mut tools, &ext.hooks, proj.path());
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_plugin_pretooluse_hook_blocks_a_tool_call() {
+        use otto_engine_core::tool::ToolRegistry;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping plugin hook blocking test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        // A marketplace under the project base offering one local plugin whose bundled hooks.json
+        // blocks fs.read; enabled via project settings.json.
+        let mp_dir = proj
+            .path()
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("acme");
+        let cp = mp_dir.join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(
+            cp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"guard","source":"./plugins/guard"}]}"#,
+        )
+        .unwrap();
+        let proot = mp_dir.join("plugins").join("guard");
+        let pcp = proot.join(".claude-plugin");
+        std::fs::create_dir_all(&pcp).unwrap();
+        std::fs::write(pcp.join("plugin.json"), r#"{"name":"guard"}"#).unwrap();
+        let hooks_dir = proot.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"fs.read","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"guard@acme":true}}"#,
         )
         .unwrap();
 

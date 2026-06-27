@@ -108,10 +108,10 @@ fn to_gate_name(server_name: &str) -> String {
 // Public connect API
 // ---------------------------------------------------------------------------
 
-/// Spawn `command` as an MCP server, initialise the connection, list its tools, and return a
-/// `McpConnection` (keeps the child alive) plus one `Arc<dyn Tool>` per advertised tool.
-pub async fn connect(
+/// Core connect: spawn `command`, list tools, map each server tool name to a gate name via `map`.
+async fn connect_mapped(
     command: tokio::process::Command,
+    map: impl Fn(&str) -> String,
 ) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
     let transport = TokioChildProcess::new(command)?;
     let service = Arc::new(().serve(transport).await?);
@@ -122,7 +122,7 @@ pub async fn connect(
         .into_iter()
         .map(|t| {
             let server_name = t.name.to_string();
-            let gate_name = to_gate_name(&server_name);
+            let gate_name = map(&server_name);
             Arc::new(McpTool {
                 service: Arc::clone(&service),
                 server_name,
@@ -132,6 +132,45 @@ pub async fn connect(
         .collect();
 
     Ok((McpConnection { service }, mcp_tools))
+}
+
+/// Spawn `command` as an MCP server, initialise the connection, list its tools, and return a
+/// `McpConnection` (keeps the child alive) plus one `Arc<dyn Tool>` per advertised tool.
+pub async fn connect(
+    command: tokio::process::Command,
+) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+    connect_mapped(command, to_gate_name).await
+}
+
+/// Namespaced gate name for a plugin-bundled MCP tool. Distinct from otto's `fs.*`/`bash`/`git.*`
+/// so a plugin server can never shadow or be confused with a built-in tool by the gate.
+fn plugin_gate_name(namespace: &str, server_key: &str, tool: &str) -> String {
+    format!("plugin__{namespace}__{server_key}__{tool}")
+}
+
+/// Spawn a plugin-bundled MCP server from its spec and register each advertised tool under a
+/// namespaced gate name. The spec's `command`/`args`/`env`/`cwd` are already
+/// `${CLAUDE_PLUGIN_ROOT}`-expanded by discovery.
+///
+/// Security note: the registered tools route through the gate like any other, but the gate's
+/// sensitive-path floor only inspects the standard `path`/`paths`/`glob` argument shapes (same as
+/// otto's own `git.*`/`grep` tools). A third-party plugin tool that takes a file path under a
+/// non-standard key would not have that path floor-checked — vetting a plugin's tool schemas is part
+/// of deciding whether to add it to `enabledPlugins` (the trust gate for plugins at all).
+pub async fn connect_plugin_server(
+    spec: &otto_extensions::PluginMcpServer,
+) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {
+    let mut command = tokio::process::Command::new(&spec.command);
+    command.args(&spec.args);
+    for (k, v) in &spec.env {
+        command.env(k, v);
+    }
+    if let Some(cwd) = &spec.cwd {
+        command.current_dir(cwd);
+    }
+    let ns = spec.namespace.clone();
+    let key = spec.server_key.clone();
+    connect_mapped(command, move |tool| plugin_gate_name(&ns, &key, tool)).await
 }
 
 /// Convenience: build the `mcp-fs <root>` command and connect.
@@ -213,5 +252,27 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn plugin_gate_name_is_namespaced() {
+        assert_eq!(
+            super::plugin_gate_name("foo", "my-server", "search"),
+            "plugin__foo__my-server__search"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_plugin_server_with_bogus_command_errors() {
+        use otto_extensions::PluginMcpServer;
+        let spec = PluginMcpServer {
+            namespace: "foo".into(),
+            server_key: "s".into(),
+            command: "definitely-not-a-real-binary-xyz".into(),
+            args: vec![],
+            env: Default::default(),
+            cwd: None,
+        };
+        assert!(connect_plugin_server(&spec).await.is_err());
     }
 }
