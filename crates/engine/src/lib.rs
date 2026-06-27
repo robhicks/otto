@@ -108,9 +108,10 @@ pub fn build_tool_registry_approving(workspace: Arc<dyn Workspace>, root: PathBu
     build_tool_registry_inner(workspace, root, true, None)
 }
 
-/// Build the tool registry with a `PolicyGate` applying `permissions` over the default gate.
-/// Used by the `otto run` spine when `.claude/settings.json` declares any permission rules; the
-/// PolicyGate owns the bash decision, so it pairs with a plain `DenyAsk` resolver.
+/// Build the tool registry, applying `permissions` via a `PolicyGate` over the default gate when
+/// `permissions` is non-empty (an empty set falls back to the default wiring). Used by the `otto
+/// run` spine when `.claude/settings.json` declares any permission rules; the PolicyGate owns the
+/// bash decision, so it pairs with a plain `DenyAsk` resolver.
 pub fn build_tool_registry_with_permissions(
     workspace: Arc<dyn Workspace>,
     root: PathBuf,
@@ -132,6 +133,13 @@ fn build_tool_registry_inner(
     approve_edits: bool,
     permissions: Option<&PermissionRules>,
 ) -> ToolRegistry {
+    // Invariant: permissions are wired only on the non-approving run path this slice. The
+    // PolicyGate × ApprovalModeGate composition is a deferred serve-path slice; if a future
+    // caller passes both, fail loud rather than silently dropping approval mode.
+    debug_assert!(
+        !(approve_edits && matches!(permissions, Some(r) if !r.is_empty())),
+        "PolicyGate × ApprovalModeGate composition is not yet wired",
+    );
     let sandboxed = os_sandbox_available();
     let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
 
