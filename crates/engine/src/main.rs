@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use otto_engine::{
     McpConnection, build_router, build_tool_registry, mcp_connect_bash, mcp_connect_fs,
-    mcp_connect_git, mcp_connect_grep, resolve_tls_paths, run_goal, serve_app_with_base, serve_run,
+    mcp_connect_git, mcp_connect_grep, mcp_connect_plugin_server, resolve_tls_paths, run_goal,
+    serve_app_with_base, serve_run,
 };
 use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
@@ -278,13 +279,31 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (mut tools, _mcp_conns) =
+    let (mut tools, mut mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
-    // _mcp_conns is held until end of function so the mcp children stay alive.
+    // mcp_conns is held until end of function so the mcp children stay alive.
     // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
     let ext = otto_extensions::discover(&root, &home_dir());
     register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
+    // Bundled plugin MCP servers (Plan B): spawn each enabled plugin's servers through the same
+    // stdio connect path otto uses for its own MCP servers; register the namespaced tools behind the
+    // gate. A server that won't spawn is logged and skipped (additive, never fatal). With no
+    // `.claude/plugins/`, `ext.mcp_servers` is empty and the tool set is byte-for-byte unchanged.
+    for spec in &ext.mcp_servers {
+        match mcp_connect_plugin_server(spec).await {
+            Ok((conn, mcp_tools)) => {
+                for t in mcp_tools {
+                    tools.register(t);
+                }
+                mcp_conns.push(conn);
+            }
+            Err(e) => eprintln!(
+                "plugin mcp server {}:{} unavailable ({e}); skipping",
+                spec.namespace, spec.server_key
+            ),
+        }
+    }
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
