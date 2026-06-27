@@ -218,6 +218,17 @@ the one shipped today — the offline determinism suite is untouched.
   pure data); rule matching does no I/O. The offline determinism suite stays green.
 - **No self-granting plugins.** Only user/project `settings.json` is read; bundled-plugin permissions are
   out of scope.
+- **`Bash(...)` rules do not constrain otto's native `git.*` tools.** A ported Claude Code config
+  typically limits git via `Bash(git push:*)`, which maps to otto's `bash`. otto *also* exposes
+  native `git.*` MCP tools (structured calls, not bash commands) that a `Bash(...)` rule never
+  matches — to constrain those, write explicit `git.*` rules (otto-native names pass through the
+  alias map unchanged). This is a consequence of the alias model, surfaced here so a user writing
+  Claude-Code-style rules isn't lulled into a false sense of coverage.
+- **Rule path-globs match literally, not path-normalized.** A `deny` like `Write(dist/**)` matches
+  the candidate path as given; a non-normalized path such as `foo/../dist/x` is not canonicalized
+  before matching, so rule-level path denies are best-effort (the same semantics as Claude Code).
+  The inviolable sensitive-path floor is unaffected — it is component-based (`is_sensitive`), not
+  glob-based — so this is a precision limitation of user rules, never a floor bypass.
 
 ## Testing
 
