@@ -151,6 +151,12 @@ fn plugin_gate_name(namespace: &str, server_key: &str, tool: &str) -> String {
 /// Spawn a plugin-bundled MCP server from its spec and register each advertised tool under a
 /// namespaced gate name. The spec's `command`/`args`/`env`/`cwd` are already
 /// `${CLAUDE_PLUGIN_ROOT}`-expanded by discovery.
+///
+/// Security note: the registered tools route through the gate like any other, but the gate's
+/// sensitive-path floor only inspects the standard `path`/`paths`/`glob` argument shapes (same as
+/// otto's own `git.*`/`grep` tools). A third-party plugin tool that takes a file path under a
+/// non-standard key would not have that path floor-checked — vetting a plugin's tool schemas is part
+/// of deciding whether to add it to `enabledPlugins` (the trust gate for plugins at all).
 pub async fn connect_plugin_server(
     spec: &otto_extensions::PluginMcpServer,
 ) -> anyhow::Result<(McpConnection, Vec<Arc<dyn Tool>>)> {

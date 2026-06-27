@@ -290,6 +290,8 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     // stdio connect path otto uses for its own MCP servers; register the namespaced tools behind the
     // gate. A server that won't spawn is logged and skipped (additive, never fatal). With no
     // `.claude/plugins/`, `ext.mcp_servers` is empty and the tool set is byte-for-byte unchanged.
+    // These register after `register_hooks`' `wrap_each`, so plugin MCP tools are gate-guarded but
+    // not hook-wrapped this slice — a `plugin__…` hook matcher would not fire (deferred extension).
     for spec in &ext.mcp_servers {
         match mcp_connect_plugin_server(spec).await {
             Ok((conn, mcp_tools)) => {
@@ -370,7 +372,7 @@ async fn run_custom_agent_in(
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
 
@@ -422,7 +424,7 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) =
@@ -529,7 +531,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills are wired only in the main `otto run` spine for now; the
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
