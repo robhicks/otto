@@ -360,6 +360,8 @@ fn fold_one_plugin(
     };
     if let Some(v) = raw {
         // Tolerate both the `.mcp.json` wrapper ({"mcpServers": {...}}) and a bare server map.
+        // Known edge case: a server literally named "mcpServers" would be misread as the wrapper.
+        // Accepted Claude-Code-compat heuristic; intentionally not made stricter.
         let servers = v.get("mcpServers").unwrap_or(&v);
         for mut spec in parse_mcp_servers(servers, ns) {
             spec.command = expand_plugin_root(&spec.command, plugin_root);
@@ -382,7 +384,14 @@ fn fold_one_plugin(
 /// Read + parse a JSON file. Missing file → `None` (silent, convention default may be absent);
 /// unreadable-but-present or malformed → `None` with a warning. Never fatal.
 fn read_json_file(path: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("warning: skipping unreadable {}: {e}", path.display());
+            return None;
+        }
+    };
     match serde_json::from_str(&text) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -1071,6 +1080,59 @@ mod tests {
         let ext = discover(proj.path(), home.path());
         assert_eq!(ext.mcp_servers.len(), 1);
         assert_eq!(ext.mcp_servers[0].server_key, "s");
+    }
+
+    #[test]
+    fn enabled_plugin_mcp_server_from_path_field_is_folded_and_expanded() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        // plugin.json declares mcpServers as a *path* to a sibling JSON file.
+        let proot = write_plugin_with_mcp(
+            proj.path(),
+            "acme",
+            "foo",
+            r#"{"name":"foo","mcpServers":"./servers.json"}"#,
+            None,
+        );
+        // The referenced file uses the wrapped `{"mcpServers": {...}}` shape.
+        fs::write(
+            proot.join("servers.json"),
+            r#"{"mcpServers":{"my-server":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/s.js"]}}}"#,
+        )
+        .unwrap();
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert_eq!(ext.mcp_servers.len(), 1);
+        let s = &ext.mcp_servers[0];
+        assert_eq!(s.namespace, "foo");
+        assert_eq!(s.server_key, "my-server");
+        assert!(s.args.iter().all(|a| !a.contains("${CLAUDE_PLUGIN_ROOT}")));
+        assert!(
+            s.args
+                .iter()
+                .any(|a| a.contains("plugins") && a.ends_with("s.js"))
+        );
+    }
+
+    #[test]
+    fn enabled_plugin_mcp_server_from_bare_map_dot_mcp_json_is_folded() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        // .mcp.json whose top-level object IS the server map (no "mcpServers" wrapper).
+        write_plugin_with_mcp(
+            proj.path(),
+            "acme",
+            "foo",
+            r#"{"name":"foo"}"#,
+            Some(r#"{"bare-server":{"command":"node"}}"#),
+        );
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert_eq!(ext.mcp_servers.len(), 1);
+        assert_eq!(ext.mcp_servers[0].server_key, "bare-server");
+        assert_eq!(ext.mcp_servers[0].namespace, "foo");
     }
 
     #[test]

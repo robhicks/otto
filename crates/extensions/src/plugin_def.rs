@@ -220,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_servers_drops_non_string_args_and_env() {
+        // By design, values are taken as strings: non-string args/env entries are silently dropped.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"s":{"command":"node","args":[1,"good",null],
+                 "env":{"OK":"yes","NUM":7}}}"#,
+        )
+        .unwrap();
+        let s = &parse_mcp_servers(&v, "ns")[0];
+        assert_eq!(s.args, vec!["good"]);
+        assert_eq!(s.env.get("OK").map(String::as_str), Some("yes"));
+        assert_eq!(s.env.get("NUM"), None, "non-string env value is dropped");
+    }
+
+    #[test]
     fn parse_mcp_servers_defaults_args_env_cwd() {
         let v: serde_json::Value = serde_json::from_str(r#"{"s":{"command":"x"}}"#).unwrap();
         let s = &parse_mcp_servers(&v, "ns")[0];
