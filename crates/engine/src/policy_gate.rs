@@ -28,16 +28,17 @@ impl PolicyGate {
 
 impl PermissionGate for PolicyGate {
     fn evaluate(&self, tool: &str, args: &Value) -> Decision {
-        // 1. The sensitive-path floor is inviolable — no allow rule can pierce it.
+        // 1. An inner `Deny` (the sensitive-path floor, for the default `DefaultPermissionGate`
+        //    inner) short-circuits — no allow rule can pierce it.
         let base = self.inner.evaluate(tool, args);
         if base == Decision::Deny {
             return Decision::Deny;
         }
-        // 2–4. Rules, deny > ask > allow.
+        // 2. Rules, deny > ask > allow (the ordering lives inside `decision`).
         if let Some(d) = self.rules.decision(tool, args) {
             return d;
         }
-        // 5. No rule matched → base, except sandboxed bash's structural Ask becomes Allow.
+        // 3. No rule matched → base, except a sandboxed bash's structural Ask becomes Allow.
         if tool == "bash" && base == Decision::Ask && self.bash_allowed {
             return Decision::Allow;
         }
@@ -78,6 +79,22 @@ mod tests {
         );
         let g = gate("{}", false);
         assert_eq!(g.evaluate("bash", &json!({"command": "ls"})), Decision::Ask);
+    }
+
+    #[test]
+    fn deny_rule_beats_bash_upgrade_even_when_sandboxed() {
+        // bash_allowed = true would upgrade an unmatched bash Ask to Allow (step 5), but a deny
+        // rule (step 2) runs first and must win.
+        let g = gate(r#"{ "permissions": { "deny": ["Bash(rm:*)"] } }"#, true);
+        assert_eq!(
+            g.evaluate("bash", &json!({"command": "rm -rf /"})),
+            Decision::Deny
+        );
+        // a non-matching bash command is still upgraded to Allow by the sandbox flag.
+        assert_eq!(
+            g.evaluate("bash", &json!({"command": "ls"})),
+            Decision::Allow
+        );
     }
 
     #[test]
