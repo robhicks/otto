@@ -43,6 +43,7 @@ pub struct Extensions {
     pub commands: Vec<CustomCommandDef>,
     pub skills: Vec<CustomSkillDef>,
     pub hooks: HookSet,
+    pub mcp_servers: Vec<PluginMcpServer>,
 }
 
 /// Discover `<home>/.claude/agents/*.md` then `<project_root>/.claude/agents/*.md`. Project
@@ -59,6 +60,7 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
     let mut skills: std::collections::BTreeMap<String, CustomSkillDef> =
         std::collections::BTreeMap::new();
     let mut hooks = HookSet::default();
+    let mut mcp_servers: Vec<PluginMcpServer> = Vec::new();
     for base in [home, project_root] {
         let claude = base.join(".claude");
         for def in read_agents_dir(&claude.join("agents")) {
@@ -82,12 +84,14 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         &mut commands,
         &mut skills,
         &mut hooks,
+        &mut mcp_servers,
     );
     Extensions {
         agents: agents.into_values().collect(),
         commands: commands.into_values().collect(),
         skills: skills.into_values().collect(),
         hooks,
+        mcp_servers,
     }
 }
 
@@ -293,6 +297,7 @@ fn fold_one_plugin(
     commands: &mut std::collections::BTreeMap<String, CustomCommandDef>,
     skills: &mut std::collections::BTreeMap<String, CustomSkillDef>,
     hooks: &mut HookSet,
+    mcp_servers: &mut Vec<PluginMcpServer>,
 ) {
     let manifest_path = plugin_root.join(".claude-plugin").join("plugin.json");
     let manifest = match std::fs::read_to_string(&manifest_path) {
@@ -344,6 +349,47 @@ fn fold_one_plugin(
     }
     hooks.pre_tool_use.append(&mut plugin_hooks.pre_tool_use);
     hooks.post_tool_use.append(&mut plugin_hooks.post_tool_use);
+
+    // Bundled MCP servers (Plan B): path override, inline object, or the convention `.mcp.json`.
+    let raw: Option<serde_json::Value> = match &manifest.mcp_servers {
+        Some(McpServersField::Inline(v)) => Some(v.clone()),
+        Some(McpServersField::Path(p)) => {
+            read_json_file(&plugin_root.join(p.trim_start_matches("./")))
+        }
+        None => read_json_file(&plugin_root.join(".mcp.json")),
+    };
+    if let Some(v) = raw {
+        // Tolerate both the `.mcp.json` wrapper ({"mcpServers": {...}}) and a bare server map.
+        let servers = v.get("mcpServers").unwrap_or(&v);
+        for mut spec in parse_mcp_servers(servers, ns) {
+            spec.command = expand_plugin_root(&spec.command, plugin_root);
+            spec.args = spec
+                .args
+                .iter()
+                .map(|a| expand_plugin_root(a, plugin_root))
+                .collect();
+            spec.env = spec
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), expand_plugin_root(v, plugin_root)))
+                .collect();
+            spec.cwd = spec.cwd.map(|c| expand_plugin_root(&c, plugin_root));
+            mcp_servers.push(spec);
+        }
+    }
+}
+
+/// Read + parse a JSON file. Missing file → `None` (silent, convention default may be absent);
+/// unreadable-but-present or malformed → `None` with a warning. Never fatal.
+fn read_json_file(path: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("warning: skipping malformed {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Discover enabled plugins from on-disk marketplaces under both bases and fold their bundled
@@ -357,6 +403,7 @@ fn fold_plugins(
     commands: &mut std::collections::BTreeMap<String, CustomCommandDef>,
     skills: &mut std::collections::BTreeMap<String, CustomSkillDef>,
     hooks: &mut HookSet,
+    mcp_servers: &mut Vec<PluginMcpServer>,
 ) {
     // Merge the enable allowlist (project overrides user for the same key).
     let mut enabled = std::collections::BTreeMap::new();
@@ -415,7 +462,15 @@ fn fold_plugins(
                     );
                     continue;
                 }
-                fold_one_plugin(&plugin.name, &plugin_root, agents, commands, skills, hooks);
+                fold_one_plugin(
+                    &plugin.name,
+                    &plugin_root,
+                    agents,
+                    commands,
+                    skills,
+                    hooks,
+                    mcp_servers,
+                );
             }
         }
     }
@@ -934,6 +989,116 @@ mod tests {
 
         let ext = discover(proj.path(), home.path());
         assert!(ext.skills.is_empty());
+    }
+
+    /// Lay out a marketplace under `<base>/.claude/plugins/marketplaces/<mp>/` offering a local
+    /// plugin `<plugin>` whose `plugin.json` is exactly `plugin_json`. If `dot_mcp_json` is `Some`,
+    /// also writes `<plugin_root>/.mcp.json` with that content. Returns the plugin root path.
+    fn write_plugin_with_mcp(
+        base: &Path,
+        mp: &str,
+        plugin: &str,
+        plugin_json: &str,
+        dot_mcp_json: Option<&str>,
+    ) -> std::path::PathBuf {
+        let mp_dir = base
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join(mp);
+        let cp = mp_dir.join(".claude-plugin");
+        fs::create_dir_all(&cp).unwrap();
+        fs::write(
+            cp.join("marketplace.json"),
+            format!(
+                r#"{{"name":"{mp}","plugins":[{{"name":"{plugin}","source":"./plugins/{plugin}"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let proot = mp_dir.join("plugins").join(plugin);
+        let pcp = proot.join(".claude-plugin");
+        fs::create_dir_all(&pcp).unwrap();
+        fs::write(pcp.join("plugin.json"), plugin_json).unwrap();
+        if let Some(content) = dot_mcp_json {
+            fs::write(proot.join(".mcp.json"), content).unwrap();
+        }
+        proot
+    }
+
+    #[test]
+    fn enabled_plugin_mcp_server_from_dot_mcp_json_is_folded_namespaced_and_expanded() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_with_mcp(
+            proj.path(),
+            "acme",
+            "foo",
+            r#"{"name":"foo"}"#,
+            Some(
+                r#"{"mcpServers":{"my-server":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/s.js"]}}}"#,
+            ),
+        );
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert_eq!(ext.mcp_servers.len(), 1);
+        let s = &ext.mcp_servers[0];
+        assert_eq!(s.namespace, "foo");
+        assert_eq!(s.server_key, "my-server");
+        // ${CLAUDE_PLUGIN_ROOT} expanded to the absolute plugin root in args; no token remains.
+        assert!(s.args.iter().all(|a| !a.contains("${CLAUDE_PLUGIN_ROOT}")));
+        assert!(
+            s.args
+                .iter()
+                .any(|a| a.contains("plugins") && a.ends_with("s.js"))
+        );
+    }
+
+    #[test]
+    fn inline_mcp_servers_in_plugin_json_are_folded() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_with_mcp(
+            proj.path(),
+            "acme",
+            "foo",
+            r#"{"name":"foo","mcpServers":{"s":{"command":"node"}}}"#,
+            None,
+        );
+        enable_plugin(proj.path(), "foo@acme");
+
+        let ext = discover(proj.path(), home.path());
+        assert_eq!(ext.mcp_servers.len(), 1);
+        assert_eq!(ext.mcp_servers[0].server_key, "s");
+    }
+
+    #[test]
+    fn no_plugins_yields_no_mcp_servers() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        assert!(discover(proj.path(), home.path()).mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn disabled_plugin_contributes_no_mcp_servers() {
+        let home = tempdir().unwrap();
+        let proj = tempdir().unwrap();
+        write_plugin_with_mcp(
+            proj.path(),
+            "acme",
+            "foo",
+            r#"{"name":"foo"}"#,
+            Some(r#"{"mcpServers":{"my-server":{"command":"node"}}}"#),
+        );
+        fs::write(
+            proj.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"foo@acme":false}}"#,
+        )
+        .unwrap();
+
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.mcp_servers.is_empty());
     }
 
     #[test]
