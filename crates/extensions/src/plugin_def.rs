@@ -1,9 +1,11 @@
-//! Parses a Claude Code plugin manifest (`.claude-plugin/plugin.json`): the plugin `name` plus
-//! optional component path overrides. An omitted component field means "use the convention dir"
-//! (resolved by discovery, not here). Bundled MCP servers (`mcpServers`) are Plan B and are not
-//! parsed in this module yet. Pure parsing — no I/O.
+//! Parses a Claude Code plugin manifest (`.claude-plugin/plugin.json`): the plugin `name`, optional
+//! component path overrides, and the bundled-MCP-server declaration (`mcpServers`: a path to a JSON
+//! file or an inline object). An omitted component field means "use the convention dir" (resolved by
+//! discovery, not here). Pure parsing — no I/O; `${CLAUDE_PLUGIN_ROOT}` expansion happens at fold
+//! time, where the plugin root is known.
 
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// A parsed `plugin.json`. Each `Option<String>` component field is a path **relative to the
 /// plugin root**; `None` means discovery falls back to the convention directory.
@@ -16,11 +18,33 @@ pub struct PluginManifest {
     pub agents: Option<String>,
     pub skills: Option<String>,
     pub hooks: Option<String>,
+    pub mcp_servers: Option<McpServersField>,
+}
+
+/// A bundled MCP server config, resolved to pure data (no process spawned here). `command`/`args`/
+/// `env`/`cwd` are stored verbatim from the manifest; `${CLAUDE_PLUGIN_ROOT}` expansion happens at
+/// fold time (in `lib.rs`, where the plugin root is known).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMcpServer {
+    pub namespace: String,  // the plugin name, for tool-name prefixing
+    pub server_key: String, // the key under "mcpServers"
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<String>,
+}
+
+/// How a plugin declares its MCP servers: a path to a JSON file (relative to the plugin root) or an
+/// inline object (the value of the `mcpServers` key in `plugin.json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServersField {
+    Path(String),
+    Inline(Value),
 }
 
 /// Parse a `plugin.json` document. Errors on invalid JSON or a missing/empty `name`. Component
-/// path overrides are read when present and non-empty; unknown keys (`author`, `homepage`, …) and
-/// `mcpServers` (Plan B) are ignored.
+/// path overrides are read when present and non-empty; the `mcpServers` field is parsed into an
+/// `McpServersField` (path-or-inline); unknown keys (`author`, `homepage`, …) are ignored.
 pub fn parse_plugin_json(json: &str) -> anyhow::Result<PluginManifest> {
     let v: Value = serde_json::from_str(json)?;
     let name = v
@@ -35,6 +59,11 @@ pub fn parse_plugin_json(json: &str) -> anyhow::Result<PluginManifest> {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     };
+    let mcp_servers = match v.get("mcpServers") {
+        Some(Value::String(s)) if !s.is_empty() => Some(McpServersField::Path(s.clone())),
+        Some(Value::Object(o)) => Some(McpServersField::Inline(Value::Object(o.clone()))),
+        _ => None,
+    };
     Ok(PluginManifest {
         name,
         version: s("version"),
@@ -43,7 +72,59 @@ pub fn parse_plugin_json(json: &str) -> anyhow::Result<PluginManifest> {
         agents: s("agents"),
         skills: s("skills"),
         hooks: s("hooks"),
+        mcp_servers,
     })
+}
+
+/// Parse a map of `server_key -> config` into `PluginMcpServer` specs, namespaced by `namespace`.
+/// A server missing a non-empty `command` is skipped. `args` defaults to empty, `env` to empty,
+/// `cwd` to `None`. Values are stored verbatim — `${CLAUDE_PLUGIN_ROOT}` is expanded by the caller.
+pub fn parse_mcp_servers(servers: &Value, namespace: &str) -> Vec<PluginMcpServer> {
+    let Some(map) = servers.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (server_key, cfg) in map {
+        let Some(command) = cfg
+            .get("command")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let args = cfg
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let env = cfg
+            .get("env")
+            .and_then(|e| e.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = cfg
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        out.push(PluginMcpServer {
+            namespace: namespace.to_string(),
+            server_key: server_key.clone(),
+            command: command.to_string(),
+            args,
+            env,
+            cwd,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -89,9 +170,61 @@ mod tests {
     }
 
     #[test]
-    fn mcp_servers_field_is_ignored_this_plan() {
-        // Plan A does not parse mcpServers; presence must not break parsing.
-        let m = parse_plugin_json(r#"{"name":"foo","mcpServers":{"s":{}}}"#).unwrap();
-        assert_eq!(m.name, "foo");
+    fn parses_mcp_servers_path_field() {
+        let m = parse_plugin_json(r#"{"name":"foo","mcpServers":"./.mcp.json"}"#).unwrap();
+        assert_eq!(
+            m.mcp_servers,
+            Some(McpServersField::Path("./.mcp.json".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_mcp_servers_inline_field() {
+        let m =
+            parse_plugin_json(r#"{"name":"foo","mcpServers":{"s":{"command":"node"}}}"#).unwrap();
+        assert!(matches!(m.mcp_servers, Some(McpServersField::Inline(_))));
+    }
+
+    #[test]
+    fn absent_mcp_servers_is_none() {
+        let m = parse_plugin_json(r#"{"name":"foo"}"#).unwrap();
+        assert_eq!(m.mcp_servers, None);
+    }
+
+    #[test]
+    fn parse_mcp_servers_maps_each_server() {
+        // The map of server_key -> config (the value under "mcpServers").
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"my-server":{"command":"node","args":["${CLAUDE_PLUGIN_ROOT}/s.js","--x"],
+                 "env":{"FOO":"bar"},"cwd":"${CLAUDE_PLUGIN_ROOT}"}}"#,
+        )
+        .unwrap();
+        let specs = parse_mcp_servers(&v, "foo");
+        assert_eq!(specs.len(), 1);
+        let s = &specs[0];
+        assert_eq!(s.namespace, "foo");
+        assert_eq!(s.server_key, "my-server");
+        assert_eq!(s.command, "node");
+        assert_eq!(s.args, vec!["${CLAUDE_PLUGIN_ROOT}/s.js", "--x"]); // un-expanded here; fold expands
+        assert_eq!(s.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(s.cwd.as_deref(), Some("${CLAUDE_PLUGIN_ROOT}"));
+    }
+
+    #[test]
+    fn parse_mcp_servers_skips_server_without_command() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"good":{"command":"node"},"bad":{"args":["x"]}}"#).unwrap();
+        let specs = parse_mcp_servers(&v, "foo");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].server_key, "good");
+    }
+
+    #[test]
+    fn parse_mcp_servers_defaults_args_env_cwd() {
+        let v: serde_json::Value = serde_json::from_str(r#"{"s":{"command":"x"}}"#).unwrap();
+        let s = &parse_mcp_servers(&v, "ns")[0];
+        assert!(s.args.is_empty());
+        assert!(s.env.is_empty());
+        assert_eq!(s.cwd, None);
     }
 }
