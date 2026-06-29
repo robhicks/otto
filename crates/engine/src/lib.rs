@@ -8,8 +8,8 @@ use otto_engine_core::tool::{
     AllowListAskResolver, AskResolver, DenyAsk, PermissionGate, ToolRegistry,
 };
 use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
-use otto_extensions::PermissionRules;
 use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
+use otto_extensions::PermissionRules;
 use otto_persistence::SessionStore;
 use otto_protocol::{CapabilitiesManifest, Event, Role};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};

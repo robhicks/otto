@@ -64,13 +64,19 @@ mod tests {
     fn floor_beats_allow_rule() {
         // An allow rule naming a sensitive path must NOT pierce the floor.
         let g = gate(r#"{ "permissions": { "allow": ["Read(.env)"] } }"#, true);
-        assert_eq!(g.evaluate("fs.read", &json!({"path": ".env"})), Decision::Deny);
+        assert_eq!(
+            g.evaluate("fs.read", &json!({"path": ".env"})),
+            Decision::Deny
+        );
     }
 
     #[test]
     fn bash_with_no_rule_follows_sandbox_flag() {
         let g = gate("{}", true);
-        assert_eq!(g.evaluate("bash", &json!({"command": "ls"})), Decision::Allow);
+        assert_eq!(
+            g.evaluate("bash", &json!({"command": "ls"})),
+            Decision::Allow
+        );
         let g = gate("{}", false);
         assert_eq!(g.evaluate("bash", &json!({"command": "ls"})), Decision::Ask);
     }
@@ -92,7 +98,10 @@ mod tests {
     #[test]
     fn ask_rule_on_bash_returns_ask() {
         // A rule-driven Ask (paired with DenyAsk in the registry) fails closed in headless.
-        let g = gate(r#"{ "permissions": { "ask": ["Bash(git push:*)"] } }"#, true);
+        let g = gate(
+            r#"{ "permissions": { "ask": ["Bash(git push:*)"] } }"#,
+            true,
+        );
         assert_eq!(
             g.evaluate("bash", &json!({"command": "git push origin"})),
             Decision::Ask
@@ -103,7 +112,10 @@ mod tests {
     fn allow_rule_upgrades_bash_when_sandbox_absent() {
         // Even without a sandbox flag, an explicit allow rule wins (rules are checked before the
         // step-5 sandbox upgrade).
-        let g = gate(r#"{ "permissions": { "allow": ["Bash(cargo test:*)"] } }"#, false);
+        let g = gate(
+            r#"{ "permissions": { "allow": ["Bash(cargo test:*)"] } }"#,
+            false,
+        );
         assert_eq!(
             g.evaluate("bash", &json!({"command": "cargo test --all"})),
             Decision::Allow

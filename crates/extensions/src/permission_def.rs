@@ -250,7 +250,10 @@ mod tests {
             Some(Decision::Deny)
         );
         // Non-matching path → no rule applies.
-        assert_eq!(rules.decision("fs.read", &json!({"path": "docs/a.md"})), None);
+        assert_eq!(
+            rules.decision("fs.read", &json!({"path": "docs/a.md"})),
+            None
+        );
         // Leading "./" on the arg is tolerated.
         assert_eq!(
             rules.decision("fs.read", &json!({"path": "./src/a.rs"})),
@@ -271,7 +274,10 @@ mod tests {
             Some(Decision::Deny)
         );
         // Different tool → no match.
-        assert_eq!(rules.decision("fs.write", &json!({"path": "anything.rs"})), None);
+        assert_eq!(
+            rules.decision("fs.write", &json!({"path": "anything.rs"})),
+            None
+        );
     }
 
     #[test]
@@ -281,7 +287,10 @@ mod tests {
             wild.decision("bash", &json!({"command": "cargo test --all"})),
             Some(Decision::Allow)
         );
-        assert_eq!(wild.decision("bash", &json!({"command": "cargo build"})), None);
+        assert_eq!(
+            wild.decision("bash", &json!({"command": "cargo build"})),
+            None
+        );
 
         let exact = parse_permissions(r#"{ "permissions": { "allow": ["Bash(cargo test)"] } }"#);
         assert_eq!(
@@ -289,7 +298,10 @@ mod tests {
             Some(Decision::Allow)
         );
         // Exact rule does not match a longer command.
-        assert_eq!(exact.decision("bash", &json!({"command": "cargo test --all"})), None);
+        assert_eq!(
+            exact.decision("bash", &json!({"command": "cargo test --all"})),
+            None
+        );
     }
 
     #[test]

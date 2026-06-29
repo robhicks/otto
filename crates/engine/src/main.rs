@@ -161,7 +161,11 @@ async fn build_tools_preferring_mcp(
     let mut registry = if !permissions.is_empty() {
         // Permission rules override the default gate with a PolicyGate (run path only; not
         // composed with approve_edits this slice).
-        otto_engine::build_tool_registry_with_permissions(tools_workspace, root.clone(), permissions)
+        otto_engine::build_tool_registry_with_permissions(
+            tools_workspace,
+            root.clone(),
+            permissions,
+        )
     } else if approve_edits {
         otto_engine::build_tool_registry_approving(tools_workspace, root.clone())
     } else {
@@ -381,9 +385,13 @@ async fn run_custom_agent_in(
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
-    let (base_tools, _mcp) =
-        build_tools_preferring_mcp(tools_ws, root, false, &otto_extensions::PermissionRules::default())
-            .await;
+    let (base_tools, _mcp) = build_tools_preferring_mcp(
+        tools_ws,
+        root,
+        false,
+        &otto_extensions::PermissionRules::default(),
+    )
+    .await;
 
     let task = TaskTool::new(
         router,
@@ -952,6 +960,7 @@ mod tests {
         assert!(!ext.permissions.is_empty());
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        // Mirrors the gate-selection logic in `build_tools_preferring_mcp`; keep in sync.
         let reg = if !ext.permissions.is_empty() {
             otto_engine::build_tool_registry_with_permissions(
                 ws,
