@@ -128,10 +128,65 @@ impl PermissionRules {
         self.ask.extend(other.ask);
     }
 
-    /// The verdict for a proposed call, or `None` when no rule matches. Added in Task 2.
-    pub fn decision(&self, _tool: &str, _args: &Value) -> Option<Decision> {
+    /// The verdict for a proposed call, or `None` when no rule matches. Precedence: deny > ask >
+    /// allow (the first matching rule in that order wins).
+    pub fn decision(&self, tool: &str, args: &Value) -> Option<Decision> {
+        if self.deny.iter().any(|r| r.matches(tool, args)) {
+            return Some(Decision::Deny);
+        }
+        if self.ask.iter().any(|r| r.matches(tool, args)) {
+            return Some(Decision::Ask);
+        }
+        if self.allow.iter().any(|r| r.matches(tool, args)) {
+            return Some(Decision::Allow);
+        }
         None
     }
+}
+
+impl Rule {
+    /// True if this rule governs `(tool, args)`.
+    fn matches(&self, tool: &str, args: &Value) -> bool {
+        if self.tool != tool {
+            return false;
+        }
+        match &self.spec {
+            None => true,
+            Some(Specifier::PathGlob(pat)) => {
+                let Ok(glob) = globset::Glob::new(pat) else {
+                    return false;
+                };
+                let matcher = glob.compile_matcher();
+                candidate_paths(args).iter().any(|p| {
+                    let p = p.strip_prefix("./").unwrap_or(p);
+                    matcher.is_match(p)
+                })
+            }
+            Some(Specifier::CmdPrefix { prefix, wildcard }) => {
+                match args.get("command").and_then(Value::as_str) {
+                    Some(cmd) if *wildcard => cmd.starts_with(prefix),
+                    Some(cmd) => cmd == prefix,
+                    None => false,
+                }
+            }
+        }
+    }
+}
+
+/// Candidate path strings from common tool-arg shapes — mirrors `DefaultPermissionGate`'s arg
+/// inspection (`path`, `paths[]`, `glob`) so rules and the floor see the same surface.
+fn candidate_paths(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(p) = args.get("path").and_then(Value::as_str) {
+        out.push(p.to_string());
+    }
+    if let Some(arr) = args.get("paths").and_then(Value::as_array) {
+        out.extend(arr.iter().filter_map(Value::as_str).map(str::to_string));
+    }
+    if let Some(g) = args.get("glob").and_then(Value::as_str) {
+        out.push(g.to_string());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -187,10 +242,91 @@ mod tests {
         assert!(parse_rule("Read()").is_some());
     }
 
-    // Placeholder: decision() returns None until Task 2 wires matching.
     #[test]
-    fn decision_is_none_before_matcher() {
+    fn path_glob_matches_path_args() {
         let rules = parse_permissions(r#"{ "permissions": { "deny": ["Read(src/**)"] } }"#);
-        assert_eq!(rules.decision("fs.read", &json!({"path": "src/a.rs"})), None);
+        assert_eq!(
+            rules.decision("fs.read", &json!({"path": "src/a.rs"})),
+            Some(Decision::Deny)
+        );
+        // Non-matching path → no rule applies.
+        assert_eq!(rules.decision("fs.read", &json!({"path": "docs/a.md"})), None);
+        // Leading "./" on the arg is tolerated.
+        assert_eq!(
+            rules.decision("fs.read", &json!({"path": "./src/a.rs"})),
+            Some(Decision::Deny)
+        );
+        // paths[] form: any element matching triggers.
+        assert_eq!(
+            rules.decision("fs.read", &json!({"paths": ["docs/a.md", "src/b.rs"]})),
+            Some(Decision::Deny)
+        );
+    }
+
+    #[test]
+    fn bare_tool_rule_matches_any_args() {
+        let rules = parse_permissions(r#"{ "permissions": { "deny": ["Read"] } }"#);
+        assert_eq!(
+            rules.decision("fs.read", &json!({"path": "anything.rs"})),
+            Some(Decision::Deny)
+        );
+        // Different tool → no match.
+        assert_eq!(rules.decision("fs.write", &json!({"path": "anything.rs"})), None);
+    }
+
+    #[test]
+    fn bash_prefix_exact_vs_wildcard() {
+        let wild = parse_permissions(r#"{ "permissions": { "allow": ["Bash(cargo test:*)"] } }"#);
+        assert_eq!(
+            wild.decision("bash", &json!({"command": "cargo test --all"})),
+            Some(Decision::Allow)
+        );
+        assert_eq!(wild.decision("bash", &json!({"command": "cargo build"})), None);
+
+        let exact = parse_permissions(r#"{ "permissions": { "allow": ["Bash(cargo test)"] } }"#);
+        assert_eq!(
+            exact.decision("bash", &json!({"command": "cargo test"})),
+            Some(Decision::Allow)
+        );
+        // Exact rule does not match a longer command.
+        assert_eq!(exact.decision("bash", &json!({"command": "cargo test --all"})), None);
+    }
+
+    #[test]
+    fn precedence_is_deny_over_ask_over_allow() {
+        // Same call matched by all three buckets → deny wins.
+        let rules = parse_permissions(
+            r#"{ "permissions": { "allow": ["Bash(git:*)"], "ask": ["Bash(git push:*)"],
+                                  "deny": ["Bash(git push --force:*)"] } }"#,
+        );
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "git push --force origin"})),
+            Some(Decision::Deny)
+        );
+        // ask beats allow when deny doesn't match.
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "git push origin"})),
+            Some(Decision::Ask)
+        );
+        // only allow matches.
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "git status"})),
+            Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn extend_unions_rule_sets() {
+        let mut a = parse_permissions(r#"{ "permissions": { "allow": ["Read(src/**)"] } }"#);
+        let b = parse_permissions(r#"{ "permissions": { "deny": ["Read(secret/**)"] } }"#);
+        a.extend(b);
+        assert_eq!(
+            a.decision("fs.read", &json!({"path": "secret/x"})),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            a.decision("fs.read", &json!({"path": "src/x"})),
+            Some(Decision::Allow)
+        );
     }
 }
