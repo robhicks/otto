@@ -27,7 +27,8 @@ enum Specifier {
     /// call's path argument(s).
     PathGlob(String),
     /// A bash command-prefix match against the `command` argument. `wildcard` is the trailing
-    /// `:*` form (prefix match); without it the command must match exactly.
+    /// `:*` form, which matches at a whitespace boundary (e.g. `git:*` matches `git`/`git push`,
+    /// not `gitfoo`); without it the command must match exactly.
     CmdPrefix { prefix: String, wildcard: bool },
 }
 
@@ -81,9 +82,8 @@ fn build_specifier(tool: &str, inner: &str) -> Option<Specifier> {
         };
         Some(Specifier::CmdPrefix { prefix, wildcard })
     } else {
-        let pat = inner.strip_prefix("./").unwrap_or(inner).to_string();
-        globset::Glob::new(&pat).ok()?; // reject an uncompilable glob
-        Some(Specifier::PathGlob(pat))
+        build_glob(inner).ok()?; // reject an uncompilable glob
+        Some(Specifier::PathGlob(inner.to_string()))
     }
 }
 
@@ -157,7 +157,7 @@ impl Rule {
                 // `PermissionRules` derive `Clone`/`Eq` (a `GlobMatcher` is neither). Call volume
                 // is low (a handful of rules × tool calls); an `Arc<GlobMatcher>` is the future
                 // optimization if it ever matters.
-                let Ok(glob) = globset::Glob::new(pat) else {
+                let Ok(glob) = build_glob(pat) else {
                     return false;
                 };
                 let matcher = glob.compile_matcher();
@@ -168,13 +168,32 @@ impl Rule {
             }
             Some(Specifier::CmdPrefix { prefix, wildcard }) => {
                 match args.get("command").and_then(Value::as_str) {
-                    Some(cmd) if *wildcard => cmd.starts_with(prefix),
+                    // A wildcard prefix matches the command itself, or a longer command that
+                    // continues at a whitespace boundary — so `git:*` matches `git`/`git status`
+                    // but NOT `gitfoo` (an over-allow). An empty prefix (`Bash(:*)`) matches every
+                    // command.
+                    Some(cmd) if *wildcard => {
+                        prefix.is_empty()
+                            || cmd == prefix
+                            || (cmd.starts_with(prefix.as_str())
+                                && cmd[prefix.len()..].starts_with(char::is_whitespace))
+                    }
                     Some(cmd) => cmd == prefix,
                     None => false,
                 }
             }
         }
     }
+}
+
+/// Compile a path-glob pattern with gitignore-style semantics (`*` does not cross `/`, `**`
+/// does). A leading `./` is stripped so workspace-relative patterns and args line up. Used at
+/// both parse time (validation) and match time so the two never diverge.
+fn build_glob(pat: &str) -> Result<globset::Glob, globset::Error> {
+    let pat = pat.strip_prefix("./").unwrap_or(pat);
+    globset::GlobBuilder::new(pat)
+        .literal_separator(true)
+        .build()
 }
 
 /// Candidate path strings from common tool-arg shapes — mirrors `DefaultPermissionGate`'s arg
@@ -340,6 +359,46 @@ mod tests {
         assert_eq!(
             rules.decision("bash", &json!({"command": "git status"})),
             Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn bash_wildcard_respects_word_boundary() {
+        let rules = parse_permissions(r#"{ "permissions": { "allow": ["Bash(git:*)"] } }"#);
+        // matches the bare command and a whitespace-separated continuation...
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "git"})),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "git status"})),
+            Some(Decision::Allow)
+        );
+        // ...but NOT a longer token that merely starts with the prefix.
+        assert_eq!(
+            rules.decision("bash", &json!({"command": "gitfoo bar"})),
+            None
+        );
+    }
+
+    #[test]
+    fn single_star_does_not_cross_slash() {
+        let star = parse_permissions(r#"{ "permissions": { "deny": ["Read(src/*)"] } }"#);
+        assert_eq!(
+            star.decision("fs.read", &json!({"path": "src/a.rs"})),
+            Some(Decision::Deny)
+        );
+        // `*` stops at `/`, so a nested path is NOT matched.
+        assert_eq!(
+            star.decision("fs.read", &json!({"path": "src/sub/a.rs"})),
+            None
+        );
+
+        let dstar = parse_permissions(r#"{ "permissions": { "deny": ["Read(src/**)"] } }"#);
+        // `**` crosses `/`.
+        assert_eq!(
+            dstar.decision("fs.read", &json!({"path": "src/sub/a.rs"})),
+            Some(Decision::Deny)
         );
     }
 
