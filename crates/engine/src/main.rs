@@ -156,8 +156,13 @@ async fn build_tools_preferring_mcp(
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
     approve_edits: bool,
+    permissions: &otto_extensions::PermissionRules,
 ) -> (ToolRegistry, Vec<McpConnection>) {
-    let mut registry = if approve_edits {
+    let mut registry = if !permissions.is_empty() {
+        // Permission rules override the default gate with a PolicyGate (run path only; not
+        // composed with approve_edits this slice).
+        otto_engine::build_tool_registry_with_permissions(tools_workspace, root.clone(), permissions)
+    } else if approve_edits {
         otto_engine::build_tool_registry_approving(tools_workspace, root.clone())
     } else {
         build_tool_registry(tools_workspace, root.clone())
@@ -279,11 +284,13 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
+    // Discover extensions first: the permission rules are needed at registry-construction time so
+    // the gate can be a PolicyGate.
+    let ext = otto_extensions::discover(&root, &home_dir());
     let (mut tools, mut mcp_conns) =
-        build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
+        build_tools_preferring_mcp(tools_workspace, root.clone(), false, &ext.permissions).await;
     // mcp_conns is held until end of function so the mcp children stay alive.
     // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
-    let ext = otto_extensions::discover(&root, &home_dir());
     register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
     // Bundled plugin MCP servers (Plan B): spawn each enabled plugin's servers through the same
@@ -374,7 +381,9 @@ async fn run_custom_agent_in(
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
-    let (base_tools, _mcp) = build_tools_preferring_mcp(tools_ws, root, false).await;
+    let (base_tools, _mcp) =
+        build_tools_preferring_mcp(tools_ws, root, false, &otto_extensions::PermissionRules::default())
+            .await;
 
     let task = TaskTool::new(
         router,
@@ -427,8 +436,13 @@ async fn run_command_in(
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) =
-        build_tools_preferring_mcp(tools_workspace, root.clone(), false).await;
+    let (tools, _mcp_conns) = build_tools_preferring_mcp(
+        tools_workspace,
+        root.clone(),
+        false,
+        &otto_extensions::PermissionRules::default(),
+    )
+    .await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
     let tools = Arc::new(tools);
 
@@ -533,8 +547,13 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
     // --agent/--command/serve paths are deferred (extensions hooks slice).
-    let (tools, _mcp_conns) =
-        build_tools_preferring_mcp(tools_workspace, root.clone(), approve_edits).await;
+    let (tools, _mcp_conns) = build_tools_preferring_mcp(
+        tools_workspace,
+        root.clone(),
+        approve_edits,
+        &otto_extensions::PermissionRules::default(),
+    )
+    .await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -911,5 +930,42 @@ mod tests {
             out.to_string().contains("hi"),
             "expected fs.read to return file content, got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_path_registry_applies_discovered_permissions() {
+        use otto_workspace::LocalWorkspace;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.permissions.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let reg = if !ext.permissions.is_empty() {
+            otto_engine::build_tool_registry_with_permissions(
+                ws,
+                proj.path().to_path_buf(),
+                &ext.permissions,
+            )
+        } else {
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf())
+        };
+
+        let err = reg
+            .call("fs.write", json!({"path": "dist/x.txt", "contents": "hi"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied by permission gate"));
     }
 }
