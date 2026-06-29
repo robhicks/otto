@@ -362,6 +362,12 @@ async fn run_custom_agent_in(
              (hooks are wired only on the `otto run` spine for now)."
         );
     }
+    if !ext.permissions.is_empty() {
+        eprintln!(
+            "warning: settings.json permissions are configured but are NOT enforced on \
+             this path (permissions are wired only on the `otto run` spine for now)."
+        );
+    }
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
@@ -426,6 +432,12 @@ async fn run_command_in(
         eprintln!(
             "warning: settings.json hooks are configured but are NOT enforced on this path \
              (hooks are wired only on the `otto run` spine for now)."
+        );
+    }
+    if !ext.permissions.is_empty() {
+        eprintln!(
+            "warning: settings.json permissions are configured but are NOT enforced on \
+             this path (permissions are wired only on the `otto run` spine for now)."
         );
     }
     let def = ext
@@ -546,6 +558,12 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             eprintln!(
                 "warning: settings.json hooks are configured but are NOT enforced on the serve \
                  path (hooks are wired only on the `otto run` spine for now)."
+            );
+        }
+        if !ext.permissions.is_empty() {
+            eprintln!(
+                "warning: settings.json permissions are configured but are NOT enforced on \
+                 this path (permissions are wired only on the `otto run` spine for now)."
             );
         }
     }

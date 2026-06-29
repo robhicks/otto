@@ -75,8 +75,10 @@ struct Rule {
 }
 
 enum Specifier {
-    /// A gitignore-style path glob, matched against the call's path argument(s).
-    PathGlob(globset::GlobMatcher),
+    /// A gitignore-style path glob (stored raw and compiled at match time, so `Specifier`
+    /// can derive `Clone`/`Eq` — `globset::GlobMatcher` is neither), matched against the
+    /// call's path argument(s).
+    PathGlob(String),
     /// A bash command-prefix match against the `command` argument. `wildcard` is the trailing
     /// `:*` form (prefix match); without it the command must match exactly.
     CmdPrefix { prefix: String, wildcard: bool },

@@ -153,6 +153,10 @@ impl Rule {
         match &self.spec {
             None => true,
             Some(Specifier::PathGlob(pat)) => {
+                // Recompiled per call by design: storing the raw pattern lets `Specifier` /
+                // `PermissionRules` derive `Clone`/`Eq` (a `GlobMatcher` is neither). Call volume
+                // is low (a handful of rules × tool calls); an `Arc<GlobMatcher>` is the future
+                // optimization if it ever matters.
                 let Ok(glob) = globset::Glob::new(pat) else {
                     return false;
                 };
@@ -264,6 +268,11 @@ mod tests {
             rules.decision("fs.read", &json!({"paths": ["docs/a.md", "src/b.rs"]})),
             Some(Decision::Deny)
         );
+        // glob arg key (mcp-grep's file-filter arg shape) is also a candidate path.
+        assert_eq!(
+            rules.decision("fs.read", &json!({"glob": "src/foo.rs"})),
+            Some(Decision::Deny)
+        );
     }
 
     #[test]
@@ -301,6 +310,13 @@ mod tests {
         assert_eq!(
             exact.decision("bash", &json!({"command": "cargo test --all"})),
             None
+        );
+
+        // `Bash(:*)` → empty prefix + wildcard ⇒ matches every bash command.
+        let all = parse_permissions(r#"{ "permissions": { "deny": ["Bash(:*)"] } }"#);
+        assert_eq!(
+            all.decision("bash", &json!({"command": "anything at all"})),
+            Some(Decision::Deny)
         );
     }
 

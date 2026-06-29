@@ -276,7 +276,14 @@ fn read_settings_hooks(path: &Path) -> HookSet {
 fn read_settings_permissions(path: &Path) -> PermissionRules {
     match std::fs::read_to_string(path) {
         Ok(text) => parse_permissions(&text),
-        Err(_) => PermissionRules::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PermissionRules::default(),
+        Err(e) => {
+            eprintln!(
+                "warning: skipping unreadable settings {}: {e}",
+                path.display()
+            );
+            PermissionRules::default()
+        }
     }
 }
 
