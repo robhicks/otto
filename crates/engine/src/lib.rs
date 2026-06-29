@@ -8,6 +8,7 @@ use otto_engine_core::tool::{
     AllowListAskResolver, AskResolver, DenyAsk, PermissionGate, ToolRegistry,
 };
 use otto_engine_core::traits::{Provider, Workspace, WorkspaceRead};
+use otto_extensions::PermissionRules;
 use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
 use otto_persistence::SessionStore;
 use otto_protocol::{CapabilitiesManifest, Event, Role};
@@ -97,14 +98,25 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
 
 /// Build the tool registry with the default gate (ordinary writes auto-`Allow`ed).
 pub fn build_tool_registry(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
-    build_tool_registry_inner(workspace, root, false)
+    build_tool_registry_inner(workspace, root, false, None)
 }
 
 /// Build the tool registry in **approval mode**: ordinary `fs.write` is gated `Ask` (the
 /// interactive approver applies it only on an explicit approval). The sensitive floor is
 /// unchanged. Used by `serve --approve-edits`.
 pub fn build_tool_registry_approving(workspace: Arc<dyn Workspace>, root: PathBuf) -> ToolRegistry {
-    build_tool_registry_inner(workspace, root, true)
+    build_tool_registry_inner(workspace, root, true, None)
+}
+
+/// Build the tool registry with a `PolicyGate` applying `permissions` over the default gate.
+/// Used by the `otto run` spine when `.claude/settings.json` declares any permission rules; the
+/// PolicyGate owns the bash decision, so it pairs with a plain `DenyAsk` resolver.
+pub fn build_tool_registry_with_permissions(
+    workspace: Arc<dyn Workspace>,
+    root: PathBuf,
+    permissions: &PermissionRules,
+) -> ToolRegistry {
+    build_tool_registry_inner(workspace, root, false, Some(permissions))
 }
 
 /// Always includes the sensitive-path-floor gate and the in-process fs tools. A sandboxed
@@ -118,21 +130,37 @@ fn build_tool_registry_inner(
     workspace: Arc<dyn Workspace>,
     root: PathBuf,
     approve_edits: bool,
+    permissions: Option<&PermissionRules>,
 ) -> ToolRegistry {
     let sandboxed = os_sandbox_available();
-    // NB: the ask-resolver only ever auto-allows `bash`. An `Ask` on `fs.write` (approval mode)
-    // is resolved by the orchestrator's `Approver`, never here — so writes can't slip through.
-    let ask: Arc<dyn AskResolver> = if sandboxed {
-        Arc::new(AllowListAskResolver::new(vec!["bash".to_string()]))
-    } else {
-        Arc::new(DenyAsk)
-    };
-
     let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
-    let gate: Arc<dyn PermissionGate> = if approve_edits {
-        Arc::new(ApprovalModeGate::new(base_gate))
-    } else {
-        base_gate
+
+    // When permission rules exist, the PolicyGate owns every verdict (incl. bash), so it pairs
+    // with a plain DenyAsk. Otherwise the wiring is exactly as before: the bash allow-list
+    // resolver auto-allows the structurally-Asked sandboxed bash, and approval mode (serve) may
+    // upgrade fs.write. (PolicyGate × ApprovalModeGate composition is a deferred serve-path slice,
+    // so `permissions` is only ever Some on the non-approving run path.)
+    let (gate, ask): (Arc<dyn PermissionGate>, Arc<dyn AskResolver>) = match permissions {
+        Some(rules) if !rules.is_empty() => (
+            Arc::new(PolicyGate::new(base_gate, rules.clone(), sandboxed)),
+            Arc::new(DenyAsk),
+        ),
+        _ => {
+            // NB: the ask-resolver only ever auto-allows `bash`. An `Ask` on `fs.write` (approval
+            // mode) is resolved by the orchestrator's `Approver`, never here — so writes can't
+            // slip through.
+            let ask: Arc<dyn AskResolver> = if sandboxed {
+                Arc::new(AllowListAskResolver::new(vec!["bash".to_string()]))
+            } else {
+                Arc::new(DenyAsk)
+            };
+            let gate: Arc<dyn PermissionGate> = if approve_edits {
+                Arc::new(ApprovalModeGate::new(base_gate))
+            } else {
+                base_gate
+            };
+            (gate, ask)
+        }
     };
 
     let mut registry = ToolRegistry::new(gate, ask);
@@ -331,5 +359,32 @@ mod tests {
         assert!(!capabilities_from_env(None, Some(""), false).remote_llm);
         // sandbox passes through unchanged.
         assert!(capabilities_from_env(None, None, true).sandbox);
+    }
+
+    #[tokio::test]
+    async fn registry_with_permissions_denies_matched_write() {
+        use otto_extensions::parse_permissions;
+        use otto_workspace::LocalWorkspace;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
+        let rules = parse_permissions(r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#);
+        let reg = build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules);
+
+        // A write to a denied path is rejected by the gate before dispatch.
+        let err = reg
+            .call("fs.write", json!({"path": "dist/x.txt", "contents": "hi"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied by permission gate"));
+
+        // An unmatched write is permitted.
+        assert!(
+            reg.call("fs.write", json!({"path": "src/x.txt", "contents": "hi"}))
+                .await
+                .is_ok()
+        );
     }
 }
