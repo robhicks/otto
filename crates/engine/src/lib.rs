@@ -132,6 +132,14 @@ fn build_tool_registry_inner(
     approve_edits: bool,
     permissions: Option<&PermissionRules>,
 ) -> ToolRegistry {
+    // Invariant: permissions are wired only on the non-approving run path this slice. The
+    // PolicyGate × ApprovalModeGate composition is a deferred serve-path slice. A hard assert
+    // (not debug_assert) so a future caller passing both fails loud in release too, rather than
+    // silently dropping approval mode (a security regression).
+    assert!(
+        !(approve_edits && matches!(permissions, Some(r) if !r.is_empty())),
+        "PolicyGate × ApprovalModeGate composition is not yet wired",
+    );
     let sandboxed = os_sandbox_available();
     let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
 
