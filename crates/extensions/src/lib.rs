@@ -13,6 +13,7 @@ mod hook_exec;
 mod hooked_tool;
 mod markdown_agent;
 mod marketplace_def;
+mod permission_def;
 mod plugin_def;
 mod skill_def;
 mod skill_tool;
@@ -26,6 +27,7 @@ pub use hook_exec::{HookEvent, HookExecutor, HookOutcome, matcher_selects};
 pub use hooked_tool::HookedTool;
 pub use markdown_agent::MarkdownAgent;
 pub use marketplace_def::{Marketplace, MarketplaceEntry, PluginSource, parse_marketplace_json};
+pub use permission_def::{PermissionRules, parse_permissions};
 pub use plugin_def::{
     McpServersField, PluginManifest, PluginMcpServer, parse_mcp_servers, parse_plugin_json,
 };
@@ -44,6 +46,7 @@ pub struct Extensions {
     pub skills: Vec<CustomSkillDef>,
     pub hooks: HookSet,
     pub mcp_servers: Vec<PluginMcpServer>,
+    pub permissions: PermissionRules,
 }
 
 /// Discover `<home>/.claude/agents/*.md` then `<project_root>/.claude/agents/*.md`. Project
@@ -61,6 +64,7 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         std::collections::BTreeMap::new();
     let mut hooks = HookSet::default();
     let mut mcp_servers: Vec<PluginMcpServer> = Vec::new();
+    let mut permissions = PermissionRules::default();
     for base in [home, project_root] {
         let claude = base.join(".claude");
         for def in read_agents_dir(&claude.join("agents")) {
@@ -76,6 +80,7 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         // Concatenate (user-base first, then project) — hooks are additive, not override-by-name.
         hooks.pre_tool_use.append(&mut base_hooks.pre_tool_use);
         hooks.post_tool_use.append(&mut base_hooks.post_tool_use);
+        permissions.extend(read_settings_permissions(&claude.join("settings.json")));
     }
     fold_plugins(
         home,
@@ -92,6 +97,7 @@ pub fn discover(project_root: &Path, home: &Path) -> Extensions {
         skills: skills.into_values().collect(),
         hooks,
         mcp_servers,
+        permissions,
     }
 }
 
@@ -261,6 +267,22 @@ fn read_settings_hooks(path: &Path) -> HookSet {
                 path.display()
             );
             HookSet::default()
+        }
+    }
+}
+
+/// Read `<base>/.claude/settings.json` and parse its `permissions` block. Missing/unreadable →
+/// empty (never fatal), matching every other `.claude/` reader.
+fn read_settings_permissions(path: &Path) -> PermissionRules {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_permissions(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PermissionRules::default(),
+        Err(e) => {
+            eprintln!(
+                "warning: skipping unreadable settings {}: {e}",
+                path.display()
+            );
+            PermissionRules::default()
         }
     }
 }
@@ -746,6 +768,49 @@ mod tests {
         let proj = tempdir().unwrap();
         write_settings(proj.path(), "{ not json");
         assert_eq!(discover(proj.path(), home.path()).hooks, HookSet::default());
+    }
+
+    #[test]
+    fn discovers_and_unions_permissions_across_bases() {
+        use std::fs;
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let home_claude = home.path().join(".claude");
+        let proj_claude = proj.path().join(".claude");
+        fs::create_dir_all(&home_claude).unwrap();
+        fs::create_dir_all(&proj_claude).unwrap();
+        fs::write(
+            home_claude.join("settings.json"),
+            r#"{ "permissions": { "allow": ["Read(src/**)"] } }"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_claude.join("settings.json"),
+            r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#,
+        )
+        .unwrap();
+
+        let ext = discover(proj.path(), home.path());
+        assert!(!ext.permissions.is_empty());
+        // user allow + project deny are both present (unioned).
+        assert_eq!(
+            ext.permissions
+                .decision("fs.read", &serde_json::json!({"path": "src/a.rs"})),
+            Some(otto_engine_core::tool::Decision::Allow)
+        );
+        assert_eq!(
+            ext.permissions
+                .decision("fs.write", &serde_json::json!({"path": "dist/x"})),
+            Some(otto_engine_core::tool::Decision::Deny)
+        );
+    }
+
+    #[test]
+    fn no_permissions_block_yields_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let ext = discover(proj.path(), home.path());
+        assert!(ext.permissions.is_empty());
     }
 
     #[test]
