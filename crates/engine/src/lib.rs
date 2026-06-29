@@ -22,6 +22,7 @@ mod approval;
 mod hooks;
 mod loopback;
 mod mcp;
+mod policy_gate;
 mod serve;
 mod service;
 
@@ -38,6 +39,7 @@ pub use otto_remote::{
     Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget, export_bundle,
     promote,
 };
+pub use policy_gate::PolicyGate;
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,
 };
