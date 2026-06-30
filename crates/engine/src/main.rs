@@ -988,10 +988,11 @@ mod tests {
         };
 
         // None → all tools unchanged (fs.write is always registered).
-        let all: std::collections::BTreeSet<String> =
-            build().tool_names().into_iter().collect();
-        let kept: std::collections::BTreeSet<String> =
-            narrow_for_command(build(), &None).tool_names().into_iter().collect();
+        let all: std::collections::BTreeSet<String> = build().tool_names().into_iter().collect();
+        let kept: std::collections::BTreeSet<String> = narrow_for_command(build(), &None)
+            .tool_names()
+            .into_iter()
+            .collect();
         assert_eq!(kept, all, "None must keep every base tool");
 
         // Some(list) → narrowed to exactly the intersection.
@@ -1001,7 +1002,9 @@ mod tests {
 
         // Some([]) → no tools.
         assert!(
-            narrow_for_command(build(), &Some(vec![])).tool_names().is_empty(),
+            narrow_for_command(build(), &Some(vec![]))
+                .tool_names()
+                .is_empty(),
             "an empty allowlist must yield no tools"
         );
 
