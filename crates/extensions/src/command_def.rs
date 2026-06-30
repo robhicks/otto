@@ -4,7 +4,9 @@
 //! caller), not from frontmatter, and frontmatter is optional — a bare prompt file is valid.
 
 /// One parsed custom command. All frontmatter fields are optional. `model` is preserved for a
-/// later slice (not routed); `allowed_tools` is preserved for a later slice (not enforced).
+/// later slice (not routed). `allowed_tools` is enforced on the `otto run --command` path, where
+/// it narrows the tool registry via `ToolRegistry::subset` (absent = all tools, present =
+/// intersection, empty = none); it is inert on any other path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomCommandDef {
     pub name: String,
