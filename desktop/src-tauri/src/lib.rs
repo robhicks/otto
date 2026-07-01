@@ -65,8 +65,21 @@ pub fn run() {
 
       Ok(())
     })
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|app_handle, event| {
+      if let tauri::RunEvent::ExitRequested { .. } = event {
+        if let Some(child) = app_handle
+          .state::<SidecarHandle>()
+          .0
+          .lock()
+          .unwrap()
+          .take()
+        {
+          let _ = child.kill();
+        }
+      }
+    });
 }
 
 /// Watches the sidecar's output for otto serve's readiness line (with a 5s timeout), then
