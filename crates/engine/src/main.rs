@@ -417,6 +417,21 @@ async fn run_custom_agent_in(
     Ok(())
 }
 
+/// Apply a command's `allowed_tools` to its tool registry, matching the agent narrowing
+/// convention: an absent allowlist (`None`) keeps every tool; a present allowlist narrows to
+/// exactly that intersection (a present-but-empty list yields no tools). `subset` shares the
+/// underlying gate, so the inviolable sensitive-path floor is preserved within the narrowed set,
+/// and narrowing can only remove tools — never widen access.
+fn narrow_for_command(
+    tools: otto_engine_core::tool::ToolRegistry,
+    allowed: &Option<Vec<String>>,
+) -> otto_engine_core::tool::ToolRegistry {
+    match allowed {
+        Some(list) => tools.subset(list),
+        None => tools,
+    }
+}
+
 /// Expand a discovered command (`expand_args` then gated `!bash`/`@file` injection) and run the
 /// result as the goal of a normal spine turn. `home` is injected so tests stay hermetic.
 async fn run_command_in(
@@ -464,7 +479,9 @@ async fn run_command_in(
     )
     .await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
-    let tools = Arc::new(tools);
+    // Narrow the registry to the command's allowed-tools (None = all tools) before it is used for
+    // BOTH injection resolution and the spine turn — so a disallowed tool is fail-closed.
+    let tools = Arc::new(narrow_for_command(tools, &def.allowed_tools));
 
     // Args are substituted first, then the whole string is scanned for `!`cmd`/@path`
     // injections — so a user-supplied arg is intentionally re-scanned (Claude-Code parity).
@@ -955,6 +972,80 @@ mod tests {
         assert!(
             out.to_string().contains("hi"),
             "expected fs.read to return file content, got: {out}"
+        );
+    }
+
+    #[test]
+    fn narrow_for_command_applies_the_allowlist_convention() {
+        use otto_workspace::LocalWorkspace;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let build = || {
+            otto_engine::build_tool_registry(
+                Arc::new(LocalWorkspace::new(root.clone())),
+                root.clone(),
+            )
+        };
+
+        // None → all tools unchanged (fs.write is always registered).
+        let all: std::collections::BTreeSet<String> = build().tool_names().into_iter().collect();
+        let kept: std::collections::BTreeSet<String> = narrow_for_command(build(), &None)
+            .tool_names()
+            .into_iter()
+            .collect();
+        assert_eq!(kept, all, "None must keep every base tool");
+
+        // Some(list) → narrowed to exactly the intersection.
+        let only_read =
+            narrow_for_command(build(), &Some(vec!["fs.read".to_string()])).tool_names();
+        assert_eq!(only_read, vec!["fs.read".to_string()]);
+
+        // Some([]) → no tools.
+        assert!(
+            narrow_for_command(build(), &Some(vec![]))
+                .tool_names()
+                .is_empty(),
+            "an empty allowlist must yield no tools"
+        );
+
+        // An unknown name is silently dropped (intersection), never an error.
+        let unknown =
+            narrow_for_command(build(), &Some(vec!["does.not.exist".to_string()])).tool_names();
+        assert!(unknown.is_empty(), "unknown tool names are dropped");
+    }
+
+    #[tokio::test]
+    async fn command_allowed_tools_narrows_and_blocks_disallowed_injection() {
+        use std::fs;
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global commands
+        fs::write(proj.path().join("target.txt"), "file-body").unwrap();
+        let cmds = proj.path().join(".claude").join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        // allowed-tools is present and excludes fs.read, so the @target.txt injection
+        // must fail closed (fs.read is not in the narrowed registry).
+        fs::write(
+            cmds.join("peek.md"),
+            "---\nallowed-tools: fs.write\n---\nShow @target.txt\n",
+        )
+        .unwrap();
+
+        let res = run_command_in(
+            "peek",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected fail-closed @-injection under a narrowed allowlist, got: {res:?}"
+        );
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("file injection `@target.txt`"),
+            "expected the fs.read injection to be the failure cause"
         );
     }
 
