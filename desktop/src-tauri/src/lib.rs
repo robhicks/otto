@@ -1,10 +1,14 @@
 mod launch;
 
 use std::sync::Mutex;
+use std::time::Duration;
 
-use tauri::Manager;
-use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_shell::{process::CommandChild, ShellExt};
+use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri_plugin_shell::{
+  process::{CommandChild, CommandEvent},
+  ShellExt,
+};
 
 /// Holds the spawned sidecar's handle so it can be killed on app exit (Task 8). `None` until
 /// the sidecar spawns, and stays `None` if the user cancels the folder picker (nothing to kill).
@@ -36,7 +40,7 @@ pub fn run() {
         .map_err(|e| format!("chosen folder is not a filesystem path: {e}"))?;
 
       let token = uuid::Uuid::new_v4().to_string();
-      let (_rx, child) = app
+      let (rx, child) = app
         .shell()
         .sidecar("otto")
         .map_err(|e| e.to_string())?
@@ -57,8 +61,67 @@ pub fn run() {
         .unwrap()
         .replace(child);
 
+      watch_for_readiness(app.handle().clone(), rx, token);
+
       Ok(())
     })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+/// Watches the sidecar's output for otto serve's readiness line (with a 5s timeout), then
+/// navigates the main window to the bootstrap URL — or shows an error dialog on failure/timeout.
+fn watch_for_readiness(
+  app: AppHandle,
+  mut rx: tauri::async_runtime::Receiver<CommandEvent>,
+  token: String,
+) {
+  tauri::async_runtime::spawn(async move {
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+      while let Some(event) = rx.recv().await {
+        match event {
+          CommandEvent::Stderr(line) => {
+            let text = String::from_utf8_lossy(&line);
+            if launch::is_ready_line(&text) {
+              return Ok(());
+            }
+          }
+          CommandEvent::Terminated(payload) => {
+            return Err(format!(
+              "otto serve exited before starting (code {:?})",
+              payload.code
+            ));
+          }
+          _ => {}
+        }
+      }
+      Err("otto serve's output stream closed unexpectedly".to_string())
+    })
+    .await;
+
+    match outcome {
+      Ok(Ok(())) => {
+        let target = launch::build_launch_url("ws://127.0.0.1:8787", &token);
+        if let Some(window) = app.get_webview_window("main") {
+          match target.parse() {
+            Ok(url) => {
+              let _ = window.navigate(url);
+            }
+            Err(e) => show_startup_error(&app, &format!("invalid launch URL: {e}")),
+          }
+        }
+      }
+      Ok(Err(message)) => show_startup_error(&app, &message),
+      Err(_) => show_startup_error(&app, "otto serve did not start within 5 seconds"),
+    }
+  });
+}
+
+fn show_startup_error(app: &AppHandle, message: &str) {
+  app
+    .dialog()
+    .message(message)
+    .title("otto failed to start")
+    .kind(MessageDialogKind::Error)
+    .blocking_show();
 }
