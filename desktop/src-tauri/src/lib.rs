@@ -116,7 +116,14 @@ fn watch_for_readiness(
       Ok(Ok(())) => {
         let target = launch::build_launch_url("ws://127.0.0.1:8787", &token);
         if let Some(window) = app.get_webview_window("main") {
-          match target.parse() {
+          // `target` is relative (`index.html?...`), so it must be resolved against the
+          // webview's current base URL before `navigate` — `Url::parse` rejects a relative
+          // URL outright ("relative URL without a base").
+          let joined = window
+            .url()
+            .map_err(|e| e.to_string())
+            .and_then(|base| base.join(&target).map_err(|e| e.to_string()));
+          match joined {
             Ok(url) => {
               let _ = window.navigate(url);
             }

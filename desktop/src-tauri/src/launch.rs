@@ -15,6 +15,10 @@ pub fn is_ready_line(line: &str) -> bool {
 /// `parse_launch_params` is the reader side of this exact contract — the query key names
 /// (`ws`, `token`, `autoconnect`) must match.
 ///
+/// This is intentionally **relative** (no scheme/host) — the caller (`lib.rs`) must resolve it
+/// against the webview's current base URL (`WebviewWindow::url()`) before navigating, since
+/// `Url::parse` rejects a relative URL outright ("relative URL without a base").
+///
 /// `ws_base` and `token` are never percent-encoded here: `ws_base` is always the fixed
 /// `ws://127.0.0.1:8787` (no dynamic port this slice) and `token` is a `Uuid::new_v4()`
 /// string (hex digits and hyphens only) — neither can contain a character that needs
@@ -49,6 +53,22 @@ mod tests {
         assert_eq!(
             build_launch_url("ws://127.0.0.1:8787", "abc-123"),
             "index.html?ws=ws://127.0.0.1:8787&token=abc-123&autoconnect=1"
+        );
+    }
+
+    #[test]
+    fn launch_url_is_relative_and_resolves_against_the_webview_base() {
+        // Locks the contract `lib.rs` relies on: build_launch_url's output must be a valid
+        // *relative reference* that Url::join can resolve against the webview's base — this
+        // is exactly what caught the original bug (Url::parse on the bare output fails with
+        // "relative URL without a base"). "tauri://localhost/" mirrors the base tauri's own
+        // test suite uses for its default webview origin.
+        let target = build_launch_url("ws://127.0.0.1:8787", "abc-123");
+        let base: url::Url = "tauri://localhost/".parse().unwrap();
+        let resolved = base.join(&target).expect("relative launch URL must be joinable");
+        assert_eq!(
+            resolved.as_str(),
+            "tauri://localhost/index.html?ws=ws://127.0.0.1:8787&token=abc-123&autoconnect=1"
         );
     }
 }
