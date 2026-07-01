@@ -490,7 +490,9 @@ async fn run_command_in(
     let expanded = expand_args(&def.template, args);
     let goal = resolve_injections(&expanded, tools.as_ref()).await?;
 
-    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    // Pin the remote model to the command's `model:` field (None = normal env-based routing).
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::from(otto_engine::build_router_with_model(def.model.as_deref()));
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -781,6 +783,34 @@ mod tests {
         .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("no command named"));
+    }
+
+    #[tokio::test]
+    async fn run_command_with_model_field_runs_offline() {
+        use std::fs;
+        // A command declaring `model:` still runs a deterministic offline turn when no
+        // ANTHROPIC_API_KEY is set (graceful fallback + stderr warning).
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global commands
+        let cmds = proj.path().join(".claude").join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            cmds.join("plan.md"),
+            "---\nmodel: claude-opus-4-8\n---\nDescribe the plan for $1.\n",
+        )
+        .unwrap();
+
+        let ok = run_command_in(
+            "plan",
+            &["auth".to_string()],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected model-pinned command to run offline: {ok:?}"
+        );
     }
 
     #[test]
