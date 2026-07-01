@@ -6,7 +6,10 @@
 /// One parsed custom command. All frontmatter fields are optional. `model` is preserved for a
 /// later slice (not routed). `allowed_tools` is enforced on the `otto run --command` path, where
 /// it narrows the tool registry via `ToolRegistry::subset` (absent = all tools, present =
-/// intersection, empty = none); it is inert on any other path.
+/// intersection, empty = none); it is inert on any other path. Each token is normalized via
+/// `permission_def::normalize_tool` (so `Read`/`Edit`/`Write`/`Bash`/... match otto's
+/// `fs.read`/`fs.write`/`bash`/... names) and any argument specifier (`Bash(git diff:*)`) is
+/// stripped before matching, since `subset` narrows by tool name only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomCommandDef {
     pub name: String,
@@ -48,12 +51,18 @@ pub fn parse_command_md(name: &str, text: &str) -> anyhow::Result<CustomCommandD
                 "argument-hint" if !value.is_empty() => argument_hint = Some(value.to_string()),
                 "model" if !value.is_empty() => model = Some(value.to_string()),
                 // Present (even if empty) → Some(list); only an absent key stays None.
+                // Each token is normalized (Claude Code names like `Read`/`Bash` → otto's
+                // `fs.read`/`bash`, matching the `permissions` block's alias map) and any
+                // argument specifier (`Bash(git diff:*)`) is dropped — `ToolRegistry::subset`
+                // narrows by tool name only, it has no notion of a per-argument scope.
                 "allowed-tools" => {
                     let list: Vec<String> = value
                         .trim_matches(['[', ']'])
                         .split(',')
-                        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
+                        .map(|s| s.trim().trim_matches(['"', '\'']))
+                        .map(|s| s.split('(').next().unwrap_or(s).trim())
                         .filter(|s| !s.is_empty())
+                        .map(crate::permission_def::normalize_tool)
                         .collect();
                     allowed_tools = Some(list);
                 }
@@ -101,6 +110,23 @@ mod tests {
         assert_eq!(
             def.allowed_tools,
             Some(vec!["bash".to_string(), "fs.read".to_string()])
+        );
+    }
+
+    #[test]
+    fn allowed_tools_normalizes_claude_code_names() {
+        // Idiomatic Claude Code syntax (native tool names, some with an argument specifier) must
+        // normalize to otto's names — matching the permissions block's alias map — instead of
+        // silently producing an empty, all-denying subset.
+        let text = "---\nallowed-tools: Bash(git status:*), Read, Edit\n---\nbody\n";
+        let def = parse_command_md("c", text).unwrap();
+        assert_eq!(
+            def.allowed_tools,
+            Some(vec![
+                "bash".to_string(),
+                "fs.read".to_string(),
+                "fs.write".to_string()
+            ])
         );
     }
 

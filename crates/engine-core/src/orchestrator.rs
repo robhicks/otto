@@ -267,7 +267,7 @@ mod tests {
     use crate::meter::TokenMeter;
     use crate::router::{RouteHints, Router};
     use crate::tool::{
-        Approver, Decision, DenyApprover, DenyAsk, NeverPause, PermissionGate, ToolRegistry,
+        Approver, Decision, DenyApprover, DenyAsk, NeverPause, PermissionGate, Tool, ToolRegistry,
     };
     use crate::traits::{Agent, Workspace, WorkspaceRead};
     use crate::types::{
@@ -285,6 +285,21 @@ mod tests {
         Uuid::from_u128(0)
     }
 
+    // `check` denies any tool absent from the registry regardless of the gate's verdict (so a
+    // `subset`-narrowed registry fails closed even for callers that only ever `check`, never
+    // `call`) — every gate-driven test registry below must register this stub under "fs.write"
+    // so the gate's verdict, not tool absence, is what's under test.
+    struct NoopFsWrite;
+    #[async_trait]
+    impl Tool for NoopFsWrite {
+        fn name(&self) -> &str {
+            "fs.write"
+        }
+        async fn call(&self, _args: Value) -> anyhow::Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
     struct TestAllowGate;
     impl PermissionGate for TestAllowGate {
         fn evaluate(&self, _tool: &str, _args: &Value) -> Decision {
@@ -292,7 +307,9 @@ mod tests {
         }
     }
     fn empty_tools() -> ToolRegistry {
-        ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(DenyAsk))
+        let mut tools = ToolRegistry::new(Arc::new(TestAllowGate), Arc::new(DenyAsk));
+        tools.register(Arc::new(NoopFsWrite));
+        tools
     }
 
     struct TestDenyWriteGate;
@@ -306,7 +323,9 @@ mod tests {
         }
     }
     fn deny_write_tools() -> ToolRegistry {
-        ToolRegistry::new(Arc::new(TestDenyWriteGate), Arc::new(DenyAsk))
+        let mut tools = ToolRegistry::new(Arc::new(TestDenyWriteGate), Arc::new(DenyAsk));
+        tools.register(Arc::new(NoopFsWrite));
+        tools
     }
 
     struct TestAskWriteGate;
@@ -318,6 +337,11 @@ mod tests {
                 Decision::Allow
             }
         }
+    }
+    fn ask_write_tools() -> ToolRegistry {
+        let mut tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        tools.register(Arc::new(NoopFsWrite));
+        tools
     }
 
     struct FakeRouter;
@@ -554,7 +578,7 @@ mod tests {
         let reg = registry(); // OneEditCoder produces an edit to out.txt
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
-        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let tools = ask_write_tools();
         let meter = TokenMeter::default();
         let orch = Orchestrator {
             registry: &reg,
@@ -739,7 +763,7 @@ mod tests {
         let reg = registry(); // OneEditCoder → edit to out.txt
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
-        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let tools = ask_write_tools();
         let approver = ScriptedApprover {
             approve: true,
             seen: Mutex::new(Vec::new()),
@@ -789,7 +813,7 @@ mod tests {
         let reg = registry();
         let router = FakeRouter;
         let workspace = RecordingWorkspace::default();
-        let tools = ToolRegistry::new(Arc::new(TestAskWriteGate), Arc::new(DenyAsk));
+        let tools = ask_write_tools();
         let approver = ScriptedApprover {
             approve: false,
             seen: Mutex::new(Vec::new()),

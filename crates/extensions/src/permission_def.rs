@@ -33,8 +33,9 @@ enum Specifier {
 }
 
 /// Map a Claude Code tool name to its otto equivalent. otto-native and unknown names pass through
-/// verbatim, so a future otto tool name works without a code change.
-fn normalize_tool(name: &str) -> String {
+/// verbatim, so a future otto tool name works without a code change. Shared with `command_def`'s
+/// `allowed-tools` parsing so both surfaces recognize the same Claude-Code-native names.
+pub(crate) fn normalize_tool(name: &str) -> String {
     match name {
         "Read" => "fs.read",
         "Edit" | "Write" | "MultiEdit" => "fs.write",

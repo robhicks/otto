@@ -173,8 +173,13 @@ impl ToolRegistry {
 
     /// Return the gate's `Decision` for a proposed call WITHOUT dispatching. Lets the
     /// orchestrator gate edits it applies directly (via the workspace) through the same
-    /// policy that governs tool calls.
+    /// policy that governs tool calls — including `call`'s requirement that the tool actually
+    /// be registered, so a `subset`-narrowed registry that dropped `name` denies here too,
+    /// even when the shared gate would otherwise allow it.
     pub fn check(&self, name: &str, args: &Value) -> Decision {
+        if !self.tools.contains_key(name) {
+            return Decision::Deny;
+        }
         self.gate.evaluate(name, args)
     }
 
@@ -317,15 +322,29 @@ mod tests {
 
     #[test]
     fn check_returns_gate_decision_without_dispatch() {
-        let allow = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        let mut allow = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        allow.register(Arc::new(EchoTool));
         assert_eq!(
-            allow.check("fs.write", &json!({"path": "a.txt"})),
+            allow.check("echo", &json!({"path": "a.txt"})),
             Decision::Allow
         );
 
-        let deny = ToolRegistry::new(Arc::new(DenyAll), Arc::new(DenyAsk));
+        let mut deny = ToolRegistry::new(Arc::new(DenyAll), Arc::new(DenyAsk));
+        deny.register(Arc::new(EchoTool));
         assert_eq!(
-            deny.check("fs.write", &json!({"path": "a.txt"})),
+            deny.check("echo", &json!({"path": "a.txt"})),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn check_denies_a_tool_absent_from_the_registry_even_when_the_gate_would_allow() {
+        // A subset-narrowed registry that dropped "fs.write" must deny it via `check`, matching
+        // `call`'s fail-closed behavior for unregistered tools — otherwise narrowing would be a
+        // no-op for callers (like the orchestrator's edit-apply loop) that only ever `check`.
+        let registry = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        assert_eq!(
+            registry.check("fs.write", &json!({"path": "a.txt"})),
             Decision::Deny
         );
     }
@@ -340,6 +359,20 @@ mod tests {
         assert!(sub.call("ping", json!({})).await.is_ok());
         // "echo" was excluded by the allowlist → no such tool in the subset.
         assert!(sub.call("echo", json!({})).await.is_err());
+    }
+
+    #[test]
+    fn subset_that_drops_a_tool_makes_check_deny_it_even_under_an_allow_gate() {
+        // Reproduces the orchestrator's edit-apply path: it calls `check("fs.write", ..)`, never
+        // `call`, so subset's tool-map filtering must be visible to `check` too — otherwise
+        // narrowing a command's allowed-tools to exclude fs.write would not stop Coder edits.
+        let mut r = ToolRegistry::new(Arc::new(AllowAll), Arc::new(DenyAsk));
+        r.register(Arc::new(PingTool));
+        let narrowed = r.subset(&["ping".to_string()]); // fs.write dropped
+        assert_eq!(
+            narrowed.check("fs.write", &json!({"path": "a.txt"})),
+            Decision::Deny
+        );
     }
 
     #[tokio::test]
