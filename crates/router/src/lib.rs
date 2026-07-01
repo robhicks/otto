@@ -1,6 +1,7 @@
 //! Concrete routers for otto. `SingleProviderRouter` is a pass-through over one
 //! provider; `BrainBlendRouter` selects across a local+remote pool with
-//! privacy/complexity routing and cross-provider fallback.
+//! privacy/complexity routing and cross-provider fallback; `PinnedModelRouter` pins
+//! the remote model, routing every request remote unless the request is privacy-sensitive.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -122,6 +123,46 @@ impl Router for BrainBlendRouter {
                         )
                     })
             }
+        }
+    }
+}
+
+/// A router that honors an explicitly pinned remote model: it routes every request to the
+/// remote provider (built with the pinned model id) EXCEPT privacy-sensitive requests, which
+/// stay local — the privacy floor is inviolable. Complexity and prior-failure-based escalation
+/// are ignored — the caller named a model, so the remote is always primary. A liveness fallback
+/// to local is retained if the remote errors on a non-privacy request, matching BrainBlendRouter.
+pub struct PinnedModelRouter {
+    local: Arc<dyn Provider>,
+    remote: Arc<dyn Provider>,
+}
+
+impl PinnedModelRouter {
+    pub fn new(local: Arc<dyn Provider>, remote: Arc<dyn Provider>) -> Self {
+        Self { local, remote }
+    }
+}
+
+#[async_trait]
+impl Router for PinnedModelRouter {
+    async fn complete(
+        &self,
+        req: CompleteRequest,
+        hints: RouteHints,
+    ) -> anyhow::Result<CompleteResponse> {
+        // Privacy floor: a sensitive request stays local and never crosses to the remote model.
+        if hints.privacy_sensitive {
+            return self.local.complete(req).await;
+        }
+        match self.remote.complete(req.clone()).await {
+            Ok(resp) => Ok(resp),
+            // Non-privacy liveness fallback to local, matching BrainBlendRouter.
+            Err(remote_err) => self.local.complete(req).await.map_err(|local_err| {
+                anyhow::anyhow!(
+                    "pinned remote failed and local fallback failed: \
+                     remote={remote_err}; local={local_err}"
+                )
+            }),
         }
     }
 }
@@ -394,5 +435,106 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(meter.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn pinned_routes_remote_for_non_privacy() {
+        // A pinned model must reach the remote slot regardless of task kind / complexity.
+        let router = PinnedModelRouter::new(
+            Arc::new(TagProvider("local")),
+            Arc::new(TagProvider("remote")),
+        );
+        let out = router
+            .complete(
+                CompleteRequest { prompt: "x".into() },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "remote");
+    }
+
+    #[tokio::test]
+    async fn pinned_routes_local_for_privacy() {
+        // The privacy floor is inviolable: a privacy-sensitive request stays local even when
+        // a remote model is pinned.
+        let router = PinnedModelRouter::new(
+            Arc::new(TagProvider("local")),
+            Arc::new(TagProvider("remote")),
+        );
+        let hints = RouteHints {
+            privacy_sensitive: true,
+            ..RouteHints::default()
+        };
+        let out = router
+            .complete(
+                CompleteRequest {
+                    prompt: "secret".into(),
+                },
+                hints,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "local");
+    }
+
+    #[tokio::test]
+    async fn pinned_non_privacy_remote_error_falls_back_to_local() {
+        // Liveness: a non-privacy remote failure falls back to local (matching BrainBlend).
+        let router = PinnedModelRouter::new(Arc::new(TagProvider("local")), Arc::new(FailProvider));
+        let out = router
+            .complete(
+                CompleteRequest { prompt: "x".into() },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "local");
+    }
+
+    #[tokio::test]
+    async fn pinned_both_fail_surfaces_both_errors() {
+        // Non-privacy: remote fails, local fallback also fails → combined error mentions both.
+        let router = PinnedModelRouter::new(Arc::new(FailProvider), Arc::new(FailProvider));
+        let err = router
+            .complete(
+                CompleteRequest { prompt: "x".into() },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("remote="), "remote label missing: {msg}");
+        assert!(msg.contains("local="), "local label missing: {msg}");
+        assert!(msg.contains("boom"), "original error text missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn pinned_privacy_error_never_crosses_to_remote() {
+        // A privacy-sensitive request routes local; if local fails it MUST surface the error,
+        // never re-send to the pinned remote model.
+        let router =
+            PinnedModelRouter::new(Arc::new(FailProvider), Arc::new(TagProvider("remote")));
+        let hints = RouteHints {
+            privacy_sensitive: true,
+            ..RouteHints::default()
+        };
+        let err = router
+            .complete(
+                CompleteRequest {
+                    prompt: "secret".into(),
+                },
+                hints,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "expected local error, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("remote"),
+            "must not have reached remote: {err}"
+        );
     }
 }
