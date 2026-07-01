@@ -371,7 +371,13 @@ async fn run_custom_agent_in(
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    // Pin the remote model to the top-level `--agent`'s `model:` field. Nested Task
+    // sub-dispatches inherit this same pinned router (per-sub-agent model is deferred).
+    let mut model_override: Option<String> = None;
     for def in ext.agents {
+        if def.name == name {
+            model_override = def.model.clone();
+        }
         allowlists.insert(def.name.clone(), def.tools.clone());
         registry.register(
             Role::Custom(def.name.clone()),
@@ -386,7 +392,9 @@ async fn run_custom_agent_in(
         );
     }
 
-    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    let router: Arc<dyn otto_engine_core::Router> = Arc::from(
+        otto_engine::build_router_with_model(model_override.as_deref()),
+    );
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
@@ -490,7 +498,9 @@ async fn run_command_in(
     let expanded = expand_args(&def.template, args);
     let goal = resolve_injections(&expanded, tools.as_ref()).await?;
 
-    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    // Pin the remote model to the command's `model:` field (None = normal env-based routing).
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::from(otto_engine::build_router_with_model(def.model.as_deref()));
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -731,6 +741,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_custom_agent_with_model_field_runs_offline() {
+        use std::fs;
+        // A custom agent declaring `model:` still runs a deterministic offline dispatch when no
+        // ANTHROPIC_API_KEY is set (graceful fallback).
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global agents
+        let agents = proj.path().join(".claude").join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews code\nmodel: claude-opus-4-8\n---\nYou review code.\n",
+        )
+        .unwrap();
+
+        let ok = run_custom_agent_in(
+            "reviewer",
+            "look at lib.rs",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected model-pinned agent to run offline: {ok:?}"
+        );
+    }
+
     #[test]
     fn parse_command_flag_extracts_name_and_keeps_args() {
         let args = vec![
@@ -781,6 +819,34 @@ mod tests {
         .await;
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("no command named"));
+    }
+
+    #[tokio::test]
+    async fn run_command_with_model_field_runs_offline() {
+        use std::fs;
+        // A command declaring `model:` still runs a deterministic offline turn when no
+        // ANTHROPIC_API_KEY is set (graceful fallback + stderr warning).
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global commands
+        let cmds = proj.path().join(".claude").join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            cmds.join("plan.md"),
+            "---\nmodel: claude-opus-4-8\n---\nDescribe the plan for $1.\n",
+        )
+        .unwrap();
+
+        let ok = run_command_in(
+            "plan",
+            &["auth".to_string()],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected model-pinned command to run offline: {ok:?}"
+        );
     }
 
     #[test]

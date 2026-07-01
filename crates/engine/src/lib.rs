@@ -13,7 +13,7 @@ use otto_extensions::PermissionRules;
 use otto_persistence::SessionStore;
 use otto_protocol::{CapabilitiesManifest, Event, Role};
 use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
-use otto_router::{BrainBlendRouter, SingleProviderRouter};
+use otto_router::{BrainBlendRouter, PinnedModelRouter, SingleProviderRouter};
 use otto_tools::{
     BashTool, DefaultPermissionGate, FsListTool, FsReadTool, FsWriteTool, SandboxPolicy,
     os_sandbox_available,
@@ -62,37 +62,66 @@ pub fn build_default_registry() -> AgentRegistry {
     registry
 }
 
-/// Build a router from environment configuration.
-///
-/// - Local slot: `OllamaProvider` if `OTTO_OLLAMA=1` (model from `OTTO_OLLAMA_MODEL`,
-///   default `llama3.2`), otherwise the deterministic `LocalProvider`.
-/// - Remote slot: `AnthropicProvider` if `ANTHROPIC_API_KEY` is set (model from
-///   `OTTO_ANTHROPIC_MODEL`, default `claude-haiku-4-5`), otherwise the local slot is
-///   reused so routing still works with one real backend.
-///
-/// With no env vars set, both slots are the deterministic `LocalProvider`, so the engine
-/// runs fully offline and deterministically — the default for tests and first-run.
-pub fn build_router() -> Box<dyn otto_engine_core::Router> {
-    let local: Arc<dyn Provider> = if std::env::var("OTTO_OLLAMA").as_deref() == Ok("1") {
+/// Construct the local provider slot from the environment (shared by both router builders).
+fn build_local_provider() -> Arc<dyn Provider> {
+    if std::env::var("OTTO_OLLAMA").as_deref() == Ok("1") {
         let model =
             std::env::var("OTTO_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
         Arc::new(OllamaProvider::local_default(model))
     } else {
         Arc::new(LocalProvider::new())
-    };
+    }
+}
+
+/// Equivalent to [`build_router_with_model`]`(None)`; see that function for full behavior.
+pub fn build_router() -> Box<dyn otto_engine_core::Router> {
+    build_router_with_model(None)
+}
+
+/// Build a router, optionally pinning the remote slot to an explicit model id (from a
+/// command/agent `model:` field).
+///
+/// - `model_override = Some(m)` + `ANTHROPIC_API_KEY` present: the remote slot is an
+///   `AnthropicProvider` built with `m` (NOT `OTTO_ANTHROPIC_MODEL`), wrapped in a
+///   `PinnedModelRouter` so the named model actually runs (privacy-sensitive requests still
+///   stay local).
+/// - `model_override = Some(m)` + no key: not honorable — warn and fall back to the offline
+///   `SingleProviderRouter`, so the default stays deterministic.
+/// - `model_override = None`: unchanged behavior (`BrainBlendRouter` with a key, else
+///   `SingleProviderRouter`).
+pub fn build_router_with_model(model_override: Option<&str>) -> Box<dyn otto_engine_core::Router> {
+    let local = build_local_provider();
 
     match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(key) if !key.is_empty() => {
-            let model = std::env::var("OTTO_ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string());
-            let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
-                AnthropicProvider::api_base_default(),
-                key,
-                model,
-            ));
-            Box::new(BrainBlendRouter::new(local, remote))
+        Ok(key) if !key.is_empty() => match model_override {
+            Some(model) => {
+                let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
+                    AnthropicProvider::api_base_default(),
+                    key,
+                    model.to_string(),
+                ));
+                Box::new(PinnedModelRouter::new(local, remote))
+            }
+            None => {
+                let model = std::env::var("OTTO_ANTHROPIC_MODEL")
+                    .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string());
+                let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
+                    AnthropicProvider::api_base_default(),
+                    key,
+                    model,
+                ));
+                Box::new(BrainBlendRouter::new(local, remote))
+            }
+        },
+        _ => {
+            if let Some(model) = model_override {
+                eprintln!(
+                    "warning: requested model '{model}' but ANTHROPIC_API_KEY is not set; \
+                     falling back to the offline/local router"
+                );
+            }
+            Box::new(SingleProviderRouter::new(local))
         }
-        _ => Box::new(SingleProviderRouter::new(local)),
     }
 }
 
@@ -315,9 +344,12 @@ mod tests {
     #[tokio::test]
     async fn default_build_router_is_offline_and_deterministic() {
         // Ensure the env that would select real backends is absent for this test.
-        // SAFETY: this is the only test in this lib's test binary, so no other test
-        // races on these process-global env vars. Do not add a test here that reads
-        // OTTO_OLLAMA / ANTHROPIC_API_KEY without revisiting this.
+        // SAFETY: there are exactly two tests in this lib's test binary that touch
+        // OTTO_OLLAMA / ANTHROPIC_API_KEY: this one and
+        // `model_override_without_key_is_offline_and_deterministic`. Both only ever
+        // REMOVE these vars (removing an absent var is idempotent), so ordering is
+        // irrelevant and they cannot race destructively. Do not add a test here that
+        // SETS these vars without revisiting this comment.
         unsafe {
             std::env::remove_var("OTTO_OLLAMA");
             std::env::remove_var("ANTHROPIC_API_KEY");
@@ -343,6 +375,39 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert!(a.text.contains("ping"));
+    }
+
+    #[tokio::test]
+    async fn model_override_without_key_is_offline_and_deterministic() {
+        // SAFETY: the only other test touching these vars is the sibling
+        // `default_build_router_is_offline_and_deterministic`; both only ever REMOVE (never set)
+        // these vars, and removing an absent var is idempotent, so ordering is irrelevant.
+        unsafe {
+            std::env::remove_var("OTTO_OLLAMA");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        // Naming a model with no ANTHROPIC_API_KEY must NOT change routing: it falls back to the
+        // offline local router (a warning is printed to stderr, not asserted here).
+        let router = build_router_with_model(Some("claude-opus-4-8"));
+        let a = router
+            .complete(
+                CompleteRequest {
+                    prompt: "ping".into(),
+                },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        let b = router
+            .complete(
+                CompleteRequest {
+                    prompt: "ping".into(),
+                },
+                RouteHints::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
