@@ -326,6 +326,28 @@ pub fn App() -> impl IntoView {
         });
     };
 
+    // Auto-connect when launched with `?ws=...&token=...&autoconnect=1` (the Tauri desktop
+    // wrapper's bootstrap — sub-project G). Runs once on mount: it reads no reactive signal
+    // itself, so this Effect never re-fires on its own. `connect()` does read `url`/`token`
+    // internally, though, and Leptos's tracking is dynamic (it tracks any signal read while
+    // the effect is running, even through a nested function call) — so calling it untracked
+    // is required here, otherwise this effect would resubscribe to `url`/`token` on its first
+    // run and then re-fire (re-reading the *unchanged* browser query string and reconnecting)
+    // every time either signal changes later, e.g. from the "connect to a different engine"
+    // fallback below. A plain browser visit has no query string, so `parse_launch_params`
+    // returns `None`, `connect()` (and thus the url/token reads) is never reached, and the
+    // manual form behaves exactly as before.
+    Effect::new(move |_| {
+        let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+            return;
+        };
+        if let Some(params) = crate::url::parse_launch_params(&search) {
+            url.set(params.ws);
+            token.set(params.token);
+            untrack(connect);
+        }
+    });
+
     // Auto-load the tree when the connection reaches Connected.
     Effect::new(move |_| {
         if matches!(conn.get(), ConnState::Connected { .. }) {
@@ -389,6 +411,15 @@ pub fn App() -> impl IntoView {
                 on_pause=Callback::new(move |_| pause())
                 on_resume=Callback::new(move |_| resume())
             />
+            <button
+                class="link-button"
+                on:click=move |_| {
+                    disconnect();
+                    url.set("ws://127.0.0.1:8787".to_string());
+                    token.set(String::new());
+                }
+                disabled=move || matches!(conn.get(), ConnState::Connecting)
+            >"Connect to a different engine"</button>
             <ConnectionForm
                 url=url
                 token=token
