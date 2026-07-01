@@ -54,6 +54,49 @@ pub fn ws_to_http_base(ws_url: &str) -> String {
     }
 }
 
+/// The Tauri desktop wrapper's auto-connect bootstrap (sub-project G): the local sidecar's
+/// WS base URL and a freshly-generated bearer token, carried as query params on the webview's
+/// initial navigation (`desktop/src-tauri/src/launch.rs`'s `build_launch_url` is the writer
+/// side of this contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchParams {
+    pub ws: String,
+    pub token: String,
+}
+
+/// Parse `ws`/`token`/`autoconnect` from a query string (with or without a leading `?`, as
+/// returned by `web_sys`'s `Location::search()`). Returns `Some` only when `autoconnect=1` and
+/// both `ws` and `token` are present and non-empty — anything else (a plain browser visit with
+/// no query string, a manually-typed URL, a malformed/partial query) yields `None`, leaving the
+/// existing manual connect form as the fallback. Unknown keys and malformed `key=value` pairs
+/// are silently ignored, not an error.
+pub fn parse_launch_params(query: &str) -> Option<LaunchParams> {
+    let query = query.strip_prefix('?').unwrap_or(query);
+    let mut ws = None;
+    let mut token = None;
+    let mut autoconnect = false;
+    for pair in query.split('&') {
+        let Some((key, raw_value)) = pair.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = urlencoding::decode(raw_value) else {
+            continue;
+        };
+        match key {
+            "ws" => ws = Some(value.into_owned()),
+            "token" => token = Some(value.into_owned()),
+            "autoconnect" => autoconnect = value == "1",
+            _ => {}
+        }
+    }
+    if !autoconnect {
+        return None;
+    }
+    let ws = ws.filter(|s| !s.is_empty())?;
+    let token = token.filter(|s| !s.is_empty())?;
+    Some(LaunchParams { ws, token })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +157,53 @@ mod tests {
         assert_eq!(
             build_ws_url("ws://h/ws/", "t", None, None),
             "ws://h/ws?token=t"
+        );
+    }
+
+    #[test]
+    fn launch_params_requires_ws_token_and_autoconnect() {
+        assert_eq!(
+            parse_launch_params("ws=ws%3A%2F%2F127.0.0.1%3A8787&token=abc-123&autoconnect=1"),
+            Some(LaunchParams {
+                ws: "ws://127.0.0.1:8787".to_string(),
+                token: "abc-123".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn launch_params_tolerates_leading_question_mark() {
+        assert_eq!(
+            parse_launch_params("?ws=ws://h&token=t&autoconnect=1"),
+            Some(LaunchParams {
+                ws: "ws://h".to_string(),
+                token: "t".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn launch_params_none_without_autoconnect() {
+        assert_eq!(parse_launch_params("ws=ws://h&token=t"), None);
+        assert_eq!(parse_launch_params("ws=ws://h&token=t&autoconnect=0"), None);
+    }
+
+    #[test]
+    fn launch_params_none_when_ws_or_token_missing_or_empty() {
+        assert_eq!(parse_launch_params("token=t&autoconnect=1"), None);
+        assert_eq!(parse_launch_params("ws=ws://h&autoconnect=1"), None);
+        assert_eq!(parse_launch_params("ws=&token=t&autoconnect=1"), None);
+        assert_eq!(parse_launch_params(""), None);
+    }
+
+    #[test]
+    fn launch_params_ignores_unknown_keys_and_malformed_pairs() {
+        assert_eq!(
+            parse_launch_params("ws=ws://h&token=t&autoconnect=1&extra=ignored&malformed"),
+            Some(LaunchParams {
+                ws: "ws://h".to_string(),
+                token: "t".to_string(),
+            })
         );
     }
 }
