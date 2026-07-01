@@ -371,7 +371,13 @@ async fn run_custom_agent_in(
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    // Pin the remote model to the top-level `--agent`'s `model:` field. Nested Task
+    // sub-dispatches inherit this same pinned router (per-sub-agent model is deferred).
+    let mut model_override: Option<String> = None;
     for def in ext.agents {
+        if def.name == name {
+            model_override = def.model.clone();
+        }
         allowlists.insert(def.name.clone(), def.tools.clone());
         registry.register(
             Role::Custom(def.name.clone()),
@@ -386,7 +392,9 @@ async fn run_custom_agent_in(
         );
     }
 
-    let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
+    let router: Arc<dyn otto_engine_core::Router> = Arc::from(
+        otto_engine::build_router_with_model(model_override.as_deref()),
+    );
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
@@ -730,6 +738,34 @@ mod tests {
             err.unwrap_err()
                 .to_string()
                 .contains("no custom agent named")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_custom_agent_with_model_field_runs_offline() {
+        use std::fs;
+        // A custom agent declaring `model:` still runs a deterministic offline dispatch when no
+        // ANTHROPIC_API_KEY is set (graceful fallback).
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global agents
+        let agents = proj.path().join(".claude").join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews code\nmodel: claude-opus-4-8\n---\nYou review code.\n",
+        )
+        .unwrap();
+
+        let ok = run_custom_agent_in(
+            "reviewer",
+            "look at lib.rs",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected model-pinned agent to run offline: {ok:?}"
         );
     }
 
