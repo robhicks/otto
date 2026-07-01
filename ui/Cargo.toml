@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "otto-ui"
 version = "0.1.0"
