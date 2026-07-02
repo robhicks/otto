@@ -82,15 +82,22 @@ pub fn run() {
     });
 }
 
-/// Watches the sidecar's output for otto serve's readiness line (with a 5s timeout), then
-/// navigates the main window to the bootstrap URL — or shows an error dialog on failure/timeout.
+/// `otto serve` builds/refreshes the workspace's retrieval index (a full first-run index build,
+/// tree-sitter chunking over every file) before it ever binds the listener or prints its
+/// readiness line — on a large or previously-unindexed workspace that alone can take a while, so
+/// the timeout below needs real headroom rather than just covering process-startup overhead.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Watches the sidecar's output for otto serve's readiness line (with a `READINESS_TIMEOUT`
+/// timeout), then navigates the main window to the bootstrap URL — or shows an error dialog on
+/// failure/timeout.
 fn watch_for_readiness(
   app: AppHandle,
   mut rx: tauri::async_runtime::Receiver<CommandEvent>,
   token: String,
 ) {
   tauri::async_runtime::spawn(async move {
-    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+    let outcome = tokio::time::timeout(READINESS_TIMEOUT, async {
       while let Some(event) = rx.recv().await {
         match event {
           CommandEvent::Stderr(line) => {
@@ -132,7 +139,7 @@ fn watch_for_readiness(
         }
       }
       Ok(Err(message)) => show_startup_error(&app, &message),
-      Err(_) => show_startup_error(&app, "otto serve did not start within 5 seconds"),
+      Err(_) => show_startup_error(&app, "otto serve did not start within 30 seconds"),
     }
   });
 }
