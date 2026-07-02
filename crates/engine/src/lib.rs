@@ -137,15 +137,21 @@ pub fn build_tool_registry_approving(workspace: Arc<dyn Workspace>, root: PathBu
     build_tool_registry_inner(workspace, root, true, None)
 }
 
-/// Build the tool registry with a `PolicyGate` applying `permissions` over the default gate.
-/// Used by the `otto run` spine when `.claude/settings.json` declares any permission rules; the
-/// PolicyGate owns the bash decision, so it pairs with a plain `DenyAsk` resolver.
+/// Build the tool registry with a `PolicyGate` applying `permissions` over the default gate,
+/// optionally composed with approval mode. Used by the `otto run` spine (`approve_edits =
+/// false`) and by `otto serve --approve-edits` (`approve_edits` reflects the flag) when
+/// `.claude/settings.json` declares any permission rules. The PolicyGate always owns the bash
+/// decision, so it pairs with a plain `DenyAsk` resolver; when `approve_edits` is true, an
+/// `ApprovalModeGate` wraps the `PolicyGate` so an ordinary (rule-`Allow`ed) `fs.write` is
+/// upgraded to `Ask` for interactive approval — a rule-driven `deny`/`ask` (and the sensitive
+/// floor) still win.
 pub fn build_tool_registry_with_permissions(
     workspace: Arc<dyn Workspace>,
     root: PathBuf,
     permissions: &PermissionRules,
+    approve_edits: bool,
 ) -> ToolRegistry {
-    build_tool_registry_inner(workspace, root, false, Some(permissions))
+    build_tool_registry_inner(workspace, root, approve_edits, Some(permissions))
 }
 
 /// Always includes the sensitive-path-floor gate and the in-process fs tools. A sandboxed
@@ -161,27 +167,26 @@ fn build_tool_registry_inner(
     approve_edits: bool,
     permissions: Option<&PermissionRules>,
 ) -> ToolRegistry {
-    // Invariant: permissions are wired only on the non-approving run path this slice. The
-    // PolicyGate × ApprovalModeGate composition is a deferred serve-path slice. A hard assert
-    // (not debug_assert) so a future caller passing both fails loud in release too, rather than
-    // silently dropping approval mode (a security regression).
-    assert!(
-        !(approve_edits && matches!(permissions, Some(r) if !r.is_empty())),
-        "PolicyGate × ApprovalModeGate composition is not yet wired",
-    );
     let sandboxed = os_sandbox_available();
     let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
 
-    // When permission rules exist, the PolicyGate owns every verdict (incl. bash), so it pairs
-    // with a plain DenyAsk. Otherwise the wiring is exactly as before: the bash allow-list
-    // resolver auto-allows the structurally-Asked sandboxed bash, and approval mode (serve) may
-    // upgrade fs.write. (PolicyGate × ApprovalModeGate composition is a deferred serve-path slice,
-    // so `permissions` is only ever Some on the non-approving run path.)
+    // When permission rules exist, the PolicyGate owns every verdict (incl. bash), so it always
+    // pairs with a plain DenyAsk. `approve_edits` then wraps an `ApprovalModeGate` around the
+    // PolicyGate: an ordinary (rule-`Allow`ed) `fs.write` is upgraded to `Ask` for interactive
+    // approval, while a rule-driven `deny`/`ask` (and the sensitive floor) pass through
+    // unchanged. The orchestrator's edit-apply path treats any `Ask` on `fs.write` identically
+    // regardless of which gate produced it, so the two compose without special-casing there.
     let (gate, ask): (Arc<dyn PermissionGate>, Arc<dyn AskResolver>) = match permissions {
-        Some(rules) if !rules.is_empty() => (
-            Arc::new(PolicyGate::new(base_gate, rules.clone(), sandboxed)),
-            Arc::new(DenyAsk),
-        ),
+        Some(rules) if !rules.is_empty() => {
+            let policy_gate: Arc<dyn PermissionGate> =
+                Arc::new(PolicyGate::new(base_gate, rules.clone(), sandboxed));
+            let gate: Arc<dyn PermissionGate> = if approve_edits {
+                Arc::new(ApprovalModeGate::new(policy_gate))
+            } else {
+                policy_gate
+            };
+            (gate, Arc::new(DenyAsk))
+        }
         _ => {
             // NB: the ask-resolver only ever auto-allows `bash`. An `Ask` on `fs.write` (approval
             // mode) is resolved by the orchestrator's `Approver`, never here — so writes can't
@@ -444,7 +449,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
         let rules = parse_permissions(r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#);
-        let reg = build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules);
+        let reg = build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, false);
 
         // A write to a denied path is rejected by the gate before dispatch.
         let err = reg
@@ -458,6 +463,61 @@ mod tests {
             reg.call("fs.write", json!({"path": "src/x.txt", "contents": "hi"}))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_with_permissions_and_approval_upgrades_ordinary_write_to_ask() {
+        use otto_engine_core::tool::Decision;
+        use otto_extensions::parse_permissions;
+        use otto_workspace::LocalWorkspace;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
+        let rules = parse_permissions(r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#);
+        let reg =
+            build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
+
+        // An ordinary write (no matching rule) is upgraded from the PolicyGate's Allow to Ask
+        // for interactive approval, not silently applied.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": "src/x.txt"})),
+            Decision::Ask
+        );
+        // A rule-driven deny still wins over approval mode.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": "dist/x.txt"})),
+            Decision::Deny
+        );
+        // The sensitive-path floor still wins over everything.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": ".env"})),
+            Decision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_with_permissions_and_approval_preserves_rule_driven_ask() {
+        use otto_engine_core::tool::Decision;
+        use otto_extensions::parse_permissions;
+        use otto_workspace::LocalWorkspace;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
+        let rules = parse_permissions(r#"{ "permissions": { "ask": ["Write(secrets/**)"] } }"#);
+        let reg =
+            build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
+
+        // A rule-driven `ask` on write is unaffected by the ApprovalModeGate wrap (it only
+        // upgrades Allow, never re-classifies an existing Ask) — it still reaches interactive
+        // approval, same as an ordinary write would.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": "secrets/x.txt"})),
+            Decision::Ask
         );
     }
 }
