@@ -169,23 +169,26 @@ fn build_tool_registry_inner(
 ) -> ToolRegistry {
     let sandboxed = os_sandbox_available();
     let base_gate: Arc<dyn PermissionGate> = Arc::new(DefaultPermissionGate::new());
+    // `approve_edits` wraps an `ApprovalModeGate` around whichever gate is otherwise chosen: an
+    // ordinary (permitted) `fs.write` is upgraded to `Ask` for interactive approval, while a
+    // `Deny` or an existing `Ask` (a permission rule, or the sensitive floor) pass through
+    // unchanged. The orchestrator's edit-apply path treats any `Ask` on `fs.write` identically
+    // regardless of which gate produced it, so this composes without special-casing there.
+    let maybe_approve = |g: Arc<dyn PermissionGate>| -> Arc<dyn PermissionGate> {
+        if approve_edits {
+            Arc::new(ApprovalModeGate::new(g))
+        } else {
+            g
+        }
+    };
 
     // When permission rules exist, the PolicyGate owns every verdict (incl. bash), so it always
-    // pairs with a plain DenyAsk. `approve_edits` then wraps an `ApprovalModeGate` around the
-    // PolicyGate: an ordinary (rule-`Allow`ed) `fs.write` is upgraded to `Ask` for interactive
-    // approval, while a rule-driven `deny`/`ask` (and the sensitive floor) pass through
-    // unchanged. The orchestrator's edit-apply path treats any `Ask` on `fs.write` identically
-    // regardless of which gate produced it, so the two compose without special-casing there.
+    // pairs with a plain DenyAsk.
     let (gate, ask): (Arc<dyn PermissionGate>, Arc<dyn AskResolver>) = match permissions {
         Some(rules) if !rules.is_empty() => {
             let policy_gate: Arc<dyn PermissionGate> =
                 Arc::new(PolicyGate::new(base_gate, rules.clone(), sandboxed));
-            let gate: Arc<dyn PermissionGate> = if approve_edits {
-                Arc::new(ApprovalModeGate::new(policy_gate))
-            } else {
-                policy_gate
-            };
-            (gate, Arc::new(DenyAsk))
+            (maybe_approve(policy_gate), Arc::new(DenyAsk))
         }
         _ => {
             // NB: the ask-resolver only ever auto-allows `bash`. An `Ask` on `fs.write` (approval
@@ -196,12 +199,7 @@ fn build_tool_registry_inner(
             } else {
                 Arc::new(DenyAsk)
             };
-            let gate: Arc<dyn PermissionGate> = if approve_edits {
-                Arc::new(ApprovalModeGate::new(base_gate))
-            } else {
-                base_gate
-            };
-            (gate, ask)
+            (maybe_approve(base_gate), ask)
         }
     };
 
