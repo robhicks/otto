@@ -477,8 +477,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
         let rules = parse_permissions(r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#);
-        let reg =
-            build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
+        let reg = build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
 
         // An ordinary write (no matching rule) is upgraded from the PolicyGate's Allow to Ask
         // for interactive approval, not silently applied.
@@ -509,8 +508,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path().to_path_buf()));
         let rules = parse_permissions(r#"{ "permissions": { "ask": ["Write(secrets/**)"] } }"#);
-        let reg =
-            build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
+        let reg = build_tool_registry_with_permissions(ws, dir.path().to_path_buf(), &rules, true);
 
         // A rule-driven `ask` on write is unaffected by the ApprovalModeGate wrap (it only
         // upgrades Allow, never re-classifies an existing Ask) — it still reaches interactive
