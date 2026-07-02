@@ -159,12 +159,13 @@ async fn build_tools_preferring_mcp(
     permissions: &otto_extensions::PermissionRules,
 ) -> (ToolRegistry, Vec<McpConnection>) {
     let mut registry = if !permissions.is_empty() {
-        // Permission rules override the default gate with a PolicyGate (run path only; not
-        // composed with approve_edits this slice).
+        // Permission rules override the default gate with a PolicyGate, composed with approval
+        // mode when the caller requests it (e.g. `otto serve --approve-edits`).
         otto_engine::build_tool_registry_with_permissions(
             tools_workspace,
             root.clone(),
             permissions,
+            approve_edits,
         )
     } else if approve_edits {
         otto_engine::build_tool_registry_approving(tools_workspace, root.clone())
@@ -579,32 +580,26 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         }
     };
 
-    {
-        let ext = otto_extensions::discover(&root, &home_dir());
-        if !ext.hooks.is_empty() {
-            eprintln!(
-                "warning: settings.json hooks are configured but are NOT enforced on the serve \
-                 path (hooks are wired only on the `otto run` spine for now)."
-            );
-        }
-        if !ext.permissions.is_empty() {
-            eprintln!(
-                "warning: settings.json permissions are configured but are NOT enforced on \
-                 this path (permissions are wired only on the `otto run` spine for now)."
-            );
-        }
+    let ext = otto_extensions::discover(&root, &home_dir());
+    if !ext.hooks.is_empty() {
+        eprintln!(
+            "warning: settings.json hooks are configured but are NOT enforced on the serve \
+             path (hooks are wired only on the `otto run` spine for now)."
+        );
     }
 
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
-    // --agent/--command/serve paths are deferred (extensions hooks slice).
+    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now;
+    // the --agent/--command paths are deferred (extensions hooks slice). Permissions ARE
+    // enforced here, composed with --approve-edits when both are configured (see
+    // build_tool_registry_inner).
     let (tools, _mcp_conns) = build_tools_preferring_mcp(
         tools_workspace,
         root.clone(),
         approve_edits,
-        &otto_extensions::PermissionRules::default(),
+        &ext.permissions,
     )
     .await;
     let tools = Arc::new(tools);
@@ -1137,10 +1132,12 @@ mod tests {
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         // Mirrors the gate-selection logic in `build_tools_preferring_mcp`; keep in sync.
         let reg = if !ext.permissions.is_empty() {
+            // The `otto run` spine never sets approve_edits.
             otto_engine::build_tool_registry_with_permissions(
                 ws,
                 proj.path().to_path_buf(),
                 &ext.permissions,
+                false,
             )
         } else {
             otto_engine::build_tool_registry(ws, proj.path().to_path_buf())
@@ -1151,5 +1148,54 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("denied by permission gate"));
+    }
+
+    #[tokio::test]
+    async fn serve_path_registry_composes_permissions_with_approval_mode() {
+        use otto_engine_core::tool::Decision;
+        use otto_workspace::LocalWorkspace;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{ "permissions": { "deny": ["Write(dist/**)"] } }"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.permissions.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let approve_edits = true;
+        // Mirrors the gate-selection logic in `build_tools_preferring_mcp` (which `cmd_serve`
+        // calls with the discovered permissions + the --approve-edits flag); keep in sync.
+        let reg = if !ext.permissions.is_empty() {
+            otto_engine::build_tool_registry_with_permissions(
+                ws,
+                proj.path().to_path_buf(),
+                &ext.permissions,
+                approve_edits,
+            )
+        } else if approve_edits {
+            otto_engine::build_tool_registry_approving(ws, proj.path().to_path_buf())
+        } else {
+            otto_engine::build_tool_registry(ws, proj.path().to_path_buf())
+        };
+
+        // An ordinary write is upgraded to Ask for interactive approval, not silently applied.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": "src/x.rs"})),
+            Decision::Ask
+        );
+        // A rule-driven deny still wins over approval mode.
+        assert_eq!(
+            reg.check("fs.write", &json!({"path": "dist/x.txt"})),
+            Decision::Deny
+        );
     }
 }
