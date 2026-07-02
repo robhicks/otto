@@ -58,8 +58,13 @@ sensitive floor still Denies first; the headless `DenyApprover` default denies).
 the socket concurrently with the running turn (`split` + `select!`), routing `ApproveDiff` frames
 through a per-connection `ApprovalRegistry`/`InteractiveApprover`, and the UI renders the diff with
 Approve/Reject buttons. **Sub-project E then shipped** (token/cost meter + pause/resume) and
-**sub-project F then shipped** (promote-to-remote UX) — **all sub-projects A–F are shipped**. The
-roadmap and per-slice spec/plan live in `docs/superpowers/specs/2026-06-17-ui-roadmap.md`.
+**sub-project F then shipped** (promote-to-remote UX), and **sub-project G then shipped** (Tauri
+desktop wrapper): a new workspace-excluded `desktop/` crate (zero `otto-*` dependencies) wraps the
+existing `ui/dist` browser build in a native Tauri 2 shell — a folder picker provisions the
+workspace root, a bundled `otto serve` sidecar is auto-launched on a fixed local port, and the
+webview auto-connects with no manual URL/token entry. **All sub-projects A–G are shipped**, closing
+out the UI roadmap. The roadmap and per-slice spec/plan live in
+`docs/superpowers/specs/2026-06-17-ui-roadmap.md`.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`mcp-lsp`, `cli`, etc. — `retrieval` and `extensions` are now shipped, see the
