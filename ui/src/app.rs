@@ -345,6 +345,20 @@ pub fn App() -> impl IntoView {
             url.set(params.ws);
             token.set(params.token);
             untrack(connect);
+            // Scrub the bearer token out of the visible URL now that it's been read — it has
+            // no further purpose, and leaving it in the address bar/history for the window's
+            // whole lifetime is needless exposure (the OTTO_TOKEN convention elsewhere is
+            // env-var-only, never in anything visible/loggable). `replace_state` swaps the
+            // current history entry in place — no navigation, no reload.
+            if let Some(win) = web_sys::window() {
+                if let (Ok(history), Ok(pathname)) = (win.history(), win.location().pathname()) {
+                    let _ = history.replace_state_with_url(
+                        &wasm_bindgen::JsValue::NULL,
+                        "",
+                        Some(&pathname),
+                    );
+                }
+            }
         }
     });
 
