@@ -602,27 +602,16 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     };
 
     let ext = otto_extensions::discover(&root, &home_dir());
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on the serve \
-             path (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
 
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now;
-    // the --agent/--command paths are deferred (extensions hooks slice). Permissions ARE
-    // enforced here, composed with --approve-edits when both are configured (see
-    // build_tool_registry_inner).
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(
-        tools_workspace,
-        root.clone(),
-        approve_edits,
-        &ext.permissions,
-    )
-    .await;
+    // NOTE: skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
+    // --agent/--command paths are deferred (extensions hooks slice). Permissions and hooks ARE
+    // enforced here via `build_serve_tools`, composed with --approve-edits when both are
+    // configured (see build_tool_registry_inner / register_hooks).
+    let (tools, _mcp_conns) =
+        build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
