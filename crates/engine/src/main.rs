@@ -225,6 +225,27 @@ async fn build_tools_preferring_mcp(
     (registry, conns)
 }
 
+/// The tool-registry composition `otto serve` uses: the permission/approval gate from
+/// `build_tools_preferring_mcp`, then hook-wrapping on top via `register_hooks` — the same two
+/// steps `cmd_run` performs inline. Skills and plugin MCP servers are NOT registered here; that
+/// remains deferred for the serve path.
+async fn build_serve_tools(
+    ext: &otto_extensions::Extensions,
+    tools_workspace: Arc<dyn Workspace>,
+    root: PathBuf,
+    approve_edits: bool,
+) -> (ToolRegistry, Vec<McpConnection>) {
+    let (mut tools, conns) = build_tools_preferring_mcp(
+        tools_workspace,
+        root.clone(),
+        approve_edits,
+        &ext.permissions,
+    )
+    .await;
+    register_hooks(&mut tools, &ext.hooks, &root);
+    (tools, conns)
+}
+
 /// Register the built-in `skill` tool when any skills were discovered. No-op otherwise, so a
 /// workspace with no `.claude/skills/` leaves the spine's tool set byte-for-byte unchanged.
 fn register_skills(
@@ -1196,6 +1217,54 @@ mod tests {
         assert_eq!(
             reg.check("fs.write", &json!({"path": "dist/x.txt"})),
             Decision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_wraps_hooks_around_permission_and_approval_gate() {
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping serve hooks composition test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{
+                "permissions": { "deny": ["Write(dist/**)"] },
+                "hooks": { "PreToolUse": [
+                    {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
+                ] }
+            }"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.permissions.is_empty());
+        assert!(!ext.hooks.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), true).await;
+
+        // The hook fires even though fs.read is otherwise allowed by the permission/approval gate.
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+        // The permission-gate deny still wins for an unrelated tool call (composition intact).
+        assert_eq!(
+            tools.check("fs.write", &serde_json::json!({"path": "dist/x.txt"})),
+            otto_engine_core::tool::Decision::Deny
         );
     }
 }
