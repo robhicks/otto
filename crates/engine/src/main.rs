@@ -226,23 +226,41 @@ async fn build_tools_preferring_mcp(
 }
 
 /// The tool-registry composition `otto serve` uses: the permission/approval gate from
-/// `build_tools_preferring_mcp`, then hook-wrapping on top via `register_hooks` — the same two
-/// steps `cmd_run` performs inline. Skills and plugin MCP servers are NOT registered here; that
-/// remains deferred for the serve path.
+/// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then
+/// hook-wrapping on top via `register_hooks`, then bundled plugin MCP servers via
+/// `mcp_connect_plugin_server` — the same steps `cmd_run` performs inline, in the same order.
 async fn build_serve_tools(
     ext: &otto_extensions::Extensions,
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
     approve_edits: bool,
 ) -> (ToolRegistry, Vec<McpConnection>) {
-    let (mut tools, conns) = build_tools_preferring_mcp(
+    let (mut tools, mut conns) = build_tools_preferring_mcp(
         tools_workspace,
         root.clone(),
         approve_edits,
         &ext.permissions,
     )
     .await;
+    register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
+    // Bundled plugin MCP servers register AFTER register_hooks, mirroring cmd_run exactly: plugin
+    // tools are gate-guarded but not hook-wrapped this slice (see cmd_run's identical loop). A
+    // server that won't spawn is logged and skipped — additive, never fatal.
+    for spec in &ext.mcp_servers {
+        match mcp_connect_plugin_server(spec).await {
+            Ok((conn, mcp_tools)) => {
+                for t in mcp_tools {
+                    tools.register(t);
+                }
+                conns.push(conn);
+            }
+            Err(e) => eprintln!(
+                "plugin mcp server {}:{} unavailable ({e}); skipping",
+                spec.namespace, spec.server_key
+            ),
+        }
+    }
     (tools, conns)
 }
 
@@ -419,8 +437,9 @@ async fn run_custom_agent_in(
     );
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
-    // --agent/--command/serve paths are deferred (extensions hooks slice).
+    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
+    // `otto serve` (via build_serve_tools); the --agent/--command paths are deferred (extensions
+    // hooks slice).
     let (base_tools, _mcp) = build_tools_preferring_mcp(
         tools_ws,
         root,
@@ -498,8 +517,9 @@ async fn run_command_in(
 
     // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
     // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
-    // --agent/--command/serve paths are deferred (extensions hooks slice).
+    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
+    // `otto serve` (via build_serve_tools); the --agent/--command paths are deferred (extensions
+    // hooks slice).
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let (tools, _mcp_conns) = build_tools_preferring_mcp(
         tools_workspace,
@@ -606,10 +626,10 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
-    // --agent/--command paths are deferred (extensions hooks slice). Permissions and hooks ARE
-    // enforced here via `build_serve_tools`, composed with --approve-edits when both are
-    // configured (see build_tool_registry_inner / register_hooks).
+    // NOTE: permissions, hooks, skills, and plugin MCP servers are all enforced here via
+    // `build_serve_tools` (composed with --approve-edits when both are configured; see
+    // build_tool_registry_inner / register_skills / register_hooks). Only the --agent/--command
+    // serve subpaths remain deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
@@ -1323,6 +1343,201 @@ mod tests {
         assert!(
             out.to_string().contains("hi"),
             "expected fs.read to return content, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_registers_skill_tool_when_present() {
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let skill_dir = proj.path().join(".claude").join("skills").join("greeter");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.skills.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        assert!(
+            tools.tool_names().iter().any(|n| n == "skill"),
+            "expected the `skill` tool to be registered, got: {:?}",
+            tools.tool_names()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_connects_and_registers_a_plugin_mcp_server() {
+        use otto_extensions::{Extensions, PluginMcpServer};
+        use otto_workspace::LocalWorkspace;
+
+        // Use the real, already-built mcp-fs binary as a stand-in "plugin" MCP server — a real
+        // stdio server, so this proves the actual connect-and-register path, not a mock.
+        let bin = escargot::CargoBuild::new()
+            .package("otto-mcp-fs")
+            .bin("mcp-fs")
+            .run()
+            .expect("build mcp-fs")
+            .path()
+            .to_path_buf();
+
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let mut ext = Extensions::default();
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "fs".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![proj.path().to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        assert!(
+            tools
+                .tool_names()
+                .iter()
+                .any(|n| n == "plugin__testplugin__fs__fs.read"),
+            "expected the namespaced plugin tool to be registered, got: {:?}",
+            tools.tool_names()
+        );
+        // The connection must be retained in the returned Vec — otherwise the caller would drop
+        // it and kill the child process the instant build_serve_tools returns.
+        assert!(!conns.is_empty());
+
+        // Registered-by-name isn't enough on its own — prove the tool actually round-trips
+        // through the spawned server (catches a namespacing/routing bug that a name-only
+        // assertion would miss, e.g. the request reaching the server under the wrong tool name).
+        let out = tools
+            .call(
+                "plugin__testplugin__fs__fs.read",
+                serde_json::json!({ "path": "target.txt" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected the plugin tool call to return the file content, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_skips_an_unreachable_plugin_mcp_server() {
+        use otto_extensions::{Extensions, PluginMcpServer};
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let mut ext = Extensions::default();
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "bogus".to_string(),
+            command: "definitely-not-a-real-binary-xyz".to_string(),
+            args: vec![],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // An unreachable plugin server is logged and skipped, never fatal — matches cmd_run.
+        assert!(
+            !tools.tool_names().iter().any(|n| n.starts_with("plugin__")),
+            "expected no plugin tools to be registered, got: {:?}",
+            tools.tool_names()
+        );
+        assert!(conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_plugin_tools_are_gate_guarded_but_not_hook_wrapped() {
+        use otto_extensions::PluginMcpServer;
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!(
+                "skipping plugin-hook-ordering test: no OS sandbox backend, hooks would be skipped"
+            );
+            return;
+        }
+
+        let bin = escargot::CargoBuild::new()
+            .package("otto-mcp-fs")
+            .bin("mcp-fs")
+            .run()
+            .expect("build mcp-fs")
+            .path()
+            .to_path_buf();
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": { "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": "exit 2"}]}
+            ] }}"#,
+        )
+        .unwrap();
+
+        // A "*" PreToolUse hook blocks every tool that exists in the registry at the time
+        // register_hooks wraps it. fs.read is registered before the wrap; the plugin tool is
+        // registered after — so this hook must block the former and NOT the latter.
+        let mut ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.hooks.is_empty());
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "fs".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![proj.path().to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // fs.read was registered before the hook wrap — the "*" hook blocks it.
+        let blocked = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            blocked.to_string().contains("blocked by PreToolUse hook"),
+            "got: {blocked}"
+        );
+
+        // The plugin tool was registered after the hook wrap — the same "*" hook must NOT block
+        // it, matching the documented tradeoff (gate-guarded, not hook-wrapped, this slice).
+        let out = tools
+            .call(
+                "plugin__testplugin__fs__fs.read",
+                serde_json::json!({ "path": "target.txt" }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected the unwrapped plugin tool call to succeed, got: {out}"
         );
     }
 }
