@@ -226,9 +226,10 @@ async fn build_tools_preferring_mcp(
 }
 
 /// The tool-registry composition `otto serve` uses: the permission/approval gate from
-/// `build_tools_preferring_mcp`, then hook-wrapping on top via `register_hooks` — the same two
-/// steps `cmd_run` performs inline. Skills and plugin MCP servers are NOT registered here; that
-/// remains deferred for the serve path.
+/// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then
+/// hook-wrapping on top via `register_hooks` — the same steps `cmd_run` performs inline, in the
+/// same order. Plugin MCP servers are NOT registered here; that remains deferred for the serve
+/// path.
 async fn build_serve_tools(
     ext: &otto_extensions::Extensions,
     tools_workspace: Arc<dyn Workspace>,
@@ -242,6 +243,7 @@ async fn build_serve_tools(
         &ext.permissions,
     )
     .await;
+    register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
     (tools, conns)
 }
@@ -1323,6 +1325,34 @@ mod tests {
         assert!(
             out.to_string().contains("hi"),
             "expected fs.read to return content, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_registers_skill_tool_when_present() {
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let skill_dir = proj.path().join(".claude").join("skills").join("greeter");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.skills.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        assert!(
+            tools.tool_names().iter().any(|n| n == "skill"),
+            "expected the `skill` tool to be registered, got: {:?}",
+            tools.tool_names()
         );
     }
 }
