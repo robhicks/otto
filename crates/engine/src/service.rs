@@ -13,6 +13,7 @@ use otto_engine_core::tool::{
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
+use otto_extensions::{Extensions, expand_args, resolve_injections};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
 use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
 use otto_router::MeteringRouter;
@@ -82,6 +83,7 @@ pub struct EngineService {
     workspace: Arc<dyn Workspace>,
     tools: Arc<ToolRegistry>,
     retriever: Option<Arc<dyn Retriever>>,
+    extensions: Option<Arc<Extensions>>,
     turn_lock: tokio::sync::Mutex<()>,
 }
 
@@ -100,6 +102,7 @@ impl EngineService {
             workspace,
             tools,
             retriever: None,
+            extensions: None,
             turn_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -107,6 +110,15 @@ impl EngineService {
     /// Attach a retriever (the indexed candidate source). `None` keeps the lexical fallback.
     pub fn with_retriever(mut self, retriever: Option<Arc<dyn Retriever>>) -> Self {
         self.retriever = retriever;
+        self
+    }
+
+    /// Attach the discovered `.claude/` extensions so `run_command_with_controls` (≙
+    /// `Command::RunCommand`) can resolve a command by name. `None` (the default — every
+    /// existing `EngineService::new` call site) means every `RunCommand` call fails with a
+    /// clear error; there is no silent no-op.
+    pub fn with_extensions(mut self, extensions: Arc<Extensions>) -> Self {
+        self.extensions = Some(extensions);
         self
     }
 
@@ -251,6 +263,57 @@ impl EngineService {
         self.store.set_status(session, status).await?;
 
         Ok(outcome)
+    }
+
+    /// Look up `name` in the discovered custom commands (set via `with_extensions`), expand its
+    /// template with `args`, resolve `!bash`/`@file` injections through a tool registry narrowed
+    /// to its `allowed-tools`, and run the result as a normal turn with a router pinned to its
+    /// `model`. (≙ `Command::RunCommand`.) Errors before any turn starts — unknown `name`, or an
+    /// injection failure (e.g. the sensitive-path floor denying `@.env`) — so no `seq` is
+    /// consumed and the session is untouched.
+    pub async fn run_command_with_controls(
+        &self,
+        session: SessionId,
+        name: &str,
+        args: &[String],
+        sink: &mut dyn EventSink,
+        approver: Arc<dyn Approver>,
+        pauser: Arc<dyn PauseController>,
+    ) -> anyhow::Result<TurnOutcome> {
+        let extensions = self.extensions.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no command named '{name}': this server was not configured with any extensions"
+            )
+        })?;
+        let def = extensions
+            .commands
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no command named '{name}' in ~/.claude/commands/ or the project .claude/commands/"
+                )
+            })?;
+
+        let narrowed_tools: Arc<ToolRegistry> = match &def.allowed_tools {
+            Some(list) => Arc::new(self.tools.subset(list)),
+            None => Arc::clone(&self.tools),
+        };
+
+        let expanded = expand_args(&def.template, args);
+        let goal = resolve_injections(&expanded, &narrowed_tools).await?;
+
+        let pinned_router: Arc<dyn Router> =
+            Arc::from(crate::build_router_with_model(def.model.as_deref()));
+
+        let controls = TurnControls {
+            approver,
+            pauser,
+            tools: Some(narrowed_tools),
+            router: Some(pinned_router),
+        };
+        self.run_prompt_with_controls(session, &goal, sink, controls)
+            .await
     }
 
     /// Validate every workspace file in `bundle` through the permission gate and return the edits
@@ -890,6 +953,130 @@ mod tests {
             workspace,
             tools,
         )
+    }
+
+    fn command_def(
+        name: &str,
+        template: &str,
+        allowed_tools: Option<Vec<String>>,
+    ) -> otto_extensions::CustomCommandDef {
+        otto_extensions::CustomCommandDef {
+            name: name.to_string(),
+            description: None,
+            argument_hint: None,
+            model: None,
+            allowed_tools,
+            template: template.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_unknown_name_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(Extensions::default()));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "nope",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no command named 'nope'"));
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_expands_args_and_narrows_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = command_def("greet", "do $1", Some(vec!["fs.read".to_string()]));
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_command_with_controls(
+                id,
+                "greet",
+                &["thing".to_string()],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+
+        // Expansion: the recorded turn's goal is the expanded template, not the raw one.
+        let state = service.store().snapshot(id).await.unwrap();
+        assert_eq!(state.turns.last().unwrap().goal, "do thing");
+
+        // Narrowing: fs.write was excluded, so the Coder's edit was never applied.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new("out.txt"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_injection_failure_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = command_def("leak", "secret: @.env", None);
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let result = service
+            .run_command_with_controls(
+                id,
+                "leak",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the sensitive-path floor must fail the @.env injection closed"
+        );
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
     }
 
     #[tokio::test]
