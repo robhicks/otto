@@ -624,18 +624,32 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::DemoteToLocal { .. } => {
                 handle_handover(&state, &mut writer, session, false).await;
             }
-            // TODO(serve-run-command Task 5): wire this to `EngineService`'s command-lookup +
-            // narrowed-registry/pinned-router turn. This stub only keeps `match command`
-            // exhaustive after the protocol variant landed (Task 1) — no turn starts, no `seq`
-            // is consumed, matching the variant's documented not-yet-wired posture.
-            Command::RunCommand { .. } => {
-                let _ = send_msg(
-                    &mut writer,
-                    &ServerMessage::Error {
-                        message: "RunCommand is not yet supported on this server".to_string(),
-                    },
-                )
-                .await;
+            Command::RunCommand { name, args, .. } => {
+                let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
+                let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
+                let outcome = {
+                    let mut sink = WsSink {
+                        writer: &mut writer,
+                    };
+                    let turn = state.service.run_command_with_controls(
+                        session, &name, &args, &mut sink, approver, pauser,
+                    );
+                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session).await
+                }; // `sink` dropped here → `writer` is free again
+
+                match outcome {
+                    TurnLoopOutcome::Finished(Some(e)) => {
+                        let _ = send_msg(
+                            &mut writer,
+                            &ServerMessage::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    TurnLoopOutcome::Finished(None) => {}
+                    TurnLoopOutcome::StopOuterLoop => break 'outer,
+                }
             }
         }
     }
