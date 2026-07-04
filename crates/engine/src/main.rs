@@ -628,8 +628,9 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: permissions, hooks, skills, and plugin MCP servers are all enforced here via
     // `build_serve_tools` (composed with --approve-edits when both are configured; see
-    // build_tool_registry_inner / register_skills / register_hooks). Only the --agent/--command
-    // serve subpaths remain deferred (extensions hooks slice).
+    // build_tool_registry_inner / register_skills / register_hooks). `--command` is now wired
+    // on serve too (via `EngineService::with_extensions`/`run_command_with_controls`); only the
+    // --agent serve subpath remains deferred.
     let (tools, _mcp_conns) =
         build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
