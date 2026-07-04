@@ -269,8 +269,9 @@ impl EngineService {
     /// template with `args`, resolve `!bash`/`@file` injections through a tool registry narrowed
     /// to its `allowed-tools`, and run the result as a normal turn with a router pinned to its
     /// `model`. (≙ `Command::RunCommand`.) Errors before any turn starts — unknown `name`, or an
-    /// injection failure (e.g. the sensitive-path floor denying `@.env`) — so no `seq` is
-    /// consumed and the session is untouched.
+    /// injection failure (e.g. the sensitive-path floor denying `@.env`), or no extensions
+    /// having been attached via `with_extensions` at all — so no `seq` is consumed and the
+    /// session is untouched.
     pub async fn run_command_with_controls(
         &self,
         session: SessionId,
@@ -303,6 +304,10 @@ impl EngineService {
         let expanded = expand_args(&def.template, args);
         let goal = resolve_injections(&expanded, &narrowed_tools).await?;
 
+        // Always rebuilt from the environment (never falls back to self.router), matching
+        // otto run --command's model-pinning behavior exactly — a command with model: None
+        // still gets a fresh router built the same way SendPrompt's default router would be,
+        // not necessarily the SAME instance as self.router.
         let pinned_router: Arc<dyn Router> =
             Arc::from(crate::build_router_with_model(def.model.as_deref()));
 
@@ -1000,9 +1005,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_with_controls_expands_args_and_narrows_tools() {
+    async fn run_command_with_controls_expands_args() {
         let dir = tempfile::tempdir().unwrap();
-        let def = command_def("greet", "do $1", Some(vec!["fs.read".to_string()]));
+        let def = command_def("greet", "do $1", None);
         let extensions = Extensions {
             commands: vec![def],
             ..Default::default()
@@ -1032,15 +1037,79 @@ mod tests {
         // Expansion: the recorded turn's goal is the expanded template, not the raw one.
         let state = service.store().snapshot(id).await.unwrap();
         assert_eq!(state.turns.last().unwrap().goal, "do thing");
+    }
 
-        // Narrowing: fs.write was excluded, so the Coder's edit was never applied.
+    #[tokio::test]
+    async fn run_command_with_controls_narrows_tools_denies_excluded_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        // The referenced file actually exists and is readable — so if `fs.read` were present in
+        // the narrowed registry, the injection would resolve successfully and the turn would
+        // proceed. That is what makes the assertion below load-bearing: the failure below can
+        // only be explained by the narrowing itself, not by a missing/unreadable file.
+        std::fs::write(dir.path().join("plain.txt"), b"CONTENT").unwrap();
+        // allowed_tools excludes fs.read — the @$1 injection must be denied because the
+        // NARROWED registry has no fs.read tool at all (ToolRegistry::call errors on a tool
+        // absent from its map, independent of the shared gate's decision on the path).
+        let def = command_def("narrow", "read @$1", Some(vec!["bash".to_string()]));
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "narrow",
+                &["plain.txt".to_string()],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        // Proves BOTH expansion (the path in the error is the substituted "plain.txt", not
+        // literal "$1") and narrowing (fs.read was excluded, so the injection is denied even
+        // though plain.txt is not a sensitive path and the shared gate would otherwise allow it).
         assert!(
-            service
-                .workspace()
-                .read(std::path::Path::new("out.txt"))
-                .await
-                .is_err()
+            err.to_string().contains("plain.txt"),
+            "expected the expanded path in the error, got: {err}"
         );
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_no_extensions_configured_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "anything",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured with any extensions"));
     }
 
     #[tokio::test]
