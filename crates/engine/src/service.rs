@@ -1109,7 +1109,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("not configured with any extensions"));
+        assert!(
+            err.to_string()
+                .contains("not configured with any extensions")
+        );
     }
 
     #[tokio::test]

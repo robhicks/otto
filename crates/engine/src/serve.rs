@@ -585,7 +585,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     let turn = state
                         .service
                         .run_prompt_with_controls(session, &text, &mut sink, controls);
-                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session).await
+                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
+                        .await
                 }; // `sink` dropped here → `writer` is free again
 
                 match outcome {
@@ -634,7 +635,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     let turn = state.service.run_command_with_controls(
                         session, &name, &args, &mut sink, approver, pauser,
                     );
-                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session).await
+                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
+                        .await
                 }; // `sink` dropped here → `writer` is free again
 
                 match outcome {
