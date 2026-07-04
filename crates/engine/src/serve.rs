@@ -18,7 +18,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use futures_util::SinkExt;
-use futures_util::stream::{SplitSink, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream, StreamExt};
+use otto_engine_core::TurnOutcome;
 use otto_engine_core::tool::Approver;
 use otto_engine_core::tool::PauseController;
 use otto_protocol::{
@@ -292,6 +293,9 @@ async fn export_handler(
 /// The writer half of a split WebSocket — what events and frames are sent through.
 type WsWriter = SplitSink<WebSocket, Message>;
 
+/// The reader half of a split WebSocket — inbound frames are read through this.
+type WsReader = SplitStream<WebSocket>;
+
 /// Per-connection registry of pending edit approvals, keyed by the `ApprovalRequest` id.
 /// Shared between the running turn's `InteractiveApprover` and the socket-reader that routes
 /// inbound `ApproveDiff` frames. Dropping a sender (on `clear`/disconnect) resolves the awaiting
@@ -412,6 +416,71 @@ impl EventSink for WsSink<'_> {
     }
 }
 
+/// The result of racing a turn future against inbound socket frames.
+enum TurnLoopOutcome {
+    /// The turn future resolved (successfully or with an error). The connection stays open.
+    Finished(Option<anyhow::Error>),
+    /// An explicit `Abort` or a disconnect ended things — the caller must stop reading frames
+    /// entirely.
+    StopOuterLoop,
+}
+
+/// Drive `turn` to completion while concurrently reading inbound frames for
+/// `ApproveDiff`/`Pause`/`Resume`/`Abort`. Shared by every command that starts a turn
+/// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart.
+async fn run_turn_loop(
+    turn: impl std::future::Future<Output = anyhow::Result<TurnOutcome>>,
+    reader: &mut WsReader,
+    approvals: &ApprovalRegistry,
+    pause_state: &PauseState,
+    state: &ServeState,
+    session: SessionId,
+) -> TurnLoopOutcome {
+    tokio::pin!(turn);
+    loop {
+        tokio::select! {
+            res = &mut turn => {
+                let err = res.err();
+                approvals.clear();
+                // Drop any leftover pause flag so a Pause that arrived but was never resumed
+                // before the turn ended cannot pre-pause the next one.
+                pause_state.resume_all();
+                return TurnLoopOutcome::Finished(err);
+            }
+            inbound = reader.next() => match inbound {
+                Some(Ok(Message::Text(t))) => {
+                    match serde_json::from_str::<Command>(t.as_str()) {
+                        Ok(Command::ApproveDiff { id, approved, .. }) => {
+                            approvals.resolve(id, approved);
+                        }
+                        Ok(Command::Pause { .. }) => {
+                            pause_state.pause();
+                        }
+                        Ok(Command::Resume { .. }) => {
+                            pause_state.resume_all();
+                        }
+                        Ok(Command::Abort { .. }) => {
+                            let _ = state.service.abort(session).await;
+                            approvals.clear();
+                            pause_state.resume_all();
+                            return TurnLoopOutcome::StopOuterLoop;
+                        }
+                        // A second SendPrompt/RunCommand mid-turn is ignored (one turn at a
+                        // time); other commands are no-ops here.
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    approvals.clear();
+                    pause_state.resume_all();
+                    return TurnLoopOutcome::StopOuterLoop;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<ServeState>) {
     // Split up-front so the turn (writer) and inbound approvals (reader) can run concurrently.
     let (mut writer, mut reader) = socket.split();
@@ -507,73 +576,30 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     router: None,
                 };
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
-                // `writer` (via the sink); the reader borrows `reader` — disjoint, so `select!`
-                // can poll both. `StreamExt::next` is cancel-safe, so the reader future being
-                // dropped when the turn wins a race loses no inbound frame.
-                let turn_err = {
+                // `writer` (via the sink); `run_turn_loop` borrows `reader` — disjoint, so it can
+                // poll both.
+                let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
                     };
                     let turn = state
                         .service
                         .run_prompt_with_controls(session, &text, &mut sink, controls);
-                    tokio::pin!(turn);
-                    let mut err: Option<anyhow::Error> = None;
-                    loop {
-                        tokio::select! {
-                            res = &mut turn => {
-                                if let Err(e) = res {
-                                    err = Some(e);
-                                }
-                                approvals.clear();
-                                // Drop any leftover pause flag so a Pause that arrived but was
-                                // never resumed before the turn ended cannot pre-pause the next one.
-                                pause_state.resume_all();
-                                break;
-                            }
-                            inbound = reader.next() => match inbound {
-                                Some(Ok(Message::Text(t))) => {
-                                    match serde_json::from_str::<Command>(t.as_str()) {
-                                        Ok(Command::ApproveDiff { id, approved, .. }) => {
-                                            approvals.resolve(id, approved);
-                                        }
-                                        Ok(Command::Pause { .. }) => {
-                                            pause_state.pause();
-                                        }
-                                        Ok(Command::Resume { .. }) => {
-                                            pause_state.resume_all();
-                                        }
-                                        Ok(Command::Abort { .. }) => {
-                                            let _ = state.service.abort(session).await;
-                                            approvals.clear();
-                                            pause_state.resume_all();
-                                            break 'outer;
-                                        }
-                                        // A second SendPrompt mid-turn is ignored (one turn at a
-                                        // time); other commands are no-ops here.
-                                        _ => {}
-                                    }
-                                }
-                                Some(Ok(Message::Close(_))) | None => {
-                                    approvals.clear();
-                                    pause_state.resume_all();
-                                    break 'outer;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    err
+                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session).await
                 }; // `sink` dropped here → `writer` is free again
 
-                if let Some(e) = turn_err {
-                    let _ = send_msg(
-                        &mut writer,
-                        &ServerMessage::Error {
-                            message: e.to_string(),
-                        },
-                    )
-                    .await;
+                match outcome {
+                    TurnLoopOutcome::Finished(Some(e)) => {
+                        let _ = send_msg(
+                            &mut writer,
+                            &ServerMessage::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                    TurnLoopOutcome::Finished(None) => {}
+                    TurnLoopOutcome::StopOuterLoop => break 'outer,
                 }
             }
             Command::Abort { .. } => {
