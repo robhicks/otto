@@ -1256,4 +1256,73 @@ mod tests {
             otto_engine_core::tool::Decision::Deny
         );
     }
+
+    #[tokio::test]
+    async fn build_serve_tools_enforces_hooks_on_the_plain_gate_branch() {
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping serve hooks plain-branch test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": { "PreToolUse": [
+                {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
+            ] }}"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(ext.permissions.is_empty());
+        assert!(!ext.hooks.is_empty());
+
+        // No permission rules and approve_edits=false: build_tools_preferring_mcp takes its
+        // plain build_tool_registry branch, not PolicyGate/ApprovalModeGate.
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_matches_direct_call_when_nothing_is_configured() {
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(ext.permissions.is_empty());
+        assert!(ext.hooks.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // With no settings.json at all, build_serve_tools must behave exactly like calling
+        // build_tools_preferring_mcp directly — register_hooks is a no-op with no hooks.
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return content, got: {out}"
+        );
+    }
 }
