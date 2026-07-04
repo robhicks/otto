@@ -500,7 +500,12 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::SendPrompt { text, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
                 let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
-                let controls = TurnControls { approver, pauser };
+                let controls = TurnControls {
+                    approver,
+                    pauser,
+                    tools: None,
+                    router: None,
+                };
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
                 // `writer` (via the sink); the reader borrows `reader` — disjoint, so `select!`
                 // can poll both. `StreamExt::next` is cancel-safe, so the reader future being
@@ -592,6 +597,19 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             }
             Command::DemoteToLocal { .. } => {
                 handle_handover(&state, &mut writer, session, false).await;
+            }
+            // TODO(serve-run-command Task 5): wire this to `EngineService`'s command-lookup +
+            // narrowed-registry/pinned-router turn. This stub only keeps `match command`
+            // exhaustive after the protocol variant landed (Task 1) — no turn starts, no `seq`
+            // is consumed, matching the variant's documented not-yet-wired posture.
+            Command::RunCommand { .. } => {
+                let _ = send_msg(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: "RunCommand is not yet supported on this server".to_string(),
+                    },
+                )
+                .await;
             }
         }
     }

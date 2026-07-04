@@ -39,11 +39,15 @@ impl EventSink for CollectingSink {
     }
 }
 
-/// The per-turn control handles the serve layer can inject: how `Ask` edits are approved, and
-/// how the turn is paused. `Default` is the headless/CLI posture (deny approvals, never pause).
+/// The per-turn control handles the serve layer can inject: how `Ask` edits are approved, how
+/// the turn is paused, and (for a `Command::RunCommand` turn) a narrowed tool registry / pinned
+/// router that apply to THIS call only — the service's own long-lived `tools`/`router` are never
+/// mutated. `Default` is the headless/CLI posture (deny approvals, never pause, no overrides).
 pub struct TurnControls {
     pub approver: Arc<dyn Approver>,
     pub pauser: Arc<dyn PauseController>,
+    pub tools: Option<Arc<ToolRegistry>>,
+    pub router: Option<Arc<dyn Router>>,
 }
 
 impl Default for TurnControls {
@@ -51,6 +55,8 @@ impl Default for TurnControls {
         Self {
             approver: Arc::new(DenyApprover),
             pauser: Arc::new(NeverPause),
+            tools: None,
+            router: None,
         }
     }
 }
@@ -161,9 +167,15 @@ impl EngineService {
         // orchestrator borrows the shared deps via the Arc clones moved into the task.
         let handle = {
             let registry = Arc::clone(&self.registry);
-            let router = Arc::clone(&self.router);
+            let router = controls
+                .router
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.router));
             let workspace = Arc::clone(&self.workspace);
-            let tools = Arc::clone(&self.tools);
+            let tools = controls
+                .tools
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.tools));
             let retriever = self.retriever.clone();
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
@@ -935,6 +947,84 @@ mod tests {
         for (i, event) in sink.events.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn run_prompt_with_controls_tools_override_restricts_available_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Narrow to a tool set that excludes fs.write — the Coder's edit-apply check must Deny
+        // (ToolRegistry::check denies a tool absent from a subset-narrowed registry).
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let base = crate::build_tool_registry(ws, dir.path().to_path_buf());
+        let narrowed = Arc::new(base.subset(&["fs.read".to_string()]));
+
+        let controls = TurnControls {
+            approver: Arc::new(DenyApprover),
+            pauser: Arc::new(NeverPause),
+            tools: Some(narrowed),
+            router: None,
+        };
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .await
+            .unwrap();
+
+        // Without fs.write, the Coder's edit was never applied — proving the override, not
+        // the service's own (unnarrowed) `self.tools`, is what the orchestrator actually used.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new("out.txt"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_prompt_with_controls_router_override_takes_precedence_over_service_default() {
+        let dir = tempfile::tempdir().unwrap();
+        // The service's OWN default router (scripted_router()) would write "hi g".
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // A distinctly different override router.
+        let override_provider = ScriptedProvider::new("{}")
+            .on(
+                "edits",
+                r#"{"edits": [{"path": "out.txt", "contents": "OVERRIDDEN"}]}"#,
+            )
+            .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+        let override_router: Arc<dyn Router> =
+            Arc::new(SingleProviderRouter::new(Arc::new(override_provider)));
+
+        let controls = TurnControls {
+            approver: Arc::new(DenyApprover),
+            pauser: Arc::new(NeverPause),
+            tools: None,
+            router: Some(override_router),
+        };
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .await
+            .unwrap();
+
+        let contents = service
+            .workspace()
+            .read(std::path::Path::new("out.txt"))
+            .await
+            .unwrap();
+        assert_eq!(contents, b"OVERRIDDEN");
     }
 
     #[tokio::test]
