@@ -425,6 +425,26 @@ enum TurnLoopOutcome {
     StopOuterLoop,
 }
 
+/// Report a turn's `TurnLoopOutcome` on the socket (an error frame, or nothing on success) and
+/// say whether the caller must `break 'outer`. Shared by every command that starts a turn
+/// (`SendPrompt`, `RunCommand`) so this handling can never drift between them.
+async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) -> bool {
+    match outcome {
+        TurnLoopOutcome::Finished(Some(e)) => {
+            let _ = send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            false
+        }
+        TurnLoopOutcome::Finished(None) => false,
+        TurnLoopOutcome::StopOuterLoop => true,
+    }
+}
+
 /// Drive `turn` to completion while concurrently reading inbound frames for
 /// `ApproveDiff`/`Pause`/`Resume`/`Abort`. Shared by every command that starts a turn
 /// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart.
@@ -589,18 +609,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                         .await
                 }; // `sink` dropped here → `writer` is free again
 
-                match outcome {
-                    TurnLoopOutcome::Finished(Some(e)) => {
-                        let _ = send_msg(
-                            &mut writer,
-                            &ServerMessage::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
-                    TurnLoopOutcome::Finished(None) => {}
-                    TurnLoopOutcome::StopOuterLoop => break 'outer,
+                if report_turn_outcome(outcome, &mut writer).await {
+                    break 'outer;
                 }
             }
             Command::Abort { .. } => {
@@ -639,18 +649,8 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                         .await
                 }; // `sink` dropped here → `writer` is free again
 
-                match outcome {
-                    TurnLoopOutcome::Finished(Some(e)) => {
-                        let _ = send_msg(
-                            &mut writer,
-                            &ServerMessage::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
-                    TurnLoopOutcome::Finished(None) => {}
-                    TurnLoopOutcome::StopOuterLoop => break 'outer,
+                if report_turn_outcome(outcome, &mut writer).await {
+                    break 'outer;
                 }
             }
         }
