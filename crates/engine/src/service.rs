@@ -13,6 +13,7 @@ use otto_engine_core::tool::{
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
+use otto_extensions::{Extensions, expand_args, resolve_injections};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
 use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
 use otto_router::MeteringRouter;
@@ -39,11 +40,15 @@ impl EventSink for CollectingSink {
     }
 }
 
-/// The per-turn control handles the serve layer can inject: how `Ask` edits are approved, and
-/// how the turn is paused. `Default` is the headless/CLI posture (deny approvals, never pause).
+/// The per-turn control handles the serve layer can inject: how `Ask` edits are approved, how
+/// the turn is paused, and (for a `Command::RunCommand` turn) a narrowed tool registry / pinned
+/// router that apply to THIS call only — the service's own long-lived `tools`/`router` are never
+/// mutated. `Default` is the headless/CLI posture (deny approvals, never pause, no overrides).
 pub struct TurnControls {
     pub approver: Arc<dyn Approver>,
     pub pauser: Arc<dyn PauseController>,
+    pub tools: Option<Arc<ToolRegistry>>,
+    pub router: Option<Arc<dyn Router>>,
 }
 
 impl Default for TurnControls {
@@ -51,6 +56,8 @@ impl Default for TurnControls {
         Self {
             approver: Arc::new(DenyApprover),
             pauser: Arc::new(NeverPause),
+            tools: None,
+            router: None,
         }
     }
 }
@@ -76,6 +83,7 @@ pub struct EngineService {
     workspace: Arc<dyn Workspace>,
     tools: Arc<ToolRegistry>,
     retriever: Option<Arc<dyn Retriever>>,
+    extensions: Option<Arc<Extensions>>,
     turn_lock: tokio::sync::Mutex<()>,
 }
 
@@ -94,6 +102,7 @@ impl EngineService {
             workspace,
             tools,
             retriever: None,
+            extensions: None,
             turn_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -101,6 +110,15 @@ impl EngineService {
     /// Attach a retriever (the indexed candidate source). `None` keeps the lexical fallback.
     pub fn with_retriever(mut self, retriever: Option<Arc<dyn Retriever>>) -> Self {
         self.retriever = retriever;
+        self
+    }
+
+    /// Attach the discovered `.claude/` extensions so `run_command_with_controls` (≙
+    /// `Command::RunCommand`) can resolve a command by name. `None` (the default — every
+    /// existing `EngineService::new` call site) means every `RunCommand` call fails with a
+    /// clear error; there is no silent no-op.
+    pub fn with_extensions(mut self, extensions: Arc<Extensions>) -> Self {
+        self.extensions = Some(extensions);
         self
     }
 
@@ -161,9 +179,15 @@ impl EngineService {
         // orchestrator borrows the shared deps via the Arc clones moved into the task.
         let handle = {
             let registry = Arc::clone(&self.registry);
-            let router = Arc::clone(&self.router);
+            let router = controls
+                .router
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.router));
             let workspace = Arc::clone(&self.workspace);
-            let tools = Arc::clone(&self.tools);
+            let tools = controls
+                .tools
+                .clone()
+                .unwrap_or_else(|| Arc::clone(&self.tools));
             let retriever = self.retriever.clone();
             let goal = goal.to_string();
             let counter = Arc::new(AtomicU64::new(start_seq));
@@ -239,6 +263,62 @@ impl EngineService {
         self.store.set_status(session, status).await?;
 
         Ok(outcome)
+    }
+
+    /// Look up `name` in the discovered custom commands (set via `with_extensions`), expand its
+    /// template with `args`, resolve `!bash`/`@file` injections through a tool registry narrowed
+    /// to its `allowed-tools`, and run the result as a normal turn with a router pinned to its
+    /// `model`. (≙ `Command::RunCommand`.) Errors before any turn starts — unknown `name`, or an
+    /// injection failure (e.g. the sensitive-path floor denying `@.env`), or no extensions
+    /// having been attached via `with_extensions` at all — so no `seq` is consumed and the
+    /// session is untouched.
+    pub async fn run_command_with_controls(
+        &self,
+        session: SessionId,
+        name: &str,
+        args: &[String],
+        sink: &mut dyn EventSink,
+        approver: Arc<dyn Approver>,
+        pauser: Arc<dyn PauseController>,
+    ) -> anyhow::Result<TurnOutcome> {
+        let extensions = self.extensions.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no command named '{name}': this server was not configured with any extensions"
+            )
+        })?;
+        let def = extensions
+            .commands
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no command named '{name}' in ~/.claude/commands/ or the project .claude/commands/"
+                )
+            })?;
+
+        let narrowed_tools: Arc<ToolRegistry> = match &def.allowed_tools {
+            Some(list) => Arc::new(self.tools.subset(list)),
+            None => Arc::clone(&self.tools),
+        };
+
+        let expanded = expand_args(&def.template, args);
+        let goal = resolve_injections(&expanded, &narrowed_tools).await?;
+
+        // Always rebuilt from the environment (never falls back to self.router), matching
+        // otto run --command's model-pinning behavior exactly — a command with model: None
+        // still gets a fresh router built the same way SendPrompt's default router would be,
+        // not necessarily the SAME instance as self.router.
+        let pinned_router: Arc<dyn Router> =
+            Arc::from(crate::build_router_with_model(def.model.as_deref()));
+
+        let controls = TurnControls {
+            approver,
+            pauser,
+            tools: Some(narrowed_tools),
+            router: Some(pinned_router),
+        };
+        self.run_prompt_with_controls(session, &goal, sink, controls)
+            .await
     }
 
     /// Validate every workspace file in `bundle` through the permission gate and return the edits
@@ -880,6 +960,197 @@ mod tests {
         )
     }
 
+    fn command_def(
+        name: &str,
+        template: &str,
+        allowed_tools: Option<Vec<String>>,
+    ) -> otto_extensions::CustomCommandDef {
+        otto_extensions::CustomCommandDef {
+            name: name.to_string(),
+            description: None,
+            argument_hint: None,
+            model: None,
+            allowed_tools,
+            template: template.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_unknown_name_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(Extensions::default()));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "nope",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no command named 'nope'"));
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_expands_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = command_def("greet", "do $1", None);
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_command_with_controls(
+                id,
+                "greet",
+                &["thing".to_string()],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+
+        // Expansion: the recorded turn's goal is the expanded template, not the raw one.
+        let state = service.store().snapshot(id).await.unwrap();
+        assert_eq!(state.turns.last().unwrap().goal, "do thing");
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_narrows_tools_denies_excluded_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        // The referenced file actually exists and is readable — so if `fs.read` were present in
+        // the narrowed registry, the injection would resolve successfully and the turn would
+        // proceed. That is what makes the assertion below load-bearing: the failure below can
+        // only be explained by the narrowing itself, not by a missing/unreadable file.
+        std::fs::write(dir.path().join("plain.txt"), b"CONTENT").unwrap();
+        // allowed_tools excludes fs.read — the @$1 injection must be denied because the
+        // NARROWED registry has no fs.read tool at all (ToolRegistry::call errors on a tool
+        // absent from its map, independent of the shared gate's decision on the path).
+        let def = command_def("narrow", "read @$1", Some(vec!["bash".to_string()]));
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "narrow",
+                &["plain.txt".to_string()],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        // Proves BOTH expansion (the path in the error is the substituted "plain.txt", not
+        // literal "$1") and narrowing (fs.read was excluded, so the injection is denied even
+        // though plain.txt is not a sensitive path and the shared gate would otherwise allow it).
+        assert!(
+            err.to_string().contains("plain.txt"),
+            "expected the expanded path in the error, got: {err}"
+        );
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_no_extensions_configured_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                id,
+                "anything",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not configured with any extensions")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_with_controls_injection_failure_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = command_def("leak", "secret: @.env", None);
+        let extensions = Extensions {
+            commands: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let result = service
+            .run_command_with_controls(
+                id,
+                "leak",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "the sensitive-path floor must fail the @.env injection closed"
+        );
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
     #[tokio::test]
     async fn create_persists_active_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -935,6 +1206,84 @@ mod tests {
         for (i, event) in sink.events.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
         }
+    }
+
+    #[tokio::test]
+    async fn run_prompt_with_controls_tools_override_restricts_available_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Narrow to a tool set that excludes fs.write — the Coder's edit-apply check must Deny
+        // (ToolRegistry::check denies a tool absent from a subset-narrowed registry).
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let base = crate::build_tool_registry(ws, dir.path().to_path_buf());
+        let narrowed = Arc::new(base.subset(&["fs.read".to_string()]));
+
+        let controls = TurnControls {
+            approver: Arc::new(DenyApprover),
+            pauser: Arc::new(NeverPause),
+            tools: Some(narrowed),
+            router: None,
+        };
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .await
+            .unwrap();
+
+        // Without fs.write, the Coder's edit was never applied — proving the override, not
+        // the service's own (unnarrowed) `self.tools`, is what the orchestrator actually used.
+        assert!(
+            service
+                .workspace()
+                .read(std::path::Path::new("out.txt"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_prompt_with_controls_router_override_takes_precedence_over_service_default() {
+        let dir = tempfile::tempdir().unwrap();
+        // The service's OWN default router (scripted_router()) would write "hi g".
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // A distinctly different override router.
+        let override_provider = ScriptedProvider::new("{}")
+            .on(
+                "edits",
+                r#"{"edits": [{"path": "out.txt", "contents": "OVERRIDDEN"}]}"#,
+            )
+            .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+        let override_router: Arc<dyn Router> =
+            Arc::new(SingleProviderRouter::new(Arc::new(override_provider)));
+
+        let controls = TurnControls {
+            approver: Arc::new(DenyApprover),
+            pauser: Arc::new(NeverPause),
+            tools: None,
+            router: Some(override_router),
+        };
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .await
+            .unwrap();
+
+        let contents = service
+            .workspace()
+            .read(std::path::Path::new("out.txt"))
+            .await
+            .unwrap();
+        assert_eq!(contents, b"OVERRIDDEN");
     }
 
     #[tokio::test]

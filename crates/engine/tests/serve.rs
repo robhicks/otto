@@ -11,6 +11,7 @@ use otto_engine::{
     serve_app, serve_run,
 };
 use otto_engine_core::traits::Workspace;
+use otto_extensions::{CustomCommandDef, Extensions};
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
@@ -57,6 +58,58 @@ async fn start_server() -> (u16, tempfile::TempDir) {
         workspace,
         tools,
     );
+
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
+/// Start the serve app with one discovered command: `greet`, template `hi $1`, narrowed to
+/// `fs.read` only (excludes `fs.write` — proves narrowing reaches a served RunCommand turn).
+/// The router's ScriptedProvider ignores the exact goal text, so any expansion is acceptable;
+/// what's asserted is the narrowing (no file write) and the recorded per-turn goal.
+async fn start_server_with_command() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "should not land"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let extensions = Extensions {
+        commands: vec![CustomCommandDef {
+            name: "greet".to_string(),
+            description: None,
+            argument_hint: None,
+            model: None,
+            allowed_tools: Some(vec!["fs.read".to_string()]),
+            template: "hi $1".to_string(),
+        }],
+        ..Default::default()
+    };
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    )
+    .with_extensions(Arc::new(extensions));
 
     let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -498,6 +551,82 @@ async fn streams_a_turn_then_reconnects_with_replay() {
     }
     assert!(replayed.iter().all(|&s| s > 0), "replay gap excludes seq 0");
     assert_eq!(replayed.last(), Some(&last_seq));
+}
+
+#[tokio::test]
+async fn run_command_expands_and_narrows_tools() {
+    let (port, dir) = start_server_with_command().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({
+        "RunCommand": { "session": session, "name": "greet", "args": ["world"] }
+    });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "expected the RunCommand turn to complete");
+
+    // Narrowing worked: fs.write was excluded from the command's tools, so the Coder's edit
+    // (which the scripted provider always proposes) was never applied.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !dir.path().join("out.txt").exists(),
+        "allowed-tools must have excluded fs.write"
+    );
+}
+
+#[tokio::test]
+async fn run_command_unknown_name_reports_error_and_keeps_connection_open() {
+    let (port, _dir) = start_server_with_command().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({
+        "RunCommand": { "session": session.clone(), "name": "nope", "args": [] }
+    });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("no command named 'nope'"),
+        "got: {frame}"
+    );
+
+    // The connection is still usable afterward.
+    let cmd2 =
+        serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd2).unwrap()))
+        .await
+        .unwrap();
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "connection must survive an unknown RunCommand");
 }
 
 #[tokio::test]
