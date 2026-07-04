@@ -225,6 +225,27 @@ async fn build_tools_preferring_mcp(
     (registry, conns)
 }
 
+/// The tool-registry composition `otto serve` uses: the permission/approval gate from
+/// `build_tools_preferring_mcp`, then hook-wrapping on top via `register_hooks` — the same two
+/// steps `cmd_run` performs inline. Skills and plugin MCP servers are NOT registered here; that
+/// remains deferred for the serve path.
+async fn build_serve_tools(
+    ext: &otto_extensions::Extensions,
+    tools_workspace: Arc<dyn Workspace>,
+    root: PathBuf,
+    approve_edits: bool,
+) -> (ToolRegistry, Vec<McpConnection>) {
+    let (mut tools, conns) = build_tools_preferring_mcp(
+        tools_workspace,
+        root.clone(),
+        approve_edits,
+        &ext.permissions,
+    )
+    .await;
+    register_hooks(&mut tools, &ext.hooks, &root);
+    (tools, conns)
+}
+
 /// Register the built-in `skill` tool when any skills were discovered. No-op otherwise, so a
 /// workspace with no `.claude/skills/` leaves the spine's tool set byte-for-byte unchanged.
 fn register_skills(
@@ -581,27 +602,16 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     };
 
     let ext = otto_extensions::discover(&root, &home_dir());
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on the serve \
-             path (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
 
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired only in the main `otto run` spine for now;
-    // the --agent/--command paths are deferred (extensions hooks slice). Permissions ARE
-    // enforced here, composed with --approve-edits when both are configured (see
-    // build_tool_registry_inner).
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(
-        tools_workspace,
-        root.clone(),
-        approve_edits,
-        &ext.permissions,
-    )
-    .await;
+    // NOTE: skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
+    // --agent/--command paths are deferred (extensions hooks slice). Permissions and hooks ARE
+    // enforced here via `build_serve_tools`, composed with --approve-edits when both are
+    // configured (see build_tool_registry_inner / register_hooks).
+    let (tools, _mcp_conns) =
+        build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -1196,6 +1206,123 @@ mod tests {
         assert_eq!(
             reg.check("fs.write", &json!({"path": "dist/x.txt"})),
             Decision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_wraps_hooks_around_permission_and_approval_gate() {
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping serve hooks composition test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{
+                "permissions": { "deny": ["Write(dist/**)"] },
+                "hooks": { "PreToolUse": [
+                    {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
+                ] }
+            }"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.permissions.is_empty());
+        assert!(!ext.hooks.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), true).await;
+
+        // The hook fires even though fs.read is otherwise allowed by the permission/approval gate.
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+        // The permission-gate deny still wins for an unrelated tool call (composition intact).
+        assert_eq!(
+            tools.check("fs.write", &serde_json::json!({"path": "dist/x.txt"})),
+            otto_engine_core::tool::Decision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_enforces_hooks_on_the_plain_gate_branch() {
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping serve hooks plain-branch test: no OS sandbox backend");
+            return;
+        }
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": { "PreToolUse": [
+                {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
+            ] }}"#,
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(ext.permissions.is_empty());
+        assert!(!ext.hooks.is_empty());
+
+        // No permission rules and approve_edits=false: build_tools_preferring_mcp takes its
+        // plain build_tool_registry branch, not PolicyGate/ApprovalModeGate.
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        let err = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("blocked by PreToolUse hook"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_matches_direct_call_when_nothing_is_configured() {
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(ext.permissions.is_empty());
+        assert!(ext.hooks.is_empty());
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // With no settings.json at all, build_serve_tools must behave exactly like calling
+        // build_tools_preferring_mcp directly — register_hooks is a no-op with no hooks.
+        let out = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
+            .unwrap();
+        assert!(
+            out.to_string().contains("hi"),
+            "expected fs.read to return content, got: {out}"
         );
     }
 }
