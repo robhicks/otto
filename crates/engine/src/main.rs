@@ -624,10 +624,10 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let router: Arc<dyn otto_engine_core::Router> = Arc::from(build_router());
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: skills/plugin MCP servers are wired only in the main `otto run` spine for now; the
-    // --agent/--command paths are deferred (extensions hooks slice). Permissions and hooks ARE
-    // enforced here via `build_serve_tools`, composed with --approve-edits when both are
-    // configured (see build_tool_registry_inner / register_hooks).
+    // NOTE: permissions, hooks, skills, and plugin MCP servers are all enforced here via
+    // `build_serve_tools` (composed with --approve-edits when both are configured; see
+    // build_tool_registry_inner / register_skills / register_hooks). Only the --agent/--command
+    // serve subpaths remain deferred (extensions hooks slice).
     let (tools, _mcp_conns) =
         build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
