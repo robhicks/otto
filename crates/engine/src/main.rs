@@ -639,7 +639,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let retriever = otto_engine::build_retriever(&root).await;
     let service = otto_engine::EngineService::new(store, registry, router, orch_workspace, tools)
-        .with_retriever(retriever);
+        .with_retriever(retriever)
+        .with_extensions(Arc::new(ext));
     let capabilities = otto_engine::build_capabilities();
     let promote = match (promote_loopback, promote_vps, promote_microvm) {
         (l, v, m) if (l as u8) + (v.is_some() as u8) + (m as u8) > 1 => {
