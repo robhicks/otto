@@ -227,16 +227,15 @@ async fn build_tools_preferring_mcp(
 
 /// The tool-registry composition `otto serve` uses: the permission/approval gate from
 /// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then
-/// hook-wrapping on top via `register_hooks` — the same steps `cmd_run` performs inline, in the
-/// same order. Plugin MCP servers are NOT registered here; that remains deferred for the serve
-/// path.
+/// hook-wrapping on top via `register_hooks`, then bundled plugin MCP servers via
+/// `mcp_connect_plugin_server` — the same steps `cmd_run` performs inline, in the same order.
 async fn build_serve_tools(
     ext: &otto_extensions::Extensions,
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
     approve_edits: bool,
 ) -> (ToolRegistry, Vec<McpConnection>) {
-    let (mut tools, conns) = build_tools_preferring_mcp(
+    let (mut tools, mut conns) = build_tools_preferring_mcp(
         tools_workspace,
         root.clone(),
         approve_edits,
@@ -245,6 +244,23 @@ async fn build_serve_tools(
     .await;
     register_skills(&mut tools, &ext.skills);
     register_hooks(&mut tools, &ext.hooks, &root);
+    // Bundled plugin MCP servers register AFTER register_hooks, mirroring cmd_run exactly: plugin
+    // tools are gate-guarded but not hook-wrapped this slice (see cmd_run's identical loop). A
+    // server that won't spawn is logged and skipped — additive, never fatal.
+    for spec in &ext.mcp_servers {
+        match mcp_connect_plugin_server(spec).await {
+            Ok((conn, mcp_tools)) => {
+                for t in mcp_tools {
+                    tools.register(t);
+                }
+                conns.push(conn);
+            }
+            Err(e) => eprintln!(
+                "plugin mcp server {}:{} unavailable ({e}); skipping",
+                spec.namespace, spec.server_key
+            ),
+        }
+    }
     (tools, conns)
 }
 
@@ -1354,5 +1370,81 @@ mod tests {
             "expected the `skill` tool to be registered, got: {:?}",
             tools.tool_names()
         );
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_connects_and_registers_a_plugin_mcp_server() {
+        use otto_extensions::{Extensions, PluginMcpServer};
+        use otto_workspace::LocalWorkspace;
+
+        // Use the real, already-built mcp-fs binary as a stand-in "plugin" MCP server — a real
+        // stdio server, so this proves the actual connect-and-register path, not a mock.
+        let bin = escargot::CargoBuild::new()
+            .package("otto-mcp-fs")
+            .bin("mcp-fs")
+            .run()
+            .expect("build mcp-fs")
+            .path()
+            .to_path_buf();
+
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let mut ext = Extensions::default();
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "fs".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![proj.path().to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        assert!(
+            tools
+                .tool_names()
+                .iter()
+                .any(|n| n == "plugin__testplugin__fs__fs.read"),
+            "expected the namespaced plugin tool to be registered, got: {:?}",
+            tools.tool_names()
+        );
+        // The connection must be retained in the returned Vec — otherwise the caller would drop
+        // it and kill the child process the instant build_serve_tools returns.
+        assert!(!conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_serve_tools_skips_an_unreachable_plugin_mcp_server() {
+        use otto_extensions::{Extensions, PluginMcpServer};
+        use otto_workspace::LocalWorkspace;
+
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+
+        let mut ext = Extensions::default();
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "bogus".to_string(),
+            command: "definitely-not-a-real-binary-xyz".to_string(),
+            args: vec![],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, conns) =
+            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // An unreachable plugin server is logged and skipped, never fatal — matches cmd_run.
+        assert!(
+            !tools.tool_names().iter().any(|n| n.starts_with("plugin__")),
+            "expected no plugin tools to be registered, got: {:?}",
+            tools.tool_names()
+        );
+        assert!(conns.is_empty());
     }
 }
