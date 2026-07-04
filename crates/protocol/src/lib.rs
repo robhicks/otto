@@ -43,6 +43,16 @@ pub enum Command {
         session: SessionId,
         text: String,
     },
+    /// Run a discovered `.claude/commands/*.md` command by name: template-expand
+    /// `$ARGUMENTS`/`$1..$9` from `args`, resolve `!bash`/`@file` injections through a tool
+    /// registry narrowed to the command's `allowed-tools`, then run the result as a normal
+    /// turn with the router pinned to the command's `model`. Unknown `name` or an injection
+    /// failure surfaces as `ServerMessage::Error` — no turn starts, no `seq` is consumed.
+    RunCommand {
+        session: SessionId,
+        name: String,
+        args: Vec<String>,
+    },
     Abort {
         session: SessionId,
     },
@@ -284,6 +294,20 @@ mod tests {
         let back: Command = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn run_command_command_round_trips() {
+        let cmd = Command::RunCommand {
+            session: SessionId::new(),
+            name: "git:commit".to_string(),
+            args: vec!["fix bug".to_string()],
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        // External tagging matches the rest of Command (e.g. {"RunCommand":{...}}).
+        assert!(json.contains("\"RunCommand\""));
     }
 
     #[test]
