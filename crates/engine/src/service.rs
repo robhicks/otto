@@ -325,12 +325,17 @@ impl EngineService {
     /// Look up `name` in the discovered custom agents (set via `with_extensions`), dispatch it as
     /// a single, non-interruptible `TaskTool`/`MarkdownAgent` call (no `Orchestrator::run_turn`),
     /// and synthesize the turn's event stream from the existing `EventKind` vocabulary:
-    /// `AgentStarted`, `Log` (the agent's full response text), `AgentFinished`, `TurnComplete`.
-    /// (≙ `Command::RunAgent`.) Errors before any event is emitted — unknown `name`, or no
-    /// extensions attached via `with_extensions` at all — so no `seq` is consumed and the session
-    /// is untouched. A dispatch failure (e.g. a provider error) still emits
-    /// `AgentFinished`/`TurnComplete { ok: false }` and marks the session `Failed`, matching how
-    /// an orchestrator failure is reported for `SendPrompt`/`RunCommand`.
+    /// `AgentStarted`, `Log` (the agent's response text, or the dispatch error on failure),
+    /// `AgentFinished`, `TurnComplete`. (≙ `Command::RunAgent`.) Errors before any event is
+    /// emitted — unknown `name`, or no extensions attached via `with_extensions` at all — so no
+    /// `seq` is consumed and the session is untouched. A dispatch failure (e.g. a provider error)
+    /// is reported as `Ok(TurnOutcome { ok: false })`, not `Err`: it still emits
+    /// `AgentFinished`/`TurnComplete { ok: false }` and marks the session `Failed`, exactly like
+    /// an orchestrator verify-failure does for `SendPrompt`/`RunCommand` — `Err` is reserved for
+    /// failures that happen *before* `TurnComplete` is ever emitted (e.g. a persist failure inside
+    /// `emit_and_persist`), matching `Orchestrator::run_turn`'s own contract. This keeps
+    /// `serve.rs`'s `report_turn_outcome` from ever sending a `ServerMessage::Error` frame after a
+    /// `TurnComplete` has already streamed for the same call.
     pub async fn run_agent_with_controls(
         &self,
         session: SessionId,
@@ -443,8 +448,12 @@ impl EngineService {
 
     /// Emit the fixed `AgentStarted`/`Log`/`AgentFinished`/`TurnComplete` sequence for a single
     /// `TaskTool` dispatch, persisting each event before streaming it (fail-closed). A `task.call`
-    /// failure still emits `AgentFinished`/`TurnComplete { ok: false }` — the error is threaded
-    /// into the returned `Err`, never swallowed.
+    /// failure is reported *in-band*, as a `Log` carrying the error text followed by
+    /// `TurnComplete { ok: false }` — this function always returns `Ok(TurnOutcome { ok })`, never
+    /// propagating the dispatch error as `Err`. Only a failure in `emit_and_persist` itself (a
+    /// persist/stream error, via `?`) returns `Err` here, which — same as
+    /// `Orchestrator::run_turn` — can only happen before the fixed sequence completes, never
+    /// after a `TurnComplete` has already streamed.
     async fn run_agent_dispatch(
         &self,
         session: SessionId,
@@ -473,17 +482,20 @@ impl EngineService {
                     .ok_or_else(|| anyhow::anyhow!("task dispatch returned no `text` field"))
             });
 
-        if let Ok(text) = &dispatch {
-            self.emit_and_persist(
-                session,
-                counter,
-                sink,
-                EventKind::Log {
-                    message: text.clone(),
-                },
-            )
-            .await?;
-        }
+        let ok = dispatch.is_ok();
+        let log_message = match dispatch {
+            Ok(text) => text,
+            Err(e) => format!("agent dispatch failed: {e}"),
+        };
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::Log {
+                message: log_message,
+            },
+        )
+        .await?;
 
         self.emit_and_persist(
             session,
@@ -493,14 +505,10 @@ impl EngineService {
         )
         .await?;
 
-        let ok = dispatch.is_ok();
         self.emit_and_persist(session, counter, sink, EventKind::TurnComplete { ok })
             .await?;
 
-        match dispatch {
-            Ok(_) => Ok(TurnOutcome { ok: true }),
-            Err(e) => Err(e),
-        }
+        Ok(TurnOutcome { ok })
     }
 
     /// Assign the next seq, persist the event (fail-closed), then stream it to `sink`. Shared by
@@ -1539,7 +1547,7 @@ mod tests {
             .unwrap();
 
         let mut sink = CollectingSink::default();
-        let err = service
+        let outcome = service
             .run_agent_with_controls_inner(
                 id,
                 "reviewer",
@@ -1548,26 +1556,33 @@ mod tests {
                 Some(Arc::new(FailingRouter)),
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("simulated router failure"));
+            .unwrap();
+        // A dispatch failure is reported in-band as Ok(TurnOutcome { ok: false }), not Err — so
+        // serve.rs's report_turn_outcome never sends a redundant Error frame after the
+        // TurnComplete{ok:false} that already streamed for this same failure.
+        assert!(!outcome.ok);
 
-        // Fixed event sequence on a dispatch failure: AgentStarted, AgentFinished,
-        // TurnComplete { ok: false } — no Log event, since the dispatch never produced text.
-        assert_eq!(sink.events.len(), 3);
+        // Fixed event sequence on a dispatch failure: AgentStarted, Log (carrying the error
+        // text), AgentFinished, TurnComplete { ok: false }.
+        assert_eq!(sink.events.len(), 4);
         assert!(matches!(
             sink.events[0].kind,
             EventKind::AgentStarted {
                 role: Role::Custom(ref n)
             } if n == "reviewer"
         ));
+        match &sink.events[1].kind {
+            EventKind::Log { message } => assert!(message.contains("simulated router failure")),
+            other => panic!("expected Log, got {other:?}"),
+        }
         assert!(matches!(
-            sink.events[1].kind,
+            sink.events[2].kind,
             EventKind::AgentFinished {
                 role: Role::Custom(ref n)
             } if n == "reviewer"
         ));
         assert!(matches!(
-            sink.events[2].kind,
+            sink.events[3].kind,
             EventKind::TurnComplete { ok: false }
         ));
 
