@@ -427,7 +427,7 @@ enum TurnLoopOutcome {
 
 /// Report a turn's `TurnLoopOutcome` on the socket (an error frame, or nothing on success) and
 /// say whether the caller must `break 'outer`. Shared by every command that starts a turn
-/// (`SendPrompt`, `RunCommand`) so this handling can never drift between them.
+/// (`SendPrompt`, `RunCommand`, `RunAgent`) so this handling can never drift between them.
 async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) -> bool {
     match outcome {
         TurnLoopOutcome::Finished(Some(e)) => {

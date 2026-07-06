@@ -338,6 +338,26 @@ impl EngineService {
         prompt: &str,
         sink: &mut dyn EventSink,
     ) -> anyhow::Result<TurnOutcome> {
+        self.run_agent_with_controls_inner(session, name, prompt, sink, None)
+            .await
+    }
+
+    /// `run_agent_with_controls`'s real implementation, parameterized by an optional router
+    /// override used only by tests (see the test module) to substitute a failing `Router` and
+    /// exercise the `task.call` error path deterministically and offline —
+    /// `build_router_with_model` reads `ANTHROPIC_API_KEY` and, with no override, would
+    /// otherwise require real network I/O to ever fail. Every real caller is
+    /// `run_agent_with_controls` above, which always passes `None`, so production behavior is
+    /// byte-for-byte unchanged: the router is always freshly built via `build_router_with_model`,
+    /// never falling back to `self.router`.
+    async fn run_agent_with_controls_inner(
+        &self,
+        session: SessionId,
+        name: &str,
+        prompt: &str,
+        sink: &mut dyn EventSink,
+        router_override: Option<Arc<dyn Router>>,
+    ) -> anyhow::Result<TurnOutcome> {
         let extensions = self.extensions.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "no custom agent named '{name}': this server was not configured with any extensions"
@@ -367,9 +387,12 @@ impl EngineService {
         }
 
         // Always freshly built (never falls back to self.router), matching
-        // run_command_with_controls's model-pinning convention exactly.
-        let router: Arc<dyn Router> =
-            Arc::from(crate::build_router_with_model(model_override.as_deref()));
+        // run_command_with_controls's model-pinning convention exactly — unless a test supplied
+        // an override (see the doc comment above).
+        let router: Arc<dyn Router> = match router_override {
+            Some(r) => r,
+            None => Arc::from(crate::build_router_with_model(model_override.as_deref())),
+        };
         // `Workspace: WorkspaceRead` — this is a supertrait upcast, not a second workspace.
         let read_ws: Arc<dyn WorkspaceRead> = self.workspace.clone();
         let task = TaskTool::new(
@@ -1480,6 +1503,82 @@ mod tests {
             EventKind::Log { message } => assert!(message.contains("SECOND-PROMPT")),
             other => panic!("expected Log, got {other:?}"),
         }
+    }
+
+    /// A `Router` whose `complete` always fails — simulates a provider error (e.g. a remote
+    /// LLM call failing) so the dispatch-failure branch of `run_agent_dispatch` can be exercised
+    /// deterministically and offline. `run_agent_with_controls` itself always builds its router
+    /// from the environment (never falls back to `self.router`), so this is wired in through
+    /// `run_agent_with_controls_inner`'s test-only router-override parameter.
+    struct FailingRouter;
+    #[async_trait]
+    impl Router for FailingRouter {
+        async fn complete(
+            &self,
+            _req: otto_engine_core::types::CompleteRequest,
+            _hints: otto_engine_core::router::RouteHints,
+        ) -> anyhow::Result<otto_engine_core::types::CompleteResponse> {
+            anyhow::bail!("simulated router failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_dispatch_failure_marks_session_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = agent_def("reviewer", "SYSTEM-PROMPT", None, None);
+        let extensions = Extensions {
+            agents: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls_inner(
+                id,
+                "reviewer",
+                "look at auth.rs",
+                &mut sink,
+                Some(Arc::new(FailingRouter)),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("simulated router failure"));
+
+        // Fixed event sequence on a dispatch failure: AgentStarted, AgentFinished,
+        // TurnComplete { ok: false } — no Log event, since the dispatch never produced text.
+        assert_eq!(sink.events.len(), 3);
+        assert!(matches!(
+            sink.events[0].kind,
+            EventKind::AgentStarted {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        assert!(matches!(
+            sink.events[1].kind,
+            EventKind::AgentFinished {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        assert!(matches!(
+            sink.events[2].kind,
+            EventKind::TurnComplete { ok: false }
+        ));
+
+        // Persisted log matches what was streamed.
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, sink.events);
+
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Failed
+        );
     }
 
     #[tokio::test]
