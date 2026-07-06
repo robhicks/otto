@@ -11,7 +11,7 @@ use otto_engine::{
     serve_app, serve_run,
 };
 use otto_engine_core::traits::Workspace;
-use otto_extensions::{CustomCommandDef, Extensions};
+use otto_extensions::{CustomAgentDef, CustomCommandDef, Extensions};
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
@@ -99,6 +99,57 @@ async fn start_server_with_command() -> (u16, tempfile::TempDir) {
             model: None,
             allowed_tools: Some(vec!["fs.read".to_string()]),
             template: "hi $1".to_string(),
+        }],
+        ..Default::default()
+    };
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    )
+    .with_extensions(Arc::new(extensions));
+
+    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
+/// Start the serve app with one discovered custom agent: `reviewer`, system prompt
+/// `"SYSTEM-PROMPT"`. Uses the deterministic offline router (no ScriptedProvider needed — the
+/// dispatched `MarkdownAgent` goes through `build_router_with_model`, not the service's own
+/// router).
+async fn start_server_with_agent() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}")
+        .on(
+            "edits",
+            r#"{"edits": [{"path": "out.txt", "contents": "should not land"}]}"#,
+        )
+        .on("milestones", r#"{"milestones": [{"description": "x"}]}"#);
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let extensions = Extensions {
+        agents: vec![CustomAgentDef {
+            name: "reviewer".to_string(),
+            description: "d".to_string(),
+            tools: None,
+            model: None,
+            system_prompt: "SYSTEM-PROMPT".to_string(),
         }],
         ..Default::default()
     };
@@ -627,6 +678,101 @@ async fn run_command_unknown_name_reports_error_and_keeps_connection_open() {
         }
     }
     assert!(completed, "connection must survive an unknown RunCommand");
+}
+
+#[tokio::test]
+async fn run_agent_dispatches_and_reports_turn_complete() {
+    let (port, dir) = start_server_with_agent().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({
+        "RunAgent": { "session": session, "name": "reviewer", "prompt": "look at auth.rs" }
+    });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_started = false;
+    let mut saw_log_with_prompt = false;
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] != "event" {
+            continue;
+        }
+        let kind = &frame["event"]["kind"];
+        if kind.get("AgentStarted").is_some() {
+            saw_started = true;
+        }
+        if let Some(log) = kind.get("Log") {
+            if log["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("look at auth.rs")
+            {
+                saw_log_with_prompt = true;
+            }
+        }
+        if kind.get("TurnComplete").is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(saw_started, "expected an AgentStarted event");
+    assert!(
+        saw_log_with_prompt,
+        "expected a Log event carrying the dispatched prompt"
+    );
+    assert!(completed, "expected the RunAgent call to complete");
+
+    // A custom-agent dispatch never touches the workspace via fs.write — no orchestrator edit
+    // was ever proposed for this call.
+    assert!(!dir.path().join("out.txt").exists());
+}
+
+#[tokio::test]
+async fn run_agent_unknown_name_reports_error_and_keeps_connection_open() {
+    let (port, _dir) = start_server_with_agent().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let cmd = serde_json::json!({
+        "RunAgent": { "session": session.clone(), "name": "ghost", "prompt": "x" }
+    });
+    ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
+        .await
+        .unwrap();
+
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert!(
+        frame["message"]
+            .as_str()
+            .unwrap()
+            .contains("no custom agent named 'ghost'"),
+        "got: {frame}"
+    );
+
+    // The connection is still usable afterward — SendPrompt still completes a turn.
+    let cmd2 =
+        serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
+    ws.send(Message::Text(serde_json::to_string(&cmd2).unwrap()))
+        .await
+        .unwrap();
+    let mut completed = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "connection must survive an unknown RunAgent");
 }
 
 #[tokio::test]

@@ -3,19 +3,20 @@
 //! serve layer drive it. Maps the protocol commands onto operations: `CreateSession` ->
 //! `create_session`, `SendPrompt` -> `run_prompt`, `Abort` -> `abort`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use otto_engine_core::tool::{
-    Approver, Decision, DenyApprover, NeverPause, PauseController, ToolRegistry,
+    Approver, Decision, DenyApprover, NeverPause, PauseController, Tool, ToolRegistry,
 };
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
-use otto_extensions::{Extensions, expand_args, resolve_injections};
+use otto_extensions::{Extensions, MarkdownAgent, TaskTool, expand_args, resolve_injections};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
-use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
+use otto_protocol::{Event, EventKind, Role, SessionId, WorkspaceRequest, WorkspaceResponse};
 use otto_router::MeteringRouter;
 use serde_json::json;
 
@@ -319,6 +320,211 @@ impl EngineService {
         };
         self.run_prompt_with_controls(session, &goal, sink, controls)
             .await
+    }
+
+    /// Look up `name` in the discovered custom agents (set via `with_extensions`), dispatch it as
+    /// a single, non-interruptible `TaskTool`/`MarkdownAgent` call (no `Orchestrator::run_turn`),
+    /// and synthesize the turn's event stream from the existing `EventKind` vocabulary:
+    /// `AgentStarted`, `Log` (the agent's response text, or the dispatch error on failure),
+    /// `AgentFinished`, `TurnComplete`. (≙ `Command::RunAgent`.) Errors before any event is
+    /// emitted — unknown `name`, or no extensions attached via `with_extensions` at all — so no
+    /// `seq` is consumed and the session is untouched. A dispatch failure (e.g. a provider error)
+    /// is reported as `Ok(TurnOutcome { ok: false })`, not `Err`: it still emits
+    /// `AgentFinished`/`TurnComplete { ok: false }` and marks the session `Failed`, exactly like
+    /// an orchestrator verify-failure does for `SendPrompt`/`RunCommand` — `Err` is reserved for
+    /// failures that happen *before* `TurnComplete` is ever emitted (e.g. a persist failure inside
+    /// `emit_and_persist`), matching `Orchestrator::run_turn`'s own contract. This keeps
+    /// `serve.rs`'s `report_turn_outcome` from ever sending a `ServerMessage::Error` frame after a
+    /// `TurnComplete` has already streamed for the same call.
+    pub async fn run_agent_with_controls(
+        &self,
+        session: SessionId,
+        name: &str,
+        prompt: &str,
+        sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.run_agent_with_controls_inner(session, name, prompt, sink, None)
+            .await
+    }
+
+    /// `run_agent_with_controls`'s real implementation, parameterized by an optional router
+    /// override used only by tests (see the test module) to substitute a failing `Router` and
+    /// exercise the `task.call` error path deterministically and offline —
+    /// `build_router_with_model` reads `ANTHROPIC_API_KEY` and, with no override, would
+    /// otherwise require real network I/O to ever fail. Every real caller is
+    /// `run_agent_with_controls` above, which always passes `None`, so production behavior is
+    /// byte-for-byte unchanged: the router is always freshly built via `build_router_with_model`,
+    /// never falling back to `self.router`.
+    async fn run_agent_with_controls_inner(
+        &self,
+        session: SessionId,
+        name: &str,
+        prompt: &str,
+        sink: &mut dyn EventSink,
+        router_override: Option<Arc<dyn Router>>,
+    ) -> anyhow::Result<TurnOutcome> {
+        let extensions = self.extensions.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no custom agent named '{name}': this server was not configured with any extensions"
+            )
+        })?;
+        if !extensions.agents.iter().any(|a| a.name == name) {
+            anyhow::bail!(
+                "no custom agent named '{name}' in ~/.claude/agents/ or the project .claude/agents/"
+            );
+        }
+
+        // Register EVERY discovered custom agent (not just `name`), matching the CLI's
+        // `run_custom_agent_in` byte-for-byte — cheap, since the defs are already in memory from
+        // startup discovery.
+        let mut registry = AgentRegistry::new();
+        let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        let mut model_override: Option<String> = None;
+        for def in &extensions.agents {
+            if def.name == name {
+                model_override = def.model.clone();
+            }
+            allowlists.insert(def.name.clone(), def.tools.clone());
+            registry.register(
+                Role::Custom(def.name.clone()),
+                Arc::new(MarkdownAgent::new(def.clone())),
+            );
+        }
+
+        // Always freshly built (never falls back to self.router), matching
+        // run_command_with_controls's model-pinning convention exactly — unless a test supplied
+        // an override (see the doc comment above).
+        let router: Arc<dyn Router> = match router_override {
+            Some(r) => r,
+            None => Arc::from(crate::build_router_with_model(model_override.as_deref())),
+        };
+        // `Workspace: WorkspaceRead` — this is a supertrait upcast, not a second workspace.
+        let read_ws: Arc<dyn WorkspaceRead> = self.workspace.clone();
+        let task = TaskTool::new(
+            router,
+            read_ws,
+            Arc::new(registry),
+            Arc::clone(&self.tools),
+            allowlists,
+        );
+
+        let _guard = self.turn_lock.lock().await;
+        let start_seq = self.store.next_seq(session).await?;
+        let turn_index = self.store.next_turn(session).await?;
+        let counter = AtomicU64::new(start_seq);
+
+        // From here, seq/turn_index are reserved: any failure past this point still marks the
+        // session Failed, matching run_prompt_with_controls's contract for an in-flight turn.
+        let outcome = self
+            .run_agent_dispatch(session, &counter, name, prompt, &task, sink)
+            .await;
+
+        match &outcome {
+            Ok(turn_outcome) => {
+                self.store
+                    .record_turn(
+                        session,
+                        &TurnRecord {
+                            turn_index,
+                            goal: prompt.to_string(),
+                            outcome: serde_json::json!({ "ok": turn_outcome.ok }),
+                        },
+                    )
+                    .await?;
+                let status = if turn_outcome.ok {
+                    SessionStatus::Done
+                } else {
+                    SessionStatus::Failed
+                };
+                self.store.set_status(session, status).await?;
+            }
+            Err(_) => {
+                let _ = self.store.set_status(session, SessionStatus::Failed).await;
+            }
+        }
+
+        outcome
+    }
+
+    /// Emit the fixed `AgentStarted`/`Log`/`AgentFinished`/`TurnComplete` sequence for a single
+    /// `TaskTool` dispatch, persisting each event before streaming it (fail-closed). A `task.call`
+    /// failure is reported *in-band*, as a `Log` carrying the error text followed by
+    /// `TurnComplete { ok: false }` — this function always returns `Ok(TurnOutcome { ok })`, never
+    /// propagating the dispatch error as `Err`. Only a failure in `emit_and_persist` itself (a
+    /// persist/stream error, via `?`) returns `Err` here, which — same as
+    /// `Orchestrator::run_turn` — can only happen before the fixed sequence completes, never
+    /// after a `TurnComplete` has already streamed.
+    async fn run_agent_dispatch(
+        &self,
+        session: SessionId,
+        counter: &AtomicU64,
+        name: &str,
+        prompt: &str,
+        task: &TaskTool,
+        sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        let role = Role::Custom(name.to_string());
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::AgentStarted { role: role.clone() },
+        )
+        .await?;
+
+        let dispatch = task
+            .call(serde_json::json!({ "agent": name, "prompt": prompt }))
+            .await
+            .and_then(|out| {
+                out.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("task dispatch returned no `text` field"))
+            });
+
+        let ok = dispatch.is_ok();
+        let log_message = match dispatch {
+            Ok(text) => text,
+            Err(e) => format!("agent dispatch failed: {e}"),
+        };
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::Log {
+                message: log_message,
+            },
+        )
+        .await?;
+
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::AgentFinished { role: role.clone() },
+        )
+        .await?;
+
+        self.emit_and_persist(session, counter, sink, EventKind::TurnComplete { ok })
+            .await?;
+
+        Ok(TurnOutcome { ok })
+    }
+
+    /// Assign the next seq, persist the event (fail-closed), then stream it to `sink`. Shared by
+    /// `run_agent_dispatch`'s fixed event sequence.
+    async fn emit_and_persist(
+        &self,
+        session: SessionId,
+        counter: &AtomicU64,
+        sink: &mut dyn EventSink,
+        kind: EventKind,
+    ) -> anyhow::Result<()> {
+        let seq = counter.fetch_add(1, Ordering::SeqCst);
+        let event = Event { seq, session, kind };
+        self.store.append_event(session, &event).await?;
+        sink.emit(&event).await?;
+        Ok(())
     }
 
     /// Validate every workspace file in `bundle` through the permission gate and return the edits
@@ -975,6 +1181,21 @@ mod tests {
         }
     }
 
+    fn agent_def(
+        name: &str,
+        system_prompt: &str,
+        tools: Option<Vec<String>>,
+        model: Option<String>,
+    ) -> otto_extensions::CustomAgentDef {
+        otto_extensions::CustomAgentDef {
+            name: name.to_string(),
+            description: "d".to_string(),
+            tools,
+            model,
+            system_prompt: system_prompt.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn run_command_with_controls_unknown_name_errors_without_starting_a_turn() {
         let dir = tempfile::tempdir().unwrap();
@@ -1149,6 +1370,230 @@ mod tests {
 
         let replayed = service.store().replay_since(id, None).await.unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_unknown_name_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(Extensions::default()));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(id, "ghost", "do it", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no custom agent named 'ghost'"));
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_no_extensions_configured_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(id, "anything", "do it", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not configured with any extensions")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_dispatches_and_streams_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = agent_def(
+            "reviewer",
+            "SYSTEM-PROMPT",
+            Some(vec!["fs.read".to_string()]),
+            None,
+        );
+        let extensions = Extensions {
+            agents: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_agent_with_controls(id, "reviewer", "look at auth.rs", &mut sink)
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+
+        // Fixed event sequence: AgentStarted, Log, AgentFinished, TurnComplete.
+        assert_eq!(sink.events.len(), 4);
+        assert!(matches!(
+            sink.events[0].kind,
+            EventKind::AgentStarted {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        match &sink.events[1].kind {
+            EventKind::Log { message } => {
+                // The offline LocalProvider's deterministic completion echoes its prompt, so the
+                // composed system prompt + task prompt both surface in the logged text.
+                assert!(message.contains("SYSTEM-PROMPT"));
+                assert!(message.contains("look at auth.rs"));
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+        assert!(matches!(
+            sink.events[2].kind,
+            EventKind::AgentFinished {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        assert!(matches!(
+            sink.events[3].kind,
+            EventKind::TurnComplete { ok: true }
+        ));
+
+        // Persisted log matches what was streamed, with contiguous seqs from 0.
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, sink.events);
+
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_registers_every_discovered_agent() {
+        // Two agents discovered; dispatching the second must still work — proving the
+        // "register every discovered def" loop doesn't only wire up the first/target one.
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = Extensions {
+            agents: vec![
+                agent_def("first", "FIRST-PROMPT", None, None),
+                agent_def("second", "SECOND-PROMPT", None, None),
+            ],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_agent_with_controls(id, "second", "ping", &mut sink)
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+        match &sink.events[1].kind {
+            EventKind::Log { message } => assert!(message.contains("SECOND-PROMPT")),
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    /// A `Router` whose `complete` always fails — simulates a provider error (e.g. a remote
+    /// LLM call failing) so the dispatch-failure branch of `run_agent_dispatch` can be exercised
+    /// deterministically and offline. `run_agent_with_controls` itself always builds its router
+    /// from the environment (never falls back to `self.router`), so this is wired in through
+    /// `run_agent_with_controls_inner`'s test-only router-override parameter.
+    struct FailingRouter;
+    #[async_trait]
+    impl Router for FailingRouter {
+        async fn complete(
+            &self,
+            _req: otto_engine_core::types::CompleteRequest,
+            _hints: otto_engine_core::router::RouteHints,
+        ) -> anyhow::Result<otto_engine_core::types::CompleteResponse> {
+            anyhow::bail!("simulated router failure")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_dispatch_failure_marks_session_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = agent_def("reviewer", "SYSTEM-PROMPT", None, None);
+        let extensions = Extensions {
+            agents: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_agent_with_controls_inner(
+                id,
+                "reviewer",
+                "look at auth.rs",
+                &mut sink,
+                Some(Arc::new(FailingRouter)),
+            )
+            .await
+            .unwrap();
+        // A dispatch failure is reported in-band as Ok(TurnOutcome { ok: false }), not Err — so
+        // serve.rs's report_turn_outcome never sends a redundant Error frame after the
+        // TurnComplete{ok:false} that already streamed for this same failure.
+        assert!(!outcome.ok);
+
+        // Fixed event sequence on a dispatch failure: AgentStarted, Log (carrying the error
+        // text), AgentFinished, TurnComplete { ok: false }.
+        assert_eq!(sink.events.len(), 4);
+        assert!(matches!(
+            sink.events[0].kind,
+            EventKind::AgentStarted {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        match &sink.events[1].kind {
+            EventKind::Log { message } => assert!(message.contains("simulated router failure")),
+            other => panic!("expected Log, got {other:?}"),
+        }
+        assert!(matches!(
+            sink.events[2].kind,
+            EventKind::AgentFinished {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        assert!(matches!(
+            sink.events[3].kind,
+            EventKind::TurnComplete { ok: false }
+        ));
+
+        // Persisted log matches what was streamed.
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, sink.events);
+
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Failed
+        );
     }
 
     #[tokio::test]
