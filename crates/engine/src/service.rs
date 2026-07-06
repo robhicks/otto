@@ -3,19 +3,20 @@
 //! serve layer drive it. Maps the protocol commands onto operations: `CreateSession` ->
 //! `create_session`, `SendPrompt` -> `run_prompt`, `Abort` -> `abort`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use otto_engine_core::tool::{
-    Approver, Decision, DenyApprover, NeverPause, PauseController, ToolRegistry,
+    Approver, Decision, DenyApprover, NeverPause, PauseController, Tool, ToolRegistry,
 };
-use otto_engine_core::traits::Workspace;
+use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_engine_core::types::Edit;
 use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
-use otto_extensions::{Extensions, expand_args, resolve_injections};
+use otto_extensions::{Extensions, MarkdownAgent, TaskTool, expand_args, resolve_injections};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
-use otto_protocol::{Event, EventKind, SessionId, WorkspaceRequest, WorkspaceResponse};
+use otto_protocol::{Event, EventKind, Role, SessionId, WorkspaceRequest, WorkspaceResponse};
 use otto_router::MeteringRouter;
 use serde_json::json;
 
@@ -319,6 +320,181 @@ impl EngineService {
         };
         self.run_prompt_with_controls(session, &goal, sink, controls)
             .await
+    }
+
+    /// Look up `name` in the discovered custom agents (set via `with_extensions`), dispatch it as
+    /// a single, non-interruptible `TaskTool`/`MarkdownAgent` call (no `Orchestrator::run_turn`),
+    /// and synthesize the turn's event stream from the existing `EventKind` vocabulary:
+    /// `AgentStarted`, `Log` (the agent's full response text), `AgentFinished`, `TurnComplete`.
+    /// (≙ `Command::RunAgent`.) Errors before any event is emitted — unknown `name`, or no
+    /// extensions attached via `with_extensions` at all — so no `seq` is consumed and the session
+    /// is untouched. A dispatch failure (e.g. a provider error) still emits
+    /// `AgentFinished`/`TurnComplete { ok: false }` and marks the session `Failed`, matching how
+    /// an orchestrator failure is reported for `SendPrompt`/`RunCommand`.
+    pub async fn run_agent_with_controls(
+        &self,
+        session: SessionId,
+        name: &str,
+        prompt: &str,
+        sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        let extensions = self.extensions.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no custom agent named '{name}': this server was not configured with any extensions"
+            )
+        })?;
+        if !extensions.agents.iter().any(|a| a.name == name) {
+            anyhow::bail!(
+                "no custom agent named '{name}' in ~/.claude/agents/ or the project .claude/agents/"
+            );
+        }
+
+        // Register EVERY discovered custom agent (not just `name`), matching the CLI's
+        // `run_custom_agent_in` byte-for-byte — cheap, since the defs are already in memory from
+        // startup discovery.
+        let mut registry = AgentRegistry::new();
+        let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        let mut model_override: Option<String> = None;
+        for def in &extensions.agents {
+            if def.name == name {
+                model_override = def.model.clone();
+            }
+            allowlists.insert(def.name.clone(), def.tools.clone());
+            registry.register(
+                Role::Custom(def.name.clone()),
+                Arc::new(MarkdownAgent::new(def.clone())),
+            );
+        }
+
+        // Always freshly built (never falls back to self.router), matching
+        // run_command_with_controls's model-pinning convention exactly.
+        let router: Arc<dyn Router> =
+            Arc::from(crate::build_router_with_model(model_override.as_deref()));
+        // `Workspace: WorkspaceRead` — this is a supertrait upcast, not a second workspace.
+        let read_ws: Arc<dyn WorkspaceRead> = self.workspace.clone();
+        let task = TaskTool::new(
+            router,
+            read_ws,
+            Arc::new(registry),
+            Arc::clone(&self.tools),
+            allowlists,
+        );
+
+        let _guard = self.turn_lock.lock().await;
+        let start_seq = self.store.next_seq(session).await?;
+        let turn_index = self.store.next_turn(session).await?;
+        let counter = AtomicU64::new(start_seq);
+        let role = Role::Custom(name.to_string());
+
+        // From here, seq/turn_index are reserved: any failure past this point still marks the
+        // session Failed, matching run_prompt_with_controls's contract for an in-flight turn.
+        let outcome = self
+            .run_agent_dispatch(session, &counter, &role, name, prompt, &task, sink)
+            .await;
+
+        match &outcome {
+            Ok(turn_outcome) => {
+                self.store
+                    .record_turn(
+                        session,
+                        &TurnRecord {
+                            turn_index,
+                            goal: prompt.to_string(),
+                            outcome: serde_json::json!({ "ok": turn_outcome.ok }),
+                        },
+                    )
+                    .await?;
+                let status = if turn_outcome.ok {
+                    SessionStatus::Done
+                } else {
+                    SessionStatus::Failed
+                };
+                self.store.set_status(session, status).await?;
+            }
+            Err(_) => {
+                let _ = self.store.set_status(session, SessionStatus::Failed).await;
+            }
+        }
+
+        outcome
+    }
+
+    /// Emit the fixed `AgentStarted`/`Log`/`AgentFinished`/`TurnComplete` sequence for a single
+    /// `TaskTool` dispatch, persisting each event before streaming it (fail-closed). A `task.call`
+    /// failure still emits `AgentFinished`/`TurnComplete { ok: false }` — the error is threaded
+    /// into the returned `Err`, never swallowed.
+    async fn run_agent_dispatch(
+        &self,
+        session: SessionId,
+        counter: &AtomicU64,
+        role: &Role,
+        name: &str,
+        prompt: &str,
+        task: &TaskTool,
+        sink: &mut dyn EventSink,
+    ) -> anyhow::Result<TurnOutcome> {
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::AgentStarted { role: role.clone() },
+        )
+        .await?;
+
+        let dispatch = task
+            .call(serde_json::json!({ "agent": name, "prompt": prompt }))
+            .await
+            .and_then(|out| {
+                out.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow::anyhow!("task dispatch returned no `text` field"))
+            });
+
+        if let Ok(text) = &dispatch {
+            self.emit_and_persist(
+                session,
+                counter,
+                sink,
+                EventKind::Log {
+                    message: text.clone(),
+                },
+            )
+            .await?;
+        }
+
+        self.emit_and_persist(
+            session,
+            counter,
+            sink,
+            EventKind::AgentFinished { role: role.clone() },
+        )
+        .await?;
+
+        let ok = dispatch.is_ok();
+        self.emit_and_persist(session, counter, sink, EventKind::TurnComplete { ok })
+            .await?;
+
+        match dispatch {
+            Ok(_) => Ok(TurnOutcome { ok: true }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Assign the next seq, persist the event (fail-closed), then stream it to `sink`. Shared by
+    /// `run_agent_dispatch`'s fixed event sequence.
+    async fn emit_and_persist(
+        &self,
+        session: SessionId,
+        counter: &AtomicU64,
+        sink: &mut dyn EventSink,
+        kind: EventKind,
+    ) -> anyhow::Result<()> {
+        let seq = counter.fetch_add(1, Ordering::SeqCst);
+        let event = Event { seq, session, kind };
+        self.store.append_event(session, &event).await?;
+        sink.emit(&event).await?;
+        Ok(())
     }
 
     /// Validate every workspace file in `bundle` through the permission gate and return the edits
