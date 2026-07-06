@@ -384,12 +384,11 @@ impl EngineService {
         let start_seq = self.store.next_seq(session).await?;
         let turn_index = self.store.next_turn(session).await?;
         let counter = AtomicU64::new(start_seq);
-        let role = Role::Custom(name.to_string());
 
         // From here, seq/turn_index are reserved: any failure past this point still marks the
         // session Failed, matching run_prompt_with_controls's contract for an in-flight turn.
         let outcome = self
-            .run_agent_dispatch(session, &counter, &role, name, prompt, &task, sink)
+            .run_agent_dispatch(session, &counter, name, prompt, &task, sink)
             .await;
 
         match &outcome {
@@ -427,12 +426,12 @@ impl EngineService {
         &self,
         session: SessionId,
         counter: &AtomicU64,
-        role: &Role,
         name: &str,
         prompt: &str,
         task: &TaskTool,
         sink: &mut dyn EventSink,
     ) -> anyhow::Result<TurnOutcome> {
+        let role = Role::Custom(name.to_string());
         self.emit_and_persist(
             session,
             counter,
