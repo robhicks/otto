@@ -427,7 +427,7 @@ enum TurnLoopOutcome {
 
 /// Report a turn's `TurnLoopOutcome` on the socket (an error frame, or nothing on success) and
 /// say whether the caller must `break 'outer`. Shared by every command that starts a turn
-/// (`SendPrompt`, `RunCommand`) so this handling can never drift between them.
+/// (`SendPrompt`, `RunCommand`, `RunAgent`) so this handling can never drift between them.
 async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) -> bool {
     match outcome {
         TurnLoopOutcome::Finished(Some(e)) => {
@@ -650,6 +650,24 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 }; // `sink` dropped here → `writer` is free again
 
                 if report_turn_outcome(outcome, &mut writer).await {
+                    break 'outer;
+                }
+            }
+            Command::RunAgent { name, prompt, .. } => {
+                // No `run_turn_loop`: a single TaskTool dispatch has no fs.write gate check to
+                // approve and no multi-step turn to pause between steps of (see the design spec).
+                let outcome = {
+                    let mut sink = WsSink {
+                        writer: &mut writer,
+                    };
+                    state
+                        .service
+                        .run_agent_with_controls(session, &name, &prompt, &mut sink)
+                        .await
+                }; // `sink` dropped here → `writer` is free again
+
+                if report_turn_outcome(TurnLoopOutcome::Finished(outcome.err()), &mut writer).await
+                {
                     break 'outer;
                 }
             }
