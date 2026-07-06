@@ -1151,6 +1151,21 @@ mod tests {
         }
     }
 
+    fn agent_def(
+        name: &str,
+        system_prompt: &str,
+        tools: Option<Vec<String>>,
+        model: Option<String>,
+    ) -> otto_extensions::CustomAgentDef {
+        otto_extensions::CustomAgentDef {
+            name: name.to_string(),
+            description: "d".to_string(),
+            tools,
+            model,
+            system_prompt: system_prompt.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn run_command_with_controls_unknown_name_errors_without_starting_a_turn() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,6 +1340,147 @@ mod tests {
 
         let replayed = service.store().replay_since(id, None).await.unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_unknown_name_errors_without_starting_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(Extensions::default()));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(id, "ghost", "do it", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no custom agent named 'ghost'"));
+
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert!(replayed.is_empty(), "no turn should have started");
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_no_extensions_configured_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
+        let service = service_in(&dir, crate::build_default_registry()).await;
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(id, "anything", "do it", &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not configured with any extensions")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_dispatches_and_streams_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let def = agent_def(
+            "reviewer",
+            "SYSTEM-PROMPT",
+            Some(vec!["fs.read".to_string()]),
+            None,
+        );
+        let extensions = Extensions {
+            agents: vec![def],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_agent_with_controls(id, "reviewer", "look at auth.rs", &mut sink)
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+
+        // Fixed event sequence: AgentStarted, Log, AgentFinished, TurnComplete.
+        assert_eq!(sink.events.len(), 4);
+        assert!(matches!(
+            sink.events[0].kind,
+            EventKind::AgentStarted {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        match &sink.events[1].kind {
+            EventKind::Log { message } => {
+                // The offline LocalProvider's deterministic completion echoes its prompt, so the
+                // composed system prompt + task prompt both surface in the logged text.
+                assert!(message.contains("SYSTEM-PROMPT"));
+                assert!(message.contains("look at auth.rs"));
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+        assert!(matches!(
+            sink.events[2].kind,
+            EventKind::AgentFinished {
+                role: Role::Custom(ref n)
+            } if n == "reviewer"
+        ));
+        assert!(matches!(
+            sink.events[3].kind,
+            EventKind::TurnComplete { ok: true }
+        ));
+
+        // Persisted log matches what was streamed, with contiguous seqs from 0.
+        let replayed = service.store().replay_since(id, None).await.unwrap();
+        assert_eq!(replayed, sink.events);
+
+        assert_eq!(
+            service.store().session_status(id).await.unwrap(),
+            SessionStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_with_controls_registers_every_discovered_agent() {
+        // Two agents discovered; dispatching the second must still work — proving the
+        // "register every discovered def" loop doesn't only wire up the first/target one.
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = Extensions {
+            agents: vec![
+                agent_def("first", "FIRST-PROMPT", None, None),
+                agent_def("second", "SECOND-PROMPT", None, None),
+            ],
+            ..Default::default()
+        };
+        let service = service_in(&dir, crate::build_default_registry())
+            .await
+            .with_extensions(Arc::new(extensions));
+        let id = service
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let outcome = service
+            .run_agent_with_controls(id, "second", "ping", &mut sink)
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+        match &sink.events[1].kind {
+            EventKind::Log { message } => assert!(message.contains("SECOND-PROMPT")),
+            other => panic!("expected Log, got {other:?}"),
+        }
     }
 
     #[tokio::test]
