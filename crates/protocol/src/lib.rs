@@ -53,6 +53,16 @@ pub enum Command {
         name: String,
         args: Vec<String>,
     },
+    /// Dispatch a discovered `.claude/agents/*.md` custom agent by name as a single,
+    /// non-interruptible request/response (no orchestrator turn): compose its system prompt with
+    /// `prompt` and run it through `TaskTool`/`MarkdownAgent`. Emits the existing
+    /// `AgentStarted`/`Log`/`AgentFinished`/`TurnComplete` `EventKind`s — no new wire variant.
+    /// Unknown `name` surfaces as `ServerMessage::Error` — no turn starts, no `seq` is consumed.
+    RunAgent {
+        session: SessionId,
+        name: String,
+        prompt: String,
+    },
     Abort {
         session: SessionId,
     },
@@ -308,6 +318,20 @@ mod tests {
         assert_eq!(cmd, back);
         // External tagging matches the rest of Command (e.g. {"RunCommand":{...}}).
         assert!(json.contains("\"RunCommand\""));
+    }
+
+    #[test]
+    fn run_agent_command_round_trips() {
+        let cmd = Command::RunAgent {
+            session: SessionId::new(),
+            name: "reviewer".to_string(),
+            prompt: "look at auth.rs".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+        // External tagging matches the rest of Command (e.g. {"RunAgent":{...}}).
+        assert!(json.contains("\"RunAgent\""));
     }
 
     #[test]
