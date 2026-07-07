@@ -147,7 +147,13 @@ async fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
 ///
 /// `ref_` optionally pins a branch/tag/sha (checked out after clone); omitted, the clone's default
 /// branch is recorded as-is. Cleans up the staging directory on any failure — never leaves a
-/// partial marketplace directory behind.
+/// partial marketplace directory behind, and any failure after the rename (resolving the ref,
+/// reading the commit, or writing the lockfile) removes the newly-installed final directory too,
+/// so a failed `marketplace_add` never leaves a "phantom installed" marketplace with no lockfile
+/// entry.
+///
+/// Note: `url` is stored verbatim in the lockfile — avoid embedding credentials
+/// (e.g. `https://user:token@host/...`) in the URL you pass here.
 pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyhow::Result<String> {
     validate_clone_url(url)?;
     if let Some(r) = ref_ {
@@ -157,7 +163,7 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
     let mp_root = marketplaces_dir(home);
     std::fs::create_dir_all(&mp_root)?;
 
-    let staging_name = format!(".staging-{}", std::process::id());
+    let staging_name = format!(".staging-{}-{}", std::process::id(), uuid::Uuid::new_v4());
     let staging_path = mp_root.join(&staging_name);
     if staging_path.exists() {
         std::fs::remove_dir_all(&staging_path)?;
@@ -180,9 +186,9 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
     let manifest_path = staging_path.join(".claude-plugin").join("marketplace.json");
     let text = match std::fs::read_to_string(&manifest_path) {
         Ok(t) => t,
-        Err(_) => {
+        Err(e) => {
             return cleanup_and_err(anyhow::anyhow!(
-                "cloned repository has no {} (not a valid marketplace)",
+                "cloned repository has no {} (not a valid marketplace): {e}",
                 manifest_path.display()
             ));
         }
@@ -204,19 +210,36 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
             mp.name
         ));
     }
-    std::fs::rename(&staging_path, &final_path)?;
+    if let Err(e) = std::fs::rename(&staging_path, &final_path) {
+        return cleanup_and_err(anyhow::anyhow!("failed to install marketplace: {e}"));
+    }
 
-    let resolved_ref = match ref_ {
-        Some(r) => r.to_string(),
-        None => run_git(&final_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+    // Past this point `staging_path` no longer exists — `final_path` is the installed directory.
+    // Any failure from here on must remove `final_path` (not `staging_path`) before returning, so
+    // a failed install never leaves a "phantom installed" marketplace with no lockfile entry.
+    let resolved: anyhow::Result<(String, String)> = async {
+        let resolved_ref = match ref_ {
+            Some(r) => r.to_string(),
+            None => run_git(&final_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .await?
+                .trim()
+                .to_string(),
+        };
+        let commit = run_git(&final_path, &["rev-parse", "HEAD"])
             .await?
             .trim()
-            .to_string(),
+            .to_string();
+        Ok((resolved_ref, commit))
+    }
+    .await;
+
+    let (resolved_ref, commit) = match resolved {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&final_path);
+            return Err(e);
+        }
     };
-    let commit = run_git(&final_path, &["rev-parse", "HEAD"])
-        .await?
-        .trim()
-        .to_string();
 
     let mut lock = read_lockfile(home);
     lock.entries.insert(
@@ -228,7 +251,10 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
             updated_at_unix: now_unix(),
         },
     );
-    write_lockfile(home, &lock)?;
+    if let Err(e) = write_lockfile(home, &lock) {
+        let _ = std::fs::remove_dir_all(&final_path);
+        return Err(e);
+    }
 
     Ok(mp.name)
 }
@@ -507,5 +533,54 @@ mod tests {
             err.to_string().contains("invalid marketplace name"),
             "got: {err}"
         );
+    }
+
+    /// Fix-2 regression test: a failure *after* the rename (here, `write_lockfile` failing
+    /// because its parent directory is read-only) must remove the newly-installed `final_path`
+    /// rather than leaving a "phantom installed" marketplace directory with no lockfile entry.
+    ///
+    /// Uses Unix permission bits (`chmod 0o555` on the `plugins/` dir, which owns
+    /// `marketplaces.lock.json`) to force `std::fs::write` to fail with `EACCES` without touching
+    /// any code path — `marketplaces/` itself stays writable so the clone/rename steps that
+    /// precede the lockfile write still succeed. This is Unix-only (permission bits don't carry
+    /// the same meaning on Windows), matching the sandbox/CI target for this crate.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn marketplace_add_removes_final_dir_when_lockfile_write_fails_after_rename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+
+        // Pre-create marketplaces/ (writable) so create_dir_all is a no-op and the clone/rename
+        // steps still have write access to it, then lock down its parent plugins/ so the
+        // lockfile write (a sibling file of marketplaces/) fails with permission denied.
+        let mp_root = marketplaces_dir(home.path());
+        std::fs::create_dir_all(&mp_root).unwrap();
+        let plugins_dir = home.path().join(".claude").join("plugins");
+        std::fs::set_permissions(&plugins_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = marketplace_add(&url, None, home.path()).await;
+
+        // Restore write permission before any tempdir cleanup runs (Drop needs to remove files
+        // under plugins/), regardless of the assertion outcome below.
+        std::fs::set_permissions(&plugins_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("permission denied")
+                || err.to_string().contains("os error 13"),
+            "expected a permission-denied error, got: {err}"
+        );
+
+        let final_path = mp_root.join("acme");
+        assert!(
+            !final_path.exists(),
+            "final_path should have been removed after the post-rename failure, but exists: {}",
+            final_path.display()
+        );
+        // No lockfile entry either — the failure was genuinely all-or-nothing.
+        let lock = read_lockfile(home.path());
+        assert!(!lock.entries.contains_key("acme"));
     }
 }
