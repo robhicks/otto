@@ -259,6 +259,88 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
     Ok(mp.name)
 }
 
+/// Delete `~/.claude/plugins/marketplaces/<name>/` and its lockfile entry. Does **not** scrub any
+/// `enabledPlugins` keys referencing this marketplace — a stale key simply becomes inert on the
+/// next `discover()` (no matching directory to fold), a deliberate simplification over a
+/// cross-cutting `settings.json` cleanup.
+pub fn marketplace_remove(name: &str, home: &Path) -> anyhow::Result<()> {
+    let mp_dir = marketplaces_dir(home).join(name);
+    if !mp_dir.exists() {
+        anyhow::bail!("marketplace '{name}' is not installed");
+    }
+    std::fs::remove_dir_all(&mp_dir)?;
+
+    let mut lock = read_lockfile(home);
+    lock.entries.remove(name);
+    write_lockfile(home, &lock)?;
+    Ok(())
+}
+
+/// Refresh one (`Some(name)`) or every (`None`) locked marketplace: `git fetch origin`, then try
+/// fast-forwarding a branch ref (`reset --hard origin/<ref>`); if that fails (the ref is a pinned
+/// tag/sha, not a remote-tracking branch), fall back to a direct `checkout <ref>` — a no-op
+/// fetch-and-confirm for a pin that hasn't moved. Refreshes `commit`/`updated_at_unix` in the
+/// lockfile. A marketplace whose directory has gone missing out from under the lockfile is
+/// reported and skipped, never fatal to the rest of the batch. Returns the names actually updated.
+pub async fn marketplace_update(name: Option<&str>, home: &Path) -> anyhow::Result<Vec<String>> {
+    let mut lock = read_lockfile(home);
+
+    let names: Vec<String> = match name {
+        Some(n) => {
+            if !lock.entries.contains_key(n) {
+                anyhow::bail!("marketplace '{n}' is not installed");
+            }
+            vec![n.to_string()]
+        }
+        None => lock.entries.keys().cloned().collect(),
+    };
+
+    let mut updated = Vec::new();
+    for n in &names {
+        let entry = lock.entries.get(n).expect("checked above").clone();
+        let mp_dir = marketplaces_dir(home).join(n);
+        if !mp_dir.is_dir() {
+            eprintln!(
+                "warning: marketplace '{n}' is locked but {} is missing; skipping",
+                mp_dir.display()
+            );
+            continue;
+        }
+
+        if let Err(e) = run_git(&mp_dir, &["fetch", "origin"]).await {
+            eprintln!("warning: failed to fetch '{n}': {e}; skipping");
+            continue;
+        }
+
+        let branch_reset = run_git(
+            &mp_dir,
+            &["reset", "--hard", &format!("origin/{}", entry.git_ref)],
+        )
+        .await;
+        if branch_reset.is_err() {
+            reject_leading_dash(&entry.git_ref, "ref")?;
+            run_git(&mp_dir, &["checkout", &entry.git_ref]).await?;
+        }
+
+        let commit = run_git(&mp_dir, &["rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_string();
+        lock.entries.insert(
+            n.clone(),
+            otto_extensions::MarketplaceLock {
+                commit,
+                updated_at_unix: now_unix(),
+                ..entry
+            },
+        );
+        updated.push(n.clone());
+    }
+
+    write_lockfile(home, &lock)?;
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +664,123 @@ mod tests {
         // No lockfile entry either — the failure was genuinely all-or-nothing.
         let lock = read_lockfile(home.path());
         assert!(!lock.entries.contains_key("acme"));
+    }
+
+    #[tokio::test]
+    async fn marketplace_remove_deletes_dir_and_lock_entry() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        assert!(!marketplaces_dir(home.path()).join("acme").exists());
+        assert!(!read_lockfile(home.path()).entries.contains_key("acme"));
+    }
+
+    /// Compile-only placeholder for the real `plugin_install` landing in Task 6. `#[ignore]`
+    /// only skips *running* a test, not compiling it, so this crate-local stub (shadowing the
+    /// `use super::*;` glob for the one caller below) keeps the crate building without
+    /// implementing the real function here — its body is never reached since the sole caller is
+    /// `#[ignore]`d.
+    #[cfg(test)]
+    fn plugin_install(_spec: &str, _home: &Path) -> anyhow::Result<()> {
+        unimplemented!("plugin_install lands in Task 6")
+    }
+
+    #[tokio::test]
+    #[ignore = "plugin_install lands in Task 6"]
+    async fn marketplace_remove_leaves_stale_enabled_plugins_key_alone() {
+        // Documented limitation: remove does not scrub settings.json.
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).unwrap();
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        let enabled = otto_extensions::parse_enabled_plugins(&settings);
+        assert_eq!(
+            enabled.get("foo@acme"),
+            Some(&true),
+            "stale key must remain (documented limitation)"
+        );
+    }
+
+    #[test]
+    fn marketplace_remove_unknown_name_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let err = marketplace_remove("nope", home.path()).unwrap_err();
+        assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn marketplace_update_pulls_new_commit_and_refreshes_lock() {
+        let (src, bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+        let before = read_lockfile(home.path())
+            .entries
+            .get("acme")
+            .unwrap()
+            .commit
+            .clone();
+
+        // Push a new commit to the source, then mirror it into the bare remote.
+        std::fs::write(src.path().join("new.txt"), "x").unwrap();
+        run_git(src.path(), &["add", "-A"]).await.unwrap();
+        run_git(src.path(), &["commit", "-m", "more"])
+            .await
+            .unwrap();
+        run_git(
+            src.path(),
+            &[
+                "push",
+                bare.path().to_str().unwrap(),
+                "main:main",
+                "--force",
+            ],
+        )
+        .await
+        .unwrap();
+
+        let updated = marketplace_update(Some("acme"), home.path()).await.unwrap();
+        assert_eq!(updated, vec!["acme".to_string()]);
+        let after = read_lockfile(home.path())
+            .entries
+            .get("acme")
+            .unwrap()
+            .commit
+            .clone();
+        assert_ne!(before, after);
+        assert!(
+            marketplaces_dir(home.path())
+                .join("acme")
+                .join("new.txt")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn marketplace_update_all_when_name_omitted() {
+        let (_src1, _bare1, url1) = bare_marketplace_remote("acme", "foo").await;
+        let (_src2, _bare2, url2) = bare_marketplace_remote("beta", "bar").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url1, None, home.path()).await.unwrap();
+        marketplace_add(&url2, None, home.path()).await.unwrap();
+
+        let mut updated = marketplace_update(None, home.path()).await.unwrap();
+        updated.sort();
+        assert_eq!(updated, vec!["acme".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn marketplace_update_unknown_name_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let err = marketplace_update(Some("nope"), home.path())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not installed"), "got: {err}");
     }
 }
