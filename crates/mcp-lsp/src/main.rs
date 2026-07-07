@@ -34,6 +34,15 @@ fn severity_name(s: lsp_types::DiagnosticSeverity) -> String {
     .to_string()
 }
 
+const NAVIGATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, serde::Serialize)]
+pub struct LocationOut {
+    path: String,
+    line: u32,
+    character: u32,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct DiagnosticOut {
     line: u32,
@@ -142,6 +151,73 @@ impl LspServer {
             .collect();
         Ok((out, timed_out))
     }
+
+    fn path_for(&self, uri: &lsp_types::Uri) -> anyhow::Result<String> {
+        let s = uri.as_str();
+        let prefix = format!("file://{}/", self.root.display());
+        s.strip_prefix(&prefix)
+            .map(|p| p.to_string())
+            .ok_or_else(|| anyhow::anyhow!("uri {s} is outside the workspace root"))
+    }
+
+    fn goto_response_to_locations(
+        &self,
+        result: serde_json::Value,
+    ) -> anyhow::Result<Vec<LocationOut>> {
+        if result.is_null() {
+            return Ok(vec![]);
+        }
+        let resp: lsp_types::GotoDefinitionResponse = serde_json::from_value(result)?;
+        let items: Vec<(lsp_types::Uri, lsp_types::Range)> = match resp {
+            lsp_types::GotoDefinitionResponse::Scalar(loc) => vec![(loc.uri, loc.range)],
+            lsp_types::GotoDefinitionResponse::Array(locs) => {
+                locs.into_iter().map(|l| (l.uri, l.range)).collect()
+            }
+            lsp_types::GotoDefinitionResponse::Link(links) => links
+                .into_iter()
+                .map(|l| (l.target_uri, l.target_range))
+                .collect(),
+        };
+        items
+            .into_iter()
+            .map(|(uri, range)| {
+                Ok(LocationOut {
+                    path: self.path_for(&uri)?,
+                    line: range.start.line + 1,
+                    character: range.start.character + 1,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn do_definition(
+        &self,
+        path: String,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<LocationOut>> {
+        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let params = lsp_types::GotoDefinitionParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
+                position: lsp_types::Position::new(
+                    line.saturating_sub(1),
+                    character.saturating_sub(1),
+                ),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let result = self
+            .lsp
+            .request(
+                "textDocument/definition",
+                serde_json::to_value(params)?,
+                NAVIGATION_TIMEOUT,
+            )
+            .await?;
+        self.goto_response_to_locations(result)
+    }
 }
 
 fn main() {
@@ -231,5 +307,74 @@ mod tests {
             .unwrap();
         assert!(timed_out);
         assert!(diags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_definition_parses_a_scalar_location_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); }").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let target_uri = lsp_client::path_to_file_uri(&dir.path().join("a.rs")).unwrap();
+        let target_uri_str = target_uri.as_str().to_string();
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            assert_eq!(req["method"], "textDocument/definition");
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": {
+                        "uri": target_uri_str,
+                        "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let locations = server
+            .do_definition("a.rs".to_string(), 2, 10)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path, "a.rs");
+        assert_eq!(locations[0].line, 1);
+        assert_eq!(locations[0].character, 4);
+    }
+
+    #[tokio::test]
+    async fn do_definition_returns_empty_for_a_null_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": null}),
+            )
+            .await
+            .unwrap();
+        });
+
+        let locations = server
+            .do_definition("a.rs".to_string(), 1, 1)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert!(locations.is_empty());
     }
 }
