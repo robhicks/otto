@@ -13,6 +13,36 @@ use otto_engine_core::traits::WorkspaceRead;
 use otto_workspace::LocalWorkspace;
 use tokio::sync::Mutex;
 
+const DEFAULT_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn diagnostics_timeout() -> std::time::Duration {
+    std::env::var("OTTO_MCP_LSP_DIAG_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_DIAGNOSTICS_TIMEOUT)
+}
+
+fn severity_name(s: lsp_types::DiagnosticSeverity) -> String {
+    match s {
+        lsp_types::DiagnosticSeverity::ERROR => "error",
+        lsp_types::DiagnosticSeverity::WARNING => "warning",
+        lsp_types::DiagnosticSeverity::INFORMATION => "information",
+        lsp_types::DiagnosticSeverity::HINT => "hint",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DiagnosticOut {
+    line: u32,
+    character: u32,
+    severity: Option<String>,
+    message: String,
+    code: Option<String>,
+}
+
 /// The server struct wrapping an `LspClient` bridged to `rust-analyzer`, plus a path-contained
 /// `LocalWorkspace` used to read file content for `didOpen`/`didChange` sync.
 #[derive(Clone)]
@@ -84,6 +114,34 @@ impl LspServer {
         }
         Ok((uri_str, generation))
     }
+
+    pub async fn do_diagnostics(&self, path: String) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
+        self.do_diagnostics_with_timeout(path, diagnostics_timeout())
+            .await
+    }
+
+    async fn do_diagnostics_with_timeout(
+        &self,
+        path: String,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
+        let (uri, generation) = self.open_if_needed(&path).await?;
+        let (diags, timed_out) = self.lsp.wait_for_diagnostics(&uri, generation, wait).await;
+        let out = diags
+            .into_iter()
+            .map(|d| DiagnosticOut {
+                line: d.range.start.line + 1,
+                character: d.range.start.character + 1,
+                severity: d.severity.map(severity_name),
+                message: d.message,
+                code: d.code.map(|c| match c {
+                    lsp_types::NumberOrString::Number(n) => n.to_string(),
+                    lsp_types::NumberOrString::String(s) => s,
+                }),
+            })
+            .collect();
+        Ok((out, timed_out))
+    }
 }
 
 fn main() {
@@ -121,5 +179,57 @@ mod tests {
         let second = lsp_client::read_message(&mut sr).await.unwrap();
         assert_eq!(second["method"], "textDocument/didChange");
         assert_eq!(second["params"]["textDocument"]["version"], 2);
+    }
+
+    #[tokio::test]
+    async fn do_diagnostics_returns_fresh_results() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let responder = tokio::spawn(async move {
+            let opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let uri = opened["params"]["textDocument"]["uri"].clone();
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": uri,
+                        "diagnostics": [{
+                            "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}},
+                            "message": "unused variable"
+                        }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let (diags, timed_out) = server.do_diagnostics("a.rs".to_string()).await.unwrap();
+        responder.await.unwrap();
+        assert!(!timed_out);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].line, 1);
+        assert_eq!(diags[0].character, 4);
+        assert_eq!(diags[0].message, "unused variable");
+    }
+
+    #[tokio::test]
+    async fn do_diagnostics_times_out_without_a_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, _server_end) = duplex_server(dir.path());
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout("a.rs".to_string(), std::time::Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(timed_out);
+        assert!(diags.is_empty());
     }
 }
