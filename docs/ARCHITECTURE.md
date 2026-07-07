@@ -342,8 +342,13 @@ format:
   (`.mcp.json` or an inline `mcpServers` object) route straight into otto's MCP client: discovery
   emits `${CLAUDE_PLUGIN_ROOT}`-expanded `PluginMcpServer` specs and the engine spawns + registers
   them via `connect_plugin_server` under namespaced gate names (`plugin__{ns}__{key}__{tool}`, so a
-  bundled tool can never impersonate a built-in). The network *install action* (marketplace
-  `git clone`, lockfile) is still pending.
+  bundled tool can never impersonate a built-in). `otto plugin marketplace add|remove|update|list`
+  and `otto plugin install|uninstall|list` clone/manage marketplaces under
+  `~/.claude/plugins/marketplaces/` (tracked in `~/.claude/plugins/marketplaces.lock.json`) and
+  flip the `enabledPlugins` allowlist — a CLI-operator-only action, never agent-facing. Installing a
+  plugin whose marketplace entry is a `Remote` source (its code lives outside the marketplace repo,
+  not yet materializable) is still pending, as is a project-level (non-user-global) marketplace
+  install and an interactive `/plugin` UX.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
