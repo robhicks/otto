@@ -341,6 +341,98 @@ pub async fn marketplace_update(name: Option<&str>, home: &Path) -> anyhow::Resu
     Ok(updated)
 }
 
+/// Split `"<plugin>@<marketplace>"` into its two non-empty parts.
+fn split_plugin_key(key: &str) -> anyhow::Result<(String, String)> {
+    let (plugin, marketplace) = key
+        .split_once('@')
+        .ok_or_else(|| anyhow::anyhow!("expected '<plugin>@<marketplace>', got '{key}'"))?;
+    if plugin.is_empty() || marketplace.is_empty() {
+        anyhow::bail!("expected '<plugin>@<marketplace>', got '{key}'");
+    }
+    Ok((plugin.to_string(), marketplace.to_string()))
+}
+
+fn read_marketplace_manifest(
+    home: &Path,
+    marketplace: &str,
+) -> anyhow::Result<otto_extensions::Marketplace> {
+    let manifest_path = marketplaces_dir(home)
+        .join(marketplace)
+        .join(".claude-plugin")
+        .join("marketplace.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|_| anyhow::anyhow!("marketplace '{marketplace}' is not installed"))?;
+    otto_extensions::parse_marketplace_json(&text)
+        .map_err(|e| anyhow::anyhow!("marketplace '{marketplace}' has an invalid manifest: {e}"))
+}
+
+/// Enable `"<plugin>@<marketplace>"` in `~/.claude/settings.json`. Errors if the marketplace isn't
+/// installed, the plugin isn't offered by it, or the plugin's `source` is `Remote` (materializing
+/// a plugin whose code lives outside its marketplace repo is a deferred follow-up — see the design
+/// doc). Never activates any code — only flips the allowlist bit `discover()` reads.
+pub fn plugin_install(key: &str, home: &Path) -> anyhow::Result<()> {
+    let (plugin_name, marketplace) = split_plugin_key(key)?;
+    let mp = read_marketplace_manifest(home, &marketplace)?;
+    let entry = mp
+        .plugins
+        .iter()
+        .find(|p| p.name == plugin_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no plugin named '{plugin_name}' in marketplace '{marketplace}'")
+        })?;
+    if matches!(entry.source, otto_extensions::PluginSource::Remote(_)) {
+        anyhow::bail!(
+            "'{key}' is remote-sourced (its code lives outside its marketplace repo); \
+             installing remote-sourced plugins isn't supported yet"
+        );
+    }
+
+    let path = settings_path(home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = otto_extensions::set_enabled_plugin(&existing, key, Some(true));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, updated)?;
+    Ok(())
+}
+
+/// Remove `"<plugin>@<marketplace>"` from `~/.claude/settings.json`'s `enabledPlugins` entirely
+/// (rather than writing `false`), so the file doesn't accumulate dead entries.
+pub fn plugin_uninstall(key: &str, home: &Path) -> anyhow::Result<()> {
+    split_plugin_key(key)?; // validates shape so a typo'd key surfaces a clear error
+    let path = settings_path(home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = otto_extensions::set_enabled_plugin(&existing, key, None);
+    std::fs::write(path, updated)?;
+    Ok(())
+}
+
+/// List every plugin offered by every locked marketplace, paired with whether it's currently
+/// enabled. Order matches the lockfile's sorted marketplace order, then manifest order within.
+pub fn plugin_list(home: &Path) -> anyhow::Result<Vec<(String, bool)>> {
+    let lock = read_lockfile(home);
+    let settings_text = std::fs::read_to_string(settings_path(home)).unwrap_or_default();
+    let enabled = otto_extensions::parse_enabled_plugins(&settings_text);
+
+    let mut out = Vec::new();
+    for mp_name in lock.entries.keys() {
+        let mp = match read_marketplace_manifest(home, mp_name) {
+            Ok(mp) => mp,
+            Err(e) => {
+                eprintln!("warning: skipping '{mp_name}': {e}");
+                continue;
+            }
+        };
+        for plugin in &mp.plugins {
+            let key = format!("{}@{}", plugin.name, mp.name);
+            let is_enabled = enabled.get(&key).copied().unwrap_or(false);
+            out.push((key, is_enabled));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,18 +770,7 @@ mod tests {
         assert!(!read_lockfile(home.path()).entries.contains_key("acme"));
     }
 
-    /// Compile-only placeholder for the real `plugin_install` landing in Task 6. `#[ignore]`
-    /// only skips *running* a test, not compiling it, so this crate-local stub (shadowing the
-    /// `use super::*;` glob for the one caller below) keeps the crate building without
-    /// implementing the real function here — its body is never reached since the sole caller is
-    /// `#[ignore]`d.
-    #[cfg(test)]
-    fn plugin_install(_spec: &str, _home: &Path) -> anyhow::Result<()> {
-        unimplemented!("plugin_install lands in Task 6")
-    }
-
     #[tokio::test]
-    #[ignore = "plugin_install lands in Task 6"]
     async fn marketplace_remove_leaves_stale_enabled_plugins_key_alone() {
         // Documented limitation: remove does not scrub settings.json.
         let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
@@ -782,5 +863,125 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn plugin_install_enables_local_path_plugin() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+
+        plugin_install("foo@acme", home.path()).unwrap();
+
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        let enabled = otto_extensions::parse_enabled_plugins(&settings);
+        assert_eq!(enabled.get("foo@acme"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn plugin_install_preserves_other_settings_keys() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+        std::fs::write(settings_path(home.path()), r#"{"hooks":{"PreToolUse":[]}}"#).unwrap();
+
+        plugin_install("foo@acme", home.path()).unwrap();
+
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        assert!(v.get("hooks").is_some());
+    }
+
+    #[tokio::test]
+    async fn plugin_install_unknown_marketplace_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let err = plugin_install("foo@nope", home.path()).unwrap_err();
+        assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn plugin_install_unknown_plugin_errors() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+
+        let err = plugin_install("nope@acme", home.path()).unwrap_err();
+        assert!(err.to_string().contains("no plugin named"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn plugin_install_rejects_remote_sourced_plugin() {
+        let src = tempfile::tempdir().unwrap();
+        init_repo(src.path()).await;
+        let cp = src.path().join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(
+            cp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"rem","source":{"source":"github","repo":"a/b"}}]}"#,
+        )
+        .unwrap();
+        run_git(src.path(), &["add", "-A"]).await.unwrap();
+        run_git(src.path(), &["commit", "-m", "seed"])
+            .await
+            .unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        run_git(
+            bare.path(),
+            &["clone", "--bare", src.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
+        let url = format!("file://{}", bare.path().display());
+
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+
+        let err = plugin_install("rem@acme", home.path()).unwrap_err();
+        assert!(err.to_string().contains("remote-sourced"), "got: {err}");
+    }
+
+    #[test]
+    fn plugin_install_malformed_key_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let err = plugin_install("no-at-sign", home.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("<plugin>@<marketplace>"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_uninstall_removes_the_key() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).unwrap();
+
+        plugin_uninstall("foo@acme", home.path()).unwrap();
+
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        let enabled = otto_extensions::parse_enabled_plugins(&settings);
+        assert_eq!(enabled.get("foo@acme"), None);
+    }
+
+    #[tokio::test]
+    async fn plugin_list_reports_enabled_and_available() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).unwrap();
+
+        let listed = plugin_list(home.path()).unwrap();
+        assert_eq!(listed, vec![("foo@acme".to_string(), true)]);
+    }
+
+    #[tokio::test]
+    async fn plugin_list_reports_not_enabled_as_available() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&url, None, home.path()).await.unwrap();
+
+        let listed = plugin_list(home.path()).unwrap();
+        assert_eq!(listed, vec![("foo@acme".to_string(), false)]);
     }
 }
