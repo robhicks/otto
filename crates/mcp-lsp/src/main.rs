@@ -262,6 +262,56 @@ impl LspServer {
             })
             .collect()
     }
+
+    pub async fn do_hover(
+        &self,
+        path: String,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Option<String>> {
+        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
+                position: lsp_types::Position::new(
+                    line.saturating_sub(1),
+                    character.saturating_sub(1),
+                ),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let result = self
+            .lsp
+            .request(
+                "textDocument/hover",
+                serde_json::to_value(params)?,
+                NAVIGATION_TIMEOUT,
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let hover: lsp_types::Hover = serde_json::from_value(result)?;
+        Ok(Some(render_hover_contents(hover.contents)))
+    }
+}
+
+fn render_hover_contents(contents: lsp_types::HoverContents) -> String {
+    fn render_marked(m: lsp_types::MarkedString) -> String {
+        match m {
+            lsp_types::MarkedString::String(s) => s,
+            lsp_types::MarkedString::LanguageString(ls) => ls.value,
+        }
+    }
+    match contents {
+        lsp_types::HoverContents::Scalar(m) => render_marked(m),
+        lsp_types::HoverContents::Array(ms) => ms
+            .into_iter()
+            .map(render_marked)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        lsp_types::HoverContents::Markup(mc) => mc.value,
+    }
 }
 
 fn main() {
@@ -462,5 +512,60 @@ mod tests {
         assert_eq!(locations.len(), 2);
         assert_eq!(locations[0].line, 2);
         assert_eq!(locations[1].line, 2);
+    }
+
+    #[tokio::test]
+    async fn do_hover_renders_markup_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            assert_eq!(req["method"], "textDocument/hover");
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": {"contents": {"kind": "markdown", "value": "`fn a()`"}}
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let hover = server.do_hover("a.rs".to_string(), 1, 4).await.unwrap();
+        responder.await.unwrap();
+        assert_eq!(hover, Some("`fn a()`".to_string()));
+    }
+
+    #[tokio::test]
+    async fn do_hover_returns_none_for_a_null_response() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": req["id"], "result": null}),
+            )
+            .await
+            .unwrap();
+        });
+
+        let hover = server.do_hover("a.rs".to_string(), 1, 1).await.unwrap();
+        responder.await.unwrap();
+        assert!(hover.is_none());
     }
 }
