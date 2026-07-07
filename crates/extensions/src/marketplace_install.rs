@@ -83,6 +83,45 @@ impl MarketplaceLockfile {
     }
 }
 
+/// Insert, remove, or flip an `"<plugin>@<marketplace>"` key in a `settings.json` document's
+/// `enabledPlugins` object, returning the rewritten JSON. Every other top-level key (`hooks`,
+/// `permissions`, other `enabledPlugins` entries, …) is preserved untouched.
+///
+/// - `enabled = Some(b)` inserts/overwrites `key` with the bool `b`.
+/// - `enabled = None` removes `key` entirely (used by `uninstall`, so `settings.json` doesn't
+///   accumulate dead entries for plugins that were never re-enabled).
+///
+/// Malformed or absent input is treated as `{}` (never fatal — the CLI is creating this file for
+/// the first time in the common case).
+pub fn set_enabled_plugin(settings_json: &str, key: &str, enabled: Option<bool>) -> String {
+    let mut root: Value = serde_json::from_str(settings_json)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let root_obj = root.as_object_mut().expect("filtered to object above");
+
+    let enabled_plugins = root_obj
+        .entry("enabledPlugins".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !enabled_plugins.is_object() {
+        *enabled_plugins = Value::Object(serde_json::Map::new());
+    }
+    let map = enabled_plugins
+        .as_object_mut()
+        .expect("just ensured object");
+
+    match enabled {
+        Some(b) => {
+            map.insert(key.to_string(), Value::Bool(b));
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+
+    serde_json::to_string_pretty(&root).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +180,63 @@ mod tests {
         let alpha = json.find("alpha").unwrap();
         let mid = json.find("mid").unwrap();
         let zeta = json.find("zeta").unwrap();
-        assert!(alpha < mid && mid < zeta, "expected sorted key order: {json}");
+        assert!(
+            alpha < mid && mid < zeta,
+            "expected sorted key order: {json}"
+        );
+    }
+
+    #[test]
+    fn set_enabled_plugin_inserts_into_empty_settings() {
+        let out = set_enabled_plugin("", "foo@acme", Some(true));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn set_enabled_plugin_preserves_other_top_level_keys() {
+        let existing = r#"{"hooks":{"PreToolUse":[]},"permissions":{"allow":["Read(**)"]}}"#;
+        let out = set_enabled_plugin(existing, "foo@acme", Some(true));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("hooks").is_some(), "hooks key must survive: {out}");
+        assert!(
+            v.get("permissions").is_some(),
+            "permissions key must survive: {out}"
+        );
+        assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn set_enabled_plugin_preserves_other_enabled_plugins_entries() {
+        let existing = r#"{"enabledPlugins":{"bar@acme":true}}"#;
+        let out = set_enabled_plugin(existing, "foo@acme", Some(true));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabledPlugins"]["bar@acme"], Value::Bool(true));
+        assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn set_enabled_plugin_none_removes_the_key() {
+        let existing = r#"{"enabledPlugins":{"foo@acme":true,"bar@acme":true}}"#;
+        let out = set_enabled_plugin(existing, "foo@acme", None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["enabledPlugins"].get("foo@acme").is_none());
+        assert_eq!(v["enabledPlugins"]["bar@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn set_enabled_plugin_tolerates_malformed_input() {
+        let out = set_enabled_plugin("not json", "foo@acme", Some(true));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn set_enabled_plugin_replaces_non_object_enabled_plugins() {
+        // A hand-edited settings.json with a bogus `enabledPlugins` value must not panic.
+        let existing = r#"{"enabledPlugins": "oops"}"#;
+        let out = set_enabled_plugin(existing, "foo@acme", Some(true));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
     }
 }
