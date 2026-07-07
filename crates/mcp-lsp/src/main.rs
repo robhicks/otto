@@ -698,3 +698,71 @@ mod tests {
         assert_eq!(server.path_for(&uri).unwrap(), "a.rs");
     }
 }
+
+/// Exercises the full stack against a real `rust-analyzer`. Self-skips (prints a message,
+/// doesn't fail) when `rust-analyzer` isn't on `PATH` — the offline-determinism suite must not
+/// require it, matching the `os_sandbox_available()`-gated test pattern used elsewhere in this
+/// codebase for optional external tools.
+#[cfg(test)]
+mod rust_analyzer_integration {
+    use super::*;
+
+    fn rust_analyzer_available() -> bool {
+        // Check the exit status, not just spawnability: rustup installs a `rust-analyzer`
+        // proxy shim that spawns fine but exits nonzero ("Unknown binary") when the
+        // component isn't installed — that host must skip, not time out.
+        std::process::Command::new(rust_analyzer_bin())
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn full_round_trip_against_a_real_rust_analyzer() {
+        if !rust_analyzer_available() {
+            eprintln!("skipping: rust-analyzer not found on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn greet() -> &'static str {\n    \"hi\"\n}\n\npub fn broken() -> i32 {\n    does_not_exist()\n}\n",
+        )
+        .unwrap();
+
+        let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin()).unwrap();
+        lsp.initialize(dir.path()).await.unwrap();
+        let server = LspServer::new(lsp, dir.path().to_path_buf());
+
+        // Diagnostics: `does_not_exist()` is unresolved, so rust-analyzer should report an
+        // error. Indexing can take a while on first open, hence the generous timeout override.
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout(
+                "src/lib.rs".to_string(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(!timed_out, "rust-analyzer did not respond within 60s");
+        assert!(
+            diags.iter().any(|d| d.message.contains("does_not_exist")),
+            "expected an unresolved-symbol diagnostic, got: {diags:?}"
+        );
+
+        // Hover on `greet`'s definition (line 1, character 8, 1-based) proves navigation works
+        // against the real server.
+        let hover = server
+            .do_hover("src/lib.rs".to_string(), 1, 8)
+            .await
+            .unwrap();
+        assert!(hover.is_some(), "expected hover info for `greet`");
+    }
+}
