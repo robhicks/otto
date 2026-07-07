@@ -13,6 +13,7 @@ mod hook_exec;
 mod hooked_tool;
 mod markdown_agent;
 mod marketplace_def;
+mod marketplace_install;
 mod permission_def;
 mod plugin_def;
 mod skill_def;
@@ -27,6 +28,7 @@ pub use hook_exec::{HookEvent, HookExecutor, HookOutcome, matcher_selects};
 pub use hooked_tool::HookedTool;
 pub use markdown_agent::MarkdownAgent;
 pub use marketplace_def::{Marketplace, MarketplaceEntry, PluginSource, parse_marketplace_json};
+pub use marketplace_install::{MarketplaceLock, MarketplaceLockfile};
 pub use permission_def::{PermissionRules, parse_permissions};
 pub use plugin_def::{
     McpServersField, PluginManifest, PluginMcpServer, parse_mcp_servers, parse_plugin_json,
