@@ -68,6 +68,8 @@ struct DiagEntry {
 pub struct LspClient {
     writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
     next_id: AtomicI64,
+    // Each pending request receives the *full* response message so `request` can distinguish
+    // a `result` from an `error` member (an LSP error must surface as Err, not a null result).
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
@@ -100,8 +102,7 @@ impl LspClient {
                 let method = msg.get("method").and_then(Value::as_str);
                 if let (Some(id), None) = (has_id, method) {
                     if let Some(tx) = reader_pending.lock().await.remove(&id) {
-                        let result = msg.get("result").cloned().unwrap_or(Value::Null);
-                        let _ = tx.send(result);
+                        let _ = tx.send(msg);
                     }
                     continue;
                 }
@@ -146,7 +147,8 @@ impl LspClient {
         write_message(&mut *w, value).await
     }
 
-    /// Send a JSON-RPC request and await its matching response, or time out.
+    /// Send a JSON-RPC request and await its matching response, or time out. An `error`
+    /// response surfaces as `Err` carrying the server's message — never as a null result.
     pub async fn request(
         &self,
         method: &str,
@@ -159,7 +161,21 @@ impl LspClient {
         self.write(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
         match timeout(wait, rx).await {
-            Ok(Ok(v)) => Ok(v),
+            Ok(Ok(msg)) => {
+                if let Some(err) = msg.get("error") {
+                    let message = err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+                    match err.get("code").and_then(Value::as_i64) {
+                        Some(code) => {
+                            anyhow::bail!("LSP `{method}` failed: {message} (code {code})")
+                        }
+                        None => anyhow::bail!("LSP `{method}` failed: {message}"),
+                    }
+                }
+                Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+            }
             Ok(Err(_)) => anyhow::bail!("LSP client dropped while awaiting `{method}`"),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
@@ -261,6 +277,9 @@ pub fn spawn_process(bin: &str) -> anyhow::Result<(LspClient, tokio::process::Ch
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Early-error paths (e.g. `initialize` failing) drop the Child — kill the server then
+        // rather than leaving it lingering until it notices stdin EOF.
+        .kill_on_drop(true)
         .spawn()?;
     let stdin = child
         .stdin
@@ -355,6 +374,34 @@ mod tests {
         );
         assert_eq!(r1.unwrap(), serde_json::json!("one"));
         assert_eq!(r2.unwrap(), serde_json::json!("two"));
+    }
+
+    #[tokio::test]
+    async fn request_surfaces_an_error_response_as_err() {
+        let (client, server_end) = duplex_client();
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+
+        tokio::spawn(async move {
+            let req = read_message(&mut sr).await.unwrap();
+            write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "error": {"code": -32801, "message": "content modified"}
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = client
+            .request("ping", serde_json::json!({}), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("content modified"));
+        assert!(err.to_string().contains("-32801"));
     }
 
     #[tokio::test]

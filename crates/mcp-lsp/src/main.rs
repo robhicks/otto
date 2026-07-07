@@ -64,7 +64,7 @@ pub struct LspServer {
     lsp: Arc<LspClient>,
     workspace: Arc<LocalWorkspace>,
     root: PathBuf,
-    open_docs: Arc<Mutex<HashMap<String, i32>>>, // workspace-relative path -> last-sent version
+    open_docs: Arc<Mutex<HashMap<String, i32>>>, // document URI -> last-sent version
 }
 
 impl LspServer {
@@ -92,9 +92,9 @@ impl LspServer {
         let uri_str = uri.as_str().to_string();
         let generation = self.lsp.bump_generation(&uri_str).await;
         let mut open = self.open_docs.lock().await;
-        match open.get(path) {
+        match open.get(&uri_str) {
             None => {
-                open.insert(path.to_string(), 1);
+                open.insert(uri_str.clone(), 1);
                 self.lsp
                     .notify(
                         "textDocument/didOpen",
@@ -111,7 +111,7 @@ impl LspServer {
             }
             Some(&version) => {
                 let next = version + 1;
-                open.insert(path.to_string(), next);
+                open.insert(uri_str.clone(), next);
                 self.lsp
                     .notify(
                         "textDocument/didChange",
@@ -186,16 +186,18 @@ impl LspServer {
                 .map(|l| (l.target_uri, l.target_range))
                 .collect(),
         };
-        items
+        // Out-of-root locations (std / dependency sources, e.g. `~/.cargo/registry`) are
+        // skipped rather than erroring the whole call — the in-root subset is the answer.
+        Ok(items
             .into_iter()
-            .map(|(uri, range)| {
-                Ok(LocationOut {
-                    path: self.path_for(&uri)?,
+            .filter_map(|(uri, range)| {
+                self.path_for(&uri).ok().map(|path| LocationOut {
+                    path,
                     line: range.start.line + 1,
                     character: range.start.character + 1,
                 })
             })
-            .collect()
+            .collect())
     }
 
     pub async fn do_definition(
@@ -260,15 +262,17 @@ impl LspServer {
             return Ok(vec![]);
         }
         let locs: Vec<lsp_types::Location> = serde_json::from_value(result)?;
-        locs.into_iter()
-            .map(|l| {
-                Ok(LocationOut {
-                    path: self.path_for(&l.uri)?,
+        // Out-of-root locations are skipped, not errors — see `goto_response_to_locations`.
+        Ok(locs
+            .into_iter()
+            .filter_map(|l| {
+                self.path_for(&l.uri).ok().map(|path| LocationOut {
+                    path,
                     line: l.range.start.line + 1,
                     character: l.range.start.character + 1,
                 })
             })
-            .collect()
+            .collect())
     }
 
     pub async fn do_hover(
@@ -560,6 +564,46 @@ mod tests {
         assert_eq!(locations[0].path, "a.rs");
         assert_eq!(locations[0].line, 1);
         assert_eq!(locations[0].character, 4);
+    }
+
+    #[tokio::test]
+    async fn do_definition_skips_out_of_root_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); }").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let in_root_uri = lsp_client::path_to_file_uri(&dir.path().join("a.rs"))
+            .unwrap()
+            .as_str()
+            .to_string();
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": [
+                        {"uri": in_root_uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}},
+                        {"uri": "file:///definitely/elsewhere/x.rs", "range": {"start": {"line": 9, "character": 0}, "end": {"line": 9, "character": 1}}}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let locations = server
+            .do_definition("a.rs".to_string(), 2, 10)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path, "a.rs");
     }
 
     #[tokio::test]
