@@ -426,6 +426,9 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("usage: mcp-lsp <root>"))?;
+    // Canonicalize once so the rootUri sent to rust-analyzer matches the document URIs
+    // LspServer derives from its (internally canonicalized) root, even under symlinks.
+    let root = std::fs::canonicalize(&root)?;
     let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin())?;
     lsp.initialize(&root).await?;
     let server = LspServer::new(lsp, root);
