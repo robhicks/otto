@@ -18,3 +18,6 @@ ui/dist
 *.db
 *.db-shm
 *.db-wal
+
+# Local git worktrees (isolated feature-branch workspaces)
+/.worktrees

@@ -1,5 +1,6 @@
 //! `otto run "<goal>" [--root <path>] [--agent <name>]` — run a single turn (or a named custom agent) and print output.
 //! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto plugin marketplace add|remove|update|list` / `otto plugin install|uninstall|list` — manage Claude Code plugin marketplaces under `~/.claude/plugins/marketplaces/`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +14,8 @@ use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
+mod plugin_cli;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -22,9 +25,10 @@ async fn main() -> anyhow::Result<()> {
     match command.as_str() {
         "run" => cmd_run(rest).await,
         "serve" => cmd_serve(rest).await,
+        "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]"
+                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
             );
             std::process::exit(2);
         }
