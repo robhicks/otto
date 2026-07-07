@@ -13,6 +13,8 @@ use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
+mod plugin_cli;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
