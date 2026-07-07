@@ -74,7 +74,8 @@ impl LspClient {
     {
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let generations: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let reader_pending = Arc::clone(&pending);
@@ -98,16 +99,17 @@ impl LspClient {
                 }
                 if method == Some("textDocument/publishDiagnostics") {
                     if let Some(params) = msg.get("params") {
-                        if let Ok(p) =
-                            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone())
-                        {
+                        if let Ok(p) = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
+                            params.clone(),
+                        ) {
                             let uri = p.uri.as_str().to_string();
                             // Diagnostics aren't tagged with our generation counter by the
                             // server, so we attribute them to whatever generation was current
                             // when they arrived. A late response to a stale edit can therefore
                             // be mistaken for fresh — an accepted v1 tradeoff (see the design
                             // doc's non-goals: no incremental sync / version reconciliation).
-                            let generation = *reader_generations.lock().await.get(&uri).unwrap_or(&0);
+                            let generation =
+                                *reader_generations.lock().await.get(&uri).unwrap_or(&0);
                             reader_diagnostics.lock().await.insert(
                                 uri,
                                 DiagEntry {
@@ -136,7 +138,12 @@ impl LspClient {
     }
 
     /// Send a JSON-RPC request and await its matching response, or time out.
-    pub async fn request(&self, method: &str, params: Value, wait: Duration) -> anyhow::Result<Value> {
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> anyhow::Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -195,6 +202,56 @@ impl LspClient {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+
+    /// Send `initialize` then `initialized`. `root` becomes the `rootUri`.
+    #[allow(deprecated)] // InitializeParams.root_uri: rust-analyzer accepts rootUri fine (design choice).
+    pub async fn initialize(&self, root: &std::path::Path) -> anyhow::Result<()> {
+        let root_uri = path_to_file_uri(root)?;
+        let params = lsp_types::InitializeParams {
+            root_uri: Some(root_uri),
+            capabilities: lsp_types::ClientCapabilities::default(),
+            ..Default::default()
+        };
+        self.request(
+            "initialize",
+            serde_json::to_value(params)?,
+            Duration::from_secs(30),
+        )
+        .await?;
+        self.notify("initialized", json!({})).await?;
+        Ok(())
+    }
+}
+
+/// Build a `file://` URI from an absolute or relative filesystem path.
+pub fn path_to_file_uri(path: &std::path::Path) -> anyhow::Result<lsp_types::Uri> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    format!("file://{}", abs.display())
+        .parse::<lsp_types::Uri>()
+        .map_err(|e| anyhow::anyhow!("bad file uri for {}: {e}", abs.display()))
+}
+
+/// Spawn `bin` as a child process and wire an `LspClient` to its stdio.
+pub fn spawn_process(bin: &str) -> anyhow::Result<(LspClient, tokio::process::Child)> {
+    let mut child = tokio::process::Command::new(bin)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child process has no stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child process has no stdout"))?;
+    let client = LspClient::spawn(tokio::io::BufReader::new(stdout), stdin);
+    Ok((client, child))
 }
 
 #[cfg(test)]
@@ -230,12 +287,18 @@ mod tests {
         tokio::spawn(async move {
             let req = read_message(&mut sr).await.unwrap();
             let id = req["id"].clone();
-            write_message(&mut sw, &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}))
-                .await
-                .unwrap();
+            write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}),
+            )
+            .await
+            .unwrap();
         });
 
-        let result = client.request("ping", serde_json::json!({}), Duration::from_secs(2)).await.unwrap();
+        let result = client
+            .request("ping", serde_json::json!({}), Duration::from_secs(2))
+            .await
+            .unwrap();
         assert_eq!(result, serde_json::json!({"ok": true}));
     }
 
@@ -249,12 +312,18 @@ mod tests {
             // Reply out of order: second request first.
             let req1 = read_message(&mut sr).await.unwrap();
             let req2 = read_message(&mut sr).await.unwrap();
-            write_message(&mut sw, &serde_json::json!({"jsonrpc": "2.0", "id": req2["id"], "result": "two"}))
-                .await
-                .unwrap();
-            write_message(&mut sw, &serde_json::json!({"jsonrpc": "2.0", "id": req1["id"], "result": "one"}))
-                .await
-                .unwrap();
+            write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": req2["id"], "result": "two"}),
+            )
+            .await
+            .unwrap();
+            write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": req1["id"], "result": "one"}),
+            )
+            .await
+            .unwrap();
         });
 
         let client = Arc::new(client);
@@ -319,5 +388,34 @@ mod tests {
             .await;
         assert!(timed_out);
         assert!(diags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initialize_sends_initialize_then_initialized() {
+        let (client, server_end) = duplex_client();
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+
+        let root = std::env::current_dir().unwrap();
+        let responder = tokio::spawn(async move {
+            let init = read_message(&mut sr).await.unwrap();
+            assert_eq!(init["method"], "initialize");
+            write_message(
+                &mut sw,
+                &serde_json::json!({"jsonrpc": "2.0", "id": init["id"], "result": {"capabilities": {}}}),
+            )
+            .await
+            .unwrap();
+            let initialized = read_message(&mut sr).await.unwrap();
+            assert_eq!(initialized["method"], "initialized");
+        });
+
+        client.initialize(&root).await.unwrap();
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn spawn_process_with_bogus_binary_errors() {
+        assert!(spawn_process("definitely-not-a-real-binary-xyz").is_err());
     }
 }
