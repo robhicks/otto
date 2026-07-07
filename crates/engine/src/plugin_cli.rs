@@ -404,6 +404,9 @@ pub fn plugin_uninstall(key: &str, home: &Path) -> anyhow::Result<()> {
     let path = settings_path(home);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let updated = otto_extensions::set_enabled_plugin(&existing, key, None);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, updated)?;
     Ok(())
 }
@@ -431,6 +434,116 @@ pub fn plugin_list(home: &Path) -> anyhow::Result<Vec<(String, bool)>> {
         }
     }
     Ok(out)
+}
+
+/// Parse `--ref <value>` out of `args`. Returns `(Some(value), remaining positionals)`.
+fn parse_ref_flag(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut r = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--ref" {
+            r = it.next().cloned();
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (r, rest)
+}
+
+const USAGE: &str = "usage:\n  \
+    otto plugin marketplace add <url> [--ref <ref>]\n  \
+    otto plugin marketplace remove <name>\n  \
+    otto plugin marketplace update [<name>]\n  \
+    otto plugin marketplace list\n  \
+    otto plugin install <plugin>@<marketplace>\n  \
+    otto plugin uninstall <plugin>@<marketplace>\n  \
+    otto plugin list";
+
+/// Entry point for `otto plugin ...`, dispatched from `main()`. `home` is the user-global
+/// `.claude/` base (`dirs::home_dir()` at the real CLI edge; an explicit tempdir in tests).
+pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> {
+    let mut it = args.into_iter();
+    let sub = it.next().unwrap_or_default();
+    let rest: Vec<String> = it.collect();
+    match sub.as_str() {
+        "marketplace" => cmd_plugin_marketplace(rest, &home).await,
+        "install" => {
+            let key = rest.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("usage: otto plugin install <plugin>@<marketplace>")
+            })?;
+            plugin_install(&key, &home)?;
+            println!("installed {key}");
+            Ok(())
+        }
+        "uninstall" => {
+            let key = rest.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("usage: otto plugin uninstall <plugin>@<marketplace>")
+            })?;
+            plugin_uninstall(&key, &home)?;
+            println!("uninstalled {key}");
+            Ok(())
+        }
+        "list" => {
+            for (key, enabled) in plugin_list(&home)? {
+                println!(
+                    "{} {key}",
+                    if enabled {
+                        "[enabled]  "
+                    } else {
+                        "[available]"
+                    }
+                );
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!(USAGE),
+    }
+}
+
+async fn cmd_plugin_marketplace(args: Vec<String>, home: &Path) -> anyhow::Result<()> {
+    let mut it = args.into_iter();
+    let sub = it.next().unwrap_or_default();
+    let rest: Vec<String> = it.collect();
+    match sub.as_str() {
+        "add" => {
+            let (ref_flag, positional) = parse_ref_flag(&rest);
+            let url = positional.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("usage: otto plugin marketplace add <url> [--ref <ref>]")
+            })?;
+            let name = marketplace_add(&url, ref_flag.as_deref(), home).await?;
+            println!("installed marketplace '{name}'");
+            Ok(())
+        }
+        "remove" => {
+            let name = rest
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: otto plugin marketplace remove <name>"))?;
+            marketplace_remove(&name, home)?;
+            println!("removed marketplace '{name}'");
+            Ok(())
+        }
+        "update" => {
+            let name = rest.into_iter().next();
+            let updated = marketplace_update(name.as_deref(), home).await?;
+            if updated.is_empty() {
+                println!("nothing to update");
+            } else {
+                println!("updated: {}", updated.join(", "));
+            }
+            Ok(())
+        }
+        "list" => {
+            let lock = read_lockfile(home);
+            for (name, entry) in &lock.entries {
+                let short_commit = &entry.commit[..entry.commit.len().min(12)];
+                println!("{name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("usage: otto plugin marketplace add|remove|update|list ..."),
+    }
 }
 
 #[cfg(test)]
@@ -983,5 +1096,54 @@ mod tests {
 
         let listed = plugin_list(home.path()).unwrap();
         assert_eq!(listed, vec![("foo@acme".to_string(), false)]);
+    }
+
+    #[test]
+    fn parse_ref_flag_extracts_value() {
+        let args = vec!["--ref".to_string(), "v1".to_string(), "url".to_string()];
+        let (r, rest) = parse_ref_flag(&args);
+        assert_eq!(r, Some("v1".to_string()));
+        assert_eq!(rest, vec!["url".to_string()]);
+    }
+
+    #[test]
+    fn parse_ref_flag_absent_is_none() {
+        let args = vec!["url".to_string()];
+        let (r, rest) = parse_ref_flag(&args);
+        assert_eq!(r, None);
+        assert_eq!(rest, vec!["url".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cmd_plugin_install_then_list_end_to_end() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+
+        cmd_plugin(
+            vec!["marketplace".to_string(), "add".to_string(), url.clone()],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        cmd_plugin(
+            vec!["install".to_string(), "foo@acme".to_string()],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        let enabled = otto_extensions::parse_enabled_plugins(&settings);
+        assert_eq!(enabled.get("foo@acme"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn cmd_plugin_unknown_subcommand_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let err = cmd_plugin(vec!["bogus".to_string()], home.path().to_path_buf())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("usage"), "got: {err}");
     }
 }
