@@ -47,12 +47,20 @@ use serde_json::json;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 
+/// How long a fresh diagnostics entry must sit unchanged before `wait_for_diagnostics` trusts
+/// it — see that method's doc comment for why returning on first publish is wrong. Sized
+/// empirically: rust-analyzer's gap between the pre-analysis empty publish and the real one was
+/// observed to exceed 300ms under load (~0.5-0.6s), so this carries a few-x margin.
+const DIAGNOSTICS_QUIESCENCE: Duration = Duration::from_millis(2000);
+
 /// Cached diagnostics for one URI, tagged with the client-side generation they were received at
-/// (see `bump_generation`/`wait_for_diagnostics`).
+/// (see `bump_generation`/`wait_for_diagnostics`) and the instant they arrived (so
+/// `wait_for_diagnostics` can debounce until the publish stream quiesces).
 #[derive(Clone)]
 struct DiagEntry {
     generation: u64,
     diagnostics: Vec<lsp_types::Diagnostic>,
+    updated_at: tokio::time::Instant,
 }
 
 /// A minimal LSP client: JSON-RPC request/response over a `Content-Length`-framed stdio pipe,
@@ -115,6 +123,7 @@ impl LspClient {
                                 DiagEntry {
                                     generation,
                                     diagnostics: p.diagnostics,
+                                    updated_at: tokio::time::Instant::now(),
                                 },
                             );
                         }
@@ -175,7 +184,14 @@ impl LspClient {
     }
 
     /// Poll the diagnostics cache for `uri` until an entry at generation >= `min_generation`
-    /// arrives, or `wait` elapses. Returns `(diagnostics, timed_out)`.
+    /// arrives **and the publish stream has quiesced** (no newer publish for
+    /// `DIAGNOSTICS_QUIESCENCE`), or `wait` elapses. Returns `(diagnostics, timed_out)`.
+    ///
+    /// The debounce exists because language servers (rust-analyzer observed) publish an empty
+    /// pre-analysis diagnostics set right after `didOpen`, then the real diagnostics shortly
+    /// after — returning on the first publish would read broken code as clean. The debounce only
+    /// *delays* returning a fresh entry; it never converts a fresh result into a timeout: at the
+    /// deadline, a fresh (even un-quiesced) entry is returned with `timed_out: false`.
     pub async fn wait_for_diagnostics(
         &self,
         uri: &str,
@@ -184,12 +200,16 @@ impl LspClient {
     ) -> (Vec<lsp_types::Diagnostic>, bool) {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
+            let now = tokio::time::Instant::now();
+            let at_deadline = now >= deadline;
             if let Some(entry) = self.diagnostics.lock().await.get(uri) {
-                if entry.generation >= min_generation {
+                if entry.generation >= min_generation
+                    && (at_deadline || now >= entry.updated_at + DIAGNOSTICS_QUIESCENCE)
+                {
                     return (entry.diagnostics.clone(), false);
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if at_deadline {
                 let stale = self
                     .diagnostics
                     .lock()
@@ -377,6 +397,55 @@ mod tests {
         assert!(!timed_out);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].message, "unresolved symbol `foo`");
+    }
+
+    #[tokio::test]
+    async fn wait_for_diagnostics_debounces_past_an_empty_pre_analysis_publish() {
+        let (client, server_end) = duplex_client();
+        let generation = client.bump_generation("file:///a.rs").await;
+
+        let (_sr, mut sw) = tokio::io::split(server_end);
+        let publisher = tokio::spawn(async move {
+            // The rust-analyzer pattern: an empty pre-analysis publish first...
+            write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {"uri": "file:///a.rs", "diagnostics": []}
+                }),
+            )
+            .await
+            .unwrap();
+            // ...then the real diagnostics shortly after.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/publishDiagnostics",
+                    "params": {
+                        "uri": "file:///a.rs",
+                        "diagnostics": [{
+                            "range": {"start": {"line": 4, "character": 2}, "end": {"line": 4, "character": 5}},
+                            "message": "cannot find function `does_not_exist`"
+                        }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        // Wait comfortably longer than DIAGNOSTICS_QUIESCENCE so this exercises the debounced
+        // early return, not the fresh-at-deadline fallback.
+        let (diags, timed_out) = client
+            .wait_for_diagnostics("file:///a.rs", generation, Duration::from_secs(10))
+            .await;
+        publisher.await.unwrap();
+        assert!(!timed_out);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "cannot find function `does_not_exist`");
     }
 
     #[tokio::test]
