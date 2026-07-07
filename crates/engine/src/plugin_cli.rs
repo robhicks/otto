@@ -264,13 +264,16 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
 /// next `discover()` (no matching directory to fold), a deliberate simplification over a
 /// cross-cutting `settings.json` cleanup.
 pub fn marketplace_remove(name: &str, home: &Path) -> anyhow::Result<()> {
-    let mp_dir = marketplaces_dir(home).join(name);
-    if !mp_dir.exists() {
+    let mut lock = read_lockfile(home);
+    if !lock.entries.contains_key(name) {
         anyhow::bail!("marketplace '{name}' is not installed");
     }
-    std::fs::remove_dir_all(&mp_dir)?;
 
-    let mut lock = read_lockfile(home);
+    let mp_dir = marketplaces_dir(home).join(name);
+    if mp_dir.exists() {
+        std::fs::remove_dir_all(&mp_dir)?;
+    }
+
     lock.entries.remove(name);
     write_lockfile(home, &lock)?;
     Ok(())
@@ -356,6 +359,11 @@ fn read_marketplace_manifest(
     home: &Path,
     marketplace: &str,
 ) -> anyhow::Result<otto_extensions::Marketplace> {
+    let lock = read_lockfile(home);
+    if !lock.entries.contains_key(marketplace) {
+        anyhow::bail!("marketplace '{marketplace}' is not installed");
+    }
+
     let manifest_path = marketplaces_dir(home)
         .join(marketplace)
         .join(".claude-plugin")
@@ -907,6 +915,27 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let err = marketplace_remove("nope", home.path()).unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn marketplace_remove_rejects_unlocked_name_even_if_directory_exists() {
+        let home = tempfile::tempdir().unwrap();
+        // Simulate an attacker-relevant sibling directory that exists on disk but was never
+        // added via marketplace_add (so it's not in the lockfile) — e.g. a path-traversal
+        // attempt like "../../victim_data" would resolve outside marketplaces_dir entirely,
+        // but even a plain unlocked name inside marketplaces_dir must not be deletable.
+        let mp_root = marketplaces_dir(home.path());
+        std::fs::create_dir_all(&mp_root).unwrap();
+        let victim = mp_root.join("not-in-lockfile");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("important.txt"), "do not delete me").unwrap();
+
+        let err = marketplace_remove("not-in-lockfile", home.path()).unwrap_err();
+        assert!(err.to_string().contains("not installed"), "got: {err}");
+        assert!(
+            victim.exists(),
+            "unlocked directory must survive a remove attempt"
+        );
     }
 
     #[tokio::test]
