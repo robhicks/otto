@@ -17,6 +17,7 @@ members = [
     "crates/mcp-grep",
     "crates/mcp-git",
     "crates/mcp-bash",
+    "crates/mcp-lsp",
 ]
 exclude = ["ui", "desktop"]
 
