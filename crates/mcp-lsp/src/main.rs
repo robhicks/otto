@@ -218,6 +218,50 @@ impl LspServer {
             .await?;
         self.goto_response_to_locations(result)
     }
+
+    pub async fn do_references(
+        &self,
+        path: String,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<LocationOut>> {
+        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let params = lsp_types::ReferenceParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
+                position: lsp_types::Position::new(
+                    line.saturating_sub(1),
+                    character.saturating_sub(1),
+                ),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: lsp_types::ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let result = self
+            .lsp
+            .request(
+                "textDocument/references",
+                serde_json::to_value(params)?,
+                NAVIGATION_TIMEOUT,
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
+        let locs: Vec<lsp_types::Location> = serde_json::from_value(result)?;
+        locs.into_iter()
+            .map(|l| {
+                Ok(LocationOut {
+                    path: self.path_for(&l.uri)?,
+                    line: l.range.start.line + 1,
+                    character: l.range.start.character + 1,
+                })
+            })
+            .collect()
+    }
 }
 
 fn main() {
@@ -376,5 +420,47 @@ mod tests {
             .unwrap();
         responder.await.unwrap();
         assert!(locations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn do_references_parses_an_array_of_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); a(); }").unwrap();
+        let (server, server_end) = duplex_server(dir.path());
+        let (sr, sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        let mut sw = sw;
+
+        let uri = lsp_client::path_to_file_uri(&dir.path().join("a.rs"))
+            .unwrap()
+            .as_str()
+            .to_string();
+        let responder = tokio::spawn(async move {
+            let _opened = lsp_client::read_message(&mut sr).await.unwrap();
+            let req = lsp_client::read_message(&mut sr).await.unwrap();
+            assert_eq!(req["method"], "textDocument/references");
+            lsp_client::write_message(
+                &mut sw,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req["id"],
+                    "result": [
+                        {"uri": uri, "range": {"start": {"line": 1, "character": 9}, "end": {"line": 1, "character": 10}}},
+                        {"uri": uri, "range": {"start": {"line": 1, "character": 14}, "end": {"line": 1, "character": 15}}}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let locations = server
+            .do_references("a.rs".to_string(), 1, 1)
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].line, 2);
+        assert_eq!(locations[1].line, 2);
     }
 }
