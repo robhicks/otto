@@ -83,7 +83,7 @@ fn settings_path(home: &Path) -> PathBuf {
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -92,9 +92,19 @@ fn now_unix() -> u64 {
 // ---------------------------------------------------------------------------
 
 fn read_lockfile(home: &Path) -> otto_extensions::MarketplaceLockfile {
-    match std::fs::read_to_string(lockfile_path(home)) {
+    let path = lockfile_path(home);
+    match std::fs::read_to_string(&path) {
         Ok(text) => otto_extensions::MarketplaceLockfile::parse(&text),
-        Err(_) => otto_extensions::MarketplaceLockfile::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            otto_extensions::MarketplaceLockfile::default()
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: skipping unreadable lockfile {}: {e}",
+                path.display()
+            );
+            otto_extensions::MarketplaceLockfile::default()
+        }
     }
 }
 
