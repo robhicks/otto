@@ -11,6 +11,11 @@ use std::sync::Arc;
 use lsp_client::LspClient;
 use otto_engine_core::traits::WorkspaceRead;
 use otto_workspace::LocalWorkspace;
+use rmcp::ServiceExt;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{ErrorData, tool, tool_router};
+use serde::Deserialize;
 use tokio::sync::Mutex;
 
 const DEFAULT_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -64,6 +69,9 @@ pub struct LspServer {
 
 impl LspServer {
     pub fn new(lsp: LspClient, root: PathBuf) -> Self {
+        // Canonicalize so `path_for`'s URI prefix matches the absolutized URIs
+        // `path_to_file_uri` produces (the engine passes a possibly-relative root, e.g. `.`).
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         Self {
             lsp: Arc::new(lsp),
             workspace: Arc::new(LocalWorkspace::new(root.clone())),
@@ -314,9 +322,116 @@ fn render_hover_contents(contents: lsp_types::HoverContents) -> String {
     }
 }
 
-fn main() {
-    eprintln!("mcp-lsp: scaffold only, not yet implemented");
-    std::process::exit(1);
+#[derive(Deserialize, schemars::JsonSchema)]
+struct PathArgs {
+    path: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct PositionArgs {
+    path: String,
+    line: u32,
+    character: u32,
+}
+
+fn to_err(e: anyhow::Error) -> ErrorData {
+    ErrorData::internal_error(e.to_string(), None)
+}
+
+#[tool_router(server_handler)]
+impl LspServer {
+    #[tool(
+        name = "lsp.diagnostics",
+        description = "Get structured compiler/language-server diagnostics for a file"
+    )]
+    async fn diagnostics(
+        &self,
+        Parameters(PathArgs { path }): Parameters<PathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (diagnostics, timed_out) = self.do_diagnostics(path).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(serde_json::json!({
+            "diagnostics": diagnostics,
+            "timed_out": timed_out,
+        })))
+    }
+
+    #[tool(
+        name = "lsp.definition",
+        description = "Go to the definition of the symbol at a position"
+    )]
+    async fn definition(
+        &self,
+        Parameters(PositionArgs {
+            path,
+            line,
+            character,
+        }): Parameters<PositionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let locations = self
+            .do_definition(path, line, character)
+            .await
+            .map_err(to_err)?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "locations": locations }),
+        ))
+    }
+
+    #[tool(
+        name = "lsp.references",
+        description = "Find references to the symbol at a position"
+    )]
+    async fn references(
+        &self,
+        Parameters(PositionArgs {
+            path,
+            line,
+            character,
+        }): Parameters<PositionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let locations = self
+            .do_references(path, line, character)
+            .await
+            .map_err(to_err)?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "locations": locations }),
+        ))
+    }
+
+    #[tool(
+        name = "lsp.hover",
+        description = "Get hover information for the symbol at a position"
+    )]
+    async fn hover(
+        &self,
+        Parameters(PositionArgs {
+            path,
+            line,
+            character,
+        }): Parameters<PositionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let contents = self.do_hover(path, line, character).await.map_err(to_err)?;
+        Ok(CallToolResult::structured(
+            serde_json::json!({ "contents": contents }),
+        ))
+    }
+}
+
+fn rust_analyzer_bin() -> String {
+    std::env::var("OTTO_RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".to_string())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let root = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("usage: mcp-lsp <root>"))?;
+    let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin())?;
+    lsp.initialize(&root).await?;
+    let server = LspServer::new(lsp, root);
+    let service = server.serve(rmcp::transport::io::stdio()).await?;
+    service.waiting().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -567,5 +682,19 @@ mod tests {
         let hover = server.do_hover("a.rs".to_string(), 1, 1).await.unwrap();
         responder.await.unwrap();
         assert!(hover.is_none());
+    }
+
+    #[tokio::test]
+    async fn path_for_round_trips_with_a_non_canonical_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        // A messy but valid spelling of the same root: "<dir>/./"
+        let messy = dir.path().join(".");
+        let (client_end, _server_end) = tokio::io::duplex(1024);
+        let (cr, cw) = tokio::io::split(client_end);
+        let lsp = LspClient::spawn(BufReader::new(cr), cw);
+        let server = LspServer::new(lsp, messy);
+        let uri = server.uri_for("a.rs").unwrap();
+        assert_eq!(server.path_for(&uri).unwrap(), "a.rs");
     }
 }
