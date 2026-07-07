@@ -47,11 +47,22 @@ use serde_json::json;
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 
-/// A minimal LSP client: JSON-RPC request/response over a `Content-Length`-framed stdio pipe.
+/// Cached diagnostics for one URI, tagged with the client-side generation they were received at
+/// (see `bump_generation`/`wait_for_diagnostics`).
+#[derive(Clone)]
+struct DiagEntry {
+    generation: u64,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+}
+
+/// A minimal LSP client: JSON-RPC request/response over a `Content-Length`-framed stdio pipe,
+/// plus a versioned cache of `textDocument/publishDiagnostics` notifications.
 pub struct LspClient {
     writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
     next_id: AtomicI64,
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>>,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl LspClient {
@@ -63,7 +74,12 @@ impl LspClient {
     {
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let generations: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+
         let reader_pending = Arc::clone(&pending);
+        let reader_diagnostics = Arc::clone(&diagnostics);
+        let reader_generations = Arc::clone(&generations);
         tokio::spawn(async move {
             let mut reader = reader;
             loop {
@@ -74,12 +90,32 @@ impl LspClient {
                 let has_id = msg.get("id").and_then(Value::as_i64);
                 let method = msg.get("method").and_then(Value::as_str);
                 if let (Some(id), None) = (has_id, method) {
-                    // A response to one of our requests (no "method" field). Server-initiated
-                    // requests (e.g. `client/registerCapability`) have both an id and a method —
-                    // we don't answer those in v1; see the design doc's known-limitations note.
                     if let Some(tx) = reader_pending.lock().await.remove(&id) {
                         let result = msg.get("result").cloned().unwrap_or(Value::Null);
                         let _ = tx.send(result);
+                    }
+                    continue;
+                }
+                if method == Some("textDocument/publishDiagnostics") {
+                    if let Some(params) = msg.get("params") {
+                        if let Ok(p) =
+                            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone())
+                        {
+                            let uri = p.uri.as_str().to_string();
+                            // Diagnostics aren't tagged with our generation counter by the
+                            // server, so we attribute them to whatever generation was current
+                            // when they arrived. A late response to a stale edit can therefore
+                            // be mistaken for fresh — an accepted v1 tradeoff (see the design
+                            // doc's non-goals: no incremental sync / version reconciliation).
+                            let generation = *reader_generations.lock().await.get(&uri).unwrap_or(&0);
+                            reader_diagnostics.lock().await.insert(
+                                uri,
+                                DiagEntry {
+                                    generation,
+                                    diagnostics: p.diagnostics,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -89,6 +125,8 @@ impl LspClient {
             writer: Mutex::new(Box::new(writer)),
             next_id: AtomicI64::new(1),
             pending,
+            diagnostics,
+            generations,
         }
     }
 
@@ -118,6 +156,44 @@ impl LspClient {
     pub async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
         self.write(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .await
+    }
+
+    /// Bump and return the generation counter for `uri` — call right before sending a
+    /// `didOpen`/`didChange` so the reader loop attributes the next `publishDiagnostics` to it.
+    pub async fn bump_generation(&self, uri: &str) -> u64 {
+        let mut g = self.generations.lock().await;
+        let next = g.get(uri).copied().unwrap_or(0) + 1;
+        g.insert(uri.to_string(), next);
+        next
+    }
+
+    /// Poll the diagnostics cache for `uri` until an entry at generation >= `min_generation`
+    /// arrives, or `wait` elapses. Returns `(diagnostics, timed_out)`.
+    pub async fn wait_for_diagnostics(
+        &self,
+        uri: &str,
+        min_generation: u64,
+        wait: Duration,
+    ) -> (Vec<lsp_types::Diagnostic>, bool) {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(entry) = self.diagnostics.lock().await.get(uri) {
+                if entry.generation >= min_generation {
+                    return (entry.diagnostics.clone(), false);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let stale = self
+                    .diagnostics
+                    .lock()
+                    .await
+                    .get(uri)
+                    .map(|e| e.diagnostics.clone())
+                    .unwrap_or_default();
+                return (stale, true);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -200,5 +276,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_diagnostics_returns_fresh_entries() {
+        let (client, server_end) = duplex_client();
+        let generation = client.bump_generation("file:///a.rs").await;
+        assert_eq!(generation, 1);
+
+        let (_sr, mut sw) = tokio::io::split(server_end);
+        write_message(
+            &mut sw,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": "file:///a.rs",
+                    "diagnostics": [{
+                        "range": {"start": {"line": 4, "character": 2}, "end": {"line": 4, "character": 5}},
+                        "message": "unresolved symbol `foo`"
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let (diags, timed_out) = client
+            .wait_for_diagnostics("file:///a.rs", generation, Duration::from_secs(2))
+            .await;
+        assert!(!timed_out);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "unresolved symbol `foo`");
+    }
+
+    #[tokio::test]
+    async fn wait_for_diagnostics_times_out_when_nothing_arrives() {
+        let (client, _server_end) = duplex_client();
+        let generation = client.bump_generation("file:///a.rs").await;
+        let (diags, timed_out) = client
+            .wait_for_diagnostics("file:///a.rs", generation, Duration::from_millis(200))
+            .await;
+        assert!(timed_out);
+        assert!(diags.is_empty());
     }
 }
