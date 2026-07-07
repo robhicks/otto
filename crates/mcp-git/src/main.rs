@@ -70,6 +70,10 @@ fn is_sensitive(p: &str) -> bool {
 // Argument-injection guards
 // ---------------------------------------------------------------------------
 
+// KEEP IN SYNC: `reject_leading_dash`/`validate_clone_url`/`is_scp_like` below are duplicated
+// in `crates/engine/src/plugin_cli.rs` (that crate cannot depend on this `[[bin]]`-only crate —
+// see `plugin_cli.rs`'s module doc). If this hardening changes here, mirror the change there too.
+
 /// Reject any user-supplied positional that starts with `-`.  A leading dash is reparsed
 /// by git as a flag, enabling argv flag-smuggling attacks such as
 /// `git clone --upload-pack=<cmd>` or `git clone ext::sh -c <cmd>`.
