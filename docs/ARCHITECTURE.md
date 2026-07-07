@@ -30,7 +30,8 @@ otto-next/
 │   ├── mcp-git          # MCP stdio server: clone/branch/stage/commit/push/PR.
 │   ├── mcp-grep         # MCP stdio server: ripgrep-style search.
 │   ├── mcp-bash         # MCP stdio server: shell exec with per-call network + OS sandbox policy.
-│   ├── mcp-lsp          # MCP stdio server: LSP bridge (deferred to v2).
+│   ├── mcp-lsp          # MCP stdio server: LSP bridge to rust-analyzer (lsp.diagnostics/
+│   │                    #   definition/references/hover). Rust-only in v1; multi-language is v2.
 │   ├── retrieval        # Persistent inverted index + tree-sitter symbol chunking behind the Retriever seam (shipped). git-history selection, vector index = later/v2.
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).

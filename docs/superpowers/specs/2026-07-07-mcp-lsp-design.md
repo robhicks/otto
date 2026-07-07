@@ -1,6 +1,6 @@
 # `mcp-lsp` design
 
-Status: approved, not yet implemented. Closes the last "deferred to v2" line in the MCP
+Status: shipped. Closed the last "deferred to v2" line in the MCP
 tool-server tier (`docs/ARCHITECTURE.md`'s crate table).
 
 ## Motivation
@@ -138,6 +138,14 @@ avoids the single most common off-by-one confusion an agent calling these tools 
    slow). On timeout, whatever's cached is returned with `timed_out: true`, so the
    Verifier/Coder never mistakes "rust-analyzer hasn't responded yet" for "compiles clean."
 
+   Implementation note (discovered against the real rust-analyzer): the server publishes an
+   *empty* pre-analysis diagnostics set shortly after `didOpen`, then the real set once analysis
+   completes — so returning on the first fresh publish reads broken code as clean. The cache
+   therefore debounces: a fresh entry is returned only once the publish stream has been quiet for
+   `DIAGNOSTICS_QUIESCENCE` (2s, sized from observed 0.5-0.6s empty-to-real gaps), or at the
+   deadline (a fresh-but-unquiesced entry still returns `timed_out: false` — the debounce delays,
+   it never converts fresh into timeout).
+
 ## Engine wiring
 
 - `crates/engine/src/mcp.rs`: add `connect_lsp(bin, root)`, mirroring
@@ -155,7 +163,9 @@ One `rust-analyzer` child process is spawned once and kept warm for the whole mc
 session (restarting it is expensive — it has to re-index). No auto-restart on crash in v1
 (YAGNI): if the process dies, subsequent `lsp.*` calls surface a normal tool-call error.
 Concurrent tool calls are safe — the request-id map and diagnostics cache are both behind a
-mutex, and each request gets its own oneshot regardless of call ordering.
+mutex, and each request gets its own oneshot regardless of call ordering. The binary
+canonicalizes its argv root at startup so the rootUri sent to rust-analyzer always matches
+the document URIs derived from the workspace root.
 
 ## Testing
 
