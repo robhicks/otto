@@ -40,7 +40,7 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(r: &mut R) -> anyhow::Result<
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -66,13 +66,14 @@ struct DiagEntry {
 /// A minimal LSP client: JSON-RPC request/response over a `Content-Length`-framed stdio pipe,
 /// plus a versioned cache of `textDocument/publishDiagnostics` notifications.
 pub struct LspClient {
-    writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
+    writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     next_id: AtomicI64,
     // Each pending request receives the *full* response message so `request` can distinguish
     // a `result` from an `error` member (an LSP error must surface as Err, not a null result).
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
+    alive: Arc<AtomicBool>,
 }
 
 impl LspClient {
@@ -87,36 +88,41 @@ impl LspClient {
         let diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let generations: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let reader_pending = Arc::clone(&pending);
         let reader_diagnostics = Arc::clone(&diagnostics);
         let reader_generations = Arc::clone(&generations);
+        let reader_writer = Arc::clone(&writer);
+        let reader_alive = Arc::clone(&alive);
         tokio::spawn(async move {
             let mut reader = reader;
             loop {
                 let msg = match read_message(&mut reader).await {
                     Ok(m) => m,
-                    Err(_) => break, // stream closed / server process exited
+                    Err(_) => {
+                        reader_alive.store(false, Ordering::SeqCst);
+                        break;
+                    }
                 };
-                let has_id = msg.get("id").and_then(Value::as_i64);
                 let method = msg.get("method").and_then(Value::as_str);
-                if let (Some(id), None) = (has_id, method) {
-                    if let Some(tx) = reader_pending.lock().await.remove(&id) {
-                        let _ = tx.send(msg);
+                if method.is_none() {
+                    if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+                        if let Some(tx) = reader_pending.lock().await.remove(&id) {
+                            let _ = tx.send(msg);
+                        }
                     }
                     continue;
                 }
-                if method == Some("textDocument/publishDiagnostics") {
+                let method = method.unwrap();
+                if method == "textDocument/publishDiagnostics" {
                     if let Some(params) = msg.get("params") {
                         if let Ok(p) = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
                             params.clone(),
                         ) {
                             let uri = p.uri.as_str().to_string();
-                            // Diagnostics aren't tagged with our generation counter by the
-                            // server, so we attribute them to whatever generation was current
-                            // when they arrived. A late response to a stale edit can therefore
-                            // be mistaken for fresh — an accepted v1 tradeoff (see the design
-                            // doc's non-goals: no incremental sync / version reconciliation).
                             let generation =
                                 *reader_generations.lock().await.get(&uri).unwrap_or(&0);
                             reader_diagnostics.lock().await.insert(
@@ -129,22 +135,45 @@ impl LspClient {
                             );
                         }
                     }
+                    continue;
+                }
+                // A server->client request (has id + method) we don't handle. Minimal client
+                // capabilities normally stop servers from sending these; reply defensively so a
+                // capability-mismatched server never blocks on an unanswered request.
+                if let Some(id) = msg.get("id") {
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": id.clone(),
+                        "error": {"code": -32601, "message": "method not supported by otto lsp bridge"},
+                    });
+                    let mut w = reader_writer.lock().await;
+                    let _ = write_message(&mut *w, &reply).await;
                 }
             }
         });
 
         Self {
-            writer: Mutex::new(Box::new(writer)),
+            writer,
             next_id: AtomicI64::new(1),
             pending,
             diagnostics,
             generations,
+            alive,
         }
     }
 
     async fn write(&self, value: &Value) -> anyhow::Result<()> {
         let mut w = self.writer.lock().await;
-        write_message(&mut *w, value).await
+        let result = write_message(&mut *w, value).await;
+        if result.is_err() {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// False once the server's stream has closed (process exited) or a write to it failed.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     /// Send a JSON-RPC request and await its matching response, or time out. An `error`
@@ -239,6 +268,12 @@ impl LspClient {
         }
     }
 
+    /// INVARIANT: this client answers no server→client *requests* (the reader loop only replies
+    /// `MethodNotFound`). `capabilities` must therefore stay minimal — advertising a richer
+    /// capability (pull diagnostics, `workspace/configuration`, dynamic registration) makes a
+    /// server send requests the client can't satisfy, stalling it. This minimal-capabilities
+    /// choice is exactly why rust-analyzer/tsserver/pyright/gopls all work with no
+    /// `initializationOptions`.
     /// Send `initialize` then `initialized`. `root` becomes the `rootUri`.
     #[allow(deprecated)] // InitializeParams.root_uri: rust-analyzer accepts rootUri fine (design choice).
     pub async fn initialize(&self, root: &std::path::Path) -> anyhow::Result<()> {
@@ -535,5 +570,40 @@ mod tests {
     #[test]
     fn spawn_process_with_bogus_binary_errors() {
         assert!(spawn_process("definitely-not-a-real-binary-xyz", &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn reader_replies_method_not_found_to_unknown_server_requests() {
+        let (client, server_end) = duplex_client();
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+
+        write_message(
+            &mut sw,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "workspace/configuration",
+                "params": {}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reply = read_message(&mut sr).await.unwrap();
+        assert_eq!(reply["id"], 99);
+        assert_eq!(reply["error"]["code"], -32601);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn write_failure_marks_the_client_dead() {
+        let (client, server_end) = duplex_client();
+        assert!(client.is_alive());
+        drop(server_end);
+        let _ = client
+            .notify("textDocument/didOpen", serde_json::json!({}))
+            .await;
+        assert!(!client.is_alive());
     }
 }
