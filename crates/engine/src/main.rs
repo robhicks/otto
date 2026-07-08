@@ -215,8 +215,9 @@ async fn build_tools_preferring_mcp(
         Err(e) => eprintln!("mcp-git unavailable ({e}); git tools disabled"),
     }
 
-    // lsp: additive — absent (logged) if mcp-lsp or its rust-analyzer child can't start. No
-    // in-process fallback exists (there's no in-process LSP client), same category as grep/git.
+    // lsp: additive — absent (logged) if mcp-lsp can't start (its PATH gate finds no supported
+    // language server: rust-analyzer / typescript-language-server / pyright-langserver / gopls).
+    // No in-process fallback exists (there's no in-process LSP client), same category as grep/git.
     match mcp_connect_lsp(&mcp_lsp_bin(), &root).await {
         Ok((conn, mcp_tools)) => {
             for t in mcp_tools {

@@ -273,6 +273,14 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connect_lsp_surfaces_a_pre_handshake_exit_as_err() {
+        // `false` spawns successfully then exits nonzero immediately — before speaking MCP,
+        // exactly as `mcp-lsp` does when its PATH availability gate finds no language server.
+        // `connect` must surface this as an Err (so no lsp tools get registered), not hang.
+        assert!(connect_lsp("false", Path::new(".")).await.is_err());
+    }
+
     #[test]
     fn plugin_gate_name_is_namespaced() {
         assert_eq!(
