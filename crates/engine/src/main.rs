@@ -492,22 +492,11 @@ async fn run_command_in(
     use otto_extensions::{expand_args, resolve_injections};
 
     let ext = otto_extensions::discover(&root, &home);
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on this path \
-             (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
-    if !ext.permissions.is_empty() {
-        eprintln!(
-            "warning: settings.json permissions are configured but are NOT enforced on \
-             this path (permissions are wired only on the `otto run` spine for now)."
-        );
-    }
     let def = ext
         .commands
-        .into_iter()
+        .iter()
         .find(|c| c.name == name)
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no command named '{name}' in ~/.claude/commands/ or {}/.claude/commands/",
@@ -515,22 +504,16 @@ async fn run_command_in(
             )
         })?;
 
-    // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
-    // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
-    // `otto serve` (via build_composed_tools); the --agent/--command paths are deferred (extensions
-    // hooks slice).
+    // The composed tool registry: the same permissions/skills/hooks/plugin-MCP composition the
+    // spine and serve paths use (Slices 6–11 + this slice). Injection reaches fs.read/bash
+    // through the same gate the spine turn uses. Reused as the turn's tools.
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(
-        tools_workspace,
-        root.clone(),
-        false,
-        &otto_extensions::PermissionRules::default(),
-    )
-    .await;
+    let (tools, _mcp_conns) =
+        build_composed_tools(&ext, tools_workspace, root.clone(), false).await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
-    // Narrow the registry to the command's allowed-tools (None = all tools) before it is used for
-    // BOTH injection resolution and the spine turn — so a disallowed tool is fail-closed.
+    // Narrow the composed registry to the command's allowed-tools (None = all tools) before it
+    // is used for BOTH injection resolution and the spine turn — so a disallowed tool is
+    // fail-closed.
     let tools = Arc::new(narrow_for_command(tools, &def.allowed_tools));
 
     // Args are substituted first, then the whole string is scanned for `!`cmd`/@path`
@@ -1108,6 +1091,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_composition_exposes_skill_tool_until_narrowed_away() {
+        use std::fs;
+        // A discovered skill registers the gated `skill` tool in the composed registry a
+        // command uses; a present `allowed-tools` that omits `skill` narrows it away.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let skill_dir = proj.path().join(".claude").join("skills").join("greeter");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // No allowed-tools (None) → the composed registry keeps `skill`.
+        let kept = narrow_for_command(tools, &None);
+        assert!(kept.tool_names().iter().any(|n| n == "skill"));
+
+        // allowed-tools present but omitting `skill` → narrowed away. (Note: there is no
+        // `Skill`→`skill` alias in permission_def::normalize_tool — lowercase only.)
+        let narrowed = narrow_for_command(kept, &Some(vec!["fs.read".to_string()]));
+        assert!(!narrowed.tool_names().iter().any(|n| n == "skill"));
+    }
+
+    #[tokio::test]
     async fn command_allowed_tools_narrows_and_blocks_disallowed_injection() {
         use std::fs;
         let proj = tempfile::tempdir().unwrap();
@@ -1139,6 +1152,83 @@ mod tests {
                 .to_string()
                 .contains("file injection `@target.txt`"),
             "expected the fs.read injection to be the failure cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_path_enforces_discovered_permissions() {
+        use std::fs;
+        // A settings.json `deny: Read(secret.txt)` rule must block the command's @-injection:
+        // before CLI-composition parity, run_command_in built its registry with
+        // PermissionRules::default() and this injection succeeded.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global config
+        fs::write(proj.path().join("secret.txt"), "s3cr3t").unwrap();
+        let claude = proj.path().join(".claude");
+        let cmds = claude.join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{ "permissions": { "deny": ["Read(secret.txt)"] } }"#,
+        )
+        .unwrap();
+        fs::write(cmds.join("peek.md"), "Show @secret.txt\n").unwrap();
+
+        let res = run_command_in(
+            "peek",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected the permissions deny rule to fail the @-injection closed, got: {res:?}"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("file injection `@secret.txt`"),
+            "expected the fs.read injection to be the failure cause, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_path_fires_pretooluse_hook_on_injection() {
+        use std::fs;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping command-path hook test: no OS sandbox backend");
+            return;
+        }
+        // A blocking PreToolUse hook on `bash` must abort the command's !`…` injection —
+        // hooks now wrap the --command path's composed registry, same as spine/serve.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        let cmds = claude.join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        fs::write(cmds.join("shell.md"), "Result: !`echo hi`\n").unwrap();
+
+        let res = run_command_in(
+            "shell",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected the PreToolUse hook to block the bash injection, got: {res:?}"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("command injection `!echo hi` failed")
+                && msg.contains("blocked by PreToolUse hook"),
+            "expected a hook-blocked bash injection, got: {msg}"
         );
     }
 
