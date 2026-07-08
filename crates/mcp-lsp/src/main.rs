@@ -1098,3 +1098,103 @@ mod rust_analyzer_integration {
         assert!(hover.is_some(), "expected hover info for `greet`");
     }
 }
+
+#[cfg(test)]
+mod gopls_integration {
+    use super::*;
+
+    fn gopls_available() -> bool {
+        std::process::Command::new(lang::resolved_bin(&lang::GOPLS))
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn go_diagnostics_round_trip() {
+        if !gopls_available() {
+            eprintln!("skipping: gopls not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module fixture\n\ngo 1.21\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc main() {\n\tdoesNotExist()\n}\n",
+        )
+        .unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout("main.go".to_string(), std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!timed_out, "gopls did not respond within 60s");
+        assert!(!diags.is_empty(), "expected a diagnostic for the undefined symbol");
+    }
+}
+
+#[cfg(test)]
+mod pyright_integration {
+    use super::*;
+
+    fn pyright_available() -> bool {
+        std::process::Command::new(lang::resolved_bin(&lang::PYRIGHT))
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn python_diagnostics_round_trip() {
+        if !pyright_available() {
+            eprintln!("skipping: pyright-langserver not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x: int = \"not an int\"\n").unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout("a.py".to_string(), std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!timed_out, "pyright did not respond within 60s");
+        assert!(!diags.is_empty(), "expected a type diagnostic");
+    }
+}
+
+#[cfg(test)]
+mod typescript_integration {
+    use super::*;
+
+    fn tsserver_available() -> bool {
+        std::process::Command::new(lang::resolved_bin(&lang::TYPESCRIPT))
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn typescript_diagnostics_round_trip() {
+        if !tsserver_available() {
+            eprintln!("skipping: typescript-language-server not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\":{\"strict\":true}}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a.ts"), "const x: number = \"nope\";\n").unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout("a.ts".to_string(), std::time::Duration::from_secs(45))
+            .await
+            .unwrap();
+        assert!(!timed_out, "typescript-language-server did not respond within 45s");
+        assert!(!diags.is_empty(), "expected a type diagnostic");
+    }
+}
