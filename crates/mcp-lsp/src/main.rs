@@ -433,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
     // Canonicalize once so the rootUri sent to rust-analyzer matches the document URIs
     // LspServer derives from its (internally canonicalized) root, even under symlinks.
     let root = std::fs::canonicalize(&root)?;
-    let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin())?;
+    let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin(), &[])?;
     lsp.initialize(&root).await?;
     let server = LspServer::new(lsp, root);
     let service = server.serve(rmcp::transport::io::stdio()).await?;
@@ -785,7 +785,7 @@ mod rust_analyzer_integration {
         )
         .unwrap();
 
-        let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin()).unwrap();
+        let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin(), &[]).unwrap();
         lsp.initialize(dir.path()).await.unwrap();
         let server = LspServer::new(lsp, dir.path().to_path_buf());
 

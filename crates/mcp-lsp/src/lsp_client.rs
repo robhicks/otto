@@ -271,14 +271,16 @@ pub fn path_to_file_uri(path: &std::path::Path) -> anyhow::Result<lsp_types::Uri
         .map_err(|e| anyhow::anyhow!("bad file uri for {}: {e}", abs.display()))
 }
 
-/// Spawn `bin` as a child process and wire an `LspClient` to its stdio.
-pub fn spawn_process(bin: &str) -> anyhow::Result<(LspClient, tokio::process::Child)> {
+/// Spawn `bin args…` as a child process and wire an `LspClient` to its stdio.
+pub fn spawn_process(
+    bin: &str,
+    args: &[&str],
+) -> anyhow::Result<(LspClient, tokio::process::Child)> {
     let mut child = tokio::process::Command::new(bin)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        // Early-error paths (e.g. `initialize` failing) drop the Child — kill the server then
-        // rather than leaving it lingering until it notices stdin EOF.
         .kill_on_drop(true)
         .spawn()?;
     let stdin = child
@@ -532,6 +534,6 @@ mod tests {
 
     #[test]
     fn spawn_process_with_bogus_binary_errors() {
-        assert!(spawn_process("definitely-not-a-real-binary-xyz").is_err());
+        assert!(spawn_process("definitely-not-a-real-binary-xyz", &[]).is_err());
     }
 }
