@@ -414,8 +414,8 @@ fn capabilities_from_env(
 
 /// Derive the running engine's capabilities from the environment `build_router` reads, plus
 /// the OS sandbox probe. Lives in the wiring layer (not core) because it reads `OTTO_*` /
-/// `ANTHROPIC_API_KEY`. Mirrors `session_config`'s predicates so a session's recorded config
-/// and its reported capabilities stay consistent.
+/// the provider API keys (via `select_remote`). Mirrors `session_config`'s predicates so a
+/// session's recorded config and its reported capabilities stay consistent.
 pub fn build_capabilities() -> CapabilitiesManifest {
     capabilities_from_env(
         std::env::var("OTTO_OLLAMA").ok().as_deref(),
@@ -500,8 +500,8 @@ mod tests {
     #[tokio::test]
     async fn default_build_router_is_offline_and_deterministic() {
         // Ensure the env that would select real backends is absent for this test.
-        // SAFETY: there are exactly two tests in this lib's test binary that touch
-        // OTTO_OLLAMA / ANTHROPIC_API_KEY: this one and
+        // SAFETY: there are exactly two tests in this lib's test binary that touch these
+        // provider-selection vars: this one and
         // `model_override_without_key_is_offline_and_deterministic`. Both only ever
         // REMOVE these vars (removing an absent var is idempotent), so ordering is
         // irrelevant and they cannot race destructively. Do not add a test here that
@@ -509,6 +509,9 @@ mod tests {
         unsafe {
             std::env::remove_var("OTTO_OLLAMA");
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("OTTO_REMOTE_PROVIDER");
         }
         let router = build_router();
         let a = router
@@ -541,8 +544,11 @@ mod tests {
         unsafe {
             std::env::remove_var("OTTO_OLLAMA");
             std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("OTTO_REMOTE_PROVIDER");
         }
-        // Naming a model with no ANTHROPIC_API_KEY must NOT change routing: it falls back to the
+        // Naming a model with no provider key must NOT change routing: it falls back to the
         // offline local router (a warning is printed to stderr, not asserted here).
         let router = build_router_with_model(Some("claude-opus-4-8"));
         let a = router
