@@ -396,32 +396,20 @@ async fn run_custom_agent_in(
     use std::collections::HashMap;
 
     let ext = otto_extensions::discover(&root, &home);
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on this path \
-             (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
-    if !ext.permissions.is_empty() {
-        eprintln!(
-            "warning: settings.json permissions are configured but are NOT enforced on \
-             this path (permissions are wired only on the `otto run` spine for now)."
-        );
-    }
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
     // Pin the remote model to the top-level `--agent`'s `model:` field. Nested Task
     // sub-dispatches inherit this same pinned router (per-sub-agent model is deferred).
     let mut model_override: Option<String> = None;
-    for def in ext.agents {
+    for def in &ext.agents {
         if def.name == name {
             model_override = def.model.clone();
         }
         allowlists.insert(def.name.clone(), def.tools.clone());
         registry.register(
             Role::Custom(def.name.clone()),
-            Arc::new(MarkdownAgent::new(def)),
+            Arc::new(MarkdownAgent::new(def.clone())),
         );
     }
 
@@ -437,16 +425,11 @@ async fn run_custom_agent_in(
     );
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
-    // `otto serve` (via build_composed_tools); the --agent/--command paths are deferred (extensions
-    // hooks slice).
-    let (base_tools, _mcp) = build_tools_preferring_mcp(
-        tools_ws,
-        root,
-        false,
-        &otto_extensions::PermissionRules::default(),
-    )
-    .await;
+    // The same composed registry the spine/serve paths use (permissions PolicyGate, skills,
+    // hooks, plugin MCP servers). TaskTool then narrows it per-agent via `tools:` allowlists —
+    // mirroring serve's run_agent_with_controls, which hands TaskTool the server's composed
+    // registry. _mcp is held until end of function so the mcp children stay alive.
+    let (base_tools, _mcp) = build_composed_tools(&ext, tools_ws, root, false).await;
 
     let task = TaskTool::new(
         router,
@@ -776,6 +759,53 @@ mod tests {
         assert!(
             ok.is_ok(),
             "expected model-pinned agent to run offline: {ok:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_custom_agent_dispatches_with_full_extensions_configured() {
+        use std::fs;
+        // Permissions + skills + hooks all configured: the agent path must build its composed
+        // registry (PolicyGate, skill tool, hook wrap) and still complete an offline one-shot
+        // dispatch. Guards the --agent composition against breaking the deterministic path.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        let agents = claude.join("agents");
+        let skill_dir = claude.join("skills").join("greeter");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{
+                "permissions": { "deny": ["Write(dist/**)"] },
+                "hooks": { "PostToolUse": [
+                    {"matcher": "fs.read", "hooks": [{"type": "command", "command": "true"}]}
+                ] }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+        fs::write(
+            agents.join("echoer.md"),
+            "---\nname: echoer\ndescription: echoes\ntools: fs.read\n---\nYou are an echo agent.\n",
+        )
+        .unwrap();
+
+        let ok = run_custom_agent_in(
+            "echoer",
+            "hello",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected dispatch to succeed under full composition: {ok:?}"
         );
     }
 
