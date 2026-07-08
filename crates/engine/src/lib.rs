@@ -375,23 +375,22 @@ fn build_tool_registry_inner(
 }
 
 /// Snapshot the provider-selection environment into JSON for a session's `config` column.
-/// Mirrors the env that `build_router` reads (without re-running provider selection), so a
-/// stored session records which backends it was configured to use. This lives in the wiring
-/// layer (not core) because it reads `OTTO_*` / `ANTHROPIC_API_KEY`.
+/// Mirrors the env that `build_router` reads (re-running remote selection so the record matches
+/// the routing), so a stored session records which backends it was configured to use. Lives in
+/// the wiring layer (not core) because it reads `OTTO_*` / provider API keys.
 pub fn session_config() -> serde_json::Value {
     let ollama = std::env::var("OTTO_OLLAMA").as_deref() == Ok("1");
-    let anthropic = std::env::var("ANTHROPIC_API_KEY")
-        .map(|k| !k.is_empty())
-        .unwrap_or(false);
+    let remote = select_remote();
     serde_json::json!({
         "ollama": ollama,
-        "anthropic": anthropic,
-        // Record the EFFECTIVE model (the build_router default when the env var is unset),
+        "remote": remote.is_some(),
+        // The resolved remote provider id ("anthropic"|"openai"|"gemini") or "none".
+        "remote_provider": remote.map(RemoteChoice::id).unwrap_or("none"),
+        // Record the EFFECTIVE models (the build_router defaults when the env vars are unset),
         // so a restored session's config reflects the routing it actually used.
         "ollama_model": std::env::var("OTTO_OLLAMA_MODEL")
             .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string()),
-        "anthropic_model": std::env::var("OTTO_ANTHROPIC_MODEL")
-            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string()),
+        "remote_model": remote.map(default_model_for).unwrap_or_else(|| "none".to_string()),
     })
 }
 
@@ -402,13 +401,13 @@ pub fn session_config() -> serde_json::Value {
 /// that computes its own manifest with `engine_remote = true`.
 fn capabilities_from_env(
     otto_ollama: Option<&str>,
-    anthropic_key: Option<&str>,
+    remote_llm: bool,
     sandbox: bool,
 ) -> CapabilitiesManifest {
     CapabilitiesManifest {
         engine_remote: false,
         local_llm: otto_ollama == Some("1"),
-        remote_llm: anthropic_key.map(|k| !k.is_empty()).unwrap_or(false),
+        remote_llm,
         sandbox,
     }
 }
@@ -420,7 +419,7 @@ fn capabilities_from_env(
 pub fn build_capabilities() -> CapabilitiesManifest {
     capabilities_from_env(
         std::env::var("OTTO_OLLAMA").ok().as_deref(),
-        std::env::var("ANTHROPIC_API_KEY").ok().as_deref(),
+        select_remote().is_some(),
         os_sandbox_available(),
     )
 }
@@ -637,11 +636,11 @@ mod tests {
 
     #[test]
     fn capabilities_from_env_maps_flags() {
-        // Pure mapping — takes raw env inputs, touches no process-global env, so it does
-        // NOT race the env-reading router test in this same binary.
+        // Pure mapping — takes raw inputs, touches no process-global env, so it does NOT race
+        // the env-reading router test in this same binary.
         // Nothing set → fully offline, local engine, no sandbox.
         assert_eq!(
-            capabilities_from_env(None, None, false),
+            capabilities_from_env(None, false, false),
             CapabilitiesManifest {
                 engine_remote: false,
                 local_llm: false,
@@ -650,13 +649,14 @@ mod tests {
             }
         );
         // OTTO_OLLAMA must equal exactly "1" to count as a local LLM.
-        assert!(capabilities_from_env(Some("1"), None, false).local_llm);
-        assert!(!capabilities_from_env(Some("0"), None, false).local_llm);
-        // A non-empty ANTHROPIC_API_KEY means a remote LLM; an empty one does not.
-        assert!(capabilities_from_env(None, Some("sk-xyz"), false).remote_llm);
-        assert!(!capabilities_from_env(None, Some(""), false).remote_llm);
+        assert!(capabilities_from_env(Some("1"), false, false).local_llm);
+        assert!(!capabilities_from_env(Some("0"), false, false).local_llm);
+        // remote_llm now reflects "a remote provider is selectable" (any of the three keys /
+        // a valid selector), computed by the caller via select_remote().is_some().
+        assert!(capabilities_from_env(None, true, false).remote_llm);
+        assert!(!capabilities_from_env(None, false, false).remote_llm);
         // sandbox passes through unchanged.
-        assert!(capabilities_from_env(None, None, true).sandbox);
+        assert!(capabilities_from_env(None, false, true).sandbox);
     }
 
     #[tokio::test]
