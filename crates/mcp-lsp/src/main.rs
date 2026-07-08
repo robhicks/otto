@@ -1130,7 +1130,10 @@ mod gopls_integration {
             .await
             .unwrap();
         assert!(!timed_out, "gopls did not respond within 60s");
-        assert!(!diags.is_empty(), "expected a diagnostic for the undefined symbol");
+        assert!(
+            !diags.is_empty(),
+            "expected a diagnostic for the undefined symbol"
+        );
     }
 }
 
@@ -1203,7 +1206,10 @@ mod typescript_integration {
                 return;
             }
         };
-        assert!(!timed_out, "typescript-language-server did not respond within 45s");
+        assert!(
+            !timed_out,
+            "typescript-language-server did not respond within 45s"
+        );
         assert!(!diags.is_empty(), "expected a type diagnostic");
     }
 }
