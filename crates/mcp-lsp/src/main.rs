@@ -65,12 +65,17 @@ struct ReadyServer {
     _child: Option<tokio::process::Child>,
 }
 
+/// One language server's lazily-spawned slot: `None` until first use, then the ready client.
+type ServerSlot = Arc<Mutex<Option<ReadyServer>>>;
+/// server key → its slot.
+type SlotMap = Arc<Mutex<HashMap<&'static str, ServerSlot>>>;
+
 #[derive(Clone)]
 pub struct LspServer {
     /// server key → its lazily-spawned slot. The outer lock is held only to get-or-insert a
     /// slot; the slow spawn+initialize happens under the per-key inner lock, so a cold `gopls`
     /// never blocks a warm `rust-analyzer` call.
-    slots: Arc<Mutex<HashMap<&'static str, Arc<Mutex<Option<ReadyServer>>>>>>,
+    slots: SlotMap,
     /// server keys whose binary is definitely not on PATH — a permanent negative cache (avoids
     /// spawn hammering). Spawn/init errors are NOT cached here; they stay retry-eligible.
     absent: Arc<Mutex<HashSet<&'static str>>>,
@@ -146,11 +151,18 @@ impl LspServer {
         Ok(client)
     }
 
-    /// Drop a cached client (its server process died) so the next call re-spawns.
-    async fn evict(&self, key: &'static str) {
+    /// Drop `dead` from the cache — but only if it's still the client actually cached (a
+    /// concurrent respawn may have already replaced it with a healthy one).
+    async fn evict(&self, key: &'static str, dead: &Arc<LspClient>) {
         let slot = self.slots.lock().await.get(key).cloned();
         if let Some(slot) = slot {
-            *slot.lock().await = None;
+            let mut guard = slot.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|ready| Arc::ptr_eq(&ready.client, dead))
+            {
+                *guard = None;
+            }
         }
     }
 
@@ -188,7 +200,7 @@ impl LspServer {
     }
 
     #[cfg(test)]
-    async fn slot_handle_for_test(&self, key: &'static str) -> Arc<Mutex<Option<ReadyServer>>> {
+    async fn slot_handle_for_test(&self, key: &'static str) -> ServerSlot {
         let mut slots = self.slots.lock().await;
         slots
             .entry(key)
@@ -273,7 +285,7 @@ impl LspServer {
         };
 
         if let Err(e) = client.notify(method, params).await {
-            self.evict(spec.key).await;
+            self.evict(spec.key, &client).await;
             return Err(e);
         }
         Ok((client, uri_str, generation))
@@ -298,7 +310,7 @@ impl LspServer {
         let (diags, timed_out) = client.wait_for_diagnostics(&uri, generation, wait).await;
         if timed_out && !client.is_alive() {
             if let Some(spec) = self.spec_for(&path) {
-                self.evict(spec.key).await;
+                self.evict(spec.key, &client).await;
             }
         }
         let out = diags
@@ -358,10 +370,10 @@ impl LspServer {
     }
 
     /// Evict `path`'s server if a request failed against a now-dead client.
-    async fn evict_if_dead(&self, path: &str, client: &LspClient, failed: bool) {
+    async fn evict_if_dead(&self, path: &str, client: &Arc<LspClient>, failed: bool) {
         if failed && !client.is_alive() {
             if let Some(spec) = self.spec_for(path) {
-                self.evict(spec.key).await;
+                self.evict(spec.key, client).await;
             }
         }
     }
