@@ -327,13 +327,14 @@ registers each artifact into an existing otto primitive — there is no parallel
 format:
 
 - `agents/*.md` → `AgentRegistry` as `Role::Custom(name)` (honors per-agent tool allowlist + model).
-- `commands/*.md` → command registry (recursive, namespaced `git:commit`); expanded (`$ARGUMENTS`/`$1..$9` + gated `!bash`/`@file` injection) and run as a spine turn via `otto run --command`. (`model`/`allowed-tools` preserved, not yet routed/enforced.)
+- `commands/*.md` → command registry (recursive, namespaced `git:commit`); expanded (`$ARGUMENTS`/`$1..$9` + gated `!bash`/`@file` injection) and run as a spine turn via `otto run --command`. (`model` routed via `PinnedModelRouter`; `allowed-tools` enforced via `ToolRegistry::subset`.)
 - `skills` (`SKILL.md` + resources) → discovered one-level (`skills/<name>/SKILL.md`, project overrides user by name) and exposed via a built-in gated `skill` tool returning `instructions` + `resource_dir`; bundled resources read lazily through gated `fs.read`. (`allowed-tools` parsed, inert until the permissions slice.)
 - `settings.json` hooks → discovered (`PreToolUse`/`PostToolUse`, concatenated across user+project)
   and fired around tool dispatch via a `HookedTool` decorator, executed through the shared OS
   sandbox; a `PreToolUse` hook may block a call (exit 2), `PostToolUse` observes. Hooks compose
-  *below* the permission gate (deny-only). Lifecycle hooks, JSON-stdout control, the
-  `--command`/`--agent` run subpaths, and serve-path wiring are pending.
+  *below* the permission gate (deny-only). Enforced on every entrypoint (spine, serve, and the
+  `--command`/`--agent` subpaths, all via the shared `build_composed_tools`). Lifecycle hooks,
+  JSON-stdout control, regex matchers, and `settings.local.json` are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → discovered from on-disk marketplaces under
   `.claude/plugins/marketplaces/`, gated by the `enabledPlugins` allowlist in `settings.json`, and
