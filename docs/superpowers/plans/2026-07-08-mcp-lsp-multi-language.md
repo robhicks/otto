@@ -4,21 +4,21 @@
 
 **Goal:** Generalize the `mcp-lsp` MCP server from a single hardcoded `rust-analyzer` client to a lazy, per-language client registry routing each file to the right language server (Rust/TS/JS/Python/Go) by extension — no new tools, no protocol change.
 
-**Architecture:** A pure language table (`lang.rs`: extension → server + LSP languageId, PATH resolver) drives a lazy per-key client registry in `LspServer` (`main.rs`). Each language server spawns on first use behind a per-key lock (so a cold `gopls` never blocks a warm `rust-analyzer`), with a per-server cold-start diagnostics budget, retry-eligible spawn failures, crashed-client eviction, and a startup PATH gate that keeps the whole `lsp.*` toolset absent when no server is installed. `lsp_client.rs` gains a `spawn_process` args param and a defensive `MethodNotFound` reply that protects the load-bearing default-capabilities invariant.
+**Architecture:** A pure language table (`lang.rs`: extension → server + LSP languageId, PATH resolver) drives a lazy per-key client registry in `LspServer` (`main.rs`). Each language server spawns on first use behind a per-key lock (so a cold `gopls` never blocks a warm `rust-analyzer`), with a per-server cold-start diagnostics budget, retry-eligible spawn failures vs a permanent absent cache, and crashed-client eviction. `lsp_client.rs` gains a `spawn_process` args param, a synchronous liveness flag (flipped on write failure), and a defensive `MethodNotFound` reply protecting the load-bearing default-capabilities invariant. A startup PATH gate keeps the whole `lsp.*` toolset absent when no server is installed.
 
-**Tech Stack:** Rust (edition 2024), tokio, rmcp (stdio MCP server), lsp-types, serde_json, tempfile (tests). Design: `docs/superpowers/specs/2026-07-08-mcp-lsp-multi-language-design.md`.
+**Tech Stack:** Rust (edition 2024), tokio 1.52, rmcp (stdio MCP server), lsp-types, serde_json, tempfile (tests). Design: `docs/superpowers/specs/2026-07-08-mcp-lsp-multi-language-design.md`.
 
 ---
 
 ## File structure
 
-- `crates/mcp-lsp/src/lang.rs` — **new.** Pure, no I/O beyond a PATH filesystem probe: `ServerSpec`, the four server consts, `config_for_extension`, `resolved_bin`, `resolve_executable`, `any_server_available`. Fully unit-testable.
-- `crates/mcp-lsp/src/lsp_client.rs` — **modify.** `spawn_process(bin, args)`; shared `Arc<Mutex>` writer so the reader loop can reply; defensive `MethodNotFound` reply to unknown server→client requests; an `is_alive()` liveness flag; documented capabilities invariant on `initialize`.
-- `crates/mcp-lsp/src/main.rs` — **modify.** `mod lang;`; replace the single `lsp` field with the lazy per-key registry (`ReadyServer`, `slots`, `absent`, `served_diag`); `LspServer::new(root)`; `seed_ready_for_test`; `get_or_spawn`; `evict`; rewrite `open_if_needed` to route by extension and return the client; rewire `do_*`; per-server first-open diagnostics budget; the PATH-gate in `main()`. Rewrite the `duplex_server` helper + the `rust_analyzer_integration` test; add per-language integration tests.
-- `crates/engine/src/mcp.rs` — **modify (test only).** A test that a child which exits before the MCP handshake surfaces through `connect_lsp` as `Err`.
-- `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/superpowers/specs/2026-07-07-mcp-lsp-design.md` — **modify (docs).**
+- `crates/mcp-lsp/src/lang.rs` — **new.** Pure logic (one PATH filesystem probe): `ServerSpec`, the four server consts, `config_for_extension`, `resolved_bin`/`resolved_bin_with`, `resolve_executable`, `any_server_available`. Fully unit-testable without spawning a server.
+- `crates/mcp-lsp/src/lsp_client.rs` — **modify.** `spawn_process(bin, args)`; a shared `Arc<Mutex>` writer so the reader loop can reply; a synchronous `alive` flag (flipped on write error AND on reader EOF) + `is_alive()`; a defensive `MethodNotFound` reply to unknown server→client requests; documented capabilities invariant on `initialize`.
+- `crates/mcp-lsp/src/main.rs` — **modify.** `mod lang;`; replace the single `lsp` field with the lazy per-key registry; dispatch, timeouts, eviction, the PATH gate, and all tests.
+- `crates/engine/src/mcp.rs` — **modify (test only).**
+- `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/superpowers/specs/2026-07-07-mcp-lsp-design.md` — **docs.**
 
-Each task ends green (build + relevant tests) and is committed. Run all commands from the repo root `/home/robhicks/dev/otto-next`.
+Run all commands from the repo root `/home/robhicks/dev/otto-next`. Tasks 1–4 each end green and committed independently. **Task 5 is one atomic refactor** (struct-field change + all its usages + `main()` + tests) — it is the only large task and has a single build/test/commit at its end; it cannot be split into compiling sub-checkpoints.
 
 ---
 
@@ -30,7 +30,7 @@ Each task ends green (build + relevant tests) and is committed. Run all commands
 
 - [ ] **Step 1: Change the signature and pass args**
 
-In `crates/mcp-lsp/src/lsp_client.rs`, change `spawn_process`:
+In `crates/mcp-lsp/src/lsp_client.rs`, rewrite `spawn_process`:
 
 ```rust
 /// Spawn `bin args…` as a child process and wire an `LspClient` to its stdio.
@@ -60,8 +60,6 @@ pub fn spawn_process(
 
 - [ ] **Step 2: Update the `spawn_process` test in `lsp_client.rs`**
 
-Change `spawn_process_with_bogus_binary_errors` to:
-
 ```rust
     #[test]
     fn spawn_process_with_bogus_binary_errors() {
@@ -71,7 +69,7 @@ Change `spawn_process_with_bogus_binary_errors` to:
 
 - [ ] **Step 3: Update the two call sites in `main.rs`**
 
-In `main.rs`, `main()` currently has `let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin())?;` and the `rust_analyzer_integration` test has `spawn_process(&rust_analyzer_bin()).unwrap()`. Add `, &[]` to both so the crate compiles: `spawn_process(&rust_analyzer_bin(), &[])`. (Both call sites are rewritten later — Tasks 8 and 6 — this only keeps the build green now.)
+`main.rs` currently has (in `main()`) `let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin())?;` and (in the `rust_analyzer_integration` test) `spawn_process(&rust_analyzer_bin()).unwrap()`. Add `, &[]` to both so the crate compiles now: `spawn_process(&rust_analyzer_bin(), &[])`. (Both call sites are fully rewritten in Task 5.)
 
 - [ ] **Step 4: Build and test**
 
@@ -93,7 +91,7 @@ git commit -m "refactor(mcp-lsp): spawn_process takes an args slice"
 - Create: `crates/mcp-lsp/src/lang.rs`
 - Modify: `crates/mcp-lsp/src/main.rs` (add `mod lang;`)
 
-- [ ] **Step 1: Create `lang.rs` with the table and a failing test**
+- [ ] **Step 1: Create `lang.rs`**
 
 Create `crates/mcp-lsp/src/lang.rs`:
 
@@ -117,10 +115,10 @@ pub struct ServerSpec {
     pub args: &'static [&'static str],
     /// Env var whose value, if set, replaces `default_bin` (a bare executable path — no argv).
     pub env_override: &'static str,
-    /// Timeout budget for the FIRST `lsp.diagnostics` call against this server, before its
-    /// index is warm. Cold pyright/gopls indexing routinely exceeds the 15s steady-state
-    /// default; a too-short budget returns `{diagnostics: [], timed_out: true}`, which reads as
-    /// falsely "clean".
+    /// Timeout budget for the FIRST `lsp.diagnostics` call against this server, before its index
+    /// is warm. Cold pyright/gopls indexing routinely exceeds the 15s steady-state default; a
+    /// too-short budget returns `{diagnostics: [], timed_out: true}`, which reads as falsely
+    /// "clean".
     pub first_open_diag_timeout: Duration,
 }
 
@@ -174,9 +172,15 @@ pub fn config_for_extension(ext: &str) -> Option<(&'static ServerSpec, &'static 
     }
 }
 
+/// The executable for `spec`, given an optional override value (the `env_override`'s value).
+/// Pure — the env read lives in `resolved_bin`, so this is directly testable.
+pub fn resolved_bin_with(spec: &ServerSpec, override_val: Option<String>) -> String {
+    override_val.unwrap_or_else(|| spec.default_bin.to_string())
+}
+
 /// The executable to spawn for `spec`: the `env_override` value if set, else `default_bin`.
 pub fn resolved_bin(spec: &ServerSpec) -> String {
-    std::env::var(spec.env_override).unwrap_or_else(|_| spec.default_bin.to_string())
+    resolved_bin_with(spec, std::env::var(spec.env_override).ok())
 }
 
 #[cfg(test)]
@@ -215,16 +219,19 @@ mod tests {
     }
 
     #[test]
-    fn resolved_bin_defaults_without_an_override() {
-        // GOPLS's env var is very unlikely to be set in the test environment.
-        assert_eq!(resolved_bin(&GOPLS), "gopls");
+    fn resolved_bin_defaults_without_an_override_and_honors_one() {
+        assert_eq!(resolved_bin_with(&GOPLS, None), "gopls");
+        assert_eq!(
+            resolved_bin_with(&PYRIGHT, Some("/opt/custom-pyright".to_string())),
+            "/opt/custom-pyright"
+        );
     }
 }
 ```
 
 - [ ] **Step 2: Register the module**
 
-In `crates/mcp-lsp/src/main.rs`, add near the top with the other `mod` declaration (`mod lsp_client;`):
+In `crates/mcp-lsp/src/main.rs`, next to the existing `mod lsp_client;`, add:
 
 ```rust
 mod lang;
@@ -233,7 +240,7 @@ mod lang;
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test -p otto-mcp-lsp lang::`
-Expected: PASS (all four `lang::tests`).
+Expected: PASS.
 
 - [ ] **Step 4: Commit**
 
@@ -244,14 +251,14 @@ git commit -m "feat(mcp-lsp): language dispatch table (ext -> server, languageId
 
 ---
 
-### Task 3: `lang.rs` — PATH executable resolver + availability gate helper
+### Task 3: `lang.rs` — PATH executable resolver + availability gate
 
 **Files:**
 - Modify: `crates/mcp-lsp/src/lang.rs`
 
-- [ ] **Step 1: Add the resolver and its tests (Unix)**
+- [ ] **Step 1: Add the resolver and gate helper (Unix)**
 
-Append to `lang.rs` (before the `#[cfg(test)] mod tests`):
+Append to `lang.rs`, before `#[cfg(test)] mod tests`:
 
 ```rust
 /// Resolve `bin` to an executable file using a minimal PATH search. If `bin` contains a path
@@ -309,8 +316,10 @@ pub fn any_server_available() -> bool {
         let bin = dir.path().join("myserver");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         make_executable(&bin);
-        let path_var = dir.path().to_str().unwrap();
-        assert_eq!(resolve_executable("myserver", path_var), Some(bin));
+        assert_eq!(
+            resolve_executable("myserver", dir.path().to_str().unwrap()),
+            Some(bin)
+        );
     }
 
     #[test]
@@ -318,8 +327,7 @@ pub fn any_server_available() -> bool {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("myserver");
         std::fs::write(&bin, "not executable").unwrap(); // default 0o644
-        let path_var = dir.path().to_str().unwrap();
-        assert!(resolve_executable("myserver", path_var).is_none());
+        assert!(resolve_executable("myserver", dir.path().to_str().unwrap()).is_none());
     }
 
     #[test]
@@ -328,12 +336,10 @@ pub fn any_server_available() -> bool {
         let bin = dir.path().join("custom-ra");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         make_executable(&bin);
-        // A value with a '/' is checked directly, ignoring PATH.
         assert_eq!(
             resolve_executable(bin.to_str().unwrap(), ""),
             Some(bin.clone())
         );
-        // ...and fails if that exact file isn't executable.
         let plain = dir.path().join("plain");
         std::fs::write(&plain, "x").unwrap();
         assert!(resolve_executable(plain.to_str().unwrap(), "").is_none());
@@ -345,8 +351,6 @@ pub fn any_server_available() -> bool {
         assert!(resolve_executable("definitely-not-here", dir.path().to_str().unwrap()).is_none());
     }
 ```
-
-Note: `tempfile` is already a dev-dependency of `otto-mcp-lsp`.
 
 - [ ] **Step 3: Run the tests**
 
@@ -360,18 +364,26 @@ git add crates/mcp-lsp/src/lang.rs
 git commit -m "feat(mcp-lsp): PATH executable resolver + availability gate helper"
 ```
 
+Note: `any_server_available` is unused until Task 5, so Tasks 3–4 build with a `dead_code` warning on it (tests still pass). Task 5 wires it; the Task 9 clippy sweep confirms clean.
+
 ---
 
-### Task 4: `lsp_client.rs` — liveness flag + defensive `MethodNotFound` reply
+### Task 4: `lsp_client.rs` — synchronous liveness + defensive `MethodNotFound` reply
 
 **Files:**
 - Modify: `crates/mcp-lsp/src/lsp_client.rs`
 
-The reader loop must be able to write a reply, so the writer becomes a shared `Arc<Mutex>`. A liveness flag flips false when the read stream closes (server died), so callers can evict a dead client.
+The reader loop must reply to server→client requests (so a capability-mismatched server never stalls), which requires a shared writer. A liveness flag flips **synchronously on any write failure** (so eviction callers get an unambiguous death signal without waiting on the async reader) and also on reader EOF.
 
-- [ ] **Step 1: Share the writer and add the liveness flag**
+- [ ] **Step 1: Import `AtomicBool` and change the fields**
 
-In `LspClient`, change the fields:
+Change the existing atomic import line to include `AtomicBool`:
+
+```rust
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+```
+
+Change `LspClient`'s fields:
 
 ```rust
 pub struct LspClient {
@@ -380,11 +392,59 @@ pub struct LspClient {
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     diagnostics: Arc<Mutex<HashMap<String, DiagEntry>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
-    alive: Arc<std::sync::atomic::AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 ```
 
-In `spawn`, build the shared writer and the flag, clone them into the reader task, and reply to unknown server→client requests:
+- [ ] **Step 2: Write a failing test for the defensive reply**
+
+Add to `lsp_client.rs`'s `#[cfg(test)] mod tests`:
+
+```rust
+    #[tokio::test]
+    async fn reader_replies_method_not_found_to_unknown_server_requests() {
+        let (client, server_end) = duplex_client();
+        let (sr, mut sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+
+        write_message(
+            &mut sw,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "workspace/configuration",
+                "params": {}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reply = read_message(&mut sr).await.unwrap();
+        assert_eq!(reply["id"], 99);
+        assert_eq!(reply["error"]["code"], -32601);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn write_failure_marks_the_client_dead() {
+        let (client, server_end) = duplex_client();
+        assert!(client.is_alive());
+        drop(server_end); // pipe closed synchronously
+        let _ = client
+            .notify("textDocument/didOpen", serde_json::json!({}))
+            .await;
+        assert!(!client.is_alive());
+    }
+```
+
+- [ ] **Step 3: Run to verify they fail**
+
+Run: `cargo test -p otto-mcp-lsp lsp_client:: -- reader_replies write_failure`
+Expected: FAIL to compile (`is_alive` not defined) / fail assertions — the reply and flag don't exist yet.
+
+- [ ] **Step 4: Implement the shared writer, liveness flag, and defensive reply in `spawn`**
+
+Rewrite `LspClient::spawn`:
 
 ```rust
     pub fn spawn<R, W>(reader: R, writer: W) -> Self
@@ -399,7 +459,7 @@ In `spawn`, build the shared writer and the flag, clone them into the reader tas
         let generations: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
             Arc::new(Mutex::new(Box::new(writer)));
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let reader_pending = Arc::clone(&pending);
         let reader_diagnostics = Arc::clone(&diagnostics);
@@ -450,7 +510,7 @@ In `spawn`, build the shared writer and the flag, clone them into the reader tas
                 }
                 // A server->client *request* (has both `id` and `method`) we don't handle. The
                 // client advertises minimal capabilities specifically so well-behaved servers
-                // gate these on capability and don't send them (see `initialize`), but reply
+                // gate these on capability and don't send them (see `initialize`); reply
                 // defensively so a capability-mismatched server never blocks on an unanswered
                 // request. Notifications (method, no id) other than publishDiagnostics are ignored.
                 if let Some(id) = msg.get("id") {
@@ -476,28 +536,34 @@ In `spawn`, build the shared writer and the flag, clone them into the reader tas
     }
 ```
 
-- [ ] **Step 2: Update `write` and add `is_alive`**
+- [ ] **Step 5: Flip liveness on write failure; add `is_alive`**
+
+Rewrite `write` and add `is_alive`:
 
 ```rust
     async fn write(&self, value: &Value) -> anyhow::Result<()> {
         let mut w = self.writer.lock().await;
-        write_message(&mut *w, value).await
+        let result = write_message(&mut *w, value).await;
+        if result.is_err() {
+            // A failed write means the server's pipe is closed — mark dead synchronously so
+            // callers can evict without racing the async reader loop.
+            self.alive.store(false, Ordering::SeqCst);
+        }
+        result
     }
 
-    /// False once the server's stream has closed (process exited). Callers use this to evict a
-    /// dead client and re-spawn on the next call instead of hanging on every request.
+    /// False once the server's stream has closed (process exited) or a write to it failed.
+    /// Callers evict a dead client and re-spawn on the next call instead of hanging.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 ```
 
-- [ ] **Step 3: Document the capabilities invariant on `initialize`**
+- [ ] **Step 6: Document the capabilities invariant on `initialize`**
 
-Prepend to `initialize`'s doc comment:
+Prepend to `initialize`'s doc comment (above the existing `/// Send `initialize`…` line):
 
 ```rust
-    /// Send `initialize` then `initialized`. `root` becomes the `rootUri`.
-    ///
     /// INVARIANT: this client answers no server→client *requests* (the reader loop only replies
     /// `MethodNotFound`). `capabilities` must therefore stay minimal — advertising a richer
     /// capability (pull diagnostics, `workspace/configuration`, dynamic registration) makes a
@@ -506,83 +572,40 @@ Prepend to `initialize`'s doc comment:
     /// `initializationOptions`.
 ```
 
-- [ ] **Step 4: Add the defensive-reply + liveness tests**
-
-Add to `lsp_client.rs`'s `#[cfg(test)] mod tests`:
-
-```rust
-    #[tokio::test]
-    async fn reader_replies_method_not_found_to_unknown_server_requests() {
-        let (client, server_end) = duplex_client();
-        let (sr, mut sw) = tokio::io::split(server_end);
-        let mut sr = BufReader::new(sr);
-
-        // Server → client request we don't handle.
-        write_message(
-            &mut sw,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 99,
-                "method": "workspace/configuration",
-                "params": {}
-            }),
-        )
-        .await
-        .unwrap();
-
-        let reply = read_message(&mut sr).await.unwrap();
-        assert_eq!(reply["id"], 99);
-        assert_eq!(reply["error"]["code"], -32601);
-        drop(client);
-    }
-
-    #[tokio::test]
-    async fn is_alive_flips_false_after_the_stream_closes() {
-        let (client, server_end) = duplex_client();
-        assert!(client.is_alive());
-        drop(server_end); // server side gone → reader hits EOF
-        // Give the reader task a moment to observe EOF.
-        for _ in 0..50 {
-            if !client.is_alive() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!client.is_alive());
-    }
-```
-
-(`duplex_client`, `BufReader`, and `Duration` are already imported in that test module.)
-
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 7: Run the tests**
 
 Run: `cargo test -p otto-mcp-lsp lsp_client::`
-Expected: PASS (existing client tests + the two new ones). The pre-existing `initialize`/`request`/diagnostics tests must stay green — the writer is now shared but behavior is unchanged.
+Expected: PASS — the two new tests plus every pre-existing client test (writer sharing is behavior-preserving).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add crates/mcp-lsp/src/lsp_client.rs
-git commit -m "feat(mcp-lsp): defensive MethodNotFound reply + client liveness flag"
+git commit -m "feat(mcp-lsp): synchronous liveness flag + defensive MethodNotFound reply"
 ```
 
 ---
 
-### Task 5: `main.rs` — lazy per-key client registry
+### Task 5: `main.rs` — lazy per-language registry, dispatch, gate (one atomic refactor)
+
+This replaces the single `lsp` field with the per-key registry and rewires everything that used it, patches `main()`, and lands all tests. It compiles only at the end — implement it in full before building.
 
 **Files:**
-- Modify: `crates/mcp-lsp/src/main.rs` (`LspServer` struct, `new`, `get_or_spawn`, `evict`, `seed_ready_for_test`)
+- Modify: `crates/mcp-lsp/src/main.rs`
 
-This task introduces the registry and its spawn/seed/evict machinery but does **not** yet rewire `open_if_needed`/`do_*` (Task 6) — so `open_if_needed` still references `self.lsp` and won't compile until Task 6. To keep this task independently green, implement the registry **alongside** the rewire in one commit if your workflow requires a compiling checkpoint; otherwise treat Tasks 5+6 as a single compile unit and run the build at the end of Task 6. (Subagent note: implement Task 5 and Task 6 back-to-back; the crate compiles only after Task 6.)
+- [ ] **Step 1: Fix the top-of-file imports (avoid E0252)**
 
-- [ ] **Step 1: Replace the struct fields and constructor**
-
-Replace the `LspServer` struct and `impl LspServer::new`:
+`main.rs` already has `use std::collections::HashMap;` and `use tokio::sync::Mutex;`. Change the collections import in place to add `HashSet` — do **not** add a second `use` for `HashMap`/`Mutex` anywhere:
 
 ```rust
 use std::collections::{HashMap, HashSet};
-use tokio::sync::Mutex;
+```
 
+- [ ] **Step 2: Replace the `LspServer` struct and `new`**
+
+Replace the existing `LspServer` struct and its `impl LspServer { pub fn new(...) }` with:
+
+```rust
 /// A spawned, initialized language server. `_child` is `Option` so a test can seed a
 /// duplex-backed client with no OS process (a pipe has nothing for kill_on_drop to protect).
 struct ReadyServer {
@@ -599,8 +622,8 @@ pub struct LspServer {
     /// server keys whose binary is definitely not on PATH — a permanent negative cache (avoids
     /// spawn hammering). Spawn/init errors are NOT cached here; they stay retry-eligible.
     absent: Arc<Mutex<HashSet<&'static str>>>,
-    /// server keys that have already returned a non-timed-out diagnostics result — after which
-    /// the steady-state (short) diagnostics budget applies instead of the cold-start budget.
+    /// server keys that have returned a non-timed-out diagnostics result — after which the
+    /// steady-state (short) diagnostics budget applies instead of the cold-start budget.
     served_diag: Arc<Mutex<HashSet<&'static str>>>,
     workspace: Arc<LocalWorkspace>,
     root: PathBuf,
@@ -621,11 +644,24 @@ impl LspServer {
     }
 ```
 
-- [ ] **Step 2: Add `get_or_spawn`, `evict`, and the test seam**
+- [ ] **Step 3: Add registry, dispatch, timeout, and eviction methods**
 
-Add these methods to `impl LspServer` (keep `uri_for`, `path_for`, etc.):
+Add these to `impl LspServer` (keep the existing `uri_for`, `path_for`, `goto_response_to_locations`, `render_hover_contents`):
 
 ```rust
+    /// Extension of `path`, lowercased, no leading dot (`""` if none).
+    fn extension_of(path: &str) -> String {
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    fn spec_for(&self, path: &str) -> Option<&'static lang::ServerSpec> {
+        lang::config_for_extension(&Self::extension_of(path)).map(|(spec, _)| spec)
+    }
+
     /// Get the client for `spec`, spawning + initializing it on first use. Per-key locked, so
     /// concurrent first-calls for the same server don't double-spawn and different languages
     /// proceed in parallel. A definitely-absent binary is cached in `absent` (never retried);
@@ -663,8 +699,27 @@ Add these methods to `impl LspServer` (keep `uri_for`, `path_for`, etc.):
 
     /// Drop a cached client (its server process died) so the next call re-spawns.
     async fn evict(&self, key: &'static str) {
-        if let Some(slot) = self.slots.lock().await.get(key).cloned() {
+        let slot = self.slots.lock().await.get(key).cloned();
+        if let Some(slot) = slot {
             *slot.lock().await = None;
+        }
+    }
+
+    /// The diagnostics wait budget for `spec`: the cold-start budget until the server has
+    /// returned one non-timed-out result, then the steady-state default.
+    async fn diag_wait_for(&self, spec: &lang::ServerSpec) -> std::time::Duration {
+        if self.served_diag.lock().await.contains(spec.key) {
+            diagnostics_timeout()
+        } else {
+            spec.first_open_diag_timeout
+        }
+    }
+
+    /// Record that `spec` returned diagnostics; only a non-timed-out result flips it to
+    /// steady-state (a cold server keeps the long budget until it actually responds).
+    async fn mark_served(&self, spec: &lang::ServerSpec, timed_out: bool) {
+        if !timed_out {
+            self.served_diag.lock().await.insert(spec.key);
         }
     }
 
@@ -684,35 +739,46 @@ Add these methods to `impl LspServer` (keep `uri_for`, `path_for`, etc.):
     }
 
     #[cfg(test)]
+    async fn slot_handle_for_test(&self, key: &'static str) -> Arc<Mutex<Option<ReadyServer>>> {
+        let mut slots = self.slots.lock().await;
+        slots
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    }
+
+    #[cfg(test)]
     async fn slot_is_ready(&self, key: &'static str) -> bool {
-        match self.slots.lock().await.get(key) {
-            Some(slot) => slot.lock().await.is_some(),
+        let slot = self.slots.lock().await.get(key).cloned();
+        match slot {
+            Some(s) => s.lock().await.is_some(),
             None => false,
         }
     }
+
+    #[cfg(test)]
+    async fn mark_absent_for_test(&self, key: &'static str) {
+        self.absent.lock().await.insert(key);
+    }
+
+    #[cfg(test)]
+    async fn absent_contains(&self, key: &'static str) -> bool {
+        self.absent.lock().await.contains(key)
+    }
 ```
 
-Proceed directly to Task 6 (the crate does not compile until `open_if_needed`/`do_*` are rewired).
+- [ ] **Step 4: Rewrite `open_if_needed` (routes by extension, evicts on notify failure)**
 
----
-
-### Task 6: `main.rs` — rewire dispatch, timeouts, eviction; fix the tests
-
-**Files:**
-- Modify: `crates/mcp-lsp/src/main.rs` (`open_if_needed`, `do_*`, `duplex_server`, tests, `rust_analyzer_integration`)
-
-- [ ] **Step 1: Rewrite `open_if_needed` to route by extension and return the client**
+Replace `open_if_needed`:
 
 ```rust
     /// Ensure `path` is open (or up to date) in its language's server. Resolves the extension to
     /// a (server, languageId), spawns the server on first use, sends `didOpen`/`didChange` with
-    /// that languageId, and returns the client so the caller issues its request against it.
+    /// that languageId, and returns the client so the caller issues its request against it. A
+    /// notify write failure means the server's pipe is closed (it died) — evict so the next call
+    /// re-spawns rather than leaving a dead client cached.
     async fn open_if_needed(&self, path: &str) -> anyhow::Result<(Arc<LspClient>, String, u64)> {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
+        let ext = Self::extension_of(path);
         let (spec, language_id) = lang::config_for_extension(&ext)
             .ok_or_else(|| anyhow::anyhow!("no language server configured for .{ext}"))?;
         let client = self.get_or_spawn(spec).await?;
@@ -721,12 +787,13 @@ Proceed directly to Task 6 (the crate does not compile until `open_if_needed`/`d
         let uri = self.uri_for(path)?;
         let uri_str = uri.as_str().to_string();
         let generation = client.bump_generation(&uri_str).await;
-        let mut open = self.open_docs.lock().await;
-        match open.get(&uri_str) {
-            None => {
-                open.insert(uri_str.clone(), 1);
-                client
-                    .notify(
+
+        let (method, params) = {
+            let mut open = self.open_docs.lock().await;
+            match open.get(&uri_str).copied() {
+                None => {
+                    open.insert(uri_str.clone(), 1);
+                    (
                         "textDocument/didOpen",
                         serde_json::to_value(lsp_types::DidOpenTextDocumentParams {
                             text_document: lsp_types::TextDocumentItem::new(
@@ -737,13 +804,11 @@ Proceed directly to Task 6 (the crate does not compile until `open_if_needed`/`d
                             ),
                         })?,
                     )
-                    .await?;
-            }
-            Some(&version) => {
-                let next = version + 1;
-                open.insert(uri_str.clone(), next);
-                client
-                    .notify(
+                }
+                Some(version) => {
+                    let next = version + 1;
+                    open.insert(uri_str.clone(), next);
+                    (
                         "textDocument/didChange",
                         serde_json::to_value(lsp_types::DidChangeTextDocumentParams {
                             text_document: lsp_types::VersionedTextDocumentIdentifier::new(
@@ -756,49 +821,33 @@ Proceed directly to Task 6 (the crate does not compile until `open_if_needed`/`d
                             }],
                         })?,
                     )
-                    .await?;
+                }
             }
+        };
+
+        if let Err(e) = client.notify(method, params).await {
+            self.evict(spec.key).await;
+            return Err(e);
         }
         Ok((client, uri_str, generation))
     }
-
-    /// Resolve `path`'s server spec (for timeout budgets / eviction) without opening it.
-    fn spec_for(&self, path: &str) -> Option<&'static lang::ServerSpec> {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        lang::config_for_extension(&ext).map(|(spec, _)| spec)
-    }
 ```
 
-- [ ] **Step 2: Rewrite `do_diagnostics` with the cold-start budget**
+- [ ] **Step 5: Rewrite the four `do_*` methods (diagnostics budget + nav eviction)**
+
+Replace `do_diagnostics`, `do_diagnostics_with_timeout`, `do_definition`, `do_references`, `do_hover` with:
 
 ```rust
     pub async fn do_diagnostics(&self, path: String) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
         let spec = self
             .spec_for(&path)
             .ok_or_else(|| anyhow::anyhow!("no language server configured for `{path}`"))?;
-        let first_open = !self.served_diag.lock().await.contains(spec.key);
-        let wait = if first_open {
-            spec.first_open_diag_timeout
-        } else {
-            diagnostics_timeout()
-        };
+        let wait = self.diag_wait_for(spec).await;
         let (out, timed_out) = self.do_diagnostics_with_timeout(path, wait).await?;
-        if !timed_out {
-            self.served_diag.lock().await.insert(spec.key);
-        }
+        self.mark_served(spec, timed_out).await;
         Ok((out, timed_out))
     }
-```
 
-- [ ] **Step 3: Rewire `do_diagnostics_with_timeout` and the navigation methods to the returned client + evict on death**
-
-In `do_diagnostics_with_timeout`, replace `let (uri, generation) = self.open_if_needed(&path).await?;` and the `self.lsp.wait_for_diagnostics(...)` line:
-
-```rust
     async fn do_diagnostics_with_timeout(
         &self,
         path: String,
@@ -806,6 +855,11 @@ In `do_diagnostics_with_timeout`, replace `let (uri, generation) = self.open_if_
     ) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
         let (client, uri, generation) = self.open_if_needed(&path).await?;
         let (diags, timed_out) = client.wait_for_diagnostics(&uri, generation, wait).await;
+        if timed_out && !client.is_alive() {
+            if let Some(spec) = self.spec_for(&path) {
+                self.evict(spec.key).await;
+            }
+        }
         let out = diags
             .into_iter()
             .map(|d| DiagnosticOut {
@@ -821,11 +875,16 @@ In `do_diagnostics_with_timeout`, replace `let (uri, generation) = self.open_if_
             .collect();
         Ok((out, timed_out))
     }
-```
 
-For `do_definition`, `do_references`, `do_hover`: bind the client from `open_if_needed`, run the request, and evict on a dead client. Apply this shape (shown for `do_definition`; mirror it for the other two, keeping each one's existing params/response parsing):
+    /// Evict `path`'s server if a request failed against a now-dead client.
+    async fn evict_if_dead(&self, path: &str, client: &LspClient, failed: bool) {
+        if failed && !client.is_alive() {
+            if let Some(spec) = self.spec_for(path) {
+                self.evict(spec.key).await;
+            }
+        }
+    }
 
-```rust
     pub async fn do_definition(
         &self,
         path: String,
@@ -851,162 +910,94 @@ For `do_definition`, `do_references`, `do_hover`: bind the client from `open_if_
                 NAVIGATION_TIMEOUT,
             )
             .await;
-        if result.is_err() && !client.is_alive() {
-            if let Some(spec) = self.spec_for(&path) {
-                self.evict(spec.key).await;
-            }
-        }
+        self.evict_if_dead(&path, &client, result.is_err()).await;
         self.goto_response_to_locations(result?)
     }
-```
 
-For `do_references` and `do_hover`, wrap their `client.request(...).await` the same way: capture the `Result`, run the `is_err() && !client.is_alive()` eviction, then `?` the result and proceed with the existing parsing. Every former `self.lsp.<method>` becomes `client.<method>`.
-
-- [ ] **Step 4: Rewrite the `duplex_server` test helper (now async, seeds a client)**
-
-Replace the `duplex_server` helper in `#[cfg(test)] mod tests`:
-
-```rust
-    async fn duplex_server(root: &Path) -> (LspServer, tokio::io::DuplexStream) {
-        seeded_duplex_server(root, "rust-analyzer").await
-    }
-
-    /// A server with one duplex-backed client seeded under `key` (no real process spawned).
-    async fn seeded_duplex_server(
-        root: &Path,
-        key: &'static str,
-    ) -> (LspServer, tokio::io::DuplexStream) {
-        let (client_end, server_end) = tokio::io::duplex(16384);
-        let (cr, cw) = tokio::io::split(client_end);
-        let lsp = LspClient::spawn(BufReader::new(cr), cw);
-        let server = LspServer::new(root.to_path_buf());
-        server.seed_ready_for_test(key, lsp).await;
-        (server, server_end)
-    }
-```
-
-Every existing test that calls `duplex_server(dir.path())` now must `.await` it: `let (server, server_end) = duplex_server(dir.path()).await;`. Update all of them (`open_if_needed_sends_did_open_then_did_change`, `do_diagnostics_returns_fresh_results`, `do_diagnostics_times_out_without_a_response`, `do_definition_parses_a_scalar_location_response`, `do_definition_skips_out_of_root_locations`, `do_definition_returns_empty_for_a_null_response`, `do_references_parses_an_array_of_locations`, `do_hover_renders_markup_contents`, `do_hover_returns_none_for_a_null_response`). The `path_for_round_trips_with_a_non_canonical_root` test builds its server by hand — update it to `LspServer::new(messy)` and seed nothing (it only calls `uri_for`/`path_for`, which don't touch the registry).
-
-- [ ] **Step 5: Add the dispatch + eviction unit tests**
-
-```rust
-    #[tokio::test]
-    async fn open_if_needed_sends_python_language_id_for_py_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
-        let (server, server_end) = seeded_duplex_server(dir.path(), "pyright-langserver").await;
-        let (sr, _sw) = tokio::io::split(server_end);
-        let mut sr = BufReader::new(sr);
-
-        server.open_if_needed("a.py").await.unwrap();
-        let msg = lsp_client::read_message(&mut sr).await.unwrap();
-        assert_eq!(msg["method"], "textDocument/didOpen");
-        assert_eq!(msg["params"]["textDocument"]["languageId"], "python");
-    }
-
-    #[tokio::test]
-    async fn open_if_needed_sends_go_language_id_for_go_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
-        let (server, server_end) = seeded_duplex_server(dir.path(), "gopls").await;
-        let (sr, _sw) = tokio::io::split(server_end);
-        let mut sr = BufReader::new(sr);
-
-        server.open_if_needed("a.go").await.unwrap();
-        let msg = lsp_client::read_message(&mut sr).await.unwrap();
-        assert_eq!(msg["params"]["textDocument"]["languageId"], "go");
-    }
-
-    #[tokio::test]
-    async fn open_if_needed_rejects_an_unsupported_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
-        let server = LspServer::new(dir.path().to_path_buf());
-        let err = server.open_if_needed("a.txt").await.unwrap_err();
-        assert!(err.to_string().contains("no language server configured"));
-    }
-
-    #[tokio::test]
-    async fn a_dead_client_is_evicted_so_the_next_call_respawns() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path()).await;
-        assert!(server.slot_is_ready("rust-analyzer").await);
-        drop(server_end); // server process "dies"
-        // A navigation call now fails and, seeing the dead client, evicts the slot.
-        let _ = server.do_definition("a.rs".to_string(), 1, 1).await;
-        assert!(!server.slot_is_ready("rust-analyzer").await);
-    }
-```
-
-- [ ] **Step 6: Rewrite the `rust_analyzer_integration` test to drive the real dispatch path**
-
-Replace the body of `full_round_trip_against_a_real_rust_analyzer` (keep the `rust_analyzer_available()` self-skip helper):
-
-```rust
-    #[tokio::test]
-    async fn full_round_trip_against_a_real_rust_analyzer() {
-        if !rust_analyzer_available() {
-            eprintln!("skipping: rust-analyzer not found on PATH");
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub fn greet() -> &'static str {\n    \"hi\"\n}\n\npub fn broken() -> i32 {\n    does_not_exist()\n}\n",
-        )
-        .unwrap();
-
-        // Drive the public dispatch path: no hand-wired client. get_or_spawn spawns + initializes
-        // rust-analyzer lazily on the first `.rs` open.
-        let server = LspServer::new(dir.path().to_path_buf());
-        let (diags, timed_out) = server
-            .do_diagnostics_with_timeout(
-                "src/lib.rs".to_string(),
-                std::time::Duration::from_secs(60),
+    pub async fn do_references(
+        &self,
+        path: String,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<LocationOut>> {
+        let (client, uri, _generation) = self.open_if_needed(&path).await?;
+        let params = lsp_types::ReferenceParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
+                position: lsp_types::Position::new(
+                    line.saturating_sub(1),
+                    character.saturating_sub(1),
+                ),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: lsp_types::ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        let result = client
+            .request(
+                "textDocument/references",
+                serde_json::to_value(params)?,
+                NAVIGATION_TIMEOUT,
             )
-            .await
-            .unwrap();
-        assert!(!timed_out, "rust-analyzer did not respond within 60s");
-        assert!(
-            diags.iter().any(|d| d.message.contains("does_not_exist")),
-            "expected an unresolved-symbol diagnostic, got: {diags:?}"
-        );
-        let hover = server.do_hover("src/lib.rs".to_string(), 1, 8).await.unwrap();
-        assert!(hover.is_some(), "expected hover info for `greet`");
+            .await;
+        self.evict_if_dead(&path, &client, result.is_err()).await;
+        let result = result?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
+        let locs: Vec<lsp_types::Location> = serde_json::from_value(result)?;
+        // Out-of-root locations are skipped, not errors — see `goto_response_to_locations`.
+        Ok(locs
+            .into_iter()
+            .filter_map(|l| {
+                self.path_for(&l.uri).ok().map(|path| LocationOut {
+                    path,
+                    line: l.range.start.line + 1,
+                    character: l.range.start.character + 1,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn do_hover(
+        &self,
+        path: String,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Option<String>> {
+        let (client, uri, _generation) = self.open_if_needed(&path).await?;
+        let params = lsp_types::HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
+                position: lsp_types::Position::new(
+                    line.saturating_sub(1),
+                    character.saturating_sub(1),
+                ),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let result = client
+            .request(
+                "textDocument/hover",
+                serde_json::to_value(params)?,
+                NAVIGATION_TIMEOUT,
+            )
+            .await;
+        self.evict_if_dead(&path, &client, result.is_err()).await;
+        let result = result?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        let hover: lsp_types::Hover = serde_json::from_value(result)?;
+        Ok(Some(render_hover_contents(hover.contents)))
     }
 ```
 
-Delete the now-unused top-level `rust_analyzer_bin()` fn from `main.rs` if the compiler flags it dead (the `rust_analyzer_integration` module's own `rust_analyzer_available()` should use `lang::resolved_bin(&lang::RUST_ANALYZER)` for the binary name).
+- [ ] **Step 6: Rewrite `main()` with the PATH gate; remove `rust_analyzer_bin()`**
 
-- [ ] **Step 7: Build and test the whole crate**
-
-Run: `cargo test -p otto-mcp-lsp`
-Expected: PASS. The `rust_analyzer_integration` test either runs (if rust-analyzer is installed) or prints the skip message and passes.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add crates/mcp-lsp/src/main.rs
-git commit -m "feat(mcp-lsp): lazy per-language client registry with per-key spawn, budgets, eviction"
-```
-
----
-
-### Task 7: `main.rs` — startup PATH availability gate
-
-**Files:**
-- Modify: `crates/mcp-lsp/src/main.rs` (`main`)
-
-- [ ] **Step 1: Replace the eager rust-analyzer spawn with the PATH gate**
-
-Rewrite `main()` (removing the eager `spawn_process`/`initialize`/`LspServer::new(lsp, root)`):
+Replace `main()` and delete the now-unused top-level `fn rust_analyzer_bin()`:
 
 ```rust
 #[tokio::main]
@@ -1035,28 +1026,229 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 2: Build**
+- [ ] **Step 7: Rewrite the `duplex_server` test helper (now async, seeds a client)**
 
-Run: `cargo build -p otto-mcp-lsp && cargo test -p otto-mcp-lsp`
-Expected: PASS. (If no language server is installed, the binary now exits with the gate message when run manually — verified via the engine test in Task 8.)
+In `#[cfg(test)] mod tests`, replace `duplex_server`:
 
-- [ ] **Step 3: Commit**
+```rust
+    async fn duplex_server(root: &Path) -> (LspServer, tokio::io::DuplexStream) {
+        seeded_duplex_server(root, "rust-analyzer").await
+    }
+
+    /// A server with one duplex-backed client seeded under `key` (no real process spawned).
+    async fn seeded_duplex_server(
+        root: &Path,
+        key: &'static str,
+    ) -> (LspServer, tokio::io::DuplexStream) {
+        let (client_end, server_end) = tokio::io::duplex(16384);
+        let (cr, cw) = tokio::io::split(client_end);
+        let lsp = LspClient::spawn(BufReader::new(cr), cw);
+        let server = LspServer::new(root.to_path_buf());
+        server.seed_ready_for_test(key, lsp).await;
+        (server, server_end)
+    }
+```
+
+Then update every existing test that binds `duplex_server(...)` to `.await` it — these tests: `open_if_needed_sends_did_open_then_did_change`, `do_diagnostics_returns_fresh_results`, `do_diagnostics_times_out_without_a_response`, `do_definition_parses_a_scalar_location_response`, `do_definition_skips_out_of_root_locations`, `do_definition_returns_empty_for_a_null_response`, `do_references_parses_an_array_of_locations`, `do_hover_renders_markup_contents`, `do_hover_returns_none_for_a_null_response`. Change each `let (server, server_end) = duplex_server(dir.path());` to `... = duplex_server(dir.path()).await;`.
+
+`path_for_round_trips_with_a_non_canonical_root` builds its server inline — replace its body's server construction with `let server = LspServer::new(messy);` (it only calls `uri_for`/`path_for`; drop the `LspClient`/duplex setup entirely).
+
+- [ ] **Step 8: Add the new dispatch / per-key / budget / absent / eviction tests**
+
+Add to `#[cfg(test)] mod tests`:
+
+```rust
+    #[tokio::test]
+    async fn open_if_needed_sends_python_language_id_for_py_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "pyright-langserver").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("a.py").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["method"], "textDocument/didOpen");
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "python");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_sends_go_language_id_for_go_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "gopls").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("a.go").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "go");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_lowercases_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.PY"), "x = 1\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "pyright-langserver").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("A.PY").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "python");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_rejects_an_unsupported_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        let err = server.open_if_needed("a.txt").await.unwrap_err();
+        assert!(err.to_string().contains("no language server configured"));
+    }
+
+    // R1: a cold server holding its own slot lock must not block a warm call to another server —
+    // proves the outer map lock is never held across a busy per-key slot.
+    #[tokio::test]
+    async fn a_busy_server_slot_does_not_block_a_warm_call_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, _server_end) = duplex_server(dir.path()).await; // rust-analyzer seeded ready
+        let gopls_slot = server.slot_handle_for_test("gopls").await;
+        let _held = gopls_slot.lock().await; // simulate a cold gopls spawn in progress
+        let opened =
+            tokio::time::timeout(Duration::from_secs(2), server.open_if_needed("a.rs")).await;
+        assert!(
+            opened.is_ok(),
+            "a warm rust-analyzer call blocked behind gopls's slot lock"
+        );
+    }
+
+    // R3: cold-start budget selection + the bug-prone `if !timed_out` state transition.
+    #[tokio::test]
+    async fn diagnostics_budget_uses_first_open_then_steady_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            lang::RUST_ANALYZER.first_open_diag_timeout
+        );
+        // A timed-out result must NOT flip to steady state.
+        server.mark_served(&lang::RUST_ANALYZER, true).await;
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            lang::RUST_ANALYZER.first_open_diag_timeout
+        );
+        // A successful result flips to steady state.
+        server.mark_served(&lang::RUST_ANALYZER, false).await;
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            diagnostics_timeout()
+        );
+    }
+
+    // R4: a definitely-absent server is cached permanently and short-circuits.
+    #[tokio::test]
+    async fn an_absent_server_is_cached_and_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        server.mark_absent_for_test("gopls").await;
+        assert!(server.get_or_spawn(&lang::GOPLS).await.is_err());
+        assert!(server.get_or_spawn(&lang::GOPLS).await.is_err());
+        assert!(server.absent_contains("gopls").await);
+    }
+
+    // R4: a dead client is evicted (via the notify-failure path in open_if_needed) so the next
+    // call re-spawns.
+    #[tokio::test]
+    async fn a_dead_client_is_evicted_so_the_next_call_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path()).await;
+        assert!(server.slot_is_ready("rust-analyzer").await);
+        drop(server_end); // server process "dies" — client's write pipe closes
+        let res = server.do_definition("a.rs".to_string(), 1, 1).await;
+        assert!(res.is_err());
+        assert!(
+            !server.slot_is_ready("rust-analyzer").await,
+            "a dead client should have been evicted"
+        );
+    }
+```
+
+`Duration` is `std::time::Duration` — add `use std::time::Duration;` inside `mod tests` if not already imported there (the existing tests use fully-qualified `std::time::Duration`; either form is fine, keep it consistent with the file).
+
+- [ ] **Step 9: Rewrite the `rust_analyzer_integration` test to drive the real dispatch path**
+
+In `mod rust_analyzer_integration`, change `rust_analyzer_available()` to use `lang::resolved_bin(&lang::RUST_ANALYZER)` instead of the deleted `rust_analyzer_bin()`, and replace the test body:
+
+```rust
+    fn rust_analyzer_available() -> bool {
+        std::process::Command::new(lang::resolved_bin(&lang::RUST_ANALYZER))
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn full_round_trip_against_a_real_rust_analyzer() {
+        if !rust_analyzer_available() {
+            eprintln!("skipping: rust-analyzer not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn greet() -> &'static str {\n    \"hi\"\n}\n\npub fn broken() -> i32 {\n    does_not_exist()\n}\n",
+        )
+        .unwrap();
+
+        // Drive the public dispatch path: get_or_spawn spawns + initializes rust-analyzer lazily
+        // on the first `.rs` open — no hand-wired client.
+        let server = LspServer::new(dir.path().to_path_buf());
+        let (diags, timed_out) = server
+            .do_diagnostics_with_timeout(
+                "src/lib.rs".to_string(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        assert!(!timed_out, "rust-analyzer did not respond within 60s");
+        assert!(
+            diags.iter().any(|d| d.message.contains("does_not_exist")),
+            "expected an unresolved-symbol diagnostic, got: {diags:?}"
+        );
+        let hover = server.do_hover("src/lib.rs".to_string(), 1, 8).await.unwrap();
+        assert!(hover.is_some(), "expected hover info for `greet`");
+    }
+```
+
+- [ ] **Step 10: Build and test the whole crate**
+
+Run: `cargo test -p otto-mcp-lsp`
+Expected: PASS. `rust_analyzer_integration` runs (if installed) or prints its skip line.
+
+- [ ] **Step 11: Commit**
 
 ```bash
 git add crates/mcp-lsp/src/main.rs
-git commit -m "feat(mcp-lsp): PATH availability gate — absent when no language server installed"
+git commit -m "feat(mcp-lsp): lazy per-language registry — dispatch, budgets, eviction, PATH gate"
 ```
 
 ---
 
-### Task 8: engine — verify a pre-handshake exit surfaces as a connect error
+### Task 6: engine — verify a pre-handshake exit surfaces as a connect error
 
 **Files:**
 - Modify: `crates/engine/src/mcp.rs` (test only)
 
 - [ ] **Step 1: Add the test**
 
-In `crates/engine/src/mcp.rs`'s `#[cfg(test)] mod tests`, add:
+In `crates/engine/src/mcp.rs`'s `#[cfg(test)] mod tests`:
 
 ```rust
     #[tokio::test]
@@ -1068,10 +1260,10 @@ In `crates/engine/src/mcp.rs`'s `#[cfg(test)] mod tests`, add:
     }
 ```
 
-- [ ] **Step 2: Run the test**
+- [ ] **Step 2: Run**
 
 Run: `cargo test -p otto-engine connect_lsp`
-Expected: PASS (both `connect_lsp_with_bogus_binary_errors` and the new test).
+Expected: PASS (existing `connect_lsp_with_bogus_binary_errors` + the new test).
 
 - [ ] **Step 3: Commit**
 
@@ -1082,16 +1274,14 @@ git commit -m "test(engine): connect_lsp surfaces a pre-handshake exit as Err"
 
 ---
 
-### Task 9: per-language integration tests (self-skipping)
+### Task 7: per-language integration tests (self-skipping)
 
 **Files:**
-- Modify: `crates/mcp-lsp/src/main.rs` (add integration test modules)
+- Modify: `crates/mcp-lsp/src/main.rs` (append integration test modules)
 
-These run only where the server binary exists; otherwise they print a skip and pass. Each asserts a diagnostics *shape* (a known-broken fixture yields a non-empty diagnostic, not timed out), exercising the timeout/quiescence path, not just navigation.
+Each runs only where the server binary exists; otherwise it prints a skip and passes. Each asserts a diagnostics *shape* (a known-broken fixture yields a non-empty diagnostic, not timed out), exercising the timeout/quiescence path.
 
 - [ ] **Step 1: Add the Go integration test**
-
-Append to `main.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1114,7 +1304,6 @@ mod gopls_integration {
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("go.mod"), "module fixture\n\ngo 1.21\n").unwrap();
-        // References an undefined symbol → gopls reports an error.
         std::fs::write(
             dir.path().join("main.go"),
             "package main\n\nfunc main() {\n\tdoesNotExist()\n}\n",
@@ -1126,10 +1315,7 @@ mod gopls_integration {
             .await
             .unwrap();
         assert!(!timed_out, "gopls did not respond within 60s");
-        assert!(
-            !diags.is_empty(),
-            "expected a diagnostic for the undefined symbol, got none"
-        );
+        assert!(!diags.is_empty(), "expected a diagnostic for the undefined symbol");
     }
 }
 ```
@@ -1156,7 +1342,6 @@ mod pyright_integration {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        // A clear type error: adding a str and an int.
         std::fs::write(dir.path().join("a.py"), "x: int = \"not an int\"\n").unwrap();
         let server = LspServer::new(dir.path().to_path_buf());
         let (diags, timed_out) = server
@@ -1164,7 +1349,7 @@ mod pyright_integration {
             .await
             .unwrap();
         assert!(!timed_out, "pyright did not respond within 60s");
-        assert!(!diags.is_empty(), "expected a type diagnostic, got none");
+        assert!(!diags.is_empty(), "expected a type diagnostic");
     }
 }
 ```
@@ -1191,8 +1376,11 @@ mod typescript_integration {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tsconfig.json"), "{\"compilerOptions\":{\"strict\":true}}\n").unwrap();
-        // Type error: assigning a string to a number.
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            "{\"compilerOptions\":{\"strict\":true}}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("a.ts"), "const x: number = \"nope\";\n").unwrap();
         let server = LspServer::new(dir.path().to_path_buf());
         let (diags, timed_out) = server
@@ -1200,7 +1388,7 @@ mod typescript_integration {
             .await
             .unwrap();
         assert!(!timed_out, "typescript-language-server did not respond within 45s");
-        assert!(!diags.is_empty(), "expected a type diagnostic, got none");
+        assert!(!diags.is_empty(), "expected a type diagnostic");
     }
 }
 ```
@@ -1208,7 +1396,7 @@ mod typescript_integration {
 - [ ] **Step 4: Run (self-skips where the toolchain is absent)**
 
 Run: `cargo test -p otto-mcp-lsp integration`
-Expected: PASS — each test runs or prints its skip line. On a bare CI image only the Rust one runs.
+Expected: PASS — each runs or prints its skip line.
 
 - [ ] **Step 5: Commit**
 
@@ -1219,28 +1407,26 @@ git commit -m "test(mcp-lsp): self-skipping go/python/typescript integration rou
 
 ---
 
-### Task 10: documentation
+### Task 8: documentation
 
 **Files:**
 - Modify: `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/superpowers/specs/2026-07-07-mcp-lsp-design.md`
 
 - [ ] **Step 1: Update `CLAUDE.md`**
 
-In the intro paragraph describing the MCP tier, change the `mcp-lsp` description so it no longer says "additive and Rust-only in v1, multi-language dispatch deferred." Replace with language noting multi-language dispatch (Rust/TS/JS/Python/Go) via `rust-analyzer`/`typescript-language-server`/`pyright-langserver`/`gopls`, lazy per-language spawn, and PATH-gated presence.
-
-In the crate table `mcp-lsp` row, update the trailing clause similarly: bridges `lsp.*` to the per-extension language server (Rust/TS/JS/Python/Go), lazily spawned per language behind a per-key lock, with per-server first-open diagnostics budgets and env overrides (`OTTO_RUST_ANALYZER_BIN`, `OTTO_TYPESCRIPT_LANGUAGE_SERVER_BIN`, `OTTO_PYRIGHT_LANGSERVER_BIN`, `OTTO_GOPLS_BIN`); registered additively only when ≥1 server is on PATH.
+In the intro paragraph describing the MCP tier and in the crate-table `mcp-lsp` row, remove "additive and Rust-only in v1, multi-language dispatch deferred" and replace with: multi-language dispatch (Rust/TS/JS/Python/Go) via `rust-analyzer`/`typescript-language-server`/`pyright-langserver`/`gopls`, lazily spawned per language behind a per-key lock, with per-server first-open diagnostics budgets and env overrides (`OTTO_RUST_ANALYZER_BIN`, `OTTO_TYPESCRIPT_LANGUAGE_SERVER_BIN`, `OTTO_PYRIGHT_LANGSERVER_BIN`, `OTTO_GOPLS_BIN`); registered additively only when ≥1 server is on PATH.
 
 - [ ] **Step 2: Update `docs/ARCHITECTURE.md`**
 
-Find the `mcp-lsp` mention (grep `mcp-lsp` — it appears in the crate-tree comment and the MCP-tier prose) and drop "deferred to v2" / "Rust-only v1", replacing with the shipped multi-language description.
+Grep `mcp-lsp` (it appears in the crate-tree comment and the MCP-tier prose) and drop "deferred to v2" / "Rust-only v1", replacing with the shipped multi-language description.
 
 - [ ] **Step 3: Add a status note to the v1 design**
 
-At the top of `docs/superpowers/specs/2026-07-07-mcp-lsp-design.md`, under its Status line, add:
+Under the Status line at the top of `docs/superpowers/specs/2026-07-07-mcp-lsp-design.md`, add:
 
 ```markdown
-> **Update (2026-07-08):** the "Future generalization" section below is now built —
-> multi-language dispatch (Rust/TS/JS/Python/Go) shipped per
+> **Update (2026-07-08):** the "Future generalization" section below is now built — multi-language
+> dispatch (Rust/TS/JS/Python/Go) shipped per
 > [2026-07-08-mcp-lsp-multi-language-design.md](2026-07-08-mcp-lsp-multi-language-design.md).
 ```
 
@@ -1253,31 +1439,31 @@ git commit -m "docs: mcp-lsp is now multi-language (Rust/TS/JS/Python/Go)"
 
 ---
 
-### Task 11: full verification sweep
+### Task 9: full verification sweep
 
 **Files:** none (verification only)
 
 - [ ] **Step 1: Format**
 
 Run: `cargo fmt --all`
-Then: `git diff --stat` — if fmt changed anything, review and `git commit -am "style: cargo fmt"`.
+Then `git diff --stat`; if fmt changed anything, `git commit -am "style: cargo fmt"`.
 
-- [ ] **Step 2: Clippy (workspace + the standalone mcp-lsp crate)**
+- [ ] **Step 2: Clippy**
 
 Run: `cargo clippy --workspace --all-targets`
-Expected: no warnings in changed crates. Fix any clippy findings in the touched files (e.g. needless clones, `filter().next()`), commit as `style(mcp-lsp): clippy`.
+Expected: no warnings in changed crates (confirms `any_server_available`/helpers are all wired — no residual `dead_code`). Fix any findings in the touched files and commit as `style(mcp-lsp): clippy`.
 
 - [ ] **Step 3: Full offline test suite (determinism invariant)**
 
 Run: `cargo test --workspace`
-Expected: PASS with no network/keys. Confirms the multi-language change did not perturb the offline-deterministic engine path (`mcp-lsp` is spawned only by the binary; no unit test execs a real server).
+Expected: PASS with no network/keys — confirms the multi-language change did not perturb the offline-deterministic engine path (`mcp-lsp` is spawned only by the binary; no unit test execs a real server).
 
-- [ ] **Step 4: Targeted mcp-lsp + engine runs**
+- [ ] **Step 4: Targeted runs**
 
 Run: `cargo test -p otto-mcp-lsp && cargo test -p otto-engine connect_lsp`
 Expected: PASS. Integration tests self-skip where a server binary is absent.
 
-- [ ] **Step 5: Final commit if anything remained**
+- [ ] **Step 5: Confirm clean**
 
 ```bash
 git status   # should be clean
@@ -1287,5 +1473,11 @@ git status   # should be clean
 
 ## Spec coverage check
 
-- Language table + languageIds + env overrides → Task 2. PATH resolver + executable bit → Task 3. Per-key lazy registry + `Option<Child>` + retry-eligible-vs-permanent failures → Tasks 5–6. Cold-start diagnostics budget → Task 6. Crashed-client eviction + `is_alive` → Tasks 4, 6. Default-capabilities invariant + defensive `MethodNotFound` reply → Task 4. Startup PATH gate + behavior change → Task 7, verified Task 8. `spawn_process` args → Task 1. Test seam (`seed_ready_for_test`), rewritten `duplex_server`/integration test, PATH-resolver tests, dispatch/eviction/defensive-reply tests → Tasks 3, 4, 6. Per-language self-skipping integration tests asserting diagnostics shape → Task 9. Docs → Task 10. Determinism + clippy + fmt sweep → Task 11.
-- Documented non-goals (per-sub-project rootUri, supervision loop, incremental didChange, runtime probing, richer capabilities, Windows, `.js` semantic-only, tsserver staged publish) require no code and are recorded in the spec's "Known limitations / accepted trades".
+- Language table + languageIds + env overrides → Task 2. PATH resolver + executable bit + gate helper → Task 3. Synchronous liveness + defensive `MethodNotFound` reply + capabilities invariant → Task 4. Per-key lazy registry + `Option<Child>` + dispatch + cold-start budget + eviction + PATH gate → Task 5. `spawn_process` args → Task 1. Engine pre-handshake-exit verification → Task 6. Per-language self-skipping integration tests → Task 7. Docs → Task 8. Determinism + clippy + fmt sweep → Task 9.
+- **Review-resolution test coverage:** R1 per-key non-blocking → `a_busy_server_slot_does_not_block_a_warm_call_to_another`. R3 cold-start budget state transition → `diagnostics_budget_uses_first_open_then_steady_state` (deterministic, no real server). R4 permanent-absent cache → `an_absent_server_is_cached_and_short_circuits`; crashed-client eviction → `a_dead_client_is_evicted_so_the_next_call_respawns` (works because `write()` flips liveness synchronously and `open_if_needed` evicts on notify failure). R2b defensive reply + capabilities invariant → `reader_replies_method_not_found_to_unknown_server_requests` + `write_failure_marks_the_client_dead`. Case-folding → `open_if_needed_lowercases_the_extension`. `resolved_bin` override → `resolved_bin_defaults_without_an_override_and_honors_one`.
+- Documented non-goals (per-sub-project rootUri, supervision loop, incremental didChange, runtime probing, richer capabilities, Windows, `.js` semantic-only, tsserver staged publish) need no code and live in the spec's "Known limitations / accepted trades".
+
+## Known execution notes
+
+- **Task 5 is intentionally one atomic task** — replacing the `lsp` field touches the struct, `new`, `open_if_needed`, all `do_*`, `main()`, and every test at once; there is no compiling intermediate. All other tasks are independently green.
+- The `evict` vs in-flight-`get_or_spawn` interaction (evict could null a slot a concurrent spawn just populated) is accepted under the design's "no supervision loop" non-goal; the orchestrator spine issues tool calls sequentially, so it is not exercised.
