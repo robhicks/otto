@@ -233,4 +233,51 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, "ok");
     }
+
+    #[tokio::test]
+    async fn openai_uses_max_tokens_for_gpt_models() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        // Symmetric to the o-series test: a gpt-* id must send `max_tokens` (not
+        // `max_completion_tokens`); the mock only matches when `max_tokens` is in the body.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({ "max_tokens": 4096 })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "k", "gpt-4o-mini");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn openai_returns_empty_text_for_empty_choices() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "choices": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "k", "gpt-4o-mini");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "");
+        assert_eq!(out.usage, None);
+    }
 }
