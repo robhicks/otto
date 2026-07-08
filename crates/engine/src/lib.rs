@@ -12,7 +12,9 @@ use otto_engine_core::{AgentRegistry, Router, TurnOutcome};
 use otto_extensions::PermissionRules;
 use otto_persistence::SessionStore;
 use otto_protocol::{CapabilitiesManifest, Event, Role};
-use otto_providers::{AnthropicProvider, LocalProvider, OllamaProvider};
+use otto_providers::{
+    AnthropicProvider, GeminiProvider, LocalProvider, OllamaProvider, OpenAiProvider,
+};
 use otto_router::{BrainBlendRouter, PinnedModelRouter, SingleProviderRouter};
 use otto_tools::{
     BashTool, DefaultPermissionGate, FsListTool, FsReadTool, FsWriteTool, SandboxPolicy,
@@ -50,6 +52,8 @@ pub use service::{AcceptError, CollectingSink, EngineService, EventSink, TurnCon
 /// both `build_router` (selection) and `session_config` (recording the effective model).
 const DEFAULT_OLLAMA_MODEL: &str = "llama3.2";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 
 /// Build the registry of built-in agents: the whole spine is real: LLM-backed Planner +
 /// ContextFinder + Coder and a cargo-check Verifier. No stubs remain.
@@ -73,6 +77,158 @@ fn build_local_provider() -> Arc<dyn Provider> {
     }
 }
 
+/// Which remote provider the router's single remote slot uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteChoice {
+    Anthropic,
+    OpenAi,
+    Gemini,
+}
+
+impl RemoteChoice {
+    /// Stable id recorded in `session_config` and matching each provider's `Provider::id()`.
+    fn id(self) -> &'static str {
+        match self {
+            RemoteChoice::Anthropic => "anthropic",
+            RemoteChoice::OpenAi => "openai",
+            RemoteChoice::Gemini => "gemini",
+        }
+    }
+}
+
+/// Pure remote-slot selection for the default (non-pinned) path. Takes explicit inputs so it
+/// is unit-testable without mutating process-global env (mirrors `capabilities_from_env`).
+///
+/// `selector` is the raw `OTTO_REMOTE_PROVIDER` value; the three bools are "this provider's key
+/// is present and non-empty". A valid selector wins when its key is present; a selector whose
+/// key is absent yields `None` (offline) rather than silently falling back to another
+/// provider; an unknown selector is ignored and precedence applies:
+/// Anthropic > OpenAI > Gemini.
+fn select_remote_from(
+    selector: Option<&str>,
+    anthropic: bool,
+    openai: bool,
+    gemini: bool,
+) -> Option<RemoteChoice> {
+    if let Some(sel) = selector {
+        match sel.to_ascii_lowercase().as_str() {
+            "anthropic" => {
+                return present_or_warn(anthropic, RemoteChoice::Anthropic, "ANTHROPIC_API_KEY");
+            }
+            "openai" => return present_or_warn(openai, RemoteChoice::OpenAi, "OPENAI_API_KEY"),
+            "gemini" => return present_or_warn(gemini, RemoteChoice::Gemini, "GEMINI_API_KEY"),
+            other => {
+                eprintln!(
+                    "warning: OTTO_REMOTE_PROVIDER='{other}' is not a known provider \
+                     (anthropic|openai|gemini); using key precedence instead"
+                );
+            }
+        }
+    }
+    if anthropic {
+        Some(RemoteChoice::Anthropic)
+    } else if openai {
+        Some(RemoteChoice::OpenAi)
+    } else if gemini {
+        Some(RemoteChoice::Gemini)
+    } else {
+        None
+    }
+}
+
+/// Helper for `select_remote_from`: return the choice if its key is present, else warn and
+/// select nothing (offline) — a named-but-unusable selector must not misroute to another key.
+fn present_or_warn(present: bool, choice: RemoteChoice, key: &str) -> Option<RemoteChoice> {
+    if present {
+        Some(choice)
+    } else {
+        eprintln!(
+            "warning: OTTO_REMOTE_PROVIDER='{}' but {key} is not set; \
+             falling back to the offline/local router",
+            choice.id()
+        );
+        None
+    }
+}
+
+/// Pure model-id -> provider inference for the pinned path. Returns `None` for ids that do not
+/// match a known provider prefix (the caller then uses the active remote, if any).
+fn infer_remote(model: &str) -> Option<RemoteChoice> {
+    if model.starts_with("gpt-")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
+        Some(RemoteChoice::OpenAi)
+    } else if model.starts_with("gemini-") {
+        Some(RemoteChoice::Gemini)
+    } else if model.starts_with("claude-") {
+        Some(RemoteChoice::Anthropic)
+    } else {
+        None
+    }
+}
+
+/// True when the given provider's API key is present and non-empty in the environment.
+fn has_key(choice: RemoteChoice) -> bool {
+    let var = match choice {
+        RemoteChoice::Anthropic => "ANTHROPIC_API_KEY",
+        RemoteChoice::OpenAi => "OPENAI_API_KEY",
+        RemoteChoice::Gemini => "GEMINI_API_KEY",
+    };
+    std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Env-reading wrapper over `select_remote_from` — the default-path remote selection.
+fn select_remote() -> Option<RemoteChoice> {
+    select_remote_from(
+        std::env::var("OTTO_REMOTE_PROVIDER").ok().as_deref(),
+        has_key(RemoteChoice::Anthropic),
+        has_key(RemoteChoice::OpenAi),
+        has_key(RemoteChoice::Gemini),
+    )
+}
+
+/// The effective default model for a provider (its `OTTO_<P>_MODEL` env var, else the constant).
+fn default_model_for(choice: RemoteChoice) -> String {
+    match choice {
+        RemoteChoice::Anthropic => std::env::var("OTTO_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string()),
+        RemoteChoice::OpenAi => {
+            std::env::var("OTTO_OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string())
+        }
+        RemoteChoice::Gemini => {
+            std::env::var("OTTO_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string())
+        }
+    }
+}
+
+/// Construct the remote provider for `choice`, pinned to `model`. Callers must have confirmed
+/// the provider's key is present (`has_key`/`select_remote`); the key is read here.
+fn build_remote(choice: RemoteChoice, model: String) -> Arc<dyn Provider> {
+    match choice {
+        RemoteChoice::Anthropic => Arc::new(AnthropicProvider::new(
+            AnthropicProvider::api_base_default(),
+            std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            model,
+        )),
+        RemoteChoice::OpenAi => {
+            let base = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| OpenAiProvider::api_base_default().to_string());
+            Arc::new(OpenAiProvider::new(
+                base,
+                std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+                model,
+            ))
+        }
+        RemoteChoice::Gemini => Arc::new(GeminiProvider::new(
+            GeminiProvider::api_base_default(),
+            std::env::var("GEMINI_API_KEY").unwrap_or_default(),
+            model,
+        )),
+    }
+}
+
 /// Equivalent to [`build_router_with_model`]`(None)`; see that function for full behavior.
 pub fn build_router() -> Box<dyn otto_engine_core::Router> {
     build_router_with_model(None)
@@ -81,47 +237,45 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
 /// Build a router, optionally pinning the remote slot to an explicit model id (from a
 /// command/agent `model:` field).
 ///
-/// - `model_override = Some(m)` + `ANTHROPIC_API_KEY` present: the remote slot is an
-///   `AnthropicProvider` built with `m` (NOT `OTTO_ANTHROPIC_MODEL`), wrapped in a
-///   `PinnedModelRouter` so the named model actually runs (privacy-sensitive requests still
-///   stay local).
-/// - `model_override = Some(m)` + no key: not honorable — warn and fall back to the offline
-///   `SingleProviderRouter`, so the default stays deterministic.
-/// - `model_override = None`: unchanged behavior (`BrainBlendRouter` with a key, else
-///   `SingleProviderRouter`).
+/// - `model_override = None`: select a remote via [`select_remote`] (an `OTTO_REMOTE_PROVIDER`
+///   selector, else key precedence Anthropic > OpenAI > Gemini). Some -> `BrainBlendRouter`
+///   over that provider at its default model; None -> the offline `SingleProviderRouter`.
+/// - `model_override = Some(m)`: infer the provider from `m`'s prefix ([`infer_remote`]); an
+///   unrecognized prefix uses the active remote from [`select_remote`]. If the chosen
+///   provider's key is present, build it pinned to `m` in a `PinnedModelRouter`; otherwise warn
+///   and fall back to the offline `SingleProviderRouter` (keeping the default deterministic).
+///
+/// With no provider keys and no selector set, both branches yield
+/// `SingleProviderRouter(LocalProvider)` — the byte-for-byte offline-deterministic default.
 pub fn build_router_with_model(model_override: Option<&str>) -> Box<dyn otto_engine_core::Router> {
     let local = build_local_provider();
 
-    match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(key) if !key.is_empty() => match model_override {
-            Some(model) => {
-                let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
-                    AnthropicProvider::api_base_default(),
-                    key,
-                    model.to_string(),
-                ));
-                Box::new(PinnedModelRouter::new(local, remote))
+    match model_override {
+        Some(model) => {
+            // Known prefix is authoritative (its own key required); unknown prefix uses the
+            // active remote. Either way the chosen provider's key must be present.
+            let choice = infer_remote(model).or_else(select_remote);
+            match choice.filter(|c| has_key(*c)) {
+                Some(c) => {
+                    let remote = build_remote(c, model.to_string());
+                    Box::new(PinnedModelRouter::new(local, remote))
+                }
+                None => {
+                    eprintln!(
+                        "warning: requested model '{model}' but no usable provider key is set; \
+                         falling back to the offline/local router"
+                    );
+                    Box::new(SingleProviderRouter::new(local))
+                }
             }
-            None => {
-                let model = std::env::var("OTTO_ANTHROPIC_MODEL")
-                    .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string());
-                let remote: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
-                    AnthropicProvider::api_base_default(),
-                    key,
-                    model,
-                ));
+        }
+        None => match select_remote() {
+            Some(c) => {
+                let remote = build_remote(c, default_model_for(c));
                 Box::new(BrainBlendRouter::new(local, remote))
             }
+            None => Box::new(SingleProviderRouter::new(local)),
         },
-        _ => {
-            if let Some(model) = model_override {
-                eprintln!(
-                    "warning: requested model '{model}' but ANTHROPIC_API_KEY is not set; \
-                     falling back to the offline/local router"
-                );
-            }
-            Box::new(SingleProviderRouter::new(local))
-        }
     }
 }
 
@@ -411,6 +565,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn select_remote_from_precedence_when_no_selector() {
+        // Precedence: Anthropic > OpenAi > Gemini among present keys.
+        assert_eq!(
+            select_remote_from(None, true, true, true),
+            Some(RemoteChoice::Anthropic)
+        );
+        assert_eq!(
+            select_remote_from(None, false, true, true),
+            Some(RemoteChoice::OpenAi)
+        );
+        assert_eq!(
+            select_remote_from(None, false, false, true),
+            Some(RemoteChoice::Gemini)
+        );
+        assert_eq!(select_remote_from(None, false, false, false), None);
+    }
+
+    #[test]
+    fn select_remote_from_selector_wins_when_its_key_present() {
+        // A valid selector overrides precedence even when a higher-precedence key exists.
+        assert_eq!(
+            select_remote_from(Some("openai"), true, true, true),
+            Some(RemoteChoice::OpenAi)
+        );
+        assert_eq!(
+            select_remote_from(Some("gemini"), true, false, true),
+            Some(RemoteChoice::Gemini)
+        );
+        // Case-insensitive.
+        assert_eq!(
+            select_remote_from(Some("OpenAI"), false, true, false),
+            Some(RemoteChoice::OpenAi)
+        );
+    }
+
+    #[test]
+    fn select_remote_from_selector_without_key_is_none() {
+        // Selector names a provider whose key is absent -> None (offline), NOT a fallback to
+        // another provider's key.
+        assert_eq!(select_remote_from(Some("openai"), true, false, true), None);
+        assert_eq!(select_remote_from(Some("gemini"), true, true, false), None);
+    }
+
+    #[test]
+    fn select_remote_from_unknown_selector_falls_through_to_precedence() {
+        assert_eq!(
+            select_remote_from(Some("bogus"), true, false, false),
+            Some(RemoteChoice::Anthropic)
+        );
+        assert_eq!(select_remote_from(Some("bogus"), false, false, false), None);
+    }
+
+    #[test]
+    fn infer_remote_maps_model_id_prefixes() {
+        assert_eq!(infer_remote("gpt-4o"), Some(RemoteChoice::OpenAi));
+        assert_eq!(infer_remote("gpt-4o-mini"), Some(RemoteChoice::OpenAi));
+        assert_eq!(infer_remote("o1-preview"), Some(RemoteChoice::OpenAi));
+        assert_eq!(infer_remote("o3-mini"), Some(RemoteChoice::OpenAi));
+        assert_eq!(infer_remote("gemini-2.5-pro"), Some(RemoteChoice::Gemini));
+        assert_eq!(
+            infer_remote("claude-opus-4-8"),
+            Some(RemoteChoice::Anthropic)
+        );
+        assert_eq!(infer_remote("llama3.2"), None);
+        assert_eq!(infer_remote("mistral-large"), None);
     }
 
     #[test]
