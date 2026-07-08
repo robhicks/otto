@@ -35,6 +35,12 @@ impl OpenAiProvider {
     }
 }
 
+/// OpenAI reasoning (o-series) models reject the `max_tokens` field and require
+/// `max_completion_tokens` instead.
+fn is_o_series(model: &str) -> bool {
+    model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
+}
+
 #[derive(Serialize)]
 struct Message<'a> {
     role: &'a str,
@@ -44,7 +50,10 @@ struct Message<'a> {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
-    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     messages: Vec<Message<'a>>,
 }
 
@@ -84,9 +93,15 @@ impl Provider for OpenAiProvider {
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
+        let (max_tokens, max_completion_tokens) = if is_o_series(&self.model) {
+            (None, Some(self.max_tokens))
+        } else {
+            (Some(self.max_tokens), None)
+        };
         let body = ChatRequest {
             model: &self.model,
-            max_tokens: self.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             messages: vec![Message {
                 role: "user",
                 content: &req.prompt,
@@ -190,5 +205,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("401") || err.to_string().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn openai_uses_max_completion_tokens_for_o_series_models() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        // The mock only matches if the request body contains max_completion_tokens; if the
+        // provider wrongly sent max_tokens, the request would not match and the test fails.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({ "max_completion_tokens": 4096 }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "k", "o3-mini");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
     }
 }
