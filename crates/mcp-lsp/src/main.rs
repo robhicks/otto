@@ -242,6 +242,10 @@ impl LspServer {
             .ok_or_else(|| anyhow::anyhow!("no language server configured for .{ext}"))?;
         let client = self.get_or_spawn(spec).await?;
 
+        // NOTE: the read → bump_generation → version-assign → notify sequence below is not atomic
+        // across its three locks. That is safe only because the orchestrator spine issues tool
+        // calls sequentially, so two concurrent opens of the *same* URI never overlap. If a
+        // concurrent caller is ever added, serialize this sequence per-URI (a follow-up).
         let content = String::from_utf8(self.workspace.read(Path::new(path)).await?)?;
         let uri = self.uri_for(path)?;
         let uri_str = uri.as_str().to_string();

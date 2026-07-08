@@ -249,15 +249,19 @@ impl LspClient {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             let now = tokio::time::Instant::now();
-            let at_deadline = now >= deadline;
+            // A dead server (pipe closed → `alive` flipped) will never publish again, so treat its
+            // death like the deadline rather than polling the full (now up to 60s) budget out: a
+            // fresh entry already in the cache is its final answer (returned below with
+            // `timed_out: false`); otherwise we fall through to the stale/empty return.
+            let terminal = now >= deadline || !self.alive.load(Ordering::SeqCst);
             if let Some(entry) = self.diagnostics.lock().await.get(uri) {
                 if entry.generation >= min_generation
-                    && (at_deadline || now >= entry.updated_at + DIAGNOSTICS_QUIESCENCE)
+                    && (terminal || now >= entry.updated_at + DIAGNOSTICS_QUIESCENCE)
                 {
                     return (entry.diagnostics.clone(), false);
                 }
             }
-            if at_deadline {
+            if terminal {
                 let stale = self
                     .diagnostics
                     .lock()
@@ -544,6 +548,32 @@ mod tests {
             .await;
         assert!(timed_out);
         assert!(diags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_diagnostics_short_circuits_when_the_client_dies() {
+        let (client, server_end) = duplex_client();
+        let generation = client.bump_generation("file:///a.rs").await;
+        drop(server_end); // server exits → reader hits EOF → `alive` flips false
+        // Let the reader task observe EOF.
+        for _ in 0..50 {
+            if !client.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The budget is a full minute, but a dead client must return well under it rather than
+        // polling the whole budget out.
+        let start = tokio::time::Instant::now();
+        let (diags, timed_out) = client
+            .wait_for_diagnostics("file:///a.rs", generation, Duration::from_secs(60))
+            .await;
+        assert!(timed_out);
+        assert!(diags.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a dead client should short-circuit, not wait the full 60s budget"
+        );
     }
 
     #[tokio::test]
