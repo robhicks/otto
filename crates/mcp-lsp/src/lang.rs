@@ -85,6 +85,43 @@ pub fn resolved_bin(spec: &ServerSpec) -> String {
     resolved_bin_with(spec, std::env::var(spec.env_override).ok())
 }
 
+/// Resolve `bin` to an executable file using a minimal PATH search. If `bin` contains a path
+/// separator it is checked directly; otherwise each colon-separated entry of `path_var` is
+/// tried. Returns the path only when the file exists AND has an executable bit set — a
+/// present-but-non-executable file does not resolve. Unix-only, matching the OS sandbox's
+/// Linux/macOS targeting (Windows PATHEXT/.cmd shims are out of scope).
+pub fn resolve_executable(bin: &str, path_var: &str) -> Option<PathBuf> {
+    if bin.contains('/') {
+        let p = Path::new(bin);
+        return is_executable(p).then(|| p.to_path_buf());
+    }
+    for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join(bin);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// True when at least one configured language server's resolved binary is on PATH. The startup
+/// gate uses this: with no server present, `mcp-lsp` exits and the engine registers no `lsp.*`
+/// tools (the additive-absence pattern).
+pub fn any_server_available() -> bool {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    ALL_SERVERS
+        .iter()
+        .any(|spec| resolve_executable(&resolved_bin(spec), &path_var).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +164,54 @@ mod tests {
             resolved_bin_with(&PYRIGHT, Some("/opt/custom-pyright".to_string())),
             "/opt/custom-pyright"
         );
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    fn make_executable(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn resolve_executable_finds_a_bare_name_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("myserver");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+        assert_eq!(
+            resolve_executable("myserver", dir.path().to_str().unwrap()),
+            Some(bin)
+        );
+    }
+
+    #[test]
+    fn resolve_executable_rejects_a_non_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("myserver");
+        std::fs::write(&bin, "not executable").unwrap();
+        assert!(resolve_executable("myserver", dir.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn resolve_executable_honors_a_path_separator_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("custom-ra");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        make_executable(&bin);
+        assert_eq!(
+            resolve_executable(bin.to_str().unwrap(), ""),
+            Some(bin.clone())
+        );
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, "x").unwrap();
+        assert!(resolve_executable(plain.to_str().unwrap(), "").is_none());
+    }
+
+    #[test]
+    fn resolve_executable_returns_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_executable("definitely-not-here", dir.path().to_str().unwrap()).is_none());
     }
 }
