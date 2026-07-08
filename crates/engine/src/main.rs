@@ -245,11 +245,12 @@ async fn build_tools_preferring_mcp(
     (registry, conns)
 }
 
-/// The tool-registry composition `otto serve` uses: the permission/approval gate from
+/// The tool-registry composition every entrypoint shares (`otto run`, `otto run --command`,
+/// `otto run --agent`, `otto serve`): the permission/approval gate from
 /// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then
 /// hook-wrapping on top via `register_hooks`, then bundled plugin MCP servers via
-/// `mcp_connect_plugin_server` — the same steps `cmd_run` performs inline, in the same order.
-async fn build_serve_tools(
+/// `mcp_connect_plugin_server`. `approve_edits` is true only for `otto serve --approve-edits`.
+async fn build_composed_tools(
     ext: &otto_extensions::Extensions,
     tools_workspace: Arc<dyn Workspace>,
     root: PathBuf,
@@ -349,34 +350,13 @@ async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // Discover extensions first: the permission rules are needed at registry-construction time so
-    // the gate can be a PolicyGate.
+    // the gate can be a PolicyGate. build_composed_tools then layers skills, hooks, and bundled
+    // plugin MCP servers on top — the same composition `otto serve` and the --command/--agent
+    // subpaths use.
     let ext = otto_extensions::discover(&root, &home_dir());
-    let (mut tools, mut mcp_conns) =
-        build_tools_preferring_mcp(tools_workspace, root.clone(), false, &ext.permissions).await;
-    // mcp_conns is held until end of function so the mcp children stay alive.
-    // Register discovered skills as the gated `skill` tool so spine agents can load them mid-turn.
-    register_skills(&mut tools, &ext.skills);
-    register_hooks(&mut tools, &ext.hooks, &root);
-    // Bundled plugin MCP servers (Plan B): spawn each enabled plugin's servers through the same
-    // stdio connect path otto uses for its own MCP servers; register the namespaced tools behind the
-    // gate. A server that won't spawn is logged and skipped (additive, never fatal). With no
-    // `.claude/plugins/`, `ext.mcp_servers` is empty and the tool set is byte-for-byte unchanged.
-    // These register after `register_hooks`' `wrap_each`, so plugin MCP tools are gate-guarded but
-    // not hook-wrapped this slice — a `plugin__…` hook matcher would not fire (deferred extension).
-    for spec in &ext.mcp_servers {
-        match mcp_connect_plugin_server(spec).await {
-            Ok((conn, mcp_tools)) => {
-                for t in mcp_tools {
-                    tools.register(t);
-                }
-                mcp_conns.push(conn);
-            }
-            Err(e) => eprintln!(
-                "plugin mcp server {}:{} unavailable ({e}); skipping",
-                spec.namespace, spec.server_key
-            ),
-        }
-    }
+    let (tools, _mcp_conns) =
+        build_composed_tools(&ext, tools_workspace, root.clone(), false).await;
+    // _mcp_conns is held until end of function so the mcp children stay alive.
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -416,32 +396,20 @@ async fn run_custom_agent_in(
     use std::collections::HashMap;
 
     let ext = otto_extensions::discover(&root, &home);
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on this path \
-             (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
-    if !ext.permissions.is_empty() {
-        eprintln!(
-            "warning: settings.json permissions are configured but are NOT enforced on \
-             this path (permissions are wired only on the `otto run` spine for now)."
-        );
-    }
 
     let mut registry = AgentRegistry::new();
     let mut allowlists: HashMap<String, Option<Vec<String>>> = HashMap::new();
     // Pin the remote model to the top-level `--agent`'s `model:` field. Nested Task
     // sub-dispatches inherit this same pinned router (per-sub-agent model is deferred).
     let mut model_override: Option<String> = None;
-    for def in ext.agents {
+    for def in &ext.agents {
         if def.name == name {
             model_override = def.model.clone();
         }
         allowlists.insert(def.name.clone(), def.tools.clone());
         registry.register(
             Role::Custom(def.name.clone()),
-            Arc::new(MarkdownAgent::new(def)),
+            Arc::new(MarkdownAgent::new(def.clone())),
         );
     }
 
@@ -457,16 +425,11 @@ async fn run_custom_agent_in(
     );
     let read_ws: Arc<dyn WorkspaceRead> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
-    // `otto serve` (via build_serve_tools); the --agent/--command paths are deferred (extensions
-    // hooks slice).
-    let (base_tools, _mcp) = build_tools_preferring_mcp(
-        tools_ws,
-        root,
-        false,
-        &otto_extensions::PermissionRules::default(),
-    )
-    .await;
+    // The same composed registry the spine/serve paths use (permissions PolicyGate, skills,
+    // hooks, plugin MCP servers). TaskTool then narrows it per-agent via `tools:` allowlists —
+    // mirroring serve's run_agent_with_controls, which hands TaskTool the server's composed
+    // registry. _mcp is held until end of function so the mcp children stay alive.
+    let (base_tools, _mcp) = build_composed_tools(&ext, tools_ws, root, false).await;
 
     let task = TaskTool::new(
         router,
@@ -512,22 +475,11 @@ async fn run_command_in(
     use otto_extensions::{expand_args, resolve_injections};
 
     let ext = otto_extensions::discover(&root, &home);
-    if !ext.hooks.is_empty() {
-        eprintln!(
-            "warning: settings.json hooks are configured but are NOT enforced on this path \
-             (hooks are wired only on the `otto run` spine for now)."
-        );
-    }
-    if !ext.permissions.is_empty() {
-        eprintln!(
-            "warning: settings.json permissions are configured but are NOT enforced on \
-             this path (permissions are wired only on the `otto run` spine for now)."
-        );
-    }
     let def = ext
         .commands
-        .into_iter()
+        .iter()
         .find(|c| c.name == name)
+        .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no command named '{name}' in ~/.claude/commands/ or {}/.claude/commands/",
@@ -535,22 +487,16 @@ async fn run_command_in(
             )
         })?;
 
-    // The gated tool registry: injection reaches fs.read/bash through the same gate the spine
-    // turn uses (bash only when a sandbox backend exists). Reused as the turn's tools.
-    // NOTE: hooks/skills/plugin MCP servers are wired on the main `otto run` spine and on
-    // `otto serve` (via build_serve_tools); the --agent/--command paths are deferred (extensions
-    // hooks slice).
+    // The composed tool registry: the same permissions/skills/hooks/plugin-MCP composition the
+    // spine and serve paths use (Slices 6–11 + this slice). Injection reaches fs.read/bash
+    // through the same gate the spine turn uses. Reused as the turn's tools.
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
-    let (tools, _mcp_conns) = build_tools_preferring_mcp(
-        tools_workspace,
-        root.clone(),
-        false,
-        &otto_extensions::PermissionRules::default(),
-    )
-    .await;
+    let (tools, _mcp_conns) =
+        build_composed_tools(&ext, tools_workspace, root.clone(), false).await;
     // _mcp_conns is held until end of function so the mcp children stay alive.
-    // Narrow the registry to the command's allowed-tools (None = all tools) before it is used for
-    // BOTH injection resolution and the spine turn — so a disallowed tool is fail-closed.
+    // Narrow the composed registry to the command's allowed-tools (None = all tools) before it
+    // is used for BOTH injection resolution and the spine turn — so a disallowed tool is
+    // fail-closed.
     let tools = Arc::new(narrow_for_command(tools, &def.allowed_tools));
 
     // Args are substituted first, then the whole string is scanned for `!`cmd`/@path`
@@ -647,12 +593,12 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let orch_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     let tools_workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(root.clone()));
     // NOTE: permissions, hooks, skills, and plugin MCP servers are all enforced here via
-    // `build_serve_tools` (composed with --approve-edits when both are configured; see
-    // build_tool_registry_inner / register_skills / register_hooks). `--command` is now wired
-    // on serve too (via `EngineService::with_extensions`/`run_command_with_controls`); only the
-    // --agent serve subpath remains deferred.
+    // `build_composed_tools` (composed with --approve-edits when both are configured; see
+    // build_tool_registry_inner / register_skills / register_hooks). `--command` and `--agent`
+    // are wired on serve via `EngineService::with_extensions` (`run_command_with_controls` /
+    // `run_agent_with_controls`).
     let (tools, _mcp_conns) =
-        build_serve_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
+        build_composed_tools(&ext, tools_workspace, root.clone(), approve_edits).await;
     let tools = Arc::new(tools);
     let store: Arc<dyn otto_persistence::SessionStore> =
         Arc::new(otto_persistence::SqliteStore::open(&open_db_path()).await?);
@@ -813,6 +759,53 @@ mod tests {
         assert!(
             ok.is_ok(),
             "expected model-pinned agent to run offline: {ok:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_custom_agent_dispatches_with_full_extensions_configured() {
+        use std::fs;
+        // Permissions + skills + hooks all configured: the agent path must build its composed
+        // registry (PolicyGate, skill tool, hook wrap) and still complete an offline one-shot
+        // dispatch. Guards the --agent composition against breaking the deterministic path.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        let agents = claude.join("agents");
+        let skill_dir = claude.join("skills").join("greeter");
+        fs::create_dir_all(&agents).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{
+                "permissions": { "deny": ["Write(dist/**)"] },
+                "hooks": { "PostToolUse": [
+                    {"matcher": "fs.read", "hooks": [{"type": "command", "command": "true"}]}
+                ] }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+        fs::write(
+            agents.join("echoer.md"),
+            "---\nname: echoer\ndescription: echoes\ntools: fs.read\n---\nYou are an echo agent.\n",
+        )
+        .unwrap();
+
+        let ok = run_custom_agent_in(
+            "echoer",
+            "hello",
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "expected dispatch to succeed under full composition: {ok:?}"
         );
     }
 
@@ -1128,6 +1121,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_composition_exposes_skill_tool_until_narrowed_away() {
+        use std::fs;
+        // A discovered skill registers the gated `skill` tool in the composed registry a
+        // command uses; a present `allowed-tools` that omits `skill` narrows it away.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let skill_dir = proj.path().join(".claude").join("skills").join("greeter");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
+        )
+        .unwrap();
+
+        let ext = otto_extensions::discover(proj.path(), home.path());
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // No allowed-tools (None) → the composed registry keeps `skill`.
+        let kept = narrow_for_command(tools, &None);
+        assert!(kept.tool_names().iter().any(|n| n == "skill"));
+
+        // allowed-tools present but omitting `skill` → narrowed away. (Note: there is no
+        // `Skill`→`skill` alias in permission_def::normalize_tool — lowercase only.)
+        let narrowed = narrow_for_command(kept, &Some(vec!["fs.read".to_string()]));
+        assert!(!narrowed.tool_names().iter().any(|n| n == "skill"));
+    }
+
+    #[tokio::test]
     async fn command_allowed_tools_narrows_and_blocks_disallowed_injection() {
         use std::fs;
         let proj = tempfile::tempdir().unwrap();
@@ -1159,6 +1182,83 @@ mod tests {
                 .to_string()
                 .contains("file injection `@target.txt`"),
             "expected the fs.read injection to be the failure cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_path_enforces_discovered_permissions() {
+        use std::fs;
+        // A settings.json `deny: Read(secret.txt)` rule must block the command's @-injection:
+        // before CLI-composition parity, run_command_in built its registry with
+        // PermissionRules::default() and this injection succeeded.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap(); // empty → no user-global config
+        fs::write(proj.path().join("secret.txt"), "s3cr3t").unwrap();
+        let claude = proj.path().join(".claude");
+        let cmds = claude.join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{ "permissions": { "deny": ["Read(secret.txt)"] } }"#,
+        )
+        .unwrap();
+        fs::write(cmds.join("peek.md"), "Show @secret.txt\n").unwrap();
+
+        let res = run_command_in(
+            "peek",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected the permissions deny rule to fail the @-injection closed, got: {res:?}"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("file injection `@secret.txt`"),
+            "expected the fs.read injection to be the failure cause, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_path_fires_pretooluse_hook_on_injection() {
+        use std::fs;
+        if !otto_tools::os_sandbox_available() {
+            eprintln!("skipping command-path hook test: no OS sandbox backend");
+            return;
+        }
+        // A blocking PreToolUse hook on `bash` must abort the command's !`…` injection —
+        // hooks now wrap the --command path's composed registry, same as spine/serve.
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let claude = proj.path().join(".claude");
+        let cmds = claude.join("commands");
+        fs::create_dir_all(&cmds).unwrap();
+        fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        fs::write(cmds.join("shell.md"), "Result: !`echo hi`\n").unwrap();
+
+        let res = run_command_in(
+            "shell",
+            &[],
+            proj.path().to_path_buf(),
+            home.path().to_path_buf(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected the PreToolUse hook to block the bash injection, got: {res:?}"
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(
+            msg.contains("command injection `!echo hi` failed")
+                && msg.contains("blocked by PreToolUse hook"),
+            "expected a hook-blocked bash injection, got: {msg}"
         );
     }
 
@@ -1252,7 +1352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_wraps_hooks_around_permission_and_approval_gate() {
+    async fn build_composed_tools_wraps_hooks_around_permission_and_approval_gate() {
         use otto_workspace::LocalWorkspace;
 
         if !otto_tools::os_sandbox_available() {
@@ -1281,7 +1381,7 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, _conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), true).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), true).await;
 
         // The hook fires even though fs.read is otherwise allowed by the permission/approval gate.
         let err = tools
@@ -1300,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_enforces_hooks_on_the_plain_gate_branch() {
+    async fn build_composed_tools_enforces_hooks_on_the_plain_gate_branch() {
         use otto_workspace::LocalWorkspace;
 
         if !otto_tools::os_sandbox_available() {
@@ -1328,7 +1428,7 @@ mod tests {
         // plain build_tool_registry branch, not PolicyGate/ApprovalModeGate.
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, _conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
         let err = tools
             .call("fs.read", serde_json::json!({ "path": "target.txt" }))
@@ -1341,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_matches_direct_call_when_nothing_is_configured() {
+    async fn build_composed_tools_matches_direct_call_when_nothing_is_configured() {
         use otto_workspace::LocalWorkspace;
 
         let proj = tempfile::tempdir().unwrap();
@@ -1354,9 +1454,9 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, _conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
-        // With no settings.json at all, build_serve_tools must behave exactly like calling
+        // With no settings.json at all, build_composed_tools must behave exactly like calling
         // build_tools_preferring_mcp directly — register_hooks is a no-op with no hooks.
         let out = tools
             .call("fs.read", serde_json::json!({ "path": "target.txt" }))
@@ -1369,7 +1469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_registers_skill_tool_when_present() {
+    async fn build_composed_tools_registers_skill_tool_when_present() {
         use otto_workspace::LocalWorkspace;
 
         let proj = tempfile::tempdir().unwrap();
@@ -1387,7 +1487,7 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, _conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
         assert!(
             tools.tool_names().iter().any(|n| n == "skill"),
@@ -1397,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_connects_and_registers_a_plugin_mcp_server() {
+    async fn build_composed_tools_connects_and_registers_a_plugin_mcp_server() {
         use otto_extensions::{Extensions, PluginMcpServer};
         use otto_workspace::LocalWorkspace;
 
@@ -1426,7 +1526,7 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
         assert!(
             tools
@@ -1437,7 +1537,7 @@ mod tests {
             tools.tool_names()
         );
         // The connection must be retained in the returned Vec — otherwise the caller would drop
-        // it and kill the child process the instant build_serve_tools returns.
+        // it and kill the child process the instant build_composed_tools returns.
         assert!(!conns.is_empty());
 
         // Registered-by-name isn't enough on its own — prove the tool actually round-trips
@@ -1457,7 +1557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_skips_an_unreachable_plugin_mcp_server() {
+    async fn build_composed_tools_skips_an_unreachable_plugin_mcp_server() {
         use otto_extensions::{Extensions, PluginMcpServer};
         use otto_workspace::LocalWorkspace;
 
@@ -1476,7 +1576,7 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
         // An unreachable plugin server is logged and skipped, never fatal — matches cmd_run.
         assert!(
@@ -1488,7 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_serve_tools_plugin_tools_are_gate_guarded_but_not_hook_wrapped() {
+    async fn build_composed_tools_plugin_tools_are_gate_guarded_but_not_hook_wrapped() {
         use otto_extensions::PluginMcpServer;
         use otto_workspace::LocalWorkspace;
 
@@ -1536,7 +1636,7 @@ mod tests {
 
         let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
         let (tools, _conns) =
-            super::build_serve_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
 
         // fs.read was registered before the hook wrap — the "*" hook blocks it.
         let blocked = tools
