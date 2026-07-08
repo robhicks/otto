@@ -147,7 +147,9 @@ impl LspClient {
                         "error": {"code": -32601, "message": "method not supported by otto lsp bridge"},
                     });
                     let mut w = reader_writer.lock().await;
-                    let _ = write_message(&mut *w, &reply).await;
+                    if write_message(&mut *w, &reply).await.is_err() {
+                        reader_alive.store(false, Ordering::SeqCst);
+                    }
                 }
             }
         });
@@ -172,6 +174,7 @@ impl LspClient {
     }
 
     /// False once the server's stream has closed (process exited) or a write to it failed.
+    /// Callers evict a dead client and re-spawn on the next call instead of hanging.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
