@@ -69,6 +69,8 @@ struct ReadyServer {
 type ServerSlot = Arc<Mutex<Option<ReadyServer>>>;
 /// server key → its slot.
 type SlotMap = Arc<Mutex<HashMap<&'static str, ServerSlot>>>;
+/// document URI → a mutex serializing that URI's open/change sequence (see `open_if_needed`).
+type UriLockMap = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
 
 #[derive(Clone)]
 pub struct LspServer {
@@ -85,6 +87,10 @@ pub struct LspServer {
     workspace: Arc<LocalWorkspace>,
     root: PathBuf,
     open_docs: Arc<Mutex<HashMap<String, i32>>>,
+    /// Per-URI locks serializing each document's read/version/notify sequence. Grows one entry
+    /// per distinct URI touched, unbounded for the process lifetime — same category as
+    /// `open_docs`/the client's generation map.
+    uri_locks: UriLockMap,
 }
 
 impl LspServer {
@@ -97,7 +103,17 @@ impl LspServer {
             workspace: Arc::new(LocalWorkspace::new(root.clone())),
             root,
             open_docs: Arc::new(Mutex::new(HashMap::new())),
+            uri_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get-or-create the per-URI lock that serializes that document's open/change sequence.
+    async fn uri_lock_for(&self, uri_str: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.uri_locks.lock().await;
+        locks
+            .entry(uri_str.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Extension of `path`, lowercased, no leading dot (`""` if none).
@@ -242,13 +258,18 @@ impl LspServer {
             .ok_or_else(|| anyhow::anyhow!("no language server configured for .{ext}"))?;
         let client = self.get_or_spawn(spec).await?;
 
-        // NOTE: the read → bump_generation → version-assign → notify sequence below is not atomic
-        // across its three locks. That is safe only because the orchestrator spine issues tool
-        // calls sequentially, so two concurrent opens of the *same* URI never overlap. If a
-        // concurrent caller is ever added, serialize this sequence per-URI (a follow-up).
-        let content = String::from_utf8(self.workspace.read(Path::new(path)).await?)?;
         let uri = self.uri_for(path)?;
         let uri_str = uri.as_str().to_string();
+
+        // Serialize the read → bump_generation → version-assign → notify sequence PER URI, held
+        // across the `notify` write, so two concurrent opens of the same file can't assign
+        // versions and emit didOpen/didChange out of order (older content landing at a higher
+        // version). Different URIs — and different languages — take different locks, so the
+        // per-key cross-language concurrency is preserved.
+        let uri_lock = self.uri_lock_for(&uri_str).await;
+        let _uri_guard = uri_lock.lock().await;
+
+        let content = String::from_utf8(self.workspace.read(Path::new(path)).await?)?;
         let generation = client.bump_generation(&uri_str).await;
 
         let (method, params) = {
@@ -998,6 +1019,36 @@ mod tests {
         assert!(
             opened.is_ok(),
             "a warm rust-analyzer call blocked behind gopls's slot lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_uri_opens_serialize_but_distinct_uris_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
+        let (server, _server_end) = duplex_server(dir.path()).await;
+
+        // Hold a.rs's per-URI lock, as if an open of a.rs were mid-flight.
+        let a_uri = server.uri_for("a.rs").unwrap();
+        let a_lock = server.uri_lock_for(a_uri.as_str()).await;
+        let _held = a_lock.lock().await;
+
+        // A second open of the SAME URI must serialize behind the held lock (never completes
+        // within the window)...
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(500), server.open_if_needed("a.rs")).await;
+        assert!(
+            blocked.is_err(),
+            "a same-URI open should serialize behind the held per-URI lock"
+        );
+
+        // ...but an open of a DIFFERENT URI must proceed unimpeded.
+        let other =
+            tokio::time::timeout(Duration::from_secs(2), server.open_if_needed("b.rs")).await;
+        assert!(
+            other.is_ok(),
+            "a distinct-URI open must not block on a.rs's per-URI lock"
         );
     }
 
