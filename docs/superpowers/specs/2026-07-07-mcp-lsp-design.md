@@ -3,6 +3,10 @@
 Status: shipped. Closed the last "deferred to v2" line in the MCP
 tool-server tier (`docs/ARCHITECTURE.md`'s crate table).
 
+> **Update (2026-07-08):** the "Future generalization" section below is now built — multi-language
+> dispatch (Rust/TS/JS/Python/Go) shipped per
+> [2026-07-08-mcp-lsp-multi-language-design.md](2026-07-08-mcp-lsp-multi-language-design.md).
+
 ## Motivation
 
 The MCP tool-server tier (`mcp-fs`, `mcp-grep`, `mcp-git`, `mcp-bash`) is complete; `mcp-lsp`
