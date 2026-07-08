@@ -5,7 +5,7 @@
 mod lang;
 mod lsp_client;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,63 +58,204 @@ pub struct DiagnosticOut {
     code: Option<String>,
 }
 
-/// The server struct wrapping an `LspClient` bridged to `rust-analyzer`, plus a path-contained
-/// `LocalWorkspace` used to read file content for `didOpen`/`didChange` sync.
+/// A spawned, initialized language server. `_child` is `Option` so a test can seed a
+/// duplex-backed client with no OS process (a pipe has nothing for kill_on_drop to protect).
+struct ReadyServer {
+    client: Arc<LspClient>,
+    _child: Option<tokio::process::Child>,
+}
+
 #[derive(Clone)]
 pub struct LspServer {
-    lsp: Arc<LspClient>,
+    /// server key → its lazily-spawned slot. The outer lock is held only to get-or-insert a
+    /// slot; the slow spawn+initialize happens under the per-key inner lock, so a cold `gopls`
+    /// never blocks a warm `rust-analyzer` call.
+    slots: Arc<Mutex<HashMap<&'static str, Arc<Mutex<Option<ReadyServer>>>>>>,
+    /// server keys whose binary is definitely not on PATH — a permanent negative cache (avoids
+    /// spawn hammering). Spawn/init errors are NOT cached here; they stay retry-eligible.
+    absent: Arc<Mutex<HashSet<&'static str>>>,
+    /// server keys that have returned a non-timed-out diagnostics result — after which the
+    /// steady-state (short) diagnostics budget applies instead of the cold-start budget.
+    served_diag: Arc<Mutex<HashSet<&'static str>>>,
     workspace: Arc<LocalWorkspace>,
     root: PathBuf,
-    open_docs: Arc<Mutex<HashMap<String, i32>>>, // document URI -> last-sent version
+    open_docs: Arc<Mutex<HashMap<String, i32>>>,
 }
 
 impl LspServer {
-    pub fn new(lsp: LspClient, root: PathBuf) -> Self {
-        // Canonicalize so `path_for`'s URI prefix matches the absolutized URIs
-        // `path_to_file_uri` produces (the engine passes a possibly-relative root, e.g. `.`).
+    pub fn new(root: PathBuf) -> Self {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         Self {
-            lsp: Arc::new(lsp),
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            absent: Arc::new(Mutex::new(HashSet::new())),
+            served_diag: Arc::new(Mutex::new(HashSet::new())),
             workspace: Arc::new(LocalWorkspace::new(root.clone())),
             root,
             open_docs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Extension of `path`, lowercased, no leading dot (`""` if none).
+    fn extension_of(path: &str) -> String {
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default()
+    }
+
+    fn spec_for(&self, path: &str) -> Option<&'static lang::ServerSpec> {
+        lang::config_for_extension(&Self::extension_of(path)).map(|(spec, _)| spec)
+    }
+
+    /// Get the client for `spec`, spawning + initializing it on first use. Per-key locked, so
+    /// concurrent first-calls for the same server don't double-spawn and different languages
+    /// proceed in parallel. A definitely-absent binary is cached in `absent` (never retried);
+    /// spawn/init failures leave the slot empty (retry-eligible next call).
+    async fn get_or_spawn(
+        &self,
+        spec: &'static lang::ServerSpec,
+    ) -> anyhow::Result<Arc<LspClient>> {
+        if self.absent.lock().await.contains(spec.key) {
+            anyhow::bail!("no language server `{}` on PATH", lang::resolved_bin(spec));
+        }
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            slots
+                .entry(spec.key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        let mut guard = slot.lock().await;
+        if let Some(ready) = guard.as_ref() {
+            return Ok(ready.client.clone());
+        }
+        let bin = lang::resolved_bin(spec);
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        if lang::resolve_executable(&bin, &path_var).is_none() {
+            self.absent.lock().await.insert(spec.key);
+            anyhow::bail!("no language server `{bin}` on PATH");
+        }
+        let (client, child) = lsp_client::spawn_process(&bin, spec.args)?;
+        client.initialize(&self.root).await?;
+        let client = Arc::new(client);
+        *guard = Some(ReadyServer {
+            client: client.clone(),
+            _child: Some(child),
+        });
+        Ok(client)
+    }
+
+    /// Drop a cached client (its server process died) so the next call re-spawns.
+    async fn evict(&self, key: &'static str) {
+        let slot = self.slots.lock().await.get(key).cloned();
+        if let Some(slot) = slot {
+            *slot.lock().await = None;
+        }
+    }
+
+    /// The diagnostics wait budget for `spec`: the cold-start budget until the server has
+    /// returned one non-timed-out result, then the steady-state default.
+    async fn diag_wait_for(&self, spec: &lang::ServerSpec) -> std::time::Duration {
+        if self.served_diag.lock().await.contains(spec.key) {
+            diagnostics_timeout()
+        } else {
+            spec.first_open_diag_timeout
+        }
+    }
+
+    /// Record that `spec` returned diagnostics; only a non-timed-out result flips it to
+    /// steady-state (a cold server keeps the long budget until it actually responds).
+    async fn mark_served(&self, spec: &lang::ServerSpec, timed_out: bool) {
+        if !timed_out {
+            self.served_diag.lock().await.insert(spec.key);
+        }
+    }
+
+    #[cfg(test)]
+    async fn seed_ready_for_test(&self, key: &'static str, client: LspClient) {
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            slots
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        *slot.lock().await = Some(ReadyServer {
+            client: Arc::new(client),
+            _child: None,
+        });
+    }
+
+    #[cfg(test)]
+    async fn slot_handle_for_test(&self, key: &'static str) -> Arc<Mutex<Option<ReadyServer>>> {
+        let mut slots = self.slots.lock().await;
+        slots
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    }
+
+    #[cfg(test)]
+    async fn slot_is_ready(&self, key: &'static str) -> bool {
+        let slot = self.slots.lock().await.get(key).cloned();
+        match slot {
+            Some(s) => s.lock().await.is_some(),
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    async fn mark_absent_for_test(&self, key: &'static str) {
+        self.absent.lock().await.insert(key);
+    }
+
+    #[cfg(test)]
+    async fn absent_contains(&self, key: &'static str) -> bool {
+        self.absent.lock().await.contains(key)
+    }
+
     fn uri_for(&self, path: &str) -> anyhow::Result<lsp_types::Uri> {
         lsp_client::path_to_file_uri(&self.root.join(path))
     }
 
-    /// Ensure `path` is open (or up to date) in the language server via `didOpen`/`didChange`.
-    /// Returns the document's URI string and the diagnostics generation to wait on for freshness.
-    async fn open_if_needed(&self, path: &str) -> anyhow::Result<(String, u64)> {
+    /// Ensure `path` is open (or up to date) in its language's server. Resolves the extension to
+    /// a (server, languageId), spawns the server on first use, sends `didOpen`/`didChange` with
+    /// that languageId, and returns the client so the caller issues its request against it. A
+    /// notify write failure means the server's pipe is closed (it died) — evict so the next call
+    /// re-spawns rather than leaving a dead client cached.
+    async fn open_if_needed(&self, path: &str) -> anyhow::Result<(Arc<LspClient>, String, u64)> {
+        let ext = Self::extension_of(path);
+        let (spec, language_id) = lang::config_for_extension(&ext)
+            .ok_or_else(|| anyhow::anyhow!("no language server configured for .{ext}"))?;
+        let client = self.get_or_spawn(spec).await?;
+
         let content = String::from_utf8(self.workspace.read(Path::new(path)).await?)?;
         let uri = self.uri_for(path)?;
         let uri_str = uri.as_str().to_string();
-        let generation = self.lsp.bump_generation(&uri_str).await;
-        let mut open = self.open_docs.lock().await;
-        match open.get(&uri_str) {
-            None => {
-                open.insert(uri_str.clone(), 1);
-                self.lsp
-                    .notify(
+        let generation = client.bump_generation(&uri_str).await;
+
+        let (method, params) = {
+            let mut open = self.open_docs.lock().await;
+            match open.get(&uri_str).copied() {
+                None => {
+                    open.insert(uri_str.clone(), 1);
+                    (
                         "textDocument/didOpen",
                         serde_json::to_value(lsp_types::DidOpenTextDocumentParams {
                             text_document: lsp_types::TextDocumentItem::new(
                                 uri,
-                                "rust".to_string(),
+                                language_id.to_string(),
                                 1,
                                 content,
                             ),
                         })?,
                     )
-                    .await?;
-            }
-            Some(&version) => {
-                let next = version + 1;
-                open.insert(uri_str.clone(), next);
-                self.lsp
-                    .notify(
+                }
+                Some(version) => {
+                    let next = version + 1;
+                    open.insert(uri_str.clone(), next);
+                    (
                         "textDocument/didChange",
                         serde_json::to_value(lsp_types::DidChangeTextDocumentParams {
                             text_document: lsp_types::VersionedTextDocumentIdentifier::new(
@@ -127,15 +268,25 @@ impl LspServer {
                             }],
                         })?,
                     )
-                    .await?;
+                }
             }
+        };
+
+        if let Err(e) = client.notify(method, params).await {
+            self.evict(spec.key).await;
+            return Err(e);
         }
-        Ok((uri_str, generation))
+        Ok((client, uri_str, generation))
     }
 
     pub async fn do_diagnostics(&self, path: String) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
-        self.do_diagnostics_with_timeout(path, diagnostics_timeout())
-            .await
+        let spec = self
+            .spec_for(&path)
+            .ok_or_else(|| anyhow::anyhow!("no language server configured for `{path}`"))?;
+        let wait = self.diag_wait_for(spec).await;
+        let (out, timed_out) = self.do_diagnostics_with_timeout(path, wait).await?;
+        self.mark_served(spec, timed_out).await;
+        Ok((out, timed_out))
     }
 
     async fn do_diagnostics_with_timeout(
@@ -143,8 +294,13 @@ impl LspServer {
         path: String,
         wait: std::time::Duration,
     ) -> anyhow::Result<(Vec<DiagnosticOut>, bool)> {
-        let (uri, generation) = self.open_if_needed(&path).await?;
-        let (diags, timed_out) = self.lsp.wait_for_diagnostics(&uri, generation, wait).await;
+        let (client, uri, generation) = self.open_if_needed(&path).await?;
+        let (diags, timed_out) = client.wait_for_diagnostics(&uri, generation, wait).await;
+        if timed_out && !client.is_alive() {
+            if let Some(spec) = self.spec_for(&path) {
+                self.evict(spec.key).await;
+            }
+        }
         let out = diags
             .into_iter()
             .map(|d| DiagnosticOut {
@@ -201,13 +357,22 @@ impl LspServer {
             .collect())
     }
 
+    /// Evict `path`'s server if a request failed against a now-dead client.
+    async fn evict_if_dead(&self, path: &str, client: &LspClient, failed: bool) {
+        if failed && !client.is_alive() {
+            if let Some(spec) = self.spec_for(path) {
+                self.evict(spec.key).await;
+            }
+        }
+    }
+
     pub async fn do_definition(
         &self,
         path: String,
         line: u32,
         character: u32,
     ) -> anyhow::Result<Vec<LocationOut>> {
-        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let (client, uri, _generation) = self.open_if_needed(&path).await?;
         let params = lsp_types::GotoDefinitionParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
@@ -219,15 +384,15 @@ impl LspServer {
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         };
-        let result = self
-            .lsp
+        let result = client
             .request(
                 "textDocument/definition",
                 serde_json::to_value(params)?,
                 NAVIGATION_TIMEOUT,
             )
-            .await?;
-        self.goto_response_to_locations(result)
+            .await;
+        self.evict_if_dead(&path, &client, result.is_err()).await;
+        self.goto_response_to_locations(result?)
     }
 
     pub async fn do_references(
@@ -236,7 +401,7 @@ impl LspServer {
         line: u32,
         character: u32,
     ) -> anyhow::Result<Vec<LocationOut>> {
-        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let (client, uri, _generation) = self.open_if_needed(&path).await?;
         let params = lsp_types::ReferenceParams {
             text_document_position: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
@@ -251,19 +416,19 @@ impl LspServer {
                 include_declaration: true,
             },
         };
-        let result = self
-            .lsp
+        let result = client
             .request(
                 "textDocument/references",
                 serde_json::to_value(params)?,
                 NAVIGATION_TIMEOUT,
             )
-            .await?;
+            .await;
+        self.evict_if_dead(&path, &client, result.is_err()).await;
+        let result = result?;
         if result.is_null() {
             return Ok(vec![]);
         }
         let locs: Vec<lsp_types::Location> = serde_json::from_value(result)?;
-        // Out-of-root locations are skipped, not errors — see `goto_response_to_locations`.
         Ok(locs
             .into_iter()
             .filter_map(|l| {
@@ -282,7 +447,7 @@ impl LspServer {
         line: u32,
         character: u32,
     ) -> anyhow::Result<Option<String>> {
-        let (uri, _generation) = self.open_if_needed(&path).await?;
+        let (client, uri, _generation) = self.open_if_needed(&path).await?;
         let params = lsp_types::HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: uri.parse()? },
@@ -293,14 +458,15 @@ impl LspServer {
             },
             work_done_progress_params: Default::default(),
         };
-        let result = self
-            .lsp
+        let result = client
             .request(
                 "textDocument/hover",
                 serde_json::to_value(params)?,
                 NAVIGATION_TIMEOUT,
             )
-            .await?;
+            .await;
+        self.evict_if_dead(&path, &client, result.is_err()).await;
+        let result = result?;
         if result.is_null() {
             return Ok(None);
         }
@@ -421,22 +587,26 @@ impl LspServer {
     }
 }
 
-fn rust_analyzer_bin() -> String {
-    std::env::var("OTTO_RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".to_string())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let root = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("usage: mcp-lsp <root>"))?;
-    // Canonicalize once so the rootUri sent to rust-analyzer matches the document URIs
-    // LspServer derives from its (internally canonicalized) root, even under symlinks.
     let root = std::fs::canonicalize(&root)?;
-    let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin(), &[])?;
-    lsp.initialize(&root).await?;
-    let server = LspServer::new(lsp, root);
+
+    // Additive-absence gate: if no supported language server is on PATH, exit before the MCP
+    // handshake so the engine's `connect_lsp` fails and registers no `lsp.*` tools. If ≥1 is
+    // present, serve — individual servers spawn lazily on first use of their language.
+    if !lang::any_server_available() {
+        anyhow::bail!(
+            "no supported language server on PATH \
+             (rust-analyzer / typescript-language-server / pyright-langserver / gopls); \
+             lsp tools will be unavailable"
+        );
+    }
+
+    let server = LspServer::new(root);
     let service = server.serve(rmcp::transport::io::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -445,20 +615,31 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::BufReader;
 
-    fn duplex_server(root: &Path) -> (LspServer, tokio::io::DuplexStream) {
+    async fn duplex_server(root: &Path) -> (LspServer, tokio::io::DuplexStream) {
+        seeded_duplex_server(root, "rust-analyzer").await
+    }
+
+    /// A server with one duplex-backed client seeded under `key` (no real process spawned).
+    async fn seeded_duplex_server(
+        root: &Path,
+        key: &'static str,
+    ) -> (LspServer, tokio::io::DuplexStream) {
         let (client_end, server_end) = tokio::io::duplex(16384);
         let (cr, cw) = tokio::io::split(client_end);
         let lsp = LspClient::spawn(BufReader::new(cr), cw);
-        (LspServer::new(lsp, root.to_path_buf()), server_end)
+        let server = LspServer::new(root.to_path_buf());
+        server.seed_ready_for_test(key, lsp).await;
+        (server, server_end)
     }
 
     #[tokio::test]
     async fn open_if_needed_sends_did_open_then_did_change() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, _sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
 
@@ -478,7 +659,7 @@ mod tests {
     async fn do_diagnostics_returns_fresh_results() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -517,7 +698,7 @@ mod tests {
     async fn do_diagnostics_times_out_without_a_response() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, _server_end) = duplex_server(dir.path());
+        let (server, _server_end) = duplex_server(dir.path()).await;
         let (diags, timed_out) = server
             .do_diagnostics_with_timeout("a.rs".to_string(), std::time::Duration::from_millis(200))
             .await
@@ -530,7 +711,7 @@ mod tests {
     async fn do_definition_parses_a_scalar_location_response() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); }").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -571,7 +752,7 @@ mod tests {
     async fn do_definition_skips_out_of_root_locations() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); }").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -611,7 +792,7 @@ mod tests {
     async fn do_definition_returns_empty_for_a_null_response() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -639,7 +820,7 @@ mod tests {
     async fn do_references_parses_an_array_of_locations() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() { a(); a(); }").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -681,7 +862,7 @@ mod tests {
     async fn do_hover_renders_markup_contents() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -711,7 +892,7 @@ mod tests {
     async fn do_hover_returns_none_for_a_null_response() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
-        let (server, server_end) = duplex_server(dir.path());
+        let (server, server_end) = duplex_server(dir.path()).await;
         let (sr, sw) = tokio::io::split(server_end);
         let mut sr = BufReader::new(sr);
         let mut sw = sw;
@@ -738,12 +919,115 @@ mod tests {
         std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
         // A messy but valid spelling of the same root: "<dir>/./"
         let messy = dir.path().join(".");
-        let (client_end, _server_end) = tokio::io::duplex(1024);
-        let (cr, cw) = tokio::io::split(client_end);
-        let lsp = LspClient::spawn(BufReader::new(cr), cw);
-        let server = LspServer::new(lsp, messy);
+        let server = LspServer::new(messy);
         let uri = server.uri_for("a.rs").unwrap();
         assert_eq!(server.path_for(&uri).unwrap(), "a.rs");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_sends_python_language_id_for_py_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x = 1\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "pyright-langserver").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("a.py").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["method"], "textDocument/didOpen");
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "python");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_sends_go_language_id_for_go_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "gopls").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("a.go").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "go");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_lowercases_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A.PY"), "x = 1\n").unwrap();
+        let (server, server_end) = seeded_duplex_server(dir.path(), "pyright-langserver").await;
+        let (sr, _sw) = tokio::io::split(server_end);
+        let mut sr = BufReader::new(sr);
+        server.open_if_needed("A.PY").await.unwrap();
+        let msg = lsp_client::read_message(&mut sr).await.unwrap();
+        assert_eq!(msg["params"]["textDocument"]["languageId"], "python");
+    }
+
+    #[tokio::test]
+    async fn open_if_needed_rejects_an_unsupported_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        let err = server.open_if_needed("a.txt").await.err().unwrap();
+        assert!(err.to_string().contains("no language server configured"));
+    }
+
+    #[tokio::test]
+    async fn a_busy_server_slot_does_not_block_a_warm_call_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, _server_end) = duplex_server(dir.path()).await;
+        let gopls_slot = server.slot_handle_for_test("gopls").await;
+        let _held = gopls_slot.lock().await;
+        let opened =
+            tokio::time::timeout(Duration::from_secs(2), server.open_if_needed("a.rs")).await;
+        assert!(
+            opened.is_ok(),
+            "a warm rust-analyzer call blocked behind gopls's slot lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_budget_uses_first_open_then_steady_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            lang::RUST_ANALYZER.first_open_diag_timeout
+        );
+        server.mark_served(&lang::RUST_ANALYZER, true).await;
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            lang::RUST_ANALYZER.first_open_diag_timeout
+        );
+        server.mark_served(&lang::RUST_ANALYZER, false).await;
+        assert_eq!(
+            server.diag_wait_for(&lang::RUST_ANALYZER).await,
+            diagnostics_timeout()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_server_is_cached_and_short_circuits() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = LspServer::new(dir.path().to_path_buf());
+        server.mark_absent_for_test("gopls").await;
+        assert!(server.get_or_spawn(&lang::GOPLS).await.is_err());
+        assert!(server.get_or_spawn(&lang::GOPLS).await.is_err());
+        assert!(server.absent_contains("gopls").await);
+    }
+
+    #[tokio::test]
+    async fn a_dead_client_is_evicted_so_the_next_call_respawns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let (server, server_end) = duplex_server(dir.path()).await;
+        assert!(server.slot_is_ready("rust-analyzer").await);
+        drop(server_end);
+        let res = server.do_definition("a.rs".to_string(), 1, 1).await;
+        assert!(res.is_err());
+        assert!(
+            !server.slot_is_ready("rust-analyzer").await,
+            "a dead client should have been evicted"
+        );
     }
 }
 
@@ -756,10 +1040,7 @@ mod rust_analyzer_integration {
     use super::*;
 
     fn rust_analyzer_available() -> bool {
-        // Check the exit status, not just spawnability: rustup installs a `rust-analyzer`
-        // proxy shim that spawns fine but exits nonzero ("Unknown binary") when the
-        // component isn't installed — that host must skip, not time out.
-        std::process::Command::new(rust_analyzer_bin())
+        std::process::Command::new(lang::resolved_bin(&lang::RUST_ANALYZER))
             .arg("--version")
             .output()
             .map(|o| o.status.success())
@@ -772,7 +1053,6 @@ mod rust_analyzer_integration {
             eprintln!("skipping: rust-analyzer not found on PATH");
             return;
         }
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -786,12 +1066,7 @@ mod rust_analyzer_integration {
         )
         .unwrap();
 
-        let (lsp, _child) = lsp_client::spawn_process(&rust_analyzer_bin(), &[]).unwrap();
-        lsp.initialize(dir.path()).await.unwrap();
-        let server = LspServer::new(lsp, dir.path().to_path_buf());
-
-        // Diagnostics: `does_not_exist()` is unresolved, so rust-analyzer should report an
-        // error. Indexing can take a while on first open, hence the generous timeout override.
+        let server = LspServer::new(dir.path().to_path_buf());
         let (diags, timed_out) = server
             .do_diagnostics_with_timeout(
                 "src/lib.rs".to_string(),
@@ -804,9 +1079,6 @@ mod rust_analyzer_integration {
             diags.iter().any(|d| d.message.contains("does_not_exist")),
             "expected an unresolved-symbol diagnostic, got: {diags:?}"
         );
-
-        // Hover on `greet`'s definition (line 1, character 8, 1-based) proves navigation works
-        // against the real server.
         let hover = server
             .do_hover("src/lib.rs".to_string(), 1, 8)
             .await
