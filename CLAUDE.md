@@ -126,7 +126,11 @@ use `LocalProvider`) — this is what CI and first-run use, and why the test sui
 network or API keys.
 
 - `OTTO_OLLAMA=1` — use `OllamaProvider` for the local slot (model from `OTTO_OLLAMA_MODEL`, default `llama3.2`).
-- `ANTHROPIC_API_KEY` — use `AnthropicProvider` for the remote slot (model from `OTTO_ANTHROPIC_MODEL`, default `claude-haiku-4-5`); this enables the `BrainBlendRouter`. Absent, a `SingleProviderRouter` over the local slot is used.
+- **Remote slot** — one of three providers, selected when its API key is present. Precedence when several keys are set is `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > `GEMINI_API_KEY`; set `OTTO_REMOTE_PROVIDER=anthropic|openai|gemini` to pick explicitly (a named provider whose key is absent falls back to offline, never to another key). Any selected remote enables the `BrainBlendRouter`; absent every key/selector, a `SingleProviderRouter` over the local slot is used (the offline-deterministic default).
+  - `ANTHROPIC_API_KEY` — `AnthropicProvider` (model from `OTTO_ANTHROPIC_MODEL`, default `claude-haiku-4-5`).
+  - `OPENAI_API_KEY` — `OpenAiProvider`, Chat Completions (model from `OTTO_OPENAI_MODEL`, default `gpt-4o-mini`; `OPENAI_BASE_URL` overrides the endpoint for Azure/OpenAI-compatible hosts; o-series ids send `max_completion_tokens`).
+  - `GEMINI_API_KEY` — `GeminiProvider`, `generateContent` (model from `OTTO_GEMINI_MODEL`, default `gemini-2.5-flash`).
+  - A pinned `--model`/`model:` id routes by prefix (`gpt-`/`o1`/`o3`/`o4` → OpenAI, `gemini-` → Gemini, `claude-` → Anthropic); an unrecognized prefix uses the selected remote, and a pinned id whose provider key is absent falls back to offline.
 
 ## Architecture
 
@@ -140,7 +144,7 @@ impl crate.
 | `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`, plus the WS framing enum `ServerMessage` and `CapabilitiesManifest`). No I/O. The crate the `ui/` build shares (compiled to WASM). |
 | `engine-core` | The orchestrator state machine + the trait seams: `Agent`, `WorkspaceRead`/`Workspace`, `Provider`, `Router`, `Tool`/`ToolRegistry`/`PermissionGate`, plus `AgentRegistry` and shared `types`. |
 | `agents` | Built-in atomic agents implementing `Agent`: `Planner`, `ContextFinder` (lexical prefilter → LLM rank, with bounded per-turn read budget), `Coder`, `Verifier` (data-driven recipe table; runs the detected ecosystem's test command). All LLM-backed, all with a deterministic offline fallback. |
-| `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`. (`gemini`/`openai` are intended but not yet built.) |
+| `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`, `OpenAiProvider` (Chat Completions; o-series-aware token field), `GeminiProvider` (`generateContent`). All three remote providers mirror the same HTTP shape (configurable `base_url`, wiremock-tested, non-2xx surfaced via `error_for_status()`). |
 | `router` | `SingleProviderRouter` (pass-through) and `BrainBlendRouter` (privacy/complexity routing over a local+remote pool with cross-provider fallback), and `PinnedModelRouter` (pins the remote model to an explicit id, routing remote unless privacy-sensitive). |
 | `tools` | In-process `Tool` impls (`FsRead/Write/ListTool`, `BashTool`), the `DefaultPermissionGate`, and the OS sandbox (`SandboxPolicy`, `os_sandbox_available`, and the shared `run_sandboxed` core used by both `BashTool` and `mcp-bash`). The fs + bash tools are now the in-process *fallbacks* for `mcp-fs`/`mcp-bash`. |
 | `mcp-fs` | Standalone rmcp stdio server binary (`mcp-fs <root>`): path-contained `fs.read`/`fs.write`/`fs.list` over a `LocalWorkspace`. The engine spawns it via its MCP client (`crates/engine/src/mcp.rs`) and registers its tools behind the gate — never linked. |
@@ -208,8 +212,9 @@ filesystem read-only except the workspace root, network/pid/ipc isolated, minima
   async, and preserve the property that the orchestrator only ever holds trait objects —
   never concrete impls.
 - **Determinism is a test invariant.** The default offline path must stay reproducible:
-  `LocalProvider`/`ScriptedProvider` do no I/O. Anything reading `OTTO_*` / `ANTHROPIC_API_KEY`
-  belongs behind `build_router`, not in core logic.
+  `LocalProvider`/`ScriptedProvider` do no I/O. Anything reading `OTTO_*` / a provider API key
+  (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`) belongs behind `build_router`, not in
+  core logic.
 - **Tests live next to code** (`#[cfg(test)] mod tests`). Provider HTTP behavior is tested
   with `wiremock`; workspace/fs with `tempfile`. New agents should be unit-testable against
   a `ScriptedProvider` and the orchestrator against mocked agents (see
