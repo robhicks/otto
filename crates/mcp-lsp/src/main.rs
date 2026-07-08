@@ -2,6 +2,7 @@
 //! `rust-analyzer` language server over LSP-over-stdio. See
 //! docs/superpowers/specs/2026-07-07-mcp-lsp-design.md.
 
+mod lang;
 mod lsp_client;
 
 use std::collections::HashMap;
