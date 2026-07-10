@@ -490,19 +490,23 @@ fn fold_plugins(
                 if enabled.get(&key).copied() != Some(true) {
                     continue;
                 }
-                let rel = match &plugin.source {
-                    PluginSource::LocalPath(p) => p,
-                    PluginSource::Remote(_) => {
-                        eprintln!(
-                            "warning: skipping enabled plugin {key}: remote source not materialized on disk"
-                        );
-                        continue;
-                    }
+                let plugin_root = match &plugin.source {
+                    PluginSource::LocalPath(p) => mp_dir.join(p.trim_start_matches("./")),
+                    PluginSource::Remote(_) => base
+                        .join(".claude")
+                        .join("plugins")
+                        .join("repos")
+                        .join(&mp.name)
+                        .join(&plugin.name),
                 };
-                let plugin_root = mp_dir.join(rel.trim_start_matches("./"));
                 if !plugin_root.is_dir() {
+                    let hint = if matches!(plugin.source, PluginSource::Remote(_)) {
+                        format!(" (run 'otto plugin install {key}')")
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "warning: skipping enabled plugin {key}: source dir {} not found",
+                        "warning: skipping enabled plugin {key}: source dir {} not found{hint}",
                         plugin_root.display()
                     );
                     continue;
@@ -1252,5 +1256,77 @@ mod tests {
 
         let ext = discover(proj.path(), home.path());
         assert!(ext.skills.iter().any(|s| s.name == "foo:greet"));
+    }
+
+    #[test]
+    fn discover_folds_a_materialized_remote_plugin() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let base = home.path().join(".claude").join("plugins");
+
+        // Marketplace listing one git-remote plugin.
+        let mp = base
+            .join("marketplaces")
+            .join("acme")
+            .join(".claude-plugin");
+        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::write(
+            mp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"foo","source":{"source":"git","url":"file:///x"}}]}"#,
+        )
+        .unwrap();
+
+        // Materialized plugin code in the repos cache, with one command.
+        let proot = base.join("repos").join("acme").join("foo");
+        std::fs::create_dir_all(proot.join(".claude-plugin")).unwrap();
+        std::fs::write(
+            proot.join(".claude-plugin").join("plugin.json"),
+            r#"{"name":"foo"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(proot.join("commands")).unwrap();
+        std::fs::write(proot.join("commands").join("hello.md"), "hi").unwrap();
+
+        // Enable it.
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"foo@acme":true}}"#,
+        )
+        .unwrap();
+
+        let ext = discover(project.path(), home.path());
+        assert!(
+            ext.commands.iter().any(|c| c.name == "foo:hello"),
+            "expected foo:hello command, got: {:?}",
+            ext.commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discover_skips_an_unmaterialized_remote_plugin() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mp = home
+            .path()
+            .join(".claude")
+            .join("plugins")
+            .join("marketplaces")
+            .join("acme")
+            .join(".claude-plugin");
+        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::write(
+            mp.join("marketplace.json"),
+            r#"{"name":"acme","plugins":[{"name":"foo","source":{"source":"git","url":"file:///x"}}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"enabledPlugins":{"foo@acme":true}}"#,
+        )
+        .unwrap();
+
+        // No repos/acme/foo — discovery must skip without folding anything.
+        let ext = discover(project.path(), home.path());
+        assert!(ext.commands.iter().all(|c| c.name != "foo:hello"));
     }
 }
