@@ -349,10 +349,12 @@ format:
   bundled tool can never impersonate a built-in). `otto plugin marketplace add|remove|update|list`
   and `otto plugin install|uninstall|list` clone/manage marketplaces under
   `~/.claude/plugins/marketplaces/` (tracked in `~/.claude/plugins/marketplaces.lock.json`) and
-  flip the `enabledPlugins` allowlist — a CLI-operator-only action, never agent-facing. Installing a
-  plugin whose marketplace entry is a `Remote` source (its code lives outside the marketplace repo,
-  not yet materializable) is still pending, as is a project-level (non-user-global) marketplace
-  install and an interactive `/plugin` UX.
+  flip the `enabledPlugins` allowlist — a CLI-operator-only action, never agent-facing. Installing
+  a plugin whose marketplace entry is a `Remote` source (github/git — its code lives outside the
+  marketplace repo) materializes it: `otto plugin install` clones the plugin repo into
+  `~/.claude/plugins/repos/<marketplace>/<plugin>/`, records it in the lockfile's `plugins` map, and
+  discovery folds it from there. A project-level (non-user-global) marketplace install and an
+  interactive `/plugin` UX are still pending.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being

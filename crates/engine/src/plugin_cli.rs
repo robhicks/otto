@@ -48,18 +48,25 @@ fn is_scp_like(url: &str) -> bool {
     }
 }
 
-/// A marketplace name must be a single path-safe component: non-empty, no `/`/`\`, and not `.`
-/// or `..`. Applied to the `name` field read out of a *cloned* `marketplace.json` before it is
-/// used as a directory name — guards against a malformed/malicious manifest trying to escape
-/// `~/.claude/plugins/marketplaces/` (e.g. `"name": "../../etc"`).
-fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name == "." || name == ".." {
-        anyhow::bail!("invalid marketplace name: {name:?}");
+/// A path component must be a single safe segment: non-empty, no `/`/`\`, and not `.`/`..`.
+/// Applied to any name read out of a manifest or key before it is used as a directory component,
+/// guarding against escapes like `"../../etc"`.
+fn validate_path_component(value: &str, what: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value == "." || value == ".." {
+        anyhow::bail!("invalid {what}: {value:?}");
     }
-    if name.contains('/') || name.contains('\\') {
-        anyhow::bail!("invalid marketplace name (must be a single path component): {name:?}");
+    if value.contains('/') || value.contains('\\') {
+        anyhow::bail!("invalid {what} (must be a single path component): {value:?}");
     }
     Ok(())
+}
+
+/// A marketplace name must be a single path-safe component. Applied to the `name` field read
+/// out of a *cloned* `marketplace.json` before it is used as a directory name — guards against
+/// a malformed/malicious manifest trying to escape `~/.claude/plugins/marketplaces/` (e.g.
+/// `"name": "../../etc"`).
+fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
+    validate_path_component(name, "marketplace name")
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +75,10 @@ fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
 
 fn marketplaces_dir(home: &Path) -> PathBuf {
     home.join(".claude").join("plugins").join("marketplaces")
+}
+
+fn repos_dir(home: &Path) -> PathBuf {
+    home.join(".claude").join("plugins").join("repos")
 }
 
 fn lockfile_path(home: &Path) -> PathBuf {
@@ -259,7 +270,9 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
     Ok(mp.name)
 }
 
-/// Delete `~/.claude/plugins/marketplaces/<name>/` and its lockfile entry. Does **not** scrub any
+/// Delete `~/.claude/plugins/marketplaces/<name>/` and its lockfile entry, along with any
+/// materialized remote-plugin clones under `~/.claude/plugins/repos/<name>/` and their `plugins`
+/// lock entries — so removal leaves no orphaned clones or stale rows. Does **not** scrub any
 /// `enabledPlugins` keys referencing this marketplace — a stale key simply becomes inert on the
 /// next `discover()` (no matching directory to fold), a deliberate simplification over a
 /// cross-cutting `settings.json` cleanup.
@@ -269,10 +282,23 @@ pub fn marketplace_remove(name: &str, home: &Path) -> anyhow::Result<()> {
         anyhow::bail!("marketplace '{name}' is not installed");
     }
 
+    // Defense-in-depth: guard both recursive deletes against a hand-tampered lockfile key.
+    validate_path_component(name, "marketplace name")?;
+
     let mp_dir = marketplaces_dir(home).join(name);
     if mp_dir.exists() {
         std::fs::remove_dir_all(&mp_dir)?;
     }
+
+    // Also remove any materialized remote-plugin clones + their lock entries for this marketplace,
+    // so removal leaves no orphaned clones or stale rows.
+    let repos_mp = repos_dir(home).join(name);
+    if repos_mp.exists() {
+        std::fs::remove_dir_all(&repos_mp)?;
+    }
+    // Keys are "<plugin>@<marketplace>"; the marketplace is everything after the first '@'.
+    lock.plugins
+        .retain(|k, _| k.split_once('@').map(|(_, mp)| mp) != Some(name));
 
     lock.entries.remove(name);
     write_lockfile(home, &lock)?;
@@ -374,11 +400,130 @@ fn read_marketplace_manifest(
         .map_err(|e| anyhow::anyhow!("marketplace '{marketplace}' has an invalid manifest: {e}"))
 }
 
-/// Enable `"<plugin>@<marketplace>"` in `~/.claude/settings.json`. Errors if the marketplace isn't
-/// installed, the plugin isn't offered by it, or the plugin's `source` is `Remote` (materializing
-/// a plugin whose code lives outside its marketplace repo is a deferred follow-up — see the design
-/// doc). Never activates any code — only flips the allowlist bit `discover()` reads.
-pub fn plugin_install(key: &str, home: &Path) -> anyhow::Result<()> {
+/// Resolve `(ref, commit)` for a checked-out repo at `dir`: the pinned ref if one was requested,
+/// else the current branch name, plus `HEAD`'s commit sha.
+async fn read_repo_head(dir: &Path, pinned_ref: Option<&str>) -> anyhow::Result<(String, String)> {
+    let resolved_ref = match pinned_ref {
+        Some(r) => r.to_string(),
+        None => run_git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await?
+            .trim()
+            .to_string(),
+    };
+    let commit = run_git(dir, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+    Ok((resolved_ref, commit))
+}
+
+/// Clone a remote-sourced plugin into `repos/<marketplace>/<plugin>/` and record it in the
+/// lockfile's `plugins` map. New clones use staging-dir → atomic rename → cleanup-on-failure,
+/// mirroring `marketplace_add`; a lockfile-write failure removes a clone we created this call (never
+/// a reused one).
+///
+/// An already-materialized clone is **reused as-is** — refreshing/re-pointing it is out of scope
+/// (see the plugins design). If a lockfile entry already exists for this key, its recorded
+/// provenance is preserved verbatim (so a pinned tag/sha isn't degraded to detached `HEAD`); a
+/// requested source/ref that differs from the locked one is a no-op and emits a `note:` pointing at
+/// uninstall+reinstall. A clone directory that exists with *no* lock entry (e.g. a crashed prior
+/// install) records the on-disk origin/HEAD instead.
+async fn materialize_remote_plugin(
+    key: &str,
+    plugin: &str,
+    marketplace: &str,
+    rc: &otto_extensions::RemoteClone,
+    home: &Path,
+) -> anyhow::Result<()> {
+    validate_path_component(plugin, "plugin name")?;
+    validate_path_component(marketplace, "marketplace name")?;
+    validate_clone_url(&rc.url)?;
+    if let Some(r) = &rc.git_ref {
+        reject_leading_dash(r, "ref")?;
+    }
+
+    let mp_repos = repos_dir(home).join(marketplace);
+    std::fs::create_dir_all(&mp_repos)?;
+    let final_path = mp_repos.join(plugin);
+    let newly_created = !final_path.exists();
+
+    let mut lock = read_lockfile(home);
+    let existing = lock.plugins.get(key).cloned();
+
+    let (recorded_url, resolved_ref, commit) = if newly_created {
+        let staging_name = format!(".staging-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let staging_path = mp_repos.join(&staging_name);
+        if staging_path.exists() {
+            std::fs::remove_dir_all(&staging_path)?;
+        }
+        run_git(&mp_repos, &["clone", "--", &rc.url, &staging_name]).await?;
+
+        let cleanup_and_err = |e: anyhow::Error| {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            Err(e)
+        };
+        if let Some(r) = &rc.git_ref {
+            if let Err(e) = run_git(&staging_path, &["checkout", r]).await {
+                return cleanup_and_err(e);
+            }
+        }
+        let head = match read_repo_head(&staging_path, rc.git_ref.as_deref()).await {
+            Ok(h) => h,
+            Err(e) => return cleanup_and_err(e),
+        };
+        if let Err(e) = std::fs::rename(&staging_path, &final_path) {
+            return cleanup_and_err(anyhow::anyhow!("failed to materialize plugin: {e}"));
+        }
+        let (resolved_ref, commit) = head;
+        (rc.url.clone(), resolved_ref, commit)
+    } else if let Some(prev) = existing {
+        // True reuse: the clone and its lock entry were installed together. Reuse is a no-op
+        // (refreshing a materialized clone is out of scope — see the plugins design), so keep the
+        // recorded provenance rather than degrading a detached-HEAD pin to "HEAD". Note only when
+        // the caller asked for a different source/ref.
+        if prev.url != rc.url || rc.git_ref.as_deref().is_some_and(|r| r != prev.git_ref) {
+            eprintln!(
+                "note: plugin '{key}' is already materialized at {} (locked to {} @ {}); keeping it. \
+                 Run `otto plugin uninstall {key}` and reinstall to change its source or ref.",
+                final_path.display(),
+                prev.url,
+                prev.git_ref
+            );
+        }
+        (prev.url, prev.git_ref, prev.commit)
+    } else {
+        // Clone dir exists but no lock entry (e.g. a crashed prior install): record on-disk truth.
+        let origin = run_git(&final_path, &["config", "--get", "remote.origin.url"])
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| rc.url.clone());
+        let (resolved_ref, commit) = read_repo_head(&final_path, None).await?;
+        (origin, resolved_ref, commit)
+    };
+
+    lock.plugins.insert(
+        key.to_string(),
+        otto_extensions::MarketplaceLock {
+            url: recorded_url,
+            git_ref: resolved_ref,
+            commit,
+            updated_at_unix: now_unix(),
+        },
+    );
+    if let Err(e) = write_lockfile(home, &lock) {
+        if newly_created {
+            let _ = std::fs::remove_dir_all(&final_path);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Enable `"<plugin>@<marketplace>"` in `~/.claude/settings.json`, materializing the plugin's code
+/// first if its source is remote (github/git): clone it into `~/.claude/plugins/repos/` and record
+/// it in the lockfile. Errors if the marketplace isn't installed, the plugin isn't offered by it,
+/// or the remote descriptor is malformed/unsupported. A local-path plugin only flips the bit.
+pub async fn plugin_install(key: &str, home: &Path) -> anyhow::Result<()> {
     let (plugin_name, marketplace) = split_plugin_key(key)?;
     let mp = read_marketplace_manifest(home, &marketplace)?;
     let entry = mp
@@ -388,11 +533,16 @@ pub fn plugin_install(key: &str, home: &Path) -> anyhow::Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!("no plugin named '{plugin_name}' in marketplace '{marketplace}'")
         })?;
-    if matches!(entry.source, otto_extensions::PluginSource::Remote(_)) {
-        anyhow::bail!(
-            "'{key}' is remote-sourced (its code lives outside its marketplace repo); \
-             installing remote-sourced plugins isn't supported yet"
-        );
+
+    // Resolve the remote descriptor (if any) before dropping the borrow of `mp` across the clone.
+    let remote = match &entry.source {
+        otto_extensions::PluginSource::Remote(src) => {
+            Some(otto_extensions::resolve_remote_source(src)?)
+        }
+        otto_extensions::PluginSource::LocalPath(_) => None,
+    };
+    if let Some(rc) = remote {
+        materialize_remote_plugin(key, &plugin_name, &marketplace, &rc, home).await?;
     }
 
     let path = settings_path(home);
@@ -480,7 +630,7 @@ pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> 
             let key = rest.into_iter().next().ok_or_else(|| {
                 anyhow::anyhow!("usage: otto plugin install <plugin>@<marketplace>")
             })?;
-            plugin_install(&key, &home)?;
+            plugin_install(&key, &home).await?;
             println!("installed {key}");
             Ok(())
         }
@@ -592,6 +742,25 @@ mod tests {
         assert!(validate_marketplace_name("a/b").is_err());
     }
 
+    #[test]
+    fn validate_path_component_rejects_escapes_and_dashes() {
+        assert!(validate_path_component("foo", "plugin name").is_ok());
+        assert!(validate_path_component("", "plugin name").is_err());
+        assert!(validate_path_component(".", "plugin name").is_err());
+        assert!(validate_path_component("..", "plugin name").is_err());
+        assert!(validate_path_component("a/b", "plugin name").is_err());
+        assert!(validate_path_component("a\\b", "plugin name").is_err());
+    }
+
+    #[test]
+    fn repos_dir_is_under_claude_plugins() {
+        let home = std::path::Path::new("/home/x");
+        assert_eq!(
+            repos_dir(home),
+            std::path::Path::new("/home/x/.claude/plugins/repos")
+        );
+    }
+
     #[tokio::test]
     async fn run_git_reports_stderr_on_failure() {
         let dir = tempfile::tempdir().unwrap();
@@ -678,6 +847,179 @@ mod tests {
         .unwrap();
         let url = format!("file://{}", bare.path().display());
         (src, bare, url)
+    }
+
+    /// Build a marketplace repo whose one plugin is remote (`{"source":"git","url":"file://…"}`)
+    /// pointing at a *separate* bare repo that contains the plugin's code (a `plugin.json` plus a
+    /// `commands/hello.md` command). Returns keep-alive tempdirs and the marketplace `file://` URL.
+    async fn bare_remote_plugin_marketplace(
+        mp_name: &str,
+        plugin_name: &str,
+    ) -> (Vec<tempfile::TempDir>, String) {
+        // 1. The plugin's own repo (its code), bare-cloned to a file:// remote.
+        let psrc = tempfile::tempdir().unwrap();
+        init_repo(psrc.path()).await;
+        let cp = psrc.path().join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(
+            cp.join("plugin.json"),
+            format!(r#"{{"name":"{plugin_name}"}}"#),
+        )
+        .unwrap();
+        let cmds = psrc.path().join("commands");
+        std::fs::create_dir_all(&cmds).unwrap();
+        std::fs::write(cmds.join("hello.md"), "say hi").unwrap();
+        run_git(psrc.path(), &["add", "-A"]).await.unwrap();
+        run_git(psrc.path(), &["commit", "-m", "plugin"])
+            .await
+            .unwrap();
+        let pbare = tempfile::tempdir().unwrap();
+        run_git(
+            pbare.path(),
+            &["clone", "--bare", psrc.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
+        let plugin_url = format!("file://{}", pbare.path().display());
+
+        // 2. The marketplace repo, listing the plugin as a git-remote source.
+        let msrc = tempfile::tempdir().unwrap();
+        init_repo(msrc.path()).await;
+        let mcp = msrc.path().join(".claude-plugin");
+        std::fs::create_dir_all(&mcp).unwrap();
+        std::fs::write(
+            mcp.join("marketplace.json"),
+            format!(
+                r#"{{"name":"{mp_name}","plugins":[{{"name":"{plugin_name}","source":{{"source":"git","url":"{plugin_url}"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        run_git(msrc.path(), &["add", "-A"]).await.unwrap();
+        run_git(msrc.path(), &["commit", "-m", "marketplace"])
+            .await
+            .unwrap();
+        let mbare = tempfile::tempdir().unwrap();
+        run_git(
+            mbare.path(),
+            &["clone", "--bare", msrc.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
+        let mp_url = format!("file://{}", mbare.path().display());
+
+        (vec![psrc, pbare, msrc, mbare], mp_url)
+    }
+
+    #[tokio::test]
+    async fn plugin_install_materializes_a_remote_source() {
+        let (_keep, mp_url) = bare_remote_plugin_marketplace("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&mp_url, None, home.path()).await.unwrap();
+
+        plugin_install("foo@acme", home.path()).await.unwrap();
+
+        // The plugin's code was cloned into the repos cache.
+        let plugin_root = repos_dir(home.path()).join("acme").join("foo");
+        assert!(
+            plugin_root
+                .join(".claude-plugin")
+                .join("plugin.json")
+                .exists(),
+            "expected materialized plugin at {}",
+            plugin_root.display()
+        );
+        assert!(plugin_root.join("commands").join("hello.md").exists());
+
+        // It is recorded in the lockfile's plugins map and enabled in settings.
+        let lock = read_lockfile(home.path());
+        let entry = lock.plugins.get("foo@acme").expect("plugin locked");
+        assert!(
+            entry.url.starts_with("file://"),
+            "plugin url recorded: {}",
+            entry.url
+        );
+        assert!(!entry.commit.is_empty());
+        let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
+        assert!(settings.contains("foo@acme"));
+    }
+
+    #[tokio::test]
+    async fn plugin_install_remote_is_idempotent() {
+        let (_keep, mp_url) = bare_remote_plugin_marketplace("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&mp_url, None, home.path()).await.unwrap();
+
+        plugin_install("foo@acme", home.path()).await.unwrap();
+        // Second install reuses the existing clone without error.
+        plugin_install("foo@acme", home.path()).await.unwrap();
+
+        assert!(repos_dir(home.path()).join("acme").join("foo").exists());
+    }
+
+    #[tokio::test]
+    async fn materialize_reuse_records_on_disk_origin_not_requested() {
+        let (_keep, mp_url) = bare_remote_plugin_marketplace("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&mp_url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
+        let on_disk_url = read_lockfile(home.path()).plugins["foo@acme"].url.clone();
+
+        // The clone already exists; call materialize again with a DIFFERENT requested url.
+        // Reuse must record the on-disk origin, never fetch/record the bogus requested url.
+        let rc = otto_extensions::RemoteClone {
+            url: "file:///nonexistent-repo".to_string(),
+            git_ref: None,
+        };
+        materialize_remote_plugin("foo@acme", "foo", "acme", &rc, home.path())
+            .await
+            .unwrap();
+        let after = read_lockfile(home.path()).plugins["foo@acme"].url.clone();
+        assert_eq!(
+            after, on_disk_url,
+            "reuse must record the on-disk origin, not the requested url"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_reuse_preserves_a_pinned_ref() {
+        // A plugin repo carrying a tag `v1`.
+        let psrc = tempfile::tempdir().unwrap();
+        init_repo(psrc.path()).await;
+        let cp = psrc.path().join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(cp.join("plugin.json"), r#"{"name":"foo"}"#).unwrap();
+        run_git(psrc.path(), &["add", "-A"]).await.unwrap();
+        run_git(psrc.path(), &["commit", "-m", "p"]).await.unwrap();
+        run_git(psrc.path(), &["tag", "v1"]).await.unwrap();
+        let pbare = tempfile::tempdir().unwrap();
+        run_git(
+            pbare.path(),
+            &["clone", "--bare", psrc.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
+        let plugin_url = format!("file://{}", pbare.path().display());
+
+        let home = tempfile::tempdir().unwrap();
+        let rc = otto_extensions::RemoteClone {
+            url: plugin_url,
+            git_ref: Some("v1".to_string()),
+        };
+        // First materialize: clones + checks out the tag (detached HEAD) → records ref "v1".
+        materialize_remote_plugin("foo@acme", "foo", "acme", &rc, home.path())
+            .await
+            .unwrap();
+        assert_eq!(read_lockfile(home.path()).plugins["foo@acme"].git_ref, "v1");
+
+        // Reuse: must preserve the pin, not degrade it to the detached-HEAD string "HEAD".
+        materialize_remote_plugin("foo@acme", "foo", "acme", &rc, home.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_lockfile(home.path()).plugins["foo@acme"].git_ref,
+            "v1",
+            "reuse must preserve the pinned ref, not record detached HEAD"
+        );
     }
 
     #[tokio::test]
@@ -897,7 +1239,7 @@ mod tests {
         let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
-        plugin_install("foo@acme", home.path()).unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
 
         marketplace_remove("acme", home.path()).unwrap();
 
@@ -915,6 +1257,59 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let err = marketplace_remove("nope", home.path()).unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn marketplace_remove_cleans_up_materialized_plugins() {
+        let (_keep, mp_url) = bare_remote_plugin_marketplace("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&mp_url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
+
+        assert!(repos_dir(home.path()).join("acme").exists());
+        assert!(read_lockfile(home.path()).plugins.contains_key("foo@acme"));
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        assert!(
+            !repos_dir(home.path()).join("acme").exists(),
+            "repos tree removed"
+        );
+        assert!(
+            !read_lockfile(home.path()).plugins.contains_key("foo@acme"),
+            "plugin lock entry dropped"
+        );
+        assert!(!read_lockfile(home.path()).entries.contains_key("acme"));
+    }
+
+    #[test]
+    fn marketplace_remove_only_drops_its_own_plugin_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let mk = |u: &str| otto_extensions::MarketplaceLock {
+            url: u.to_string(),
+            git_ref: "main".to_string(),
+            commit: "c".to_string(),
+            updated_at_unix: 1,
+        };
+        let mut lock = read_lockfile(home.path());
+        lock.entries.insert("acme".to_string(), mk("m"));
+        lock.plugins.insert("foo@acme".to_string(), mk("a"));
+        lock.plugins.insert("bar@other".to_string(), mk("b"));
+        lock.plugins.insert("baz@x@acme".to_string(), mk("c")); // marketplace literally "x@acme"
+        write_lockfile(home.path(), &lock).unwrap();
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        let after = read_lockfile(home.path());
+        assert!(!after.plugins.contains_key("foo@acme"), "own key dropped");
+        assert!(
+            after.plugins.contains_key("bar@other"),
+            "unrelated marketplace kept"
+        );
+        assert!(
+            after.plugins.contains_key("baz@x@acme"),
+            "'x@acme' must not be falsely matched by removing 'acme'"
+        );
     }
 
     #[tokio::test]
@@ -1013,7 +1408,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
 
-        plugin_install("foo@acme", home.path()).unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
 
         let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
         let enabled = otto_extensions::parse_enabled_plugins(&settings);
@@ -1027,7 +1422,7 @@ mod tests {
         marketplace_add(&url, None, home.path()).await.unwrap();
         std::fs::write(settings_path(home.path()), r#"{"hooks":{"PreToolUse":[]}}"#).unwrap();
 
-        plugin_install("foo@acme", home.path()).unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
 
         let settings = std::fs::read_to_string(settings_path(home.path())).unwrap();
         let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
@@ -1037,7 +1432,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_install_unknown_marketplace_errors() {
         let home = tempfile::tempdir().unwrap();
-        let err = plugin_install("foo@nope", home.path()).unwrap_err();
+        let err = plugin_install("foo@nope", home.path()).await.unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
     }
 
@@ -1047,19 +1442,22 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
 
-        let err = plugin_install("nope@acme", home.path()).unwrap_err();
+        let err = plugin_install("nope@acme", home.path()).await.unwrap_err();
         assert!(err.to_string().contains("no plugin named"), "got: {err}");
     }
 
+    /// A remote source whose descriptor `resolve_remote_source` itself rejects (an unsupported
+    /// `source` kind) must fail fast, pure-data, with no `git clone` attempted at all — proven here
+    /// by never handing it a reachable URL.
     #[tokio::test]
-    async fn plugin_install_rejects_remote_sourced_plugin() {
+    async fn plugin_install_rejects_malformed_remote_source() {
         let src = tempfile::tempdir().unwrap();
         init_repo(src.path()).await;
         let cp = src.path().join(".claude-plugin");
         std::fs::create_dir_all(&cp).unwrap();
         std::fs::write(
             cp.join("marketplace.json"),
-            r#"{"name":"acme","plugins":[{"name":"rem","source":{"source":"github","repo":"a/b"}}]}"#,
+            r#"{"name":"acme","plugins":[{"name":"rem","source":{"source":"svn","repo":"a/b"}}]}"#,
         )
         .unwrap();
         run_git(src.path(), &["add", "-A"]).await.unwrap();
@@ -1078,14 +1476,19 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
 
-        let err = plugin_install("rem@acme", home.path()).unwrap_err();
-        assert!(err.to_string().contains("remote-sourced"), "got: {err}");
+        let err = plugin_install("rem@acme", home.path()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported remote source kind"),
+            "got: {err}"
+        );
+        // No clone was attempted — the repos cache stays empty.
+        assert!(!repos_dir(home.path()).join("acme").join("rem").exists());
     }
 
-    #[test]
-    fn plugin_install_malformed_key_errors() {
+    #[tokio::test]
+    async fn plugin_install_malformed_key_errors() {
         let home = tempfile::tempdir().unwrap();
-        let err = plugin_install("no-at-sign", home.path()).unwrap_err();
+        let err = plugin_install("no-at-sign", home.path()).await.unwrap_err();
         assert!(
             err.to_string().contains("<plugin>@<marketplace>"),
             "got: {err}"
@@ -1097,7 +1500,7 @@ mod tests {
         let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
-        plugin_install("foo@acme", home.path()).unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
 
         plugin_uninstall("foo@acme", home.path()).unwrap();
 
@@ -1111,7 +1514,7 @@ mod tests {
         let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
         let home = tempfile::tempdir().unwrap();
         marketplace_add(&url, None, home.path()).await.unwrap();
-        plugin_install("foo@acme", home.path()).unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
 
         let listed = plugin_list(home.path()).unwrap();
         assert_eq!(listed, vec![("foo@acme".to_string(), true)]);
