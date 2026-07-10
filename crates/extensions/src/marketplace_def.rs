@@ -14,6 +14,77 @@ pub enum PluginSource {
     Remote(Value),
 }
 
+/// A `PluginSource::Remote` descriptor resolved to a `git clone` target. Pure data — the CLI edge
+/// consumes this to clone into the repos cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClone {
+    pub url: String,
+    /// An optional pin (commit/tag/branch/ref) checked out after clone. `None` = the default branch.
+    pub git_ref: Option<String>,
+}
+
+/// A single URL/path segment is safe iff it is non-empty, not `-`-prefixed (argv injection), not
+/// `.`/`..`, and contains no `/` or `\`.
+fn valid_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+}
+
+/// Resolve a `Remote` plugin source (`{"source":"github","repo":"owner/name"}` or
+/// `{"source":"git","url":"…"}`) to a clone URL plus optional ref. Pure — no I/O. Errors, naming
+/// the unsupported shape, on an unknown `source` kind or a malformed descriptor.
+///
+/// Pin precedence, most-specific first: `commit` > `tag` > `branch` > `ref`.
+pub fn resolve_remote_source(src: &Value) -> anyhow::Result<RemoteClone> {
+    let obj = src
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("remote plugin source must be a JSON object"))?;
+    let kind = obj
+        .get("source")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("remote plugin source missing string `source` field"))?;
+
+    let git_ref = ["commit", "tag", "branch", "ref"]
+        .iter()
+        .find_map(|k| {
+            obj.get(*k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string());
+
+    let url = match kind {
+        "github" => {
+            let repo = obj
+                .get("repo")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("github source missing string `repo` field"))?;
+            let (owner, name) = repo.split_once('/').ok_or_else(|| {
+                anyhow::anyhow!("github `repo` must be 'owner/name', got '{repo}'")
+            })?;
+            if !valid_segment(owner) || !valid_segment(name) {
+                anyhow::bail!("github `repo` has an invalid segment: '{repo}'");
+            }
+            format!("https://github.com/{owner}/{name}")
+        }
+        "git" => obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("git source missing string `url` field"))?
+            .to_string(),
+        other => {
+            anyhow::bail!("unsupported remote source kind '{other}' (supported: github, git)")
+        }
+    };
+
+    Ok(RemoteClone { url, git_ref })
+}
+
 /// One plugin offered by a marketplace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketplaceEntry {
@@ -129,5 +200,77 @@ mod tests {
         let mp = parse_marketplace_json(json).unwrap();
         let names: Vec<_> = mp.plugins.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["ok"]);
+    }
+
+    #[test]
+    fn resolve_github_source_builds_https_url() {
+        let v = serde_json::json!({"source": "github", "repo": "acme/foo"});
+        let rc = resolve_remote_source(&v).unwrap();
+        assert_eq!(rc.url, "https://github.com/acme/foo");
+        assert_eq!(rc.git_ref, None);
+    }
+
+    #[test]
+    fn resolve_git_source_is_verbatim_url() {
+        let v = serde_json::json!({"source": "git", "url": "https://x.example/y.git"});
+        let rc = resolve_remote_source(&v).unwrap();
+        assert_eq!(rc.url, "https://x.example/y.git");
+        assert_eq!(rc.git_ref, None);
+    }
+
+    #[test]
+    fn resolve_ref_precedence_commit_wins_then_tag_branch_ref() {
+        let all = serde_json::json!({
+            "source": "git", "url": "u",
+            "ref": "r", "branch": "b", "tag": "t", "commit": "c"
+        });
+        assert_eq!(
+            resolve_remote_source(&all).unwrap().git_ref.as_deref(),
+            Some("c")
+        );
+
+        let no_commit =
+            serde_json::json!({"source":"git","url":"u","ref":"r","branch":"b","tag":"t"});
+        assert_eq!(
+            resolve_remote_source(&no_commit)
+                .unwrap()
+                .git_ref
+                .as_deref(),
+            Some("t")
+        );
+
+        let only_ref = serde_json::json!({"source":"git","url":"u","ref":"r"});
+        assert_eq!(
+            resolve_remote_source(&only_ref).unwrap().git_ref.as_deref(),
+            Some("r")
+        );
+    }
+
+    #[test]
+    fn resolve_empty_higher_precedence_pin_falls_through() {
+        let v = serde_json::json!({"source":"git","url":"u","commit":"","tag":"t"});
+        assert_eq!(
+            resolve_remote_source(&v).unwrap().git_ref.as_deref(),
+            Some("t")
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_kind_errors_naming_the_kind() {
+        let v = serde_json::json!({"source": "gitlab", "repo": "a/b"});
+        let e = resolve_remote_source(&v).unwrap_err();
+        assert!(e.to_string().contains("gitlab"), "got: {e}");
+    }
+
+    #[test]
+    fn resolve_github_rejects_malformed_repo() {
+        for bad in [
+            serde_json::json!({"source":"github","repo":"noslash"}),
+            serde_json::json!({"source":"github","repo":"../escape/x"}),
+            serde_json::json!({"source":"github","repo":"-flag/x"}),
+            serde_json::json!({"source":"github"}),
+        ] {
+            assert!(resolve_remote_source(&bad).is_err(), "should reject {bad}");
+        }
     }
 }

@@ -27,7 +27,10 @@ pub use hook_def::{HookCommand, HookMatcher, HookSet, parse_hooks};
 pub use hook_exec::{HookEvent, HookExecutor, HookOutcome, matcher_selects};
 pub use hooked_tool::HookedTool;
 pub use markdown_agent::MarkdownAgent;
-pub use marketplace_def::{Marketplace, MarketplaceEntry, PluginSource, parse_marketplace_json};
+pub use marketplace_def::{
+    Marketplace, MarketplaceEntry, PluginSource, RemoteClone, parse_marketplace_json,
+    resolve_remote_source,
+};
 pub use marketplace_install::{MarketplaceLock, MarketplaceLockfile, set_enabled_plugin};
 pub use permission_def::{PermissionRules, parse_permissions};
 pub use plugin_def::{
