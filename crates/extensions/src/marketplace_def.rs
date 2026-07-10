@@ -1,7 +1,8 @@
 //! Parses a Claude Code marketplace manifest (`.claude-plugin/marketplace.json`): the marketplace
 //! `name` plus the list of plugins it offers. A plugin's `source` is either a local path (relative
-//! to the marketplace root, resolvable on disk) or a remote descriptor (not materialized by this
-//! slice). No I/O here — pure parsing.
+//! to the marketplace root, resolvable on disk) or a remote descriptor. `resolve_remote_source`
+//! turns a remote descriptor into a clone target; the actual clone happens at the CLI edge
+//! (`crates/engine/src/plugin_cli.rs`). No I/O here — pure parsing.
 
 use serde_json::Value;
 
@@ -10,7 +11,8 @@ use serde_json::Value;
 pub enum PluginSource {
     /// A path relative to the marketplace root, e.g. `./plugins/foo`.
     LocalPath(String),
-    /// A remote source (github/git/…). Kept verbatim; this slice does not materialize it.
+    /// A remote source (github/git/…). Kept verbatim; `resolve_remote_source` turns it into a
+    /// clone target that the CLI edge materializes into `~/.claude/plugins/repos/`.
     Remote(Value),
 }
 
