@@ -57,6 +57,12 @@ pub fn resolve_remote_source(src: &Value) -> anyhow::Result<RemoteClone> {
         })
         .map(|s| s.to_string());
 
+    if let Some(r) = &git_ref {
+        if r.starts_with('-') {
+            anyhow::bail!("remote plugin ref may not start with '-': '{r}'");
+        }
+    }
+
     let url = match kind {
         "github" => {
             let repo = obj
@@ -71,12 +77,17 @@ pub fn resolve_remote_source(src: &Value) -> anyhow::Result<RemoteClone> {
             }
             format!("https://github.com/{owner}/{name}")
         }
-        "git" => obj
-            .get("url")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("git source missing string `url` field"))?
-            .to_string(),
+        "git" => {
+            let url = obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("git source missing string `url` field"))?;
+            if url.starts_with('-') {
+                anyhow::bail!("git url may not start with '-': '{url}'");
+            }
+            url.to_string()
+        }
         other => {
             anyhow::bail!("unsupported remote source kind '{other}' (supported: github, git)")
         }
@@ -252,6 +263,18 @@ mod tests {
         assert_eq!(
             resolve_remote_source(&v).unwrap().git_ref.as_deref(),
             Some("t")
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_leading_dash_url_and_ref() {
+        assert!(
+            resolve_remote_source(&serde_json::json!({"source":"git","url":"--upload-pack=x"}))
+                .is_err()
+        );
+        assert!(
+            resolve_remote_source(&serde_json::json!({"source":"git","url":"u","ref":"-x"}))
+                .is_err()
         );
     }
 
