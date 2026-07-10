@@ -21,11 +21,46 @@ pub struct MarketplaceLock {
     pub updated_at_unix: u64,
 }
 
-/// The full lockfile: marketplace name -> its lock entry. A `BTreeMap` keeps serialized output in
-/// sorted-key order, so the on-disk file stays git-diff-friendly across updates.
+/// The full lockfile: marketplace name -> its lock entry, plus materialized remote-sourced
+/// plugins keyed by their `"<plugin>@<marketplace>"` enable-key. `BTreeMap`s keep serialized
+/// output in sorted-key order, so the on-disk file stays git-diff-friendly across updates.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarketplaceLockfile {
+    /// Installed marketplaces, keyed by declared marketplace name.
     pub entries: BTreeMap<String, MarketplaceLock>,
+    /// Materialized remote-sourced plugins, keyed by the `"<plugin>@<marketplace>"` enable-key.
+    pub plugins: BTreeMap<String, MarketplaceLock>,
+}
+
+/// Parse a `name -> lock` object into a `BTreeMap`, skipping any entry missing a required field
+/// (matching every other `.claude/` reader in this crate — tolerant, never fatal).
+fn parse_lock_map(
+    map: Option<&serde_json::Map<String, Value>>,
+) -> BTreeMap<String, MarketplaceLock> {
+    let mut out = BTreeMap::new();
+    let Some(map) = map else {
+        return out;
+    };
+    for (name, v) in map {
+        let (Some(url), Some(git_ref), Some(commit), Some(updated_at_unix)) = (
+            v.get("url").and_then(|x| x.as_str()),
+            v.get("ref").and_then(|x| x.as_str()),
+            v.get("commit").and_then(|x| x.as_str()),
+            v.get("updated_at_unix").and_then(|x| x.as_u64()),
+        ) else {
+            continue;
+        };
+        out.insert(
+            name.clone(),
+            MarketplaceLock {
+                url: url.to_string(),
+                git_ref: git_ref.to_string(),
+                commit: commit.to_string(),
+                updated_at_unix,
+            },
+        );
+    }
+    out
 }
 
 impl MarketplaceLockfile {
@@ -33,52 +68,53 @@ impl MarketplaceLockfile {
     /// lockfile (never fatal — matches every other `.claude/` reader in this crate). An entry
     /// missing a required field, or with a non-string/non-number value, is skipped.
     pub fn parse(json: &str) -> Self {
-        let mut entries = BTreeMap::new();
         let Ok(Value::Object(root)) = serde_json::from_str::<Value>(json) else {
-            return Self { entries };
+            return Self::default();
         };
-        for (name, v) in root {
-            let Some(url) = v.get("url").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            let Some(git_ref) = v.get("ref").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            let Some(commit) = v.get("commit").and_then(|x| x.as_str()) else {
-                continue;
-            };
-            let Some(updated_at_unix) = v.get("updated_at_unix").and_then(|x| x.as_u64()) else {
-                continue;
-            };
-            entries.insert(
-                name,
-                MarketplaceLock {
-                    url: url.to_string(),
-                    git_ref: git_ref.to_string(),
-                    commit: commit.to_string(),
-                    updated_at_unix,
-                },
-            );
+        // Nested format: a top-level object carrying a `marketplaces` and/or `plugins` object.
+        // Otherwise treat the whole object as the legacy flat `name -> lock` marketplaces map.
+        // (Edge case: a legacy marketplace literally named "marketplaces"/"plugins" — accepted as
+        // out of scope; these are single-user pre-release lockfiles.)
+        let nested = root
+            .get("marketplaces")
+            .map(Value::is_object)
+            .unwrap_or(false)
+            || root.get("plugins").map(Value::is_object).unwrap_or(false);
+        if nested {
+            Self {
+                entries: parse_lock_map(root.get("marketplaces").and_then(Value::as_object)),
+                plugins: parse_lock_map(root.get("plugins").and_then(Value::as_object)),
+            }
+        } else {
+            Self {
+                entries: parse_lock_map(Some(&root)),
+                plugins: BTreeMap::new(),
+            }
         }
-        Self { entries }
     }
 
     /// Serialize to pretty JSON. `BTreeMap` iteration order (sorted keys) is preserved by
     /// `serde_json::Map` (this workspace does not enable the `preserve_order` feature, so
     /// `serde_json::Map` is itself `BTreeMap`-backed).
     pub fn to_json(&self) -> String {
+        let to_obj = |map: &BTreeMap<String, MarketplaceLock>| {
+            let mut o = serde_json::Map::new();
+            for (name, lock) in map {
+                o.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "url": lock.url,
+                        "ref": lock.git_ref,
+                        "commit": lock.commit,
+                        "updated_at_unix": lock.updated_at_unix,
+                    }),
+                );
+            }
+            Value::Object(o)
+        };
         let mut root = serde_json::Map::new();
-        for (name, lock) in &self.entries {
-            root.insert(
-                name.clone(),
-                serde_json::json!({
-                    "url": lock.url,
-                    "ref": lock.git_ref,
-                    "commit": lock.commit,
-                    "updated_at_unix": lock.updated_at_unix,
-                }),
-            );
-        }
+        root.insert("marketplaces".to_string(), to_obj(&self.entries));
+        root.insert("plugins".to_string(), to_obj(&self.plugins));
         serde_json::to_string_pretty(&Value::Object(root)).unwrap()
     }
 }
@@ -238,5 +274,49 @@ mod tests {
         let out = set_enabled_plugin(existing, "foo@acme", Some(true));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["enabledPlugins"]["foo@acme"], Value::Bool(true));
+    }
+
+    #[test]
+    fn nested_round_trip_with_marketplaces_and_plugins() {
+        let mut lf = MarketplaceLockfile::default();
+        lf.entries.insert(
+            "acme".to_string(),
+            MarketplaceLock {
+                url: "u".to_string(),
+                git_ref: "main".to_string(),
+                commit: "c".to_string(),
+                updated_at_unix: 1,
+            },
+        );
+        lf.plugins.insert(
+            "foo@acme".to_string(),
+            MarketplaceLock {
+                url: "g".to_string(),
+                git_ref: "v1".to_string(),
+                commit: "d".to_string(),
+                updated_at_unix: 2,
+            },
+        );
+        let back = MarketplaceLockfile::parse(&lf.to_json());
+        assert_eq!(back, lf);
+    }
+
+    #[test]
+    fn flat_legacy_format_parses_as_marketplaces_only() {
+        let legacy = r#"{"acme":{"url":"u","ref":"main","commit":"c","updated_at_unix":1}}"#;
+        let lf = MarketplaceLockfile::parse(legacy);
+        assert_eq!(lf.entries.len(), 1);
+        assert_eq!(lf.entries["acme"].git_ref, "main");
+        assert!(lf.plugins.is_empty());
+    }
+
+    #[test]
+    fn nested_with_only_plugins_section_parses() {
+        let json =
+            r#"{"plugins":{"foo@acme":{"url":"g","ref":"v1","commit":"d","updated_at_unix":2}}}"#;
+        let lf = MarketplaceLockfile::parse(json);
+        assert!(lf.entries.is_empty());
+        assert_eq!(lf.plugins.len(), 1);
+        assert_eq!(lf.plugins["foo@acme"].commit, "d");
     }
 }
