@@ -270,7 +270,9 @@ pub async fn marketplace_add(url: &str, ref_: Option<&str>, home: &Path) -> anyh
     Ok(mp.name)
 }
 
-/// Delete `~/.claude/plugins/marketplaces/<name>/` and its lockfile entry. Does **not** scrub any
+/// Delete `~/.claude/plugins/marketplaces/<name>/` and its lockfile entry, along with any
+/// materialized remote-plugin clones under `~/.claude/plugins/repos/<name>/` and their `plugins`
+/// lock entries — so removal leaves no orphaned clones or stale rows. Does **not** scrub any
 /// `enabledPlugins` keys referencing this marketplace — a stale key simply becomes inert on the
 /// next `discover()` (no matching directory to fold), a deliberate simplification over a
 /// cross-cutting `settings.json` cleanup.
@@ -280,10 +282,23 @@ pub fn marketplace_remove(name: &str, home: &Path) -> anyhow::Result<()> {
         anyhow::bail!("marketplace '{name}' is not installed");
     }
 
+    // Defense-in-depth: guard both recursive deletes against a hand-tampered lockfile key.
+    validate_path_component(name, "marketplace name")?;
+
     let mp_dir = marketplaces_dir(home).join(name);
     if mp_dir.exists() {
         std::fs::remove_dir_all(&mp_dir)?;
     }
+
+    // Also remove any materialized remote-plugin clones + their lock entries for this marketplace,
+    // so removal leaves no orphaned clones or stale rows.
+    let repos_mp = repos_dir(home).join(name);
+    if repos_mp.exists() {
+        std::fs::remove_dir_all(&repos_mp)?;
+    }
+    // Keys are "<plugin>@<marketplace>"; the marketplace is everything after the first '@'.
+    lock.plugins
+        .retain(|k, _| k.split_once('@').map(|(_, mp)| mp) != Some(name));
 
     lock.entries.remove(name);
     write_lockfile(home, &lock)?;
@@ -1191,6 +1206,59 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let err = marketplace_remove("nope", home.path()).unwrap_err();
         assert!(err.to_string().contains("not installed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn marketplace_remove_cleans_up_materialized_plugins() {
+        let (_keep, mp_url) = bare_remote_plugin_marketplace("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        marketplace_add(&mp_url, None, home.path()).await.unwrap();
+        plugin_install("foo@acme", home.path()).await.unwrap();
+
+        assert!(repos_dir(home.path()).join("acme").exists());
+        assert!(read_lockfile(home.path()).plugins.contains_key("foo@acme"));
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        assert!(
+            !repos_dir(home.path()).join("acme").exists(),
+            "repos tree removed"
+        );
+        assert!(
+            !read_lockfile(home.path()).plugins.contains_key("foo@acme"),
+            "plugin lock entry dropped"
+        );
+        assert!(!read_lockfile(home.path()).entries.contains_key("acme"));
+    }
+
+    #[test]
+    fn marketplace_remove_only_drops_its_own_plugin_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let mk = |u: &str| otto_extensions::MarketplaceLock {
+            url: u.to_string(),
+            git_ref: "main".to_string(),
+            commit: "c".to_string(),
+            updated_at_unix: 1,
+        };
+        let mut lock = read_lockfile(home.path());
+        lock.entries.insert("acme".to_string(), mk("m"));
+        lock.plugins.insert("foo@acme".to_string(), mk("a"));
+        lock.plugins.insert("bar@other".to_string(), mk("b"));
+        lock.plugins.insert("baz@x@acme".to_string(), mk("c")); // marketplace literally "x@acme"
+        write_lockfile(home.path(), &lock).unwrap();
+
+        marketplace_remove("acme", home.path()).unwrap();
+
+        let after = read_lockfile(home.path());
+        assert!(!after.plugins.contains_key("foo@acme"), "own key dropped");
+        assert!(
+            after.plugins.contains_key("bar@other"),
+            "unrelated marketplace kept"
+        );
+        assert!(
+            after.plugins.contains_key("baz@x@acme"),
+            "'x@acme' must not be falsely matched by removing 'acme'"
+        );
     }
 
     #[tokio::test]
