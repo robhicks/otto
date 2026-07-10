@@ -48,18 +48,25 @@ fn is_scp_like(url: &str) -> bool {
     }
 }
 
-/// A marketplace name must be a single path-safe component: non-empty, no `/`/`\`, and not `.`
-/// or `..`. Applied to the `name` field read out of a *cloned* `marketplace.json` before it is
-/// used as a directory name — guards against a malformed/malicious manifest trying to escape
-/// `~/.claude/plugins/marketplaces/` (e.g. `"name": "../../etc"`).
-fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name == "." || name == ".." {
-        anyhow::bail!("invalid marketplace name: {name:?}");
+/// A path component must be a single safe segment: non-empty, no `/`/`\`, and not `.`/`..`.
+/// Applied to any name read out of a manifest or key before it is used as a directory component,
+/// guarding against escapes like `"../../etc"`.
+fn validate_path_component(value: &str, what: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value == "." || value == ".." {
+        anyhow::bail!("invalid {what}: {value:?}");
     }
-    if name.contains('/') || name.contains('\\') {
-        anyhow::bail!("invalid marketplace name (must be a single path component): {name:?}");
+    if value.contains('/') || value.contains('\\') {
+        anyhow::bail!("invalid {what} (must be a single path component): {value:?}");
     }
     Ok(())
+}
+
+/// A marketplace name must be a single path-safe component. Applied to the `name` field read
+/// out of a *cloned* `marketplace.json` before it is used as a directory name — guards against
+/// a malformed/malicious manifest trying to escape `~/.claude/plugins/marketplaces/` (e.g.
+/// `"name": "../../etc"`).
+fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
+    validate_path_component(name, "marketplace name")
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +75,13 @@ fn validate_marketplace_name(name: &str) -> anyhow::Result<()> {
 
 fn marketplaces_dir(home: &Path) -> PathBuf {
     home.join(".claude").join("plugins").join("marketplaces")
+}
+
+// TODO(plugin-remote-source): consumed by the materialized-plugin clone path landing in a
+// later task on this branch; unused for now.
+#[allow(dead_code)]
+fn repos_dir(home: &Path) -> PathBuf {
+    home.join(".claude").join("plugins").join("repos")
 }
 
 fn lockfile_path(home: &Path) -> PathBuf {
@@ -590,6 +604,25 @@ mod tests {
         assert!(validate_marketplace_name("..").is_err());
         assert!(validate_marketplace_name("../../etc").is_err());
         assert!(validate_marketplace_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_path_component_rejects_escapes_and_dashes() {
+        assert!(validate_path_component("foo", "plugin name").is_ok());
+        assert!(validate_path_component("", "plugin name").is_err());
+        assert!(validate_path_component(".", "plugin name").is_err());
+        assert!(validate_path_component("..", "plugin name").is_err());
+        assert!(validate_path_component("a/b", "plugin name").is_err());
+        assert!(validate_path_component("a\\b", "plugin name").is_err());
+    }
+
+    #[test]
+    fn repos_dir_is_under_claude_plugins() {
+        let home = std::path::Path::new("/home/x");
+        assert_eq!(
+            repos_dir(home),
+            std::path::Path::new("/home/x/.claude/plugins/repos")
+        );
     }
 
     #[tokio::test]
