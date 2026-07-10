@@ -423,10 +423,11 @@ async fn read_repo_head(dir: &Path, pinned_ref: Option<&str>) -> anyhow::Result<
 /// a reused one).
 ///
 /// An already-materialized clone is **reused as-is** — refreshing/re-pointing it is out of scope
-/// (see the plugins design). On reuse the lockfile records the *on-disk* truth (the clone's
-/// `remote.origin.url` and its actual `HEAD`), never the requested `rc.url`/`rc.git_ref`, so the
-/// lockfile can never misrepresent what is actually checked out; a requested source/ref that
-/// differs from disk is a no-op and emits a `note:` pointing at uninstall+reinstall.
+/// (see the plugins design). If a lockfile entry already exists for this key, its recorded
+/// provenance is preserved verbatim (so a pinned tag/sha isn't degraded to detached `HEAD`); a
+/// requested source/ref that differs from the locked one is a no-op and emits a `note:` pointing at
+/// uninstall+reinstall. A clone directory that exists with *no* lock entry (e.g. a crashed prior
+/// install) records the on-disk origin/HEAD instead.
 async fn materialize_remote_plugin(
     key: &str,
     plugin: &str,
@@ -445,6 +446,9 @@ async fn materialize_remote_plugin(
     std::fs::create_dir_all(&mp_repos)?;
     let final_path = mp_repos.join(plugin);
     let newly_created = !final_path.exists();
+
+    let mut lock = read_lockfile(home);
+    let existing = lock.plugins.get(key).cloned();
 
     let (recorded_url, resolved_ref, commit) = if newly_created {
         let staging_name = format!(".staging-{}-{}", std::process::id(), uuid::Uuid::new_v4());
@@ -472,26 +476,31 @@ async fn materialize_remote_plugin(
         }
         let (resolved_ref, commit) = head;
         (rc.url.clone(), resolved_ref, commit)
+    } else if let Some(prev) = existing {
+        // True reuse: the clone and its lock entry were installed together. Reuse is a no-op
+        // (refreshing a materialized clone is out of scope — see the plugins design), so keep the
+        // recorded provenance rather than degrading a detached-HEAD pin to "HEAD". Note only when
+        // the caller asked for a different source/ref.
+        if prev.url != rc.url || rc.git_ref.as_deref().is_some_and(|r| r != prev.git_ref) {
+            eprintln!(
+                "note: plugin '{key}' is already materialized at {} (locked to {} @ {}); keeping it. \
+                 Run `otto plugin uninstall {key}` and reinstall to change its source or ref.",
+                final_path.display(),
+                prev.url,
+                prev.git_ref
+            );
+        }
+        (prev.url, prev.git_ref, prev.commit)
     } else {
-        // Reuse: refreshing a materialized clone is out of scope (see the plugins design). Record
-        // the on-disk truth so the lockfile never misrepresents the checkout; warn if the caller
-        // asked for a different source/ref.
+        // Clone dir exists but no lock entry (e.g. a crashed prior install): record on-disk truth.
         let origin = run_git(&final_path, &["config", "--get", "remote.origin.url"])
             .await
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| rc.url.clone());
         let (resolved_ref, commit) = read_repo_head(&final_path, None).await?;
-        if origin != rc.url || rc.git_ref.as_deref().is_some_and(|r| r != resolved_ref) {
-            eprintln!(
-                "note: plugin '{key}' is already materialized at {} (origin {origin}); keeping the \
-                 existing clone. Run `otto plugin uninstall {key}` and reinstall to change its source or ref.",
-                final_path.display()
-            );
-        }
         (origin, resolved_ref, commit)
     };
 
-    let mut lock = read_lockfile(home);
     lock.plugins.insert(
         key.to_string(),
         otto_extensions::MarketplaceLock {
@@ -968,6 +977,48 @@ mod tests {
         assert_eq!(
             after, on_disk_url,
             "reuse must record the on-disk origin, not the requested url"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_reuse_preserves_a_pinned_ref() {
+        // A plugin repo carrying a tag `v1`.
+        let psrc = tempfile::tempdir().unwrap();
+        init_repo(psrc.path()).await;
+        let cp = psrc.path().join(".claude-plugin");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(cp.join("plugin.json"), r#"{"name":"foo"}"#).unwrap();
+        run_git(psrc.path(), &["add", "-A"]).await.unwrap();
+        run_git(psrc.path(), &["commit", "-m", "p"]).await.unwrap();
+        run_git(psrc.path(), &["tag", "v1"]).await.unwrap();
+        let pbare = tempfile::tempdir().unwrap();
+        run_git(
+            pbare.path(),
+            &["clone", "--bare", psrc.path().to_str().unwrap(), "."],
+        )
+        .await
+        .unwrap();
+        let plugin_url = format!("file://{}", pbare.path().display());
+
+        let home = tempfile::tempdir().unwrap();
+        let rc = otto_extensions::RemoteClone {
+            url: plugin_url,
+            git_ref: Some("v1".to_string()),
+        };
+        // First materialize: clones + checks out the tag (detached HEAD) → records ref "v1".
+        materialize_remote_plugin("foo@acme", "foo", "acme", &rc, home.path())
+            .await
+            .unwrap();
+        assert_eq!(read_lockfile(home.path()).plugins["foo@acme"].git_ref, "v1");
+
+        // Reuse: must preserve the pin, not degrade it to the detached-HEAD string "HEAD".
+        materialize_remote_plugin("foo@acme", "foo", "acme", &rc, home.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_lockfile(home.path()).plugins["foo@acme"].git_ref,
+            "v1",
+            "reuse must preserve the pinned ref, not record detached HEAD"
         );
     }
 
