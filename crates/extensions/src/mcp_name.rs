@@ -49,20 +49,38 @@ mod tests {
 
     #[test]
     fn plugin_level_matches_any_tool_of_that_plugin() {
-        assert!(mcp_specifier_matches("mcp__acme", "plugin__acme__srv__search"));
-        assert!(mcp_specifier_matches("mcp__acme", "plugin__acme__other__list"));
+        assert!(mcp_specifier_matches(
+            "mcp__acme",
+            "plugin__acme__srv__search"
+        ));
+        assert!(mcp_specifier_matches(
+            "mcp__acme",
+            "plugin__acme__other__list"
+        ));
     }
 
     #[test]
     fn tool_level_matches_that_tool_across_servers() {
-        assert!(mcp_specifier_matches("mcp__acme__search", "plugin__acme__s1__search"));
-        assert!(mcp_specifier_matches("mcp__acme__search", "plugin__acme__s2__search"));
-        assert!(!mcp_specifier_matches("mcp__acme__search", "plugin__acme__s1__list"));
+        assert!(mcp_specifier_matches(
+            "mcp__acme__search",
+            "plugin__acme__s1__search"
+        ));
+        assert!(mcp_specifier_matches(
+            "mcp__acme__search",
+            "plugin__acme__s2__search"
+        ));
+        assert!(!mcp_specifier_matches(
+            "mcp__acme__search",
+            "plugin__acme__s1__list"
+        ));
     }
 
     #[test]
     fn wrong_plugin_does_not_match() {
-        assert!(!mcp_specifier_matches("mcp__acme", "plugin__other__srv__search"));
+        assert!(!mcp_specifier_matches(
+            "mcp__acme",
+            "plugin__other__srv__search"
+        ));
     }
 
     #[test]
@@ -76,7 +94,10 @@ mod tests {
     #[test]
     fn non_mcp_specifier_never_matches() {
         assert!(!mcp_specifier_matches("bash", "plugin__acme__srv__search"));
-        assert!(!mcp_specifier_matches("fs.read", "plugin__acme__srv__search"));
+        assert!(!mcp_specifier_matches(
+            "fs.read",
+            "plugin__acme__srv__search"
+        ));
     }
 
     #[test]
@@ -88,7 +109,10 @@ mod tests {
     #[test]
     fn malformed_specifier_never_widens() {
         assert!(!mcp_specifier_matches("mcp__", "plugin__acme__srv__search"));
-        assert!(!mcp_specifier_matches("mcp__acme__", "plugin__acme__srv__search"));
+        assert!(!mcp_specifier_matches(
+            "mcp__acme__",
+            "plugin__acme__srv__search"
+        ));
     }
 
     #[test]
