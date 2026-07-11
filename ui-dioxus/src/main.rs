@@ -1,4 +1,5 @@
 mod app;
+mod net;
 
 use app::App;
 
