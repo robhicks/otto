@@ -8,7 +8,7 @@
 
 | Slice | View/reactivity LOC | Pure-logic LOC | Wall-clock | `cfg` edge-gates | Notes |
 |---|---|---|---|---|---|
-| A — app shell + live session | 236 (`app.rs` 150 + `event_log.rs` 14 + `prompt_bar.rs` 38 + `connection_form.rs` 34) | 0 (reused from Task 2) | ~35 subagent-min | 14 total (transport's 11 + 3 new in `gloo_or_tokio_yield`) | Both targets compile clean; `net::` regression 45/45. No `Sink`-storage target-split needed — see narrative. |
+| A — app shell + live session | 246 (`app.rs` 154 + `event_log.rs` 14 + `prompt_bar.rs` 38 + `connection_form.rs` 40) | 0 (reused from Task 2) | ~50 subagent-min (incl. review fix-pass) | 11 total (all in `transport/`; the review fix removed the 3 yield-helper edges) | Both targets compile clean; `net::` regression 45/45. No `Sink`-storage target-split needed. Post-review: added `Sink::close()` + a generation-guarded per-connection drain task (idle poll loop eliminated) — see Fix pass. |
 
 **Leptos baseline (for comparison):** `ui/` totals — measure with
 `tokei ui/src` or `wc -l ui/src/**/*.rs` and record here once, split the same way.
@@ -106,6 +106,20 @@ _(notes)_
 
 ### Runtime perf
 _(notes)_
+
+**Slice A (post-review).** The original slice-A drain design was a single long-lived `use_future`
+with an `outer loop { … cooperative-yield }` polling a signal-held receiver — which, while idle
+(no connection), **idles as a throttled poll loop** (a zero-delay `TimeoutFuture`/`yield_now` every
+wake), unlike Leptos's raw `web_sys` callbacks which are genuinely zero-poll (the browser event
+loop wakes them; nothing spins). That was a real, measurable DX/perf regression versus the Leptos
+baseline. The review fix **eliminated it**: the reworked design spawns a fresh drain task *per
+connection* (dioxus `spawn`) that owns its receiver and blocks in `rx.next().await` — so while
+disconnected there is **no task at all**, and while connected the task is parked on the receiver
+(woken only by an actual inbound frame), exactly like the Leptos callbacks. Net result: the poll
+loop is gone, the cooperative-yield helper (and its `gloo-timers` dep + 3 `cfg` edges) is deleted,
+and Dioxus's idle/connected runtime-poll profile now matches Leptos's zero-poll callbacks. This is
+a win worth recording — the drain-loop-over-a-signal-held-receiver pattern is *not* required; a
+per-connection spawned task is both simpler and free of the idle spin.
 
 ## Priority gate ① — Multi-target unification
 _(% shared tree, edge-gate total, and the yes/no: does the one crate replace `ui/` + `desktop/` + Tauri?)_

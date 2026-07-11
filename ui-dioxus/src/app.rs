@@ -1,7 +1,6 @@
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 // Slice A references only these; later slices (D/E/F) add `EventKind` when they match on it.
 use otto_protocol::{Command, ServerMessage, SessionId};
@@ -22,50 +21,10 @@ pub fn App() -> Element {
     let mut session = use_signal(|| None::<String>);
     // The live outbound sink; None when disconnected.
     let mut sink = use_signal(|| None::<Rc<dyn Sink>>);
-    // The inbound receiver for the current socket, handed to the drain future on connect.
-    let mut incoming = use_signal(|| None::<UnboundedReceiver<SocketEvent>>);
-
-    // Drain loop: whenever a new receiver is installed, pull events until the socket closes.
-    use_future(move || async move {
-        loop {
-            // Take the receiver out (if any) and drain it fully, then wait for the next connect.
-            let rx = incoming.write().take();
-            if let Some(mut rx) = rx {
-                while let Some(ev) = rx.next().await {
-                    match ev {
-                        SocketEvent::Message(Ok(ServerMessage::Ready { session: s, .. })) => {
-                            let id = s.0.to_string();
-                            session.set(Some(id.clone()));
-                            conn.set(ConnState::Connected { session: id });
-                        }
-                        SocketEvent::Message(Ok(ServerMessage::Event { event })) => {
-                            let current = *last_seq.read();
-                            if should_apply(current, event.seq) {
-                                last_seq.set(advance_last_seq(current, event.seq));
-                                rows.write().push(describe_event(&event.kind));
-                            }
-                        }
-                        SocketEvent::Message(Ok(ServerMessage::Error { message })) => {
-                            rows.write().push(error_row(&message));
-                        }
-                        SocketEvent::Message(Ok(_)) => {}
-                        SocketEvent::Message(Err(detail)) => {
-                            rows.write().push(client_error_row(&detail));
-                        }
-                        SocketEvent::Closed | SocketEvent::Errored => {
-                            conn.set(ConnState::Disconnected);
-                            sink.set(None);
-                            break;
-                        }
-                    }
-                }
-            }
-            // Yield so we don't busy-spin when idle. We only re-enter the `if let Some` arm once
-            // `incoming` is repopulated by the next `connect()`, so a short cooperative yield
-            // between polls is enough — no need for an explicit dependency/wakeup channel.
-            gloo_or_tokio_yield().await;
-        }
-    });
+    // Monotonic connection id. Bumped on every connect/disconnect; each per-connection drain task
+    // captures the value current when it was spawned and bails the instant `generation` moves on,
+    // so a superseded socket's already-queued event can never write the new connection's state.
+    let mut generation = use_signal(|| 0u64);
 
     let mut do_connect = move || {
         let base = url.read().clone();
@@ -76,17 +35,77 @@ pub fn App() -> Element {
             return;
         }
         let target = build_ws_url(&base, &tok, session.read().as_deref(), *last_seq.read());
+
+        // Invalidate any live drain task and tear down the previous socket BEFORE installing the
+        // new one: bump the generation (so the old task bails), then `close()` the old sink (so the
+        // real socket stops delivering — dropping the `Rc` alone would not, on web).
+        let my_gen = generation() + 1;
+        generation.set(my_gen);
+        if let Some(old) = sink.write().take() {
+            old.close();
+        }
+
         conn.set(ConnState::Connecting);
         match connect(&target) {
-            Ok((s, rx)) => {
+            Ok((s, mut rx)) => {
                 sink.set(Some(Rc::from(s)));
-                incoming.set(Some(rx));
+                // A fresh task per connection owns this receiver. Every shared-state write is
+                // guarded by the generation check, so once a newer connect/disconnect bumps
+                // `generation` this task stops touching state and exits.
+                spawn(async move {
+                    while let Some(ev) = rx.next().await {
+                        // Stale-connection guard: a superseded task must not write the new
+                        // connection's `conn`/`rows`/`sink`/`session`/`last_seq`.
+                        if generation() != my_gen {
+                            break;
+                        }
+                        match ev {
+                            SocketEvent::Message(Ok(ServerMessage::Ready {
+                                session: s, ..
+                            })) => {
+                                let id = s.0.to_string();
+                                session.set(Some(id.clone()));
+                                conn.set(ConnState::Connected { session: id });
+                            }
+                            SocketEvent::Message(Ok(ServerMessage::Event { event })) => {
+                                let current = *last_seq.read();
+                                if should_apply(current, event.seq) {
+                                    last_seq.set(advance_last_seq(current, event.seq));
+                                    rows.write().push(describe_event(&event.kind));
+                                }
+                            }
+                            SocketEvent::Message(Ok(ServerMessage::Error { message })) => {
+                                rows.write().push(error_row(&message));
+                            }
+                            SocketEvent::Message(Ok(_)) => {}
+                            SocketEvent::Message(Err(detail)) => {
+                                rows.write().push(client_error_row(&detail));
+                            }
+                            SocketEvent::Closed | SocketEvent::Errored => {
+                                // Guarded above, so this is the CURRENT connection's close — safe
+                                // to flip to Disconnected and null the sink.
+                                conn.set(ConnState::Disconnected);
+                                sink.set(None);
+                                break;
+                            }
+                        }
+                    }
+                });
             }
             Err(e) => {
                 rows.write().push(client_error_row(&e));
                 conn.set(ConnState::Disconnected);
             }
         }
+    };
+
+    let mut disconnect = move || {
+        // Invalidate the live drain task, then actually close the socket (not just drop the `Rc`).
+        generation.set(generation() + 1);
+        if let Some(s) = sink.write().take() {
+            s.close();
+        }
+        conn.set(ConnState::Disconnected);
     };
 
     let mut send = move |cmd: Command| {
@@ -128,23 +147,8 @@ pub fn App() -> Element {
             ConnectionForm {
                 url, token, conn,
                 on_connect: move |_| do_connect(),
-                on_disconnect: move |_| {
-                    sink.set(None);
-                    conn.set(ConnState::Disconnected);
-                },
+                on_disconnect: move |_| disconnect(),
             }
         }
     }
-}
-
-/// Cross-target cooperative yield: gives the executor a chance to run other tasks (e.g. deliver
-/// the `unbounded_send` that `connect()` just triggered) between drain-loop poll attempts,
-/// without busy-spinning while `incoming` is empty.
-async fn gloo_or_tokio_yield() {
-    #[cfg(feature = "web")]
-    gloo_timers::future::TimeoutFuture::new(0).await;
-    #[cfg(feature = "desktop")]
-    tokio::task::yield_now().await;
-    #[cfg(not(any(feature = "web", feature = "desktop")))]
-    std::future::pending::<()>().await;
 }

@@ -11,11 +11,23 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::{Sink, SocketEvent};
 
-struct DesktopSink(tokio::sync::mpsc::UnboundedSender<String>);
+// The outbound sender lives behind a `RefCell<Option<..>>` so `close()` can take it out and drop
+// it explicitly (an `UnboundedSender` closes its channel only when the last sender drops; the sink
+// holds the only one). Single-threaded use, matching the `!Send` `Rc<dyn Sink>` the spine stores.
+struct DesktopSink(std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>>);
 impl Sink for DesktopSink {
     fn send(&self, cmd: &Command) -> Result<(), String> {
         let json = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
-        self.0.send(json).map_err(|e| e.to_string())
+        match self.0.borrow().as_ref() {
+            Some(tx) => tx.send(json).map_err(|e| e.to_string()),
+            None => Err("socket closed".to_string()),
+        }
+    }
+
+    fn close(&self) {
+        // Drop the outbound sender: the writer loop's `out_rx.recv()` then returns `None`, ending
+        // the loop, which `.abort()`s the reader task — an explicit close, not incidental `Drop`.
+        self.0.borrow_mut().take();
     }
 }
 
@@ -69,7 +81,10 @@ pub fn connect_impl(
         reader.abort();
     });
 
-    Ok((Box::new(DesktopSink(out_tx)), inbound_rx))
+    Ok((
+        Box::new(DesktopSink(std::cell::RefCell::new(Some(out_tx)))),
+        inbound_rx,
+    ))
 }
 
 async fn rpc(

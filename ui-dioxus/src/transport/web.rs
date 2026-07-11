@@ -20,6 +20,16 @@ impl Sink for WebSink {
         let json = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
         self.0.send_with_str(&json).map_err(|e| format!("{e:?}"))
     }
+
+    fn close(&self) {
+        // Detach the (`.forget()`'d) handlers FIRST, so the socket's async `onclose` can't fire
+        // late and emit a stale `Closed` into the channel, then close the underlying socket.
+        // Mirrors `ui/src/app.rs:60-66`.
+        self.0.set_onmessage(None);
+        self.0.set_onclose(None);
+        self.0.set_onerror(None);
+        let _ = self.0.close();
+    }
 }
 
 pub fn connect_impl(

@@ -3825,7 +3825,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "gloo-net",
- "gloo-timers",
  "otto-protocol",
  "reqwest",
  "rfd 0.15.4",

@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = []
-web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:gloo-timers", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
+web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
 desktop = ["dioxus/desktop", "dep:tokio", "dep:tokio-tungstenite", "dep:reqwest", "dep:rfd"]
 
 [dependencies]
@@ -28,7 +28,6 @@ futures-util = "0.3"
 # web transport (only compiled with --features web)
 wasm-bindgen = { version = "0.2", optional = true }
 gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
-gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 web-sys = { version = "0.3", features = [
     "Window",

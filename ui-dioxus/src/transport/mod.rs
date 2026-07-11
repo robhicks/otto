@@ -15,6 +15,13 @@ pub enum SocketEvent {
 /// trait object, never a concrete socket type.
 pub trait Sink {
     fn send(&self, cmd: &Command) -> Result<(), String>;
+
+    /// Tear the socket down explicitly. Dropping the sink is NOT enough on web — the inbound
+    /// `web_sys` closures are `.forget()`'d, so the real `WebSocket` outlives the `Rc` and keeps
+    /// delivering events. Every reconnect/disconnect path must call this on the old sink before
+    /// installing a new one, so a stale socket can't push events into the new connection's state
+    /// (mirrors `ui/src/app.rs`'s handler-detach + `close()` at the top of `connect`/`disconnect`).
+    fn close(&self);
 }
 
 #[cfg(feature = "desktop")]
