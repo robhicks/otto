@@ -4,6 +4,8 @@ use dioxus::prelude::*;
 
 use crate::net::tree::FileBody;
 
+pub mod tokens;
+
 /// The unhighlighted (plain-`textarea`) controlled-buffer editor. `open` is the currently-open
 /// file (path + classified body); `seed` is the initial document text set once at open time (a
 /// later part swaps this for a styled-span highlighted render — the diff-first non-goal means no
@@ -29,15 +31,33 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
     match body {
         FileBody::Binary => rsx! { div { class: "editor-notice", "binary file — not editable" } },
         FileBody::TooLarge => rsx! { div { class: "editor-notice", "file too large to edit" } },
-        FileBody::Text(_) => rsx! {
-            div { class: "editor",
-                div { class: "editor-path", "{path.display()}" }
-                textarea {
-                    class: "editor-area",
-                    value: "{buf}",
-                    oninput: move |e| buf.set(e.value()),
+        FileBody::Text(_) => {
+            // `plain_spans` is a plain function call, not a hook — safe to call here inside the
+            // `Text` arm (unlike `buf`/the re-seed effect above, which must stay hoisted and
+            // unconditional; see the comment at the top of this component). Tasks 11/12 swap this
+            // call for a real tokenizer behind the same `Vec<Vec<Span>>` shape.
+            let spans = tokens::plain_spans(&buf.read());
+            rsx! {
+                div { class: "editor",
+                    div { class: "editor-path", "{path.display()}" }
+                    div { class: "editor-stack",
+                        pre { class: "editor-highlight",
+                            for line in spans {
+                                div { class: "hl-line",
+                                    for sp in line {
+                                        span { class: "{sp.class}", "{sp.text}" }
+                                    }
+                                }
+                            }
+                        }
+                        textarea {
+                            class: "editor-area editor-overlay",
+                            value: "{buf}",
+                            oninput: move |e| buf.set(e.value()),
+                        }
+                    }
                 }
             }
-        },
+        }
     }
 }

@@ -109,3 +109,59 @@ button:hover:not(:disabled) { border-color: var(--accent); }
   color: var(--dim);
   font: inherit;
 }
+
+.editor { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.editor-path { padding: 4px 10px; border-bottom: 1px solid #1c2128; color: var(--dim); }
+
+/* Two-layer styled-span editor: `.editor-highlight` (a `pre` of styled spans) renders the
+   read-only view; `.editor-overlay` (a transparent `textarea`) sits directly on top and owns
+   the real input/caret/selection. Both layers share identical box metrics (font, size, line
+   height, padding, border, whitespace handling) so the overlay's caret lines up with the
+   highlighted text underneath it character-for-character. */
+.editor-stack {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.editor-highlight,
+.editor-overlay {
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-sizing: border-box;
+}
+.editor-highlight {
+  position: absolute;
+  inset: 0;
+  color: var(--fg);
+  pointer-events: none;
+  overflow: hidden;
+}
+.hl-line { min-height: 1.5em; }
+.editor-overlay {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  background: transparent;
+  /* Text itself is invisible — the `.editor-highlight` layer beneath renders the visible glyphs
+     — but the caret and selection highlight must stay visible, so only the text color is
+     transparent, not the whole layer. */
+  color: transparent;
+  caret-color: var(--fg);
+  outline: none;
+}
+.editor-overlay::selection { background: rgba(122, 162, 247, 0.35); }
+
+.tok-plain { color: var(--fg); }
+.tok-keyword { color: #bb9af7; }
+.tok-string { color: #9ece6a; }
+.tok-comment { color: var(--dim); font-style: italic; }
+.tok-type { color: #7aa2f7; }
+.tok-number { color: #e0af68; }
