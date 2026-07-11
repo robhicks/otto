@@ -31,11 +31,20 @@ Idle machines suspend (`autostop=suspend`), which halts compute billing; an orph
 the manual `fly apps destroy` sweep below, since `auto_destroy` only fires once a machine fully
 stops.
 
-## Limitations
-The bundled image includes `git` but not `gh` (GitHub CLI), so `git.pr_open` (opening GitHub
-PRs) is unavailable on Fly-provisioned sessions; all other git operations (status/diff/log/add/
-commit/branch/checkout/push/etc.) work fine. If PR-opening is needed, extend the image with
-`gh` and supply a `GH_TOKEN`.
+## Guest tools & limitations
+The image ships the engine plus the `mcp-fs`, `mcp-grep`, and `mcp-git` servers, so a Fly-provisioned
+session has file (`fs.*`), search (`grep`), and git (`git.*`) tools. Not available on the guest:
+
+- `git.pr_open` — the image includes `git` but not `gh` (GitHub CLI); all other git operations
+  (status/diff/log/add/commit/branch/checkout/push/etc.) work fine. Extend the image with `gh` and a
+  `GH_TOKEN` if you need PR-opening.
+- `bash` / sandboxed tools — no OS sandbox backend (bwrap) is installed, so `bash` stays fail-closed
+  (unregistered), consistent with otto's "no backend → no bash" rule.
+- `lsp.*` — no language servers are on PATH, so the LSP tools don't register.
+
+The image sets `OTTO_HOST=0.0.0.0` so Fly's proxy (which reaches the machine over its network
+interface, not loopback) can connect — no operator action needed. Run standalone, `otto serve`
+otherwise defaults to binding `127.0.0.1` for safe local use.
 
 ## Env reference
 `FLY_API_TOKEN`, `OTTO_FLY_ORG`, `OTTO_FLY_REGION`, `OTTO_FLY_IMAGE`, `OTTO_FLY_CPUS` (1),

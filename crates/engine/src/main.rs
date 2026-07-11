@@ -709,7 +709,11 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         public_ws_base,
     );
 
-    let addr = format!("127.0.0.1:{port}");
+    // Bind host: default loopback (safe for local/dev — never expose a local serve to the network).
+    // Set OTTO_HOST=0.0.0.0 to accept off-host connections, as the Fly deploy image does so Fly's
+    // proxy (which reaches the machine over its network interface, not loopback) can reach otto.
+    let bind_host = std::env::var("OTTO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{bind_host}:{port}");
     let listener = std::net::TcpListener::bind(&addr)?;
     listener.set_nonblocking(true)?;
     eprintln!("otto serve listening on {scheme}://{addr}/ws");
