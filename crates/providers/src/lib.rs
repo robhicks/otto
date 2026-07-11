@@ -10,6 +10,8 @@ pub mod openai;
 pub mod scripted;
 
 pub use anthropic::AnthropicProvider;
+#[cfg(feature = "candle")]
+pub use candle::CandleProvider;
 pub use gemini::GeminiProvider;
 pub use local::LocalProvider;
 pub use ollama::OllamaProvider;

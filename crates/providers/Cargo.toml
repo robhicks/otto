@@ -16,9 +16,10 @@ candle-core = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.21", optional = true, default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.3", optional = true }
+tokio = { workspace = true, optional = true, features = ["rt"] }
 
 [features]
-candle = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+candle = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:tokio"]
 candle-cuda = ["candle", "candle-core/cuda", "candle-transformers/cuda"]
 candle-metal = ["candle", "candle-core/metal", "candle-transformers/metal"]
 

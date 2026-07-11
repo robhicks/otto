@@ -3,6 +3,13 @@
 //! In local-file mode it performs no network I/O at all.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use candle_core::{Device, Tensor};
+use otto_engine_core::traits::Provider;
+use otto_engine_core::types::{CompleteRequest, CompleteResponse, Usage};
+use tokenizers::Tokenizer;
 
 /// Default HuggingFace repo used when `OTTO_CANDLE_MODEL` is unset (a small Gemma 3
 /// instruct QAT GGUF). The user is responsible for the model's license.
@@ -113,6 +120,162 @@ pub(crate) fn build_logits_processor(
         },
     };
     LogitsProcessor::from_sampling(cfg.seed, sampling)
+}
+
+/// In-process quantized Gemma 3 provider. Weights are (re)loaded per `complete()` call
+/// inside a blocking task, giving each completion an isolated KV cache and keeping the
+/// provider trivially `Send + Sync`. Suited to local / air-gapped use, not throughput.
+#[derive(Debug)]
+pub struct CandleProvider {
+    gguf: PathBuf,
+    tokenizer: Arc<Tokenizer>,
+    device: Device,
+    gen_config: GenConfig,
+}
+
+impl CandleProvider {
+    /// Resolve the model + tokenizer files and load the tokenizer once. Model weights
+    /// themselves are loaded lazily on each `complete()` call.
+    pub fn new(source: ModelSource, cfg: GenConfig, device: Device) -> anyhow::Result<Self> {
+        let (gguf, tokenizer_json) = locate_files(source)?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_json).map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            gguf,
+            tokenizer: Arc::new(tokenizer),
+            device,
+            gen_config: cfg,
+        })
+    }
+}
+
+/// Pick the compute device: an accelerator when built with `candle-cuda`/`candle-metal`
+/// and available, else CPU.
+pub fn select_device() -> Device {
+    #[cfg(feature = "candle-cuda")]
+    {
+        if let Ok(d) = Device::cuda_if_available(0) {
+            return d;
+        }
+    }
+    #[cfg(feature = "candle-metal")]
+    {
+        if let Ok(d) = Device::new_metal(0) {
+            return d;
+        }
+    }
+    Device::Cpu
+}
+
+/// Resolve a `ModelSource` to concrete (gguf, tokenizer.json) paths.
+fn locate_files(source: ModelSource) -> anyhow::Result<(PathBuf, PathBuf)> {
+    match source {
+        ModelSource::LocalGguf(gguf) => {
+            if !gguf.is_file() {
+                anyhow::bail!("candle model gguf not found: {}", gguf.display());
+            }
+            let dir = gguf.parent().unwrap_or_else(|| Path::new("."));
+            let tok = dir.join("tokenizer.json");
+            if !tok.is_file() {
+                anyhow::bail!(
+                    "candle tokenizer.json not found next to model: {}",
+                    tok.display()
+                );
+            }
+            Ok((gguf, tok))
+        }
+        ModelSource::HubRepo(repo) => download_from_hub(&repo),
+    }
+}
+
+/// Download the GGUF + tokenizer from a HuggingFace repo into the hf-hub cache.
+/// The GGUF filename within the repo is taken from `OTTO_CANDLE_GGUF_FILE`
+/// (default `model.gguf`). Network at load time only — never during inference.
+fn download_from_hub(repo: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    use hf_hub::api::sync::Api;
+    let file = std::env::var("OTTO_CANDLE_GGUF_FILE").unwrap_or_else(|_| "model.gguf".to_string());
+    let api = Api::new()?;
+    let model = api.model(repo.to_string());
+    let gguf = model.get(&file)?;
+    let tok = model.get("tokenizer.json")?;
+    Ok((gguf, tok))
+}
+
+/// Load the GGUF weights and run the generation loop. Blocking; call under
+/// `spawn_blocking`. Returns the decoded text and token usage.
+fn generate(
+    gguf: &Path,
+    device: &Device,
+    tokenizer: &Tokenizer,
+    cfg: &GenConfig,
+    prompt: &str,
+) -> anyhow::Result<(String, Usage)> {
+    use candle_core::quantized::gguf_file;
+    use candle_transformers::models::quantized_gemma3::ModelWeights;
+
+    let mut file = std::fs::File::open(gguf)?;
+    let content = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(gguf))?;
+    let mut model = ModelWeights::from_gguf(content, &mut file, device)?;
+
+    let encoding = tokenizer.encode(prompt, true).map_err(anyhow::Error::msg)?;
+    let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+    let input_tokens = prompt_tokens.len() as u32;
+
+    let eos_id = tokenizer.get_vocab(true).get("<end_of_turn>").copied();
+    let mut logits_processor = build_logits_processor(cfg);
+
+    // Prompt pass (whole prompt at position 0), then autoregressive decode.
+    let input = Tensor::new(prompt_tokens.as_slice(), device)?.unsqueeze(0)?;
+    let logits = model.forward(&input, 0)?.squeeze(0)?;
+    let mut next = logits_processor.sample(&logits)?;
+
+    let mut out_ids: Vec<u32> = Vec::new();
+    for step in 0..cfg.max_tokens {
+        if Some(next) == eos_id {
+            break;
+        }
+        out_ids.push(next);
+        let pos = prompt_tokens.len() + step;
+        let input = Tensor::new(&[next], device)?.unsqueeze(0)?;
+        let logits = model.forward(&input, pos)?.squeeze(0)?;
+        next = logits_processor.sample(&logits)?;
+    }
+
+    let output_tokens = out_ids.len() as u32;
+    let text = tokenizer
+        .decode(&out_ids, true)
+        .map_err(anyhow::Error::msg)?;
+    Ok((
+        text,
+        Usage {
+            input_tokens,
+            output_tokens,
+        },
+    ))
+}
+
+#[async_trait]
+impl Provider for CandleProvider {
+    fn id(&self) -> &str {
+        "candle"
+    }
+
+    async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
+        let gguf = self.gguf.clone();
+        let device = self.device.clone();
+        let tokenizer = self.tokenizer.clone();
+        let cfg = self.gen_config.clone();
+        let prompt = gemma_prompt(&req.prompt, cfg.raw);
+
+        let (text, usage) = tokio::task::spawn_blocking(move || {
+            generate(&gguf, &device, &tokenizer, &cfg, &prompt)
+        })
+        .await??;
+
+        Ok(CompleteResponse {
+            text,
+            usage: Some(usage),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +401,83 @@ mod tests {
         };
         assert_eq!(a, b);
         assert!((a as usize) < 4);
+    }
+
+    const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+    fn fixture_tokenizer_dir() -> tempfile::TempDir {
+        // Copy the fixture tokenizer.json next to a stub .gguf so `new` can locate both.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            format!("{FIXTURE_DIR}/tokenizer.json"),
+            dir.path().join("tokenizer.json"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn provider_id_is_candle() {
+        let dir = fixture_tokenizer_dir();
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"stub").unwrap();
+        let p = CandleProvider::new(
+            ModelSource::LocalGguf(gguf),
+            GenConfig::default(),
+            candle_core::Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(p.id(), "candle");
+    }
+
+    #[test]
+    fn new_errors_when_gguf_missing() {
+        let dir = fixture_tokenizer_dir();
+        let err = CandleProvider::new(
+            ModelSource::LocalGguf(dir.path().join("absent.gguf")),
+            GenConfig::default(),
+            candle_core::Device::Cpu,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("gguf"));
+    }
+
+    #[test]
+    fn new_errors_when_tokenizer_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"stub").unwrap();
+        let err = CandleProvider::new(
+            ModelSource::LocalGguf(gguf),
+            GenConfig::default(),
+            candle_core::Device::Cpu,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tokenizer"));
+    }
+
+    // End-to-end generation: needs a real Gemma GGUF supplied via OTTO_CANDLE_MODEL.
+    // Ignored by default; run manually with:
+    //   OTTO_CANDLE_MODEL=/path/model.gguf cargo test -p otto-providers --features candle \
+    //     candle::tests::end_to_end_generation -- --ignored --nocapture
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_to_end_generation() {
+        use otto_engine_core::traits::Provider;
+        use otto_engine_core::types::CompleteRequest;
+        let src = resolve_model_source(std::env::var("OTTO_CANDLE_MODEL").ok());
+        let cfg = GenConfig {
+            max_tokens: 32,
+            ..GenConfig::default()
+        };
+        let p = CandleProvider::new(src, cfg, select_device()).unwrap();
+        let out = p
+            .complete(CompleteRequest {
+                prompt: "Say hello in one word.".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!out.text.trim().is_empty());
+        assert!(out.usage.unwrap().output_tokens > 0);
     }
 }
