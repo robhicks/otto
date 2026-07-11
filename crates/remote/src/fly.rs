@@ -54,9 +54,120 @@ pub(crate) fn app_name_from_endpoint(endpoint: &str) -> Option<String> {
     Some(app.to_string())
 }
 
+use async_trait::async_trait;
+
+/// The only unit that talks to Fly. `machines_base`/`graphql_base`/`public_base_override` are
+/// injectable so wiremock can mock every call.
+pub(crate) struct FlyApi {
+    machines_base: String,
+    graphql_base: String,
+    public_base_override: Option<String>,
+    api_token: String,
+    http: reqwest::Client,
+}
+
+impl FlyApi {
+    pub(crate) fn from_config(cfg: &FlyConfig) -> Self {
+        Self {
+            machines_base: cfg.api_base.clone(),
+            graphql_base: cfg.graphql_base.clone(),
+            public_base_override: cfg.public_base_override.clone(),
+            api_token: cfg.api_token.clone(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+
+    /// The `ws`/`wss` base the client reconnects to. Overridable for tests.
+    fn session_endpoint(&self, app: &str) -> String {
+        self.public_base_override
+            .clone()
+            .unwrap_or_else(|| format!("wss://{app}.fly.dev"))
+    }
+}
+
+/// Build the create-machine request body. `auto_destroy` is machine-level; `autostop`/`autostart`/
+/// `min_machines_running` are per-service (verified against the Fly Machines schema).
+pub(crate) fn create_machine_body(cfg: &FlyConfig, token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "region": cfg.region,
+        "config": {
+            "image": cfg.image,
+            "auto_destroy": true,
+            "env": {
+                "OTTO_TOKEN": token,
+                "OTTO_PORT": cfg.internal_port.to_string(),
+                "OTTO_ROOT": "/workspace",
+            },
+            "guest": { "cpus": cfg.vm_cpus, "memory_mb": cfg.vm_mem_mib },
+            "services": [{
+                "protocol": "tcp",
+                "internal_port": cfg.internal_port,
+                "autostop": "suspend",
+                "autostart": true,
+                "min_machines_running": 0,
+                "ports": [{ "port": 443, "handlers": ["tls", "http"] }],
+            }],
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_cfg() -> FlyConfig {
+        FlyConfig {
+            api_token: "fly-tok".into(),
+            org_slug: "personal".into(),
+            region: "iad".into(),
+            image: "registry.fly.io/otto-serve:latest".into(),
+            vm_cpus: 1,
+            vm_mem_mib: 1024,
+            app_prefix: "otto-session".into(),
+            internal_port: 8787,
+            boot_timeout: std::time::Duration::from_secs(30),
+            api_base: "https://api.machines.dev/v1".into(),
+            graphql_base: "https://api.fly.io/graphql".into(),
+            public_base_override: None,
+        }
+    }
+
+    #[test]
+    fn create_machine_body_has_image_env_guest_and_services() {
+        let body = create_machine_body(&sample_cfg(), "sess-tok");
+        assert_eq!(body["config"]["image"], "registry.fly.io/otto-serve:latest");
+        assert_eq!(body["config"]["auto_destroy"], true); // machine-level
+        assert_eq!(body["config"]["env"]["OTTO_TOKEN"], "sess-tok");
+        assert_eq!(body["config"]["env"]["OTTO_PORT"], "8787");
+        assert_eq!(body["config"]["env"]["OTTO_ROOT"], "/workspace");
+        assert_eq!(body["config"]["guest"]["cpus"], 1);
+        assert_eq!(body["config"]["guest"]["memory_mb"], 1024);
+        let svc = &body["config"]["services"][0];
+        assert_eq!(svc["internal_port"], 8787);
+        assert_eq!(svc["autostop"], "suspend"); // service-level
+        assert_eq!(svc["autostart"], true);
+        assert_eq!(svc["min_machines_running"], 0);
+        assert_eq!(svc["ports"][0]["port"], 443);
+        assert_eq!(svc["ports"][0]["handlers"][0], "tls");
+        assert_eq!(svc["ports"][0]["handlers"][1], "http");
+        assert_eq!(body["region"], "iad");
+    }
+
+    #[test]
+    fn session_endpoint_uses_fly_dev_or_override() {
+        let api = FlyApi::from_config(&sample_cfg());
+        assert_eq!(
+            api.session_endpoint("otto-session-x"),
+            "wss://otto-session-x.fly.dev"
+        );
+        let mut cfg = sample_cfg();
+        cfg.public_base_override = Some("ws://127.0.0.1:9999".into());
+        let api = FlyApi::from_config(&cfg);
+        assert_eq!(api.session_endpoint("ignored"), "ws://127.0.0.1:9999");
+    }
 
     #[test]
     fn app_name_from_endpoint_extracts_app() {
