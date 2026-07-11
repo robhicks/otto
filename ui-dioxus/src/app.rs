@@ -293,11 +293,18 @@ pub fn App() -> Element {
     // Perform a handover reconnect: point the URL at the new endpoint and reconnect through the
     // same hardened `do_connect` used by the manual Connect button — it bumps `generation`,
     // closes the old sink, opens the new socket, and spawns a fresh generation-guarded drain
-    // task, reusing session + last_seq (via `build_ws_url`) for replay. `take()` clears
-    // `reconnect_to` in the same step it's read, so this effect settles after firing once per
-    // handover rather than re-triggering on its own write.
+    // task, reusing session + last_seq (via `build_ws_url`) for replay.
+    //
+    // `reconnect_to()` is a *tracked read* — that is what subscribes this effect to the signal,
+    // so a later `reconnect_to.set(Some(endpoint))` from the drain task actually re-fires it.
+    // (A `.write().take()` would be a write-guard access, which never subscribes — the effect
+    // would capture zero deps on its first `None` run and never wake again.) Order matters and is
+    // deliberate: read (subscribe) → `set(None)` (clear) → connect. The `set(None)` re-runs the
+    // effect once more; that run reads `None`, skips the body, and settles — bounded, not a loop.
+    // Mirrors `ui/src/app.rs`'s handover `Effect` exactly.
     use_effect(move || {
-        if let Some(endpoint) = reconnect_to.write().take() {
+        if let Some(endpoint) = reconnect_to() {
+            reconnect_to.set(None);
             url.set(endpoint);
             do_connect();
         }
