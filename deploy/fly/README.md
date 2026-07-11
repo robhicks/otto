@@ -23,9 +23,16 @@ export OTTO_TOKEN=<source bearer>           # required by `otto serve`
 ```bash
 otto serve --promote-fly
 ```
-Promoting a session then creates `otto-session-<id>.fly.dev`, runs `otto serve` on it, and the
-client reconnects. Demote/stop destroys the app. Idle machines suspend (`autostop=suspend`) and
-`auto_destroy` reaps stopped orphans.
+Promoting a session then creates an app with a unique random suffix (e.g.
+`otto-session-<random>.fly.dev` — the suffix is a random 12-hex string, not the session id),
+runs `otto serve` on it, and the client reconnects. Demote/stop destroys the app. Idle machines
+suspend (`autostop=suspend`) and `auto_destroy` reaps stopped orphans.
+
+## Limitations
+The bundled image includes `git` but not `gh` (GitHub CLI), so `git.pr_open` (opening GitHub
+PRs) is unavailable on Fly-provisioned sessions; all other git operations (status/diff/log/add/
+commit/branch/checkout/push/etc.) work fine. If PR-opening is needed, extend the image with
+`gh` and supply a `GH_TOKEN`.
 
 ## Env reference
 `FLY_API_TOKEN`, `OTTO_FLY_ORG`, `OTTO_FLY_REGION`, `OTTO_FLY_IMAGE`, `OTTO_FLY_CPUS` (1),

@@ -5,7 +5,11 @@ COPY . .
 RUN cargo build --release -p otto-engine
 
 FROM debian:bookworm-slim
-# git + ripgrep back the served spine's git/grep tools; ca-certificates for outbound TLS to LLM APIs.
+# git backs the served spine's git.* tools (mcp-git shells out to it); ripgrep is included only
+# for ad-hoc/bash use and is NOT required by mcp-grep, which searches in-process via the
+# grep/ignore crates rather than the `rg` binary; ca-certificates for outbound TLS to LLM APIs.
+# `gh` (GitHub CLI) is intentionally omitted here: git.pr_open is unavailable on Fly-provisioned
+# sessions as a result (see README Limitations); all other git.* ops work fine.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ripgrep ca-certificates \
     && rm -rf /var/lib/apt/lists/*
