@@ -210,7 +210,7 @@ fn build_promote_client() -> reqwest::Client {
 
 /// Map a `ws://`/`wss://` endpoint to its HTTP base for the promote/export POSTs
 /// (`ws→http`, `wss→https`); an unrecognized scheme passes through verbatim.
-fn http_base(endpoint: &str) -> String {
+pub(crate) fn http_base(endpoint: &str) -> String {
     if let Some(rest) = endpoint.strip_prefix("wss://") {
         format!("https://{rest}")
     } else if let Some(rest) = endpoint.strip_prefix("ws://") {

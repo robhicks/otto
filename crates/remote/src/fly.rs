@@ -86,6 +86,84 @@ impl FlyApi {
             .clone()
             .unwrap_or_else(|| format!("wss://{app}.fly.dev"))
     }
+
+    async fn bail_on_error(resp: reqwest::Response) -> anyhow::Result<()> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {status}: {body}");
+        }
+        Ok(())
+    }
+
+    async fn create_app(&self, app: &str, org: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/apps", self.machines_base))
+            .bearer_auth(&self.api_token)
+            .json(&serde_json::json!({ "app_name": app, "org_slug": org }))
+            .send()
+            .await?;
+        Self::bail_on_error(resp).await
+    }
+
+    /// Allocate a shared IPv4 (GraphQL-only) so `<app>.fly.dev` resolves. Fly's GraphQL accepts the
+    /// app name as `appId` for app-scoped mutations.
+    async fn allocate_shared_ip(&self, app: &str) -> anyhow::Result<()> {
+        let query = "mutation($input: AllocateIPAddressInput!) { \
+                     allocateIpAddress(input: $input) { ipAddress { address } } }";
+        let resp = self
+            .http
+            .post(&self.graphql_base)
+            .bearer_auth(&self.api_token)
+            .json(&serde_json::json!({
+                "query": query,
+                "variables": { "input": { "appId": app, "type": "shared_v4" } },
+            }))
+            .send()
+            .await?;
+        Self::bail_on_error(resp).await
+    }
+
+    async fn create_machine(&self, app: &str, cfg: &FlyConfig, token: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/apps/{app}/machines", self.machines_base))
+            .bearer_auth(&self.api_token)
+            .json(&create_machine_body(cfg, token))
+            .send()
+            .await?;
+        Self::bail_on_error(resp).await
+    }
+
+    /// Poll the public endpoint until any HTTP response (every otto route is gated, so 401/404 mean
+    /// "serve is up") or the boot timeout elapses.
+    async fn wait_ready(&self, app: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
+        let url = format!("{}/", crate::http_base(&self.session_endpoint(app)));
+        let poll = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if poll.get(&url).send().await.is_ok() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("Fly machine did not become reachable within boot timeout");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn delete_app(&self, app: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/apps/{app}", self.machines_base))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        Self::bail_on_error(resp).await
+    }
 }
 
 /// Build the create-machine request body. `auto_destroy` is machine-level; `autostop`/`autostart`/
@@ -117,6 +195,8 @@ pub(crate) fn create_machine_body(cfg: &FlyConfig, token: &str) -> serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_cfg() -> FlyConfig {
         FlyConfig {
@@ -206,5 +286,94 @@ mod tests {
         assert_eq!(t.len(), 32, "{t}");
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
         assert_ne!(mint_token(), mint_token());
+    }
+
+    fn cfg_for(server: &MockServer) -> FlyConfig {
+        let mut c = sample_cfg();
+        c.api_base = server.uri();
+        c.graphql_base = format!("{}/graphql", server.uri());
+        c.public_base_override = Some(server.uri().replacen("http", "ws", 1));
+        c.boot_timeout = std::time::Duration::from_secs(5);
+        c
+    }
+
+    #[tokio::test]
+    async fn create_app_posts_bearer_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps"))
+            .and(header("authorization", "Bearer fly-tok"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        api.create_app("otto-session-x", "personal").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_app_surfaces_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("name taken"))
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        let err = api.create_app("x", "personal").await.unwrap_err().to_string();
+        assert!(err.contains("422") && err.contains("name taken"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn allocate_shared_ip_posts_graphql() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        api.allocate_shared_ip("otto-session-x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_machine_posts_to_app_machines() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps/otto-session-x/machines"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"abc"}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cfg = cfg_for(&server);
+        let api = FlyApi::from_config(&cfg);
+        api.create_machine("otto-session-x", &cfg, "sess-tok").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_ready_returns_on_any_http_status() {
+        let server = MockServer::start().await;
+        // Any HTTP response (even 401) means "serve is listening".
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        api.wait_ready("otto-session-x", std::time::Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_app_issues_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/apps/otto-session-x"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        api.delete_app("otto-session-x").await.unwrap();
     }
 }
