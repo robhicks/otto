@@ -90,6 +90,15 @@ impl GenConfig {
     }
 }
 
+/// Wrap a user prompt in Gemma's instruct chat template, unless `raw` is set.
+pub fn gemma_prompt(user: &str, raw: bool) -> String {
+    if raw {
+        user.to_string()
+    } else {
+        format!("<start_of_turn>user\n{user}<end_of_turn>\n<start_of_turn>model\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +173,19 @@ mod tests {
         let cfg = parse_gen_config(get);
         assert_eq!(cfg.max_tokens, 512); // fell back to default
         assert_eq!(cfg.temperature, None);
+    }
+
+    #[test]
+    fn gemma_prompt_wraps_in_instruct_turns() {
+        let p = gemma_prompt("hello", false);
+        assert_eq!(
+            p,
+            "<start_of_turn>user\nhello<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn gemma_prompt_raw_passes_through() {
+        assert_eq!(gemma_prompt("hello", true), "hello");
     }
 }
