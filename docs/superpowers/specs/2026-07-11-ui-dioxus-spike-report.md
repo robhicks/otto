@@ -9,6 +9,7 @@
 | Slice | View/reactivity LOC | Pure-logic LOC | Wall-clock | `cfg` edge-gates | Notes |
 |---|---|---|---|---|---|
 | A — app shell + live session | 246 (`app.rs` 154 + `event_log.rs` 14 + `prompt_bar.rs` 38 + `connection_form.rs` 40) | 0 (reused from Task 2) | ~50 subagent-min (incl. review fix-pass) | 11 total (all in `transport/`; the review fix removed the 3 yield-helper edges) | Both targets compile clean; `net::` regression 45/45. No `Sink`-storage target-split needed. Post-review: added `Sink::close()` + a generation-guarded per-connection drain task (idle poll loop eliminated) — see Fix pass. |
+| B — capabilities status strip | 38 (`status_line.rs`) + ~10 (`app.rs` wiring: 1 signal decl + 5 set/clear call-sites + import + render line) ≈ 48 total | 0 new (`capability_segments`/`status_label`/`short_session` reused verbatim from Task 2) | ~15 subagent-min | 11 total, unchanged (no platform edge added — `capabilities` is a plain cross-platform `Signal<Option<CapabilitiesManifest>>`, threaded through the existing generation-guarded drain task exactly like `conn`/`sink`) | Both targets compile clean; `net::` regression 45/45; `cargo fmt --check` clean. One real (non-plan) fix: `last_seq.read().map(...)` doesn't compile directly (`Ref<Option<u64>>` isn't `ToString`) — needed `(*last_seq.read()).map(...)`, matching the deref pattern `app.rs` already uses for `last_seq` elsewhere. |
 
 **Leptos baseline (for comparison):** `ui/` totals — measure with
 `tokei ui/src` or `wc -l ui/src/**/*.rs` and record here once, split the same way.
@@ -55,6 +56,8 @@ another *previously-defined* closure by value (`send(cmd)` inside `send_prompt`'
 mutable capture of that inner closure binding. This is ordinary Rust closure-capture behavior, not
 a 0.6→0.7 API change, but it's an easy trap when porting the brief's pseudo-code verbatim — `cargo
 build` catches it immediately as a hard error, so it never silently ships.
+
+**Slice B (this task).** A near-mechanical parity port. The Leptos `StatusLine` in `ui/src/components/status_line.rs` is `RwSignal`-based and additionally renders a token/cost meter (a later Leptos slice); the Dioxus port scopes to this task's two signals (`conn`, `last_seq`, `capabilities`) and skips the meter row, matching the brief exactly. All three pure helpers (`capability_segments`, `status_label`, `short_session`) were already written and tested in Task 2's `net::view_model` port, so this slice was pure view + wiring: one new 38-line component plus five call-sites in `app.rs` (one `use_signal` declaration, one `Ready`-arm bind, three clear-sites mirroring the existing `sink`/`conn` reset pattern). No new `cfg` edge, no new dependency, no new async shape — the generation-guarded drain task from Task 4's review fix already had a slot for exactly this kind of "set on Ready, clear on every disconnect path" signal, so `capabilities` just slots in alongside `session`/`conn`. This is the DX data point worth recording: once the pure view-model layer is shared and the drain-task shape is settled, a Leptos-parity status strip is a ~15-minute port, not a re-design — the Dioxus and Leptos versions of this slice differ only in `rsx!`-vs-`view!` syntax and signal-read ergonomics (`Ref` deref vs `.get()`), not in structure.
 
 ### Build / toolchain (incl. WASM bundle size)
 _(notes)_

@@ -3,10 +3,10 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 // Slice A references only these; later slices (D/E/F) add `EventKind` when they match on it.
-use otto_protocol::{Command, ServerMessage, SessionId};
+use otto_protocol::{CapabilitiesManifest, Command, ServerMessage, SessionId};
 use uuid::Uuid;
 
-use crate::components::{ConnectionForm, EventLog, PromptBar};
+use crate::components::{ConnectionForm, EventLog, PromptBar, StatusLine};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply};
 use crate::net::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
 use crate::transport::{connect, Sink, SocketEvent};
@@ -19,6 +19,9 @@ pub fn App() -> Element {
     let mut rows = use_signal(Vec::<LogRow>::new);
     let mut last_seq = use_signal(|| None::<u64>);
     let mut session = use_signal(|| None::<String>);
+    // The capabilities manifest from the last `Ready` frame; None when disconnected (cleared on
+    // every disconnect path so the strip never shows a stale manifest from a prior connection).
+    let mut capabilities = use_signal(|| None::<CapabilitiesManifest>);
     // The live outbound sink; None when disconnected.
     let mut sink = use_signal(|| None::<Rc<dyn Sink>>);
     // Monotonic connection id. Bumped on every connect/disconnect; each per-connection drain task
@@ -44,6 +47,7 @@ pub fn App() -> Element {
         if let Some(old) = sink.write().take() {
             old.close();
         }
+        capabilities.set(None);
 
         conn.set(ConnState::Connecting);
         match connect(&target) {
@@ -61,10 +65,13 @@ pub fn App() -> Element {
                         }
                         match ev {
                             SocketEvent::Message(Ok(ServerMessage::Ready {
-                                session: s, ..
+                                session: s,
+                                capabilities: caps,
+                                ..
                             })) => {
                                 let id = s.0.to_string();
                                 session.set(Some(id.clone()));
+                                capabilities.set(Some(caps));
                                 conn.set(ConnState::Connected { session: id });
                             }
                             SocketEvent::Message(Ok(ServerMessage::Event { event })) => {
@@ -83,9 +90,10 @@ pub fn App() -> Element {
                             }
                             SocketEvent::Closed | SocketEvent::Errored => {
                                 // Guarded above, so this is the CURRENT connection's close — safe
-                                // to flip to Disconnected and null the sink.
+                                // to flip to Disconnected and null the sink/capabilities.
                                 conn.set(ConnState::Disconnected);
                                 sink.set(None);
+                                capabilities.set(None);
                                 break;
                             }
                         }
@@ -106,6 +114,7 @@ pub fn App() -> Element {
             s.close();
         }
         conn.set(ConnState::Disconnected);
+        capabilities.set(None);
     };
 
     let mut send = move |cmd: Command| {
@@ -138,6 +147,7 @@ pub fn App() -> Element {
 
     rsx! {
         div { class: "app",
+            StatusLine { conn, last_seq, capabilities }
             EventLog { rows }
             PromptBar {
                 conn,
