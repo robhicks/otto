@@ -14,8 +14,9 @@ be embedded in-process or served over the network.
 > event-log store), **`otto serve`** (bearer-authed WebSocket with `Last-Event-ID` reconnect,
 > plaintext or `wss://`), **`RemoteWorkspace`** + `promote()`/`LoopbackTarget`, the **MCP tool
 > servers** (`mcp-fs`/`mcp-grep`/`mcp-git`/`mcp-bash`), and the **first UI slice** — a
-> browser-first Leptos (Rust→WASM) app shell in [`ui/`](ui/) that talks to `otto serve`. Still
-> ahead: retrieval, extensions, the external-VPS remote provisioner, and UI sub-projects B–F
+> browser-first Leptos (Rust→WASM) app shell in [`ui/`](ui/) that talks to `otto serve`. On-demand
+> Fly.io provisioning has since shipped too (`otto serve --promote-fly`; see [`deploy/fly/`](deploy/fly/)).
+> Still ahead: retrieval, extensions, and UI sub-projects B–F
 > (capabilities strip, workspace tree/editor, diff approval, token meter, promote UX) plus the
 > Tauri desktop wrapper. The full intended design lives in
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`,
