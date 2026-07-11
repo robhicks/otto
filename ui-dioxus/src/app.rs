@@ -20,7 +20,10 @@ use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 #[component]
 pub fn App() -> Element {
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
-    let token = use_signal(String::new);
+    // `mut`: the desktop-only auto-connect mount block below calls `token.set(..)` with the
+    // sidecar-generated bearer token (`Signal::set` requires `&mut self`, so this binding must
+    // be mutable even though the web target never writes it — only reads it via `token.read()`).
+    let mut token = use_signal(String::new);
     let mut conn = use_signal(|| ConnState::Disconnected);
     let mut rows = use_signal(Vec::<LogRow>::new);
     let mut last_seq = use_signal(|| None::<u64>);
@@ -377,6 +380,34 @@ pub fn App() -> Element {
             do_connect();
         }
     });
+
+    // Desktop-only: on launch, pick a workspace folder, spawn a local `otto serve` sidecar on a
+    // fixed port with a freshly-generated token, and auto-connect — reproducing the Tauri
+    // `desktop/` wrapper's UX (sub-project G) inside this one crate, no separate wrapper crate
+    // and no `ui/dist` sidecar handoff. This whole block (and the `use_signal`/`use_future` hooks
+    // it adds) is compiled in only under `--features desktop`; the web build has neither the
+    // block nor the hooks, so there is no cross-target hook-order mismatch to worry about — each
+    // target sees its own fixed, unconditional hook sequence every render. If `boot()` returns
+    // `None` (the user cancelled the folder picker, or the sidecar failed to spawn), this is a
+    // no-op and the manual `ConnectionForm` below stays the fallback.
+    #[cfg(feature = "desktop")]
+    {
+        // Holds the sidecar guard so the child process lives for the app's lifetime; `SidecarGuard`'s
+        // `Drop` kills it. `None` until `boot()` resolves (or forever, if the user cancels/it fails).
+        let mut sidecar = use_signal(|| None::<crate::desktop_boot::SidecarGuard>);
+        use_future(move || async move {
+            if let Some((guard, params)) = crate::desktop_boot::boot().await {
+                sidecar.set(Some(guard));
+                url.set(params.ws);
+                token.set(params.token);
+                // Give the sidecar a moment to bind the port before connecting — there is no
+                // health-check RPC to poll instead, so this is a fixed grace period, matching the
+                // brief.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                do_connect();
+            }
+        });
+    }
 
     rsx! {
         div { class: "app",
