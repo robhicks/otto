@@ -34,6 +34,62 @@ pub fn resolve_model_source(value: Option<String>) -> ModelSource {
     }
 }
 
+const DEFAULT_MAX_TOKENS: usize = 512;
+const DEFAULT_SEED: u64 = 299792458;
+
+/// Generation parameters, sourced from `OTTO_CANDLE_*` env vars in production.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenConfig {
+    pub max_tokens: usize,
+    /// `None` => greedy (argmax). `Some(t > 0)` => temperature sampling.
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    /// Skip the Gemma instruct chat template (for base models).
+    pub raw: bool,
+    pub seed: u64,
+}
+
+impl Default for GenConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: None,
+            top_p: None,
+            raw: false,
+            seed: DEFAULT_SEED,
+        }
+    }
+}
+
+/// Build a `GenConfig` from a key->value lookup (injectable for tests).
+pub fn parse_gen_config(get: impl Fn(&str) -> Option<String>) -> GenConfig {
+    let max_tokens = get("OTTO_CANDLE_MAX_TOKENS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_TOKENS);
+    let temperature = get("OTTO_CANDLE_TEMPERATURE")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|t| *t > 0.0);
+    let top_p = get("OTTO_CANDLE_TOP_P").and_then(|s| s.parse::<f64>().ok());
+    let raw = get("OTTO_CANDLE_RAW").as_deref() == Some("1");
+    let seed = get("OTTO_CANDLE_SEED")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
+    GenConfig {
+        max_tokens,
+        temperature,
+        top_p,
+        raw,
+        seed,
+    }
+}
+
+impl GenConfig {
+    /// Read the generation config from the process environment.
+    pub fn from_env() -> Self {
+        parse_gen_config(|k| std::env::var(k).ok())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +124,45 @@ mod tests {
             resolve_model_source(None),
             ModelSource::HubRepo(DEFAULT_CANDLE_REPO.to_string())
         );
+    }
+
+    #[test]
+    fn gen_config_defaults_when_env_absent() {
+        let cfg = parse_gen_config(|_| None);
+        assert_eq!(cfg.max_tokens, 512);
+        assert_eq!(cfg.temperature, None);
+        assert_eq!(cfg.top_p, None);
+        assert!(!cfg.raw);
+        assert_eq!(cfg.seed, 299792458);
+    }
+
+    #[test]
+    fn gen_config_parses_all_fields() {
+        let get = |k: &str| match k {
+            "OTTO_CANDLE_MAX_TOKENS" => Some("128".to_string()),
+            "OTTO_CANDLE_TEMPERATURE" => Some("0.7".to_string()),
+            "OTTO_CANDLE_TOP_P" => Some("0.9".to_string()),
+            "OTTO_CANDLE_RAW" => Some("1".to_string()),
+            "OTTO_CANDLE_SEED" => Some("42".to_string()),
+            _ => None,
+        };
+        let cfg = parse_gen_config(get);
+        assert_eq!(cfg.max_tokens, 128);
+        assert_eq!(cfg.temperature, Some(0.7));
+        assert_eq!(cfg.top_p, Some(0.9));
+        assert!(cfg.raw);
+        assert_eq!(cfg.seed, 42);
+    }
+
+    #[test]
+    fn gen_config_ignores_unparseable_and_nonpositive_temp() {
+        let get = |k: &str| match k {
+            "OTTO_CANDLE_MAX_TOKENS" => Some("banana".to_string()),
+            "OTTO_CANDLE_TEMPERATURE" => Some("0".to_string()), // <= 0 => greedy (None)
+            _ => None,
+        };
+        let cfg = parse_gen_config(get);
+        assert_eq!(cfg.max_tokens, 512); // fell back to default
+        assert_eq!(cfg.temperature, None);
     }
 }
