@@ -1,0 +1,99 @@
+//! `FlyTarget` — provisions a fresh Fly Machine per session (one Fly app each), runs `otto serve`
+//! on it, and disposes it on demote/stop. A `RemoteTarget` shaped like `VpsTarget` (explicit async
+//! teardown, no drop-magic) because a billed remote machine must outlive the promote RPC. Always
+//! compiled: it only does HTTP, so the whole flow is wiremock-tested in CI.
+
+use uuid::Uuid;
+
+/// Fly provisioning parameters, read from `OTTO_FLY_*` / `FLY_API_TOKEN` at the CLI edge (never in
+/// this crate) and carried as plain data in `PromoteMode::Fly`.
+#[derive(Clone)]
+pub struct FlyConfig {
+    pub api_token: String,
+    pub org_slug: String,
+    pub region: String,
+    pub image: String,
+    pub vm_cpus: u32,
+    pub vm_mem_mib: u32,
+    pub app_prefix: String,
+    pub internal_port: u16,
+    pub boot_timeout: std::time::Duration,
+    /// Machines REST base. Default `https://api.machines.dev/v1`; overridable for wiremock.
+    pub api_base: String,
+    /// GraphQL base (IP allocation). Default `https://api.fly.io/graphql`; overridable for wiremock.
+    pub graphql_base: String,
+    /// Test/advanced only: overrides `wss://<app>.fly.dev` so readiness polling and the `/promote`
+    /// POST target a mock server. `None` in production.
+    pub public_base_override: Option<String>,
+}
+
+/// A fresh 32-hex per-session bearer token. Blast radius of a leak is one ephemeral session.
+pub(crate) fn mint_token() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+/// A globally-unique, DNS-safe Fly app name: `{prefix}-{12 hex}`.
+pub(crate) fn gen_app_name(prefix: &str) -> String {
+    let suffix: String = Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect();
+    format!("{prefix}-{suffix}")
+}
+
+/// Extract `<app>` from a `wss://<app>.fly.dev` endpoint (the inverse of the endpoint we hand out).
+/// Returns `None` for any other shape so `teardown` fails loudly rather than deleting the wrong app.
+pub(crate) fn app_name_from_endpoint(endpoint: &str) -> Option<String> {
+    let host = endpoint.strip_prefix("wss://")?;
+    let app = host.strip_suffix(".fly.dev")?;
+    if app.is_empty() || app.contains('/') || app.contains('.') {
+        return None;
+    }
+    Some(app.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_name_from_endpoint_extracts_app() {
+        assert_eq!(
+            app_name_from_endpoint("wss://otto-session-abc123.fly.dev"),
+            Some("otto-session-abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn app_name_from_endpoint_rejects_malformed() {
+        assert_eq!(app_name_from_endpoint("wss://.fly.dev"), None);
+        assert_eq!(app_name_from_endpoint("wss://x.example.com"), None);
+        assert_eq!(
+            app_name_from_endpoint("http://otto-session-x.fly.dev"),
+            None
+        );
+        assert_eq!(app_name_from_endpoint("otto-session-x"), None);
+    }
+
+    #[test]
+    fn gen_app_name_is_prefixed_and_dns_safe() {
+        let name = gen_app_name("otto-session");
+        assert!(name.starts_with("otto-session-"), "{name}");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{name}"
+        );
+        assert_ne!(gen_app_name("otto-session"), gen_app_name("otto-session"));
+    }
+
+    #[test]
+    fn mint_token_is_unique_hex() {
+        let t = mint_token();
+        assert_eq!(t.len(), 32, "{t}");
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
+        assert_ne!(mint_token(), mint_token());
+    }
+}

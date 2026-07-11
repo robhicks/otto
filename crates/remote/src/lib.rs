@@ -10,6 +10,9 @@ mod firecracker;
 #[cfg(feature = "firecracker")]
 pub use firecracker::FirecrackerProvisioner;
 
+mod fly;
+pub use fly::FlyConfig;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
