@@ -53,7 +53,17 @@ web-sys = { version = "0.3", features = [
 ], optional = true }
 
 # desktop transport (only compiled with --features desktop)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
+# `process`/`io-util`/`time` are used by `desktop_boot`: spawn the `otto serve` sidecar with piped
+# stderr (`process`), async-read its readiness line via `BufReader::lines` (`io-util`), and bound
+# the readiness wait with `tokio::time::timeout` (`time`).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "process",
+    "io-util",
+    "time",
+], optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 rfd = { version = "0.15", optional = true }

@@ -392,19 +392,28 @@ pub fn App() -> Element {
     // no-op and the manual `ConnectionForm` below stays the fallback.
     #[cfg(feature = "desktop")]
     {
-        // Holds the sidecar guard so the child process lives for the app's lifetime; `SidecarGuard`'s
-        // `Drop` kills it. `None` until `boot()` resolves (or forever, if the user cancels/it fails).
-        let mut sidecar = use_signal(|| None::<crate::desktop_boot::SidecarGuard>);
+        use crate::desktop_boot::BootOutcome;
+        // Holds the live sidecar `Child` (spawned `kill_on_drop(true)`) so the process lives for the
+        // app's lifetime and is killed when this signal's value is dropped. `None` until `boot()`
+        // resolves to `Ready` (or forever, if the user cancels or the spawn fails).
+        let mut sidecar = use_signal(|| None::<tokio::process::Child>);
         use_future(move || async move {
-            if let Some((guard, params)) = crate::desktop_boot::boot().await {
-                sidecar.set(Some(guard));
-                url.set(params.ws);
-                token.set(params.token);
-                // Give the sidecar a moment to bind the port before connecting — there is no
-                // health-check RPC to poll instead, so this is a fixed grace period, matching the
-                // brief.
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                do_connect();
+            // `boot()` already waits for the sidecar's readiness line before returning `Ready`, so
+            // no fixed sleep is needed here — `do_connect()` fires as soon as the port is bound.
+            match crate::desktop_boot::boot().await {
+                BootOutcome::Ready(child, params) => {
+                    sidecar.set(Some(child));
+                    url.set(params.ws);
+                    token.set(params.token);
+                    do_connect();
+                }
+                // Spawn failure (missing/misconfigured `otto` binary): surface it so the user knows
+                // why auto-connect didn't happen, then fall back to the manual form.
+                BootOutcome::SpawnFailed(msg) => {
+                    rows.write().push(client_error_row(&msg));
+                }
+                // User cancelled the picker: silent fallback to the manual ConnectionForm.
+                BootOutcome::Cancelled => {}
             }
         });
     }
