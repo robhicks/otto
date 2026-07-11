@@ -13,7 +13,10 @@ pub fn FileTree(nodes: Vec<TreeNode>, on_open: EventHandler<PathBuf>) -> Element
     rsx! {
         ul { class: "file-tree",
             for node in nodes {
-                FileTreeNode { node, on_open }
+                // Keyed by the node's unique workspace path so Dioxus diffs this list by identity,
+                // not position: a Refresh that reorders/adds/removes nodes then keeps each
+                // FileTreeNode's local `expanded` state attached to the right node.
+                FileTreeNode { key: "{node.path.display()}", node, on_open }
             }
         }
     }
@@ -34,7 +37,7 @@ fn FileTreeNode(node: TreeNode, on_open: EventHandler<PathBuf>) -> Element {
                 if *expanded.read() {
                     ul {
                         for child in node.children.clone() {
-                            FileTreeNode { node: child, on_open }
+                            FileTreeNode { key: "{child.path.display()}", node: child, on_open }
                         }
                     }
                 }
