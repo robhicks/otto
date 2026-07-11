@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "otto-ui-dioxus"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
+desktop = ["dioxus/desktop", "dep:tokio", "dep:tokio-tungstenite", "dep:reqwest", "dep:rfd", "dep:futures-util"]
+
+[dependencies]
+dioxus = "0.7"
+otto-protocol = { path = "../crates/protocol" }
+serde_json = "1"
+urlencoding = "2.1"
+# uuid's `js` feature (getrandom via wasm) is wasm-only — enabled only under the
+# `web` feature above so it never applies to the native `desktop` build.
+uuid = { version = "1", features = ["v4"] }
+
+# web transport (only compiled with --features web)
+wasm-bindgen = { version = "0.2", optional = true }
+gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
+web-sys = { version = "0.3", features = ["Window", "Location", "History"], optional = true }
+
+# desktop transport (only compiled with --features desktop)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+rfd = { version = "0.15", optional = true }
+futures-util = { version = "0.3", optional = true }

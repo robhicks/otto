@@ -1,0 +1,8 @@
+[application]
+name = "otto-ui-dioxus"
+
+[web.app]
+title = "otto (Dioxus)"
+
+[web.resource]
+style = ["/style.css"]
