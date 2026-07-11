@@ -47,8 +47,12 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
             // Span source is a plain function call, not a hook — safe to call here inside the
             // `Text` arm (unlike `buf`/the re-seed effect above, which must stay hoisted and
             // unconditional; see the comment at the top of this component). Desktop gets real
-            // tree-sitter-classified spans; web keeps `plain_spans` until Task 12 wires web
-            // highlighting.
+            // tree-sitter-classified spans; web keeps `plain_spans` permanently — Task 12 spiked
+            // `web-tree-sitter` and found a hard architectural mismatch (no Rust-native API, no
+            // reusable highlight-iterator, unverifiable JS interop in this environment), recorded
+            // as a headline native/wasm divergence rather than a gap a later slice closes. See
+            // docs/superpowers/specs/2026-07-11-ui-dioxus-spike-report.md, Ecosystem/editor,
+            // slice C.4.
             #[cfg(feature = "desktop")]
             let spans = {
                 let lang = language_for_path(&path);
