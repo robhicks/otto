@@ -2,11 +2,12 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-// Slice A references only these; later slices (D/E/F) add `EventKind` when they match on it.
-use otto_protocol::{CapabilitiesManifest, Command, ServerMessage, SessionId};
+use otto_protocol::{CapabilitiesManifest, Command, EventKind, ServerMessage, SessionId};
 use uuid::Uuid;
 
-use crate::components::{ConnectionForm, EventLog, PromptBar, StatusLine};
+use crate::components::{
+    ApprovalPanel, ConnectionForm, EventLog, PendingApproval, PromptBar, StatusLine,
+};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply};
 use crate::net::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
 use crate::transport::{connect, Sink, SocketEvent};
@@ -24,6 +25,9 @@ pub fn App() -> Element {
     let mut capabilities = use_signal(|| None::<CapabilitiesManifest>);
     // The live outbound sink; None when disconnected.
     let mut sink = use_signal(|| None::<Rc<dyn Sink>>);
+    // The pending diff awaiting Approve/Reject, if any; None when idle or disconnected (cleared
+    // on TurnComplete, on a server Error, on the decision itself, and on every disconnect path).
+    let mut pending_approval = use_signal(|| None::<PendingApproval>);
     // Monotonic connection id. Bumped on every connect/disconnect; each per-connection drain task
     // captures the value current when it was spawned and bails the instant `generation` moves on,
     // so a superseded socket's already-queued event can never write the new connection's state.
@@ -48,6 +52,7 @@ pub fn App() -> Element {
             old.close();
         }
         capabilities.set(None);
+        pending_approval.set(None);
 
         conn.set(ConnState::Connecting);
         match connect(&target) {
@@ -78,11 +83,30 @@ pub fn App() -> Element {
                                 let current = *last_seq.read();
                                 if should_apply(current, event.seq) {
                                     last_seq.set(advance_last_seq(current, event.seq));
+                                    if let EventKind::ApprovalRequest { id, path, old, new } =
+                                        &event.kind
+                                    {
+                                        pending_approval.set(Some((
+                                            *id,
+                                            path.clone(),
+                                            old.clone(),
+                                            new.clone(),
+                                        )));
+                                    }
+                                    // The turn ending resolves any outstanding approval (the
+                                    // orchestrator parks on the approval *before* emitting
+                                    // TurnComplete, so this never clears a genuinely pending
+                                    // one). On reconnect this also clears a replayed-but-stale
+                                    // request whose turn already finished fail-closed.
+                                    if let EventKind::TurnComplete { .. } = &event.kind {
+                                        pending_approval.set(None);
+                                    }
                                     rows.write().push(describe_event(&event.kind));
                                 }
                             }
                             SocketEvent::Message(Ok(ServerMessage::Error { message })) => {
                                 rows.write().push(error_row(&message));
+                                pending_approval.set(None);
                             }
                             SocketEvent::Message(Ok(_)) => {}
                             SocketEvent::Message(Err(detail)) => {
@@ -94,6 +118,7 @@ pub fn App() -> Element {
                                 conn.set(ConnState::Disconnected);
                                 sink.set(None);
                                 capabilities.set(None);
+                                pending_approval.set(None);
                                 break;
                             }
                         }
@@ -115,6 +140,7 @@ pub fn App() -> Element {
         }
         conn.set(ConnState::Disconnected);
         capabilities.set(None);
+        pending_approval.set(None);
     };
 
     let mut send = move |cmd: Command| {
@@ -144,11 +170,38 @@ pub fn App() -> Element {
             }
         }
     };
+    let mut decide = move |(id, approved): (Uuid, bool)| {
+        let Some(sid) = session.read().clone() else {
+            return;
+        };
+        let Ok(uuid) = Uuid::parse_str(&sid) else {
+            return;
+        };
+        let cmd = Command::ApproveDiff {
+            session: SessionId(uuid),
+            id,
+            approved,
+        };
+        // Only dismiss the panel once the verdict is actually on the wire. If the send fails the
+        // orchestrator is still blocked on this approval, so keep the panel up for a retry rather
+        // than silently dropping the diff.
+        let Some(s) = sink.read().clone() else {
+            return;
+        };
+        match s.send(&cmd) {
+            Ok(()) => pending_approval.set(None),
+            Err(e) => rows.write().push(client_error_row(&e)),
+        }
+    };
 
     rsx! {
         div { class: "app",
             StatusLine { conn, last_seq, capabilities }
             EventLog { rows }
+            ApprovalPanel {
+                pending: pending_approval,
+                on_decide: move |d| decide(d),
+            }
             PromptBar {
                 conn,
                 on_send: move |t| send_prompt(t),
