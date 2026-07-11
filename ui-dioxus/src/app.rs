@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
@@ -6,13 +7,15 @@ use otto_protocol::{CapabilitiesManifest, Command, EventKind, ServerMessage, Ses
 use uuid::Uuid;
 
 use crate::components::{
-    ApprovalPanel, ConnectionForm, EventLog, PendingApproval, PromptBar, StatusLine,
+    ApprovalPanel, ConnectionForm, EventLog, FileTree, PendingApproval, PromptBar, StatusLine,
 };
-use crate::net::url::{advance_last_seq, build_ws_url, should_apply};
+use crate::editor::Editor;
+use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
+use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
     can_demote, can_promote, client_error_row, describe_event, error_row, ConnState, LogRow,
 };
-use crate::transport::{connect, Sink, SocketEvent};
+use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 
 #[component]
 pub fn App() -> Element {
@@ -48,6 +51,11 @@ pub fn App() -> Element {
     // captures the value current when it was spawned and bails the instant `generation` moves on,
     // so a superseded socket's already-queued event can never write the new connection's state.
     let mut generation = use_signal(|| 0u64);
+
+    // Workspace tree + editor state (unhighlighted, controlled-buffer editor for this slice).
+    let mut tree = use_signal(Vec::<TreeNode>::new);
+    let mut open_file = use_signal(|| None::<(PathBuf, FileBody)>);
+    let mut editor_seed = use_signal(String::new);
 
     let mut do_connect = move || {
         let base = url.read().clone();
@@ -290,6 +298,66 @@ pub fn App() -> Element {
         }
     };
 
+    // Fetch the file list over the /workspace RPC and rebuild the tree. No-op without url+token
+    // (the form gates Connect on both, so by Connected they are present). Spawned the same way
+    // the drain task is — an ordinary Dioxus `spawn`, not a `use_future` (this is an action
+    // triggered by an event/effect, not a standing background task).
+    let load_files = move || {
+        let base = url.read().clone();
+        let http_base = ws_to_http_base(&base);
+        let tok = token.read().clone();
+        if http_base.is_empty() || tok.is_empty() {
+            return;
+        }
+        spawn(async move {
+            match list_files(&http_base, &tok).await {
+                Ok(paths) => tree.set(build_tree(&paths)),
+                Err(e) => rows.write().push(client_error_row(&e)),
+            }
+        });
+    };
+
+    // Read a file and mount it in the editor (or show a binary/oversize notice). No-op unless
+    // Connected, matching `ui/src/app.rs`'s `open_path` guard.
+    let open_path = move |path: PathBuf| {
+        if !matches!(conn(), ConnState::Connected { .. }) {
+            return;
+        }
+        let base = url.read().clone();
+        let http_base = ws_to_http_base(&base);
+        let tok = token.read().clone();
+        if http_base.is_empty() || tok.is_empty() {
+            return;
+        }
+        spawn(async move {
+            match read_file(&http_base, &tok, path.clone()).await {
+                Ok(bytes) => {
+                    let body = decode_or_binary(&bytes);
+                    // Only text files seed the editor; for Binary/TooLarge, Editor shows a
+                    // notice instead of mounting the buffer, so a stale `editor_seed` is never
+                    // read (matches `ui/src/app.rs`'s open_path comment).
+                    if let FileBody::Text(ref s) = body {
+                        editor_seed.set(s.clone());
+                    }
+                    open_file.set(Some((path, body)));
+                }
+                Err(e) => rows.write().push(client_error_row(&e)),
+            }
+        });
+    };
+
+    // Auto-load the tree when the connection reaches Connected. `conn()` is a TRACKED READ —
+    // that is what subscribes this effect to the signal, so the drain task's later
+    // `conn.set(ConnState::Connected { .. })` actually re-fires it. A write-guard access
+    // (`conn.write()`) would not subscribe and this would never fire — the same class of bug
+    // the handover-reconnect effect below already documents. Mirrors `ui/src/app.rs`'s
+    // "Auto-load the tree when the connection reaches Connected" Effect.
+    use_effect(move || {
+        if matches!(conn(), ConnState::Connected { .. }) {
+            load_files();
+        }
+    });
+
     // Perform a handover reconnect: point the URL at the new endpoint and reconnect through the
     // same hardened `do_connect` used by the manual Connect button — it bumps `generation`,
     // closes the old sink, opens the new socket, and spawns a fresh generation-guarded drain
@@ -313,6 +381,21 @@ pub fn App() -> Element {
     rsx! {
         div { class: "app",
             StatusLine { conn, last_seq, capabilities, meter }
+            div { class: "workspace",
+                div { class: "workspace-side",
+                    button {
+                        class: "refresh-btn",
+                        disabled: !matches!(conn(), ConnState::Connected { .. }),
+                        onclick: move |_| load_files(),
+                        "Refresh files"
+                    }
+                    FileTree {
+                        nodes: tree.read().clone(),
+                        on_open: move |p| open_path(p),
+                    }
+                }
+                Editor { open: open_file, seed: editor_seed }
+            }
             EventLog { rows }
             ApprovalPanel {
                 pending: pending_approval,

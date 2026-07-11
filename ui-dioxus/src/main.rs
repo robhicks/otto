@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod editor;
 mod net;
 mod transport;
 
