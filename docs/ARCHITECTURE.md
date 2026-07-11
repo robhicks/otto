@@ -335,8 +335,10 @@ format:
   and fired around tool dispatch via a `HookedTool` decorator, executed through the shared OS
   sandbox; a `PreToolUse` hook may block a call (exit 2), `PostToolUse` observes. Hooks compose
   *below* the permission gate (deny-only). Enforced on every entrypoint (spine, serve, and the
-  `--command`/`--agent` subpaths, all via the shared `build_composed_tools`). Lifecycle hooks,
-  JSON-stdout control, regex matchers, and `settings.local.json` are pending.
+  `--command`/`--agent` subpaths, all via the shared `build_composed_tools`) — including
+  plugin-bundled MCP tools, which register before `register_hooks` and can be selected by an
+  `mcp__<plugin>[__<tool>]` matcher. Lifecycle hooks, JSON-stdout control, regex matchers, and
+  `settings.local.json` are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → discovered from on-disk marketplaces under
   `.claude/plugins/marketplaces/`, gated by the `enabledPlugins` allowlist in `settings.json`, and
@@ -353,8 +355,10 @@ format:
   a plugin whose marketplace entry is a `Remote` source (github/git — its code lives outside the
   marketplace repo) materializes it: `otto plugin install` clones the plugin repo into
   `~/.claude/plugins/repos/<marketplace>/<plugin>/`, records it in the lockfile's `plugins` map, and
-  discovery folds it from there. A project-level (non-user-global) marketplace install and an
-  interactive `/plugin` UX are still pending.
+  discovery folds it from there. Plugin MCP tools hook-wrap (they register before `register_hooks`) and are addressable from
+  `permissions` rules and hook matchers via the `mcp__<plugin>[__<tool>]` idiom (server key
+  wildcarded), bridged by `mcp_specifier_matches`. A project-level (non-user-global) marketplace
+  install and an interactive `/plugin` UX are still pending.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
