@@ -239,6 +239,33 @@ asset pipeline, `Dioxus.toml`'s `[web.resource]` — flagged as unexercised back
 that axis both toolchains behaved identically (ordinary `rustc`/`cargo` diagnostics, no custom build
 step required for either target to type-check).
 
+**Styling is unconnected — the copied `ui/` chrome stylesheet is effectively orphaned (a known
+limitation of the compile-only spike).** The whole-branch review surfaced that this is materially
+bigger than the couple of class-name differences earlier slice notes recorded (e.g. `diff-context` vs
+`ui/`'s `diff-ctx`): when all of slices A–F are assembled, effectively **none** of the app-chrome CSS
+classes the Dioxus components emit have a matching rule in the verbatim-copied `ui/style.css`. The
+Dioxus components emit `status-line`, `prompt-bar`, `event-log`, `connection-form`, `approval-panel`,
+`meter`/`meter-cost`, `handover`, `status-conn`/`status-session`/`status-seq`, `tree-dir`, `tree-file`
+(names chosen fresh while porting each component's `rsx!`); the copied stylesheet instead defines the
+original `ui/` names — `status`, `prompt`, `log`, `conn-form`, `cap-*`, `row-*`,
+`tree-dir-row`/`tree-file-row`. The **only** classes that actually connect are the editor +
+`tok-*` classes, which were added fresh to *both* sides in C.2/C.3 (that's why the editor is the one
+place styling was exercised at all, and only in the highlight-span layer). Net effect: a real
+`dx serve` visual drive would render the entire app **chrome unstyled** until the class names are
+reconciled (either rename the components' classes to match `ui/style.css`, or extend the stylesheet to
+the new names). Two related facts compound this and are worth stating together: (1) `style.css` is
+pulled in **only** via `Dioxus.toml`'s `[web.resource]` entry — a `dx`-CLI/web-only asset path that no
+`cargo build` gate ever exercises (flagged as unexercised since Task 1) — and (2) the **desktop**
+webview includes **no stylesheet at all** (no `asset!`/`document::Stylesheet` wiring was added), so
+neither target's styling is exercised by any build gate this spike ran. This is a documentation-only
+finding: reconciling the class names / wiring the desktop stylesheet is correctly **deferred to the
+runtime-driven follow-up the verdict already recommends** (it is exactly the kind of thing a visual
+drive would catch on the first frame and a compile-only gate structurally cannot). It does **not**
+change the "functionally wired + compile-verified" framing used elsewhere in this report: the client's
+*behavior* — connect, stream events, approve diffs, promote/demote, open files into the editor — is
+wired and compile-verified; what is unconnected is the app-chrome *presentation* layer. Keep that
+distinction crisp: working client logic, unstyled chrome, pending the recommended runtime pass.
+
 **Desktop build.** `cargo build --no-default-features --features desktop` for `ui-dioxus` compiles
 clean with no separate wrapper crate or second toolchain — contrast with the Leptos axis, which needs
 a `trunk build` of `ui/` **plus** a separate `cargo tauri build`/`tauri build` of `desktop/src-tauri`
