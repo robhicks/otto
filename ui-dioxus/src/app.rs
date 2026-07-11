@@ -9,12 +9,14 @@ use crate::components::{
     ApprovalPanel, ConnectionForm, EventLog, PendingApproval, PromptBar, StatusLine,
 };
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply};
-use crate::net::view_model::{client_error_row, describe_event, error_row, ConnState, LogRow};
+use crate::net::view_model::{
+    can_demote, can_promote, client_error_row, describe_event, error_row, ConnState, LogRow,
+};
 use crate::transport::{connect, Sink, SocketEvent};
 
 #[component]
 pub fn App() -> Element {
-    let url = use_signal(|| "ws://127.0.0.1:8787".to_string());
+    let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
     let token = use_signal(String::new);
     let mut conn = use_signal(|| ConnState::Disconnected);
     let mut rows = use_signal(Vec::<LogRow>::new);
@@ -34,6 +36,14 @@ pub fn App() -> Element {
     // Whether the current turn is paused (set by pause/resume; reset on a new turn and on every
     // disconnect path, matching `ui/`).
     let mut paused = use_signal(|| false);
+    // Whether a turn is currently running: true on AgentStarted (and immediately on
+    // send_prompt), false on TurnComplete/Error and every disconnect path (matching `ui/`).
+    // Gates the Promote/Demote buttons — handing off mid-turn would snapshot partial state.
+    let mut turn_running = use_signal(|| false);
+    // Set by a Promoted/Demoted frame; an Effect below performs the actual reconnect to the
+    // handed-back endpoint (the drain task can't call `do_connect` directly — it's defined
+    // outside the task and borrowing it there would fight the `spawn`'s `'static` bound).
+    let mut reconnect_to = use_signal(|| None::<String>);
     // Monotonic connection id. Bumped on every connect/disconnect; each per-connection drain task
     // captures the value current when it was spawned and bails the instant `generation` moves on,
     // so a superseded socket's already-queued event can never write the new connection's state.
@@ -61,6 +71,7 @@ pub fn App() -> Element {
         pending_approval.set(None);
         meter.set(None);
         paused.set(false);
+        turn_running.set(false);
 
         conn.set(ConnState::Connecting);
         match connect(&target) {
@@ -108,6 +119,9 @@ pub fn App() -> Element {
                                     {
                                         meter.set(Some((*input_tokens, *output_tokens)));
                                     }
+                                    if let EventKind::AgentStarted { .. } = &event.kind {
+                                        turn_running.set(true);
+                                    }
                                     // The turn ending resolves any outstanding approval (the
                                     // orchestrator parks on the approval *before* emitting
                                     // TurnComplete, so this never clears a genuinely pending
@@ -116,6 +130,7 @@ pub fn App() -> Element {
                                     if let EventKind::TurnComplete { .. } = &event.kind {
                                         pending_approval.set(None);
                                         paused.set(false);
+                                        turn_running.set(false);
                                     }
                                     rows.write().push(describe_event(&event.kind));
                                 }
@@ -124,12 +139,24 @@ pub fn App() -> Element {
                                 rows.write().push(error_row(&message));
                                 // An Error frame is turn-terminal (the orchestrator emits
                                 // TurnComplete only on success), so clear turn-scoped state here
-                                // too — otherwise Pause/Resume would stay stuck on "Resume" until
-                                // the next turn or reconnect.
+                                // too — otherwise Pause/Resume/Promote/Demote would stay stuck
+                                // until the next turn or reconnect.
                                 pending_approval.set(None);
                                 paused.set(false);
+                                turn_running.set(false);
                             }
-                            SocketEvent::Message(Ok(_)) => {}
+                            SocketEvent::Message(Ok(ServerMessage::Promoted {
+                                endpoint, ..
+                            }))
+                            | SocketEvent::Message(Ok(ServerMessage::Demoted {
+                                endpoint, ..
+                            })) => {
+                                // Reconnect to the handed-back engine, reusing token + session +
+                                // last_seq. The new engine's manifest flips the status strip
+                                // local<->remote. Deferred to an Effect (this task can't call
+                                // `do_connect` itself — it's defined outside the `spawn`).
+                                reconnect_to.set(Some(endpoint));
+                            }
                             SocketEvent::Message(Err(detail)) => {
                                 rows.write().push(client_error_row(&detail));
                             }
@@ -142,6 +169,7 @@ pub fn App() -> Element {
                                 pending_approval.set(None);
                                 meter.set(None);
                                 paused.set(false);
+                                turn_running.set(false);
                                 break;
                             }
                         }
@@ -166,6 +194,7 @@ pub fn App() -> Element {
         pending_approval.set(None);
         meter.set(None);
         paused.set(false);
+        turn_running.set(false);
     };
 
     let mut send = move |cmd: Command| {
@@ -181,6 +210,7 @@ pub fn App() -> Element {
             if let Ok(uuid) = Uuid::parse_str(&sid) {
                 meter.set(None); // a new turn starts fresh
                 paused.set(false);
+                turn_running.set(true);
                 send(Command::SendPrompt {
                     session: SessionId(uuid),
                     text,
@@ -218,6 +248,24 @@ pub fn App() -> Element {
             }
         }
     };
+    let mut promote_remote = move |_| {
+        if let Some(sid) = session.read().clone() {
+            if let Ok(uuid) = Uuid::parse_str(&sid) {
+                send(Command::PromoteToRemote {
+                    session: SessionId(uuid),
+                });
+            }
+        }
+    };
+    let mut demote_local = move |_| {
+        if let Some(sid) = session.read().clone() {
+            if let Ok(uuid) = Uuid::parse_str(&sid) {
+                send(Command::DemoteToLocal {
+                    session: SessionId(uuid),
+                });
+            }
+        }
+    };
     let mut decide = move |(id, approved): (Uuid, bool)| {
         let Some(sid) = session.read().clone() else {
             return;
@@ -242,6 +290,19 @@ pub fn App() -> Element {
         }
     };
 
+    // Perform a handover reconnect: point the URL at the new endpoint and reconnect through the
+    // same hardened `do_connect` used by the manual Connect button — it bumps `generation`,
+    // closes the old sink, opens the new socket, and spawns a fresh generation-guarded drain
+    // task, reusing session + last_seq (via `build_ws_url`) for replay. `take()` clears
+    // `reconnect_to` in the same step it's read, so this effect settles after firing once per
+    // handover rather than re-triggering on its own write.
+    use_effect(move || {
+        if let Some(endpoint) = reconnect_to.write().take() {
+            url.set(endpoint);
+            do_connect();
+        }
+    });
+
     rsx! {
         div { class: "app",
             StatusLine { conn, last_seq, capabilities, meter }
@@ -257,6 +318,18 @@ pub fn App() -> Element {
                 on_abort: abort,
                 on_pause: move |p| pause(p),
                 on_resume: move |r| resume(r),
+            }
+            div { class: "handover",
+                button {
+                    disabled: !can_promote(&conn.read(), &capabilities.read(), *turn_running.read()),
+                    onclick: move |_| promote_remote(()),
+                    "Promote to remote"
+                }
+                button {
+                    disabled: !can_demote(&conn.read(), &capabilities.read(), *turn_running.read()),
+                    onclick: move |_| demote_local(()),
+                    "Demote to local"
+                }
             }
             ConnectionForm {
                 url, token, conn,
