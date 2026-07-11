@@ -1,6 +1,8 @@
 //! otto provider implementations (in-process libraries behind `otto_engine_core::Provider`).
 
 pub mod anthropic;
+#[cfg(feature = "candle")]
+pub mod candle;
 pub mod gemini;
 pub mod local;
 pub mod ollama;
