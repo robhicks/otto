@@ -1,0 +1,172 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --fg: #cdd3da;
+  --dim: #6b7480;
+  --accent: #7aa2f7;
+  --error: #f7768e;
+  --warn: #e0af68;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.status {
+  padding: 6px 10px;
+  border-bottom: 1px solid #1c2128;
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+
+.log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 10px;
+}
+
+.row { white-space: pre-wrap; line-height: 1.5; }
+.row-agent { color: var(--accent); }
+.row-edit { color: #9ece6a; }
+.row-verify { color: #e0af68; }
+.row-log { color: var(--fg); }
+.row-turn { color: var(--accent); font-weight: bold; }
+.row-error { color: var(--error); }
+
+.cap { color: var(--fg); }
+.cap-degraded { color: var(--warn); font-weight: bold; }
+.cap-sep { color: var(--dim); }
+
+.prompt, .conn-form {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid #1c2128;
+  flex: 0 0 auto;
+}
+
+.prompt-input, .url-input, .token-input {
+  flex: 1 1 auto;
+  background: #11151a;
+  color: var(--fg);
+  border: 1px solid #1c2128;
+  padding: 6px 8px;
+  font: inherit;
+}
+.url-input { flex: 2 1 auto; }
+.token-input { flex: 1 1 auto; }
+
+button {
+  background: #1c2128;
+  color: var(--fg);
+  border: 1px solid #2a313c;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+
+.workspace {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  border-top: 1px solid #1c2128;
+}
+.workspace-side {
+  flex: 0 0 240px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #1c2128;
+  overflow: auto;
+}
+.refresh-btn { margin: 6px; }
+.file-tree { padding: 4px 0; font: inherit; }
+.tree-row { padding: 1px 8px; white-space: nowrap; cursor: pointer; }
+.tree-row:hover { background: #11151a; }
+.tree-row:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+.tree-dir-row { color: var(--accent); }
+.tree-file-row { color: var(--fg); padding-left: 24px; }
+.tree-children { padding-left: 12px; }
+.tree-empty, .editor-empty, .editor-notice { padding: 8px 10px; color: var(--dim); }
+.editor-pane { flex: 1 1 auto; display: flex; min-width: 0; }
+.editor-host { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+.editor-header {
+  padding: 4px 10px;
+  border-bottom: 1px solid #1c2128;
+  color: var(--dim);
+  font: inherit;
+}
+
+.editor { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.editor-path { padding: 4px 10px; border-bottom: 1px solid #1c2128; color: var(--dim); }
+
+/* Two-layer styled-span editor: `.editor-highlight` (a `pre` of styled spans) renders the
+   read-only view; `.editor-overlay` (a transparent `textarea`) sits directly on top and owns
+   the real input/caret/selection. Both layers share identical box metrics (font, size, line
+   height, padding, border, whitespace handling) so the overlay's caret lines up with the
+   highlighted text underneath it character-for-character. */
+.editor-stack {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.editor-highlight,
+.editor-overlay {
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-sizing: border-box;
+}
+.editor-highlight {
+  position: absolute;
+  inset: 0;
+  color: var(--fg);
+  pointer-events: none;
+  overflow: hidden;
+}
+/* NOTE for the highlighting tasks (11/12): this `1.5em` and the shared block's unitless
+   `line-height: 1.5` resolve to the same pixel height today, keeping the overlay caret aligned
+   row-for-row. If a future per-span `font-size` is introduced, `1.5em` (relative to THIS
+   element's font-size) and the inherited unitless line-height would drift apart — keep both
+   line metrics in lock-step (identical computed line height on both layers) if you do that. */
+.hl-line { min-height: 1.5em; }
+.editor-overlay {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  background: transparent;
+  /* Text itself is invisible — the `.editor-highlight` layer beneath renders the visible glyphs
+     — but the caret and selection highlight must stay visible, so only the text color is
+     transparent, not the whole layer. */
+  color: transparent;
+  caret-color: var(--fg);
+  outline: none;
+}
+.editor-overlay::selection { background: rgba(122, 162, 247, 0.35); }
+
+.tok-plain { color: var(--fg); }
+.tok-keyword { color: #bb9af7; }
+.tok-string { color: #9ece6a; }
+.tok-comment { color: var(--dim); font-style: italic; }
+.tok-type { color: #7aa2f7; }
+.tok-number { color: #e0af68; }

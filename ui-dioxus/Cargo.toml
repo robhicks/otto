@@ -1,0 +1,80 @@
+[workspace]
+
+[package]
+name = "otto-ui-dioxus"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
+desktop = [
+    "dioxus/desktop",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:reqwest",
+    "dep:rfd",
+    "dep:tree-sitter",
+    "dep:tree-sitter-highlight",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-go",
+]
+
+[dependencies]
+dioxus = "0.7"
+otto-protocol = { path = "../crates/protocol" }
+serde_json = "1"
+urlencoding = "2.1"
+# uuid's `js` feature (getrandom via wasm) is wasm-only — enabled only under the
+# `web` feature above so it never applies to the native `desktop` build.
+uuid = { version = "1", features = ["v4"] }
+# Delivers inbound SocketEvents to the reactivity spine on both targets (transport/mod.rs).
+# Non-optional: both `web` and `desktop` transport impls depend on it.
+futures-channel = "0.3"
+# `StreamExt` (the drain loop's `.next()`) is used by app.rs on both targets — non-optional
+# (previously desktop-only, promoted here since the reactivity spine needs it unconditionally).
+futures-util = "0.3"
+
+# web transport (only compiled with --features web)
+wasm-bindgen = { version = "0.2", optional = true }
+gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "History",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+], optional = true }
+
+# desktop transport (only compiled with --features desktop)
+# `process`/`io-util`/`time` are used by `desktop_boot`: spawn the `otto serve` sidecar with piped
+# stderr (`process`), async-read its readiness line via `BufReader::lines` (`io-util`), and bound
+# the readiness wait with `tokio::time::timeout` (`time`).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "process",
+    "io-util",
+    "time",
+], optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+rfd = { version = "0.15", optional = true }
+
+# desktop-native syntax highlighting (only compiled with --features desktop; the web build keeps
+# `tokens::plain_spans` — Task 12 handles web highlighting separately). Versions match
+# crates/retrieval/Cargo.toml so the grammar set stays consistent across the workspace.
+tree-sitter = { version = "0.26.9", optional = true }
+tree-sitter-highlight = { version = "0.26.10", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
+tree-sitter-javascript = { version = "0.25.0", optional = true }
+tree-sitter-typescript = { version = "0.23.2", optional = true }
+tree-sitter-python = { version = "0.25.0", optional = true }
+tree-sitter-go = { version = "0.25.0", optional = true }
