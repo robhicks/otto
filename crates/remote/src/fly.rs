@@ -209,9 +209,62 @@ pub(crate) fn create_machine_body(cfg: &FlyConfig, token: &str) -> serde_json::V
     })
 }
 
+/// A `RemoteTarget` that provisions a fresh Fly Machine per session and disposes it explicitly.
+/// Shaped like `VpsTarget` (returns a task-less `RemoteHandle`) because the machine must outlive
+/// the promote RPC — it lives until an explicit `teardown` (demote/stop).
+pub struct FlyTarget {
+    api: FlyApi,
+    cfg: FlyConfig,
+}
+
+impl FlyTarget {
+    pub fn new(cfg: FlyConfig) -> Self {
+        Self {
+            api: FlyApi::from_config(&cfg),
+            cfg,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::RemoteTarget for FlyTarget {
+    async fn provision(
+        &self,
+        bundle: &crate::PromoteBundle,
+    ) -> anyhow::Result<crate::RemoteHandle> {
+        let token = mint_token();
+        let app = gen_app_name(&self.cfg.app_prefix);
+
+        // Everything after create_app must clean up on failure so a half-provisioned app is never
+        // left billing. `run` collects the fallible steps; on Err we best-effort delete the app.
+        let endpoint = self.api.session_endpoint(&app);
+        let run = async {
+            self.api.create_app(&app, &self.cfg.org_slug).await?;
+            self.api.allocate_shared_ip(&app).await?;
+            self.api.create_machine(&app, &self.cfg, &token).await?;
+            self.api.wait_ready(&app, self.cfg.boot_timeout).await?;
+            crate::push_promote_bundle(&endpoint, &token, bundle).await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        if let Err(e) = run.await {
+            let _ = self.api.delete_app(&app).await; // best-effort; original error wins
+            return Err(e);
+        }
+        Ok(crate::RemoteHandle::new(endpoint, token))
+    }
+
+    async fn teardown(&self, handle: crate::RemoteHandle) -> anyhow::Result<()> {
+        let app = app_name_from_endpoint(&handle.endpoint).ok_or_else(|| {
+            anyhow::anyhow!("cannot parse Fly app from endpoint {}", handle.endpoint)
+        })?;
+        self.api.delete_app(&app).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RemoteTarget;
     use wiremock::matchers::{header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -337,7 +390,11 @@ mod tests {
             .mount(&server)
             .await;
         let api = FlyApi::from_config(&cfg_for(&server));
-        let err = api.create_app("x", "personal").await.unwrap_err().to_string();
+        let err = api
+            .create_app("x", "personal")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("422") && err.contains("name taken"), "{err}");
     }
 
@@ -387,7 +444,9 @@ mod tests {
             .await;
         let cfg = cfg_for(&server);
         let api = FlyApi::from_config(&cfg);
-        api.create_machine("otto-session-x", &cfg, "sess-tok").await.unwrap();
+        api.create_machine("otto-session-x", &cfg, "sess-tok")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -400,7 +459,9 @@ mod tests {
             .mount(&server)
             .await;
         let api = FlyApi::from_config(&cfg_for(&server));
-        api.wait_ready("otto-session-x", std::time::Duration::from_secs(5)).await.unwrap();
+        api.wait_ready("otto-session-x", std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -415,5 +476,107 @@ mod tests {
             .await;
         let api = FlyApi::from_config(&cfg_for(&server));
         api.delete_app("otto-session-x").await.unwrap();
+    }
+
+    use otto_engine_core::types::WorkspaceSnapshot;
+    use otto_persistence::{SessionState, SessionStatus};
+    use otto_protocol::SessionId;
+
+    fn empty_bundle() -> crate::PromoteBundle {
+        crate::PromoteBundle {
+            session: SessionState {
+                id: SessionId::new(),
+                goal: "g".into(),
+                status: SessionStatus::Active,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        }
+    }
+
+    async fn mount_happy_path(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/apps"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/apps/.+/machines$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"m"}"#))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(server)
+            .await; // readiness
+        Mock::given(method("POST"))
+            .and(path("/promote"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn provision_creates_app_machine_and_pushes_bundle() {
+        let server = MockServer::start().await;
+        mount_happy_path(&server).await;
+        let target = FlyTarget::new(cfg_for(&server));
+        let handle = target.provision(&empty_bundle()).await.unwrap();
+        // In tests the endpoint is the override; the token is freshly minted (32 hex).
+        assert!(handle.endpoint.starts_with("ws://"), "{}", handle.endpoint);
+        assert_eq!(handle.token.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn provision_deletes_app_when_a_step_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
+            .mount(&server)
+            .await;
+        // create_machine fails → provision must clean up.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/apps/.+/machines$"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let delete = Mock::given(method("DELETE"))
+            .and(path_regex(r"^/apps/.+$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1);
+        server.register(delete).await;
+
+        let target = FlyTarget::new(cfg_for(&server));
+        assert!(target.provision(&empty_bundle()).await.is_err());
+        // On drop, MockServer verifies the DELETE .expect(1) was satisfied.
+    }
+
+    #[tokio::test]
+    async fn teardown_deletes_the_app_parsed_from_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/apps/otto-session-abc"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Endpoint carries the app name; delete goes to the (mock) machines_base.
+        let target = FlyTarget::new(cfg_for(&server));
+        let handle = crate::RemoteHandle::new("wss://otto-session-abc.fly.dev", "t");
+        target.teardown(handle).await.unwrap();
     }
 }

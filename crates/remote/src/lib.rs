@@ -11,7 +11,7 @@ mod firecracker;
 pub use firecracker::FirecrackerProvisioner;
 
 mod fly;
-pub use fly::FlyConfig;
+pub use fly::{FlyConfig, FlyTarget};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +42,9 @@ pub enum PromoteMode {
     /// drop. `config` is read from `OTTO_FC_*` by the CLI; without the `firecracker` feature the
     /// handover builds `UnsupportedProvisioner` and refuses honestly.
     Microvm { config: MicrovmConfig },
+    /// Provision a fresh Fly Machine (one Fly app per session), restore the bundle into it, and
+    /// destroy the app on demote/stop. `config` is read from `OTTO_FLY_*` by the CLI.
+    Fly { config: FlyConfig },
 }
 
 /// Firecracker microVM parameters, read from `OTTO_FC_*` at the CLI edge (never in this crate) and
