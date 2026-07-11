@@ -2,9 +2,14 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
+#[cfg(feature = "desktop")]
+use crate::net::tree::language_for_path;
 use crate::net::tree::FileBody;
 
 pub mod tokens;
+
+#[cfg(feature = "desktop")]
+mod highlight_native;
 
 /// The unhighlighted (plain-`textarea`) controlled-buffer editor. `open` is the currently-open
 /// file (path + classified body); `seed` is the initial document text set once at open time (a
@@ -39,10 +44,22 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
         FileBody::Binary => rsx! { div { class: "editor-notice", "binary file — not editable" } },
         FileBody::TooLarge => rsx! { div { class: "editor-notice", "file too large to edit" } },
         FileBody::Text(_) => {
-            // `plain_spans` is a plain function call, not a hook — safe to call here inside the
+            // Span source is a plain function call, not a hook — safe to call here inside the
             // `Text` arm (unlike `buf`/the re-seed effect above, which must stay hoisted and
-            // unconditional; see the comment at the top of this component). Tasks 11/12 swap this
-            // call for a real tokenizer behind the same `Vec<Vec<Span>>` shape.
+            // unconditional; see the comment at the top of this component). Desktop gets real
+            // tree-sitter-classified spans; web keeps `plain_spans` until Task 12 wires web
+            // highlighting.
+            #[cfg(feature = "desktop")]
+            let spans = {
+                let lang = language_for_path(&path);
+                highlight_native::highlight(&buf.read(), lang)
+            };
+            #[cfg(feature = "web")]
+            let spans = tokens::plain_spans(&buf.read());
+            // Neither target feature enabled (e.g. `cargo test --no-default-features` for the
+            // pure `editor::tokens`/`net::` seams): the crate still needs to type-check, so fall
+            // back to the plain baseline rather than fail to compile.
+            #[cfg(not(any(feature = "web", feature = "desktop")))]
             let spans = tokens::plain_spans(&buf.read());
             rsx! {
                 div { class: "editor",
