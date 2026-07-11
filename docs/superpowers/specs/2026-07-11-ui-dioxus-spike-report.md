@@ -2,7 +2,7 @@
 
 **Date started:** 2026-07-11
 **Design:** `2026-07-11-ui-dioxus-spike-design.md`
-**Status:** 🚧 In progress — rows appended as slices land.
+**Status:** ✅ Complete.
 
 ## Per-slice effort log
 
@@ -19,13 +19,86 @@
 | C.4 — web tree-sitter highlighting (timeboxed spike; **fallback taken**) | 0 (`editor/mod.rs` unchanged — the `#[cfg(feature = "web")]` arm still calls `tokens::plain_spans`; no `highlight_web.rs` created, no `index.html`/`Dioxus.toml` asset wiring added) | 0 new | ~25 subagent-min (feasibility research + report write-up only — no code path was attempted, so there were no build/debug cycles to spend timebox minutes on) | **12 total, unchanged** — no new edge-gate, because no web highlighter was added; the `#[cfg(feature = "web")]` arm from C.3 is untouched | Both targets still compile clean; `cargo tree --no-default-features --features web --target wasm32-unknown-unknown \| grep tree-sitter` still returns zero matches; `editor::tokens::` 5/5; `net::` 45/45; `cargo fmt --check` clean. See Ecosystem / editor for the full feasibility writeup and the headline asymmetry finding. |
 | 13 — desktop auto-connect (folder-picker → sidecar → auto-connect) | 98 (`desktop_boot.rs` 63 non-test: module doc + `async fn boot()` + `SidecarGuard`/its `Drop` impl + `app.rs` diff 33: the `let mut token` mutability fix/comment + the desktop-only mount block (`use_signal` for the sidecar guard + `use_future` calling `boot().await`) + `main.rs` diff 2: `#[cfg(feature = "desktop")] mod desktop_boot;`) | 0 new (reuses `net::url::LaunchParams` — the same `{ws, token}` contract the not-yet-wired web/Tauri query-string autoconnect path already defined/tested in an earlier task) + 17 new, desktop-only (`desktop_boot.rs`'s own `#[cfg(test)]` unit test `drop_does_not_panic_on_already_exited_child`, guarding `SidecarGuard::drop`'s `let _ =`-swallowed `kill()`/`wait()` — not part of the host-side `net::`/`editor::tokens::` pure seam, since it needs a real child process) | ~30 subagent-min (incl. an rfd-API doc lookup that came up empty, a Dioxus `use_future`-vs-`use_resource` docs check via `context7`, and a throwaway `rustc` probe of closure-capture mutability) | **14 total (12 → 14, +2 this slice)**: `#[cfg(feature = "desktop")] mod desktop_boot;` in `main.rs` (a single-arm gate, directly analogous to `transport/mod.rs`'s existing lone `mod desktop`/`mod web` gates) + the `app.rs` desktop-only mount block (a single-arm gate — the web target has no boot sequence to run, so there is no web/neither counterpart to pair it with) | Both targets compile clean (`--features desktop` clean; `--features web --target wasm32-unknown-unknown` clean with only pre-existing unrelated dead-code warnings); `net::` 45/45; `editor::tokens::` 5/5; `cargo fmt --check` clean. **rfd:** picked `rfd::AsyncFileDialog::new().pick_folder().await` over the blocking `rfd::FileDialog::pick_folder()` — `context7` has no `rfd` docs indexed, so this was confirmed by reasoning plus a standalone probe rather than doc lookup: the blocking call parks the OS thread the Dioxus/tokio executor runs on for as long as the picker dialog is open, which would stall every other `use_future`/`spawn` task in the app (the socket drain task, `load_files`, etc.), not just the picker's own task. `boot()` is therefore `async fn` — a signature change from the brief's sync sketch, the exact escape hatch the brief pre-authorized ("this may change `boot()`'s signature to async — fine"). **`use_future` vs `use_resource`:** confirmed via `context7`'s Dioxus 0.7 docs that `use_future` (unlike `use_resource`) is the "run once on mount, do not reactively rerun" hook — its own docs' websocket-connect example runs an infinite `while let` loop straight from mount with no dependency re-triggering. This mattered concretely here: the mount block's `do_connect()` call reads `url`/`token` internally, and if that read had made the *outer* future itself reactive (as `use_resource` would), a later `url`/`token` change from an unrelated path (e.g. the promote/demote handover effect) would silently re-fire this block and reopen the folder picker — `use_future`'s non-reactive "fire once" semantics rule that out. **Genuine (non-brief) compile fix:** `token` needed to become `let mut token = use_signal(...)` (previously a plain, read-only `let`) — `Signal::set` requires `&mut self` (confirmed by reading the actual vendored `dioxus-signals-0.7.9` source, `WritableExt::set` in `write.rs`), and a standalone `rustc` probe confirmed a `move`-closure capturing an outer non-`mut` binding cannot call a `&mut self` method on it even though `Signal` is `Copy` — the same class of fix slice F already needed for `url`. **Correctness addition beyond the brief's literal `fn boot() -> Option<(Child, LaunchParams)>`:** wrapped the raw `Child` in a `SidecarGuard` newtype whose `Drop` calls `.kill()` + `.wait()`. A bare `std::process::Child` does **not** terminate its process on drop (only an explicit `.kill()` does), so the brief's literal signature, implemented verbatim, would have silently orphaned the `otto serve` sidecar the moment the signal holding it was ever dropped or replaced — regardless of "window close" — contradicting the brief's own claim that the `Child` would be "killed on drop." Whether Dioxus's desktop shutdown path actually drops root-scope signal values (and thus fires this `Drop`) before the process exits is unconfirmed without a live run — see the Priority-①-gate finding below. **`do_connect` reuse:** the mount block's success path calls the exact same `do_connect` closure the manual `ConnectionForm`'s Connect button and the promote/demote handover effect already call — `generation`-bump, close the old sink, open the new socket, spawn a fresh generation-guarded drain task — no second connect path was hand-rolled. **Hook safety:** the new `use_signal`(sidecar)/`use_future` pair sits in a `#[cfg(feature = "desktop")]` block placed after all of `App`'s other hook declarations and both pre-existing `use_effect`s, so it neither renumbers nor reorders any existing hook on either target; it is unconditional within the desktop compilation (never inside a runtime `if`) and wholly absent from the web compilation, so each target still sees exactly one fixed hook sequence every render. The Editor's three hoisted hooks (C.1/C.2/C.3) are untouched. **Fix pass (review) — three changes superseding the above:** (1) the fixed-sleep-before-connect was replaced with a **ported readiness check** (`is_ready_line`, verbatim from `desktop/src-tauri/src/launch.rs`) — `boot()` now spawns via `tokio::process::Command` with stderr piped and reads lines until otto serve's `"otto serve listening on …"` line, bounded by a 5s `timeout` cap (400ms fixed sleep survives only as a stderr-unavailable fallback), making the reproduction genuinely equivalent to Tauri's startup handshake instead of a weaker shortcut; (2) `SidecarGuard` + its `Drop`/drop-panic test were **removed** in favor of tokio's `Child::kill_on_drop(true)` (cleaner, tokio-documented; the two `is_ready_line` unit tests replace the drop test); (3) `boot()` now returns a `BootOutcome{Cancelled, SpawnFailed(String), Ready(Child, LaunchParams)}` enum so a **spawn failure is surfaced** (`eprintln!` + a `client_error_row` in the mount block) instead of silently falling through to the manual form as a user-cancel would. LOC/test counts in the left columns reflect the first pass; net effect after the fix pass is similar size. `cfg` count unchanged at 14. See the Fix-pass section in `.superpowers/sdd/task-13-report.md`. |
 
-**Leptos baseline (for comparison):** `ui/` totals — measure with
-`tokei ui/src` or `wc -l ui/src/**/*.rs` and record here once, split the same way.
+**Leptos baseline (for comparison).** Measured with `wc -l` over every `.rs` file (Task 14):
+
+| Crate | Total LOC | Pure-logic (shared seam) | View/reactivity LOC |
+|---|---|---|---|
+| `ui/src` (browser only) | 1939 | 945 (`tree.rs` 219 + `url.rs` 209 + `view_model.rs` 517) | 994 (`app.rs` 446 + `components/*` 429 + `main.rs` 14 + `ws.rs` 48 + `workspace.rs` 57) |
+| `desktop/src-tauri/src` (native Tauri wrapper, separate crate) | 234 | 0 (no pure-logic seam of its own — thin sidecar/webview wrapper) | 234 (`launch.rs` 74 + `lib.rs` 154 + `main.rs` 6) |
+| **Leptos axis total (both targets, two crates)** | **2173** | **945** | **1228** |
+
+`ui-dioxus/src` (one crate, two targets), same method:
+
+| Bucket | LOC | Files |
+|---|---|---|
+| Pure-logic, **reused byte-identical** from `ui/` (Task 2) | 945 | `net/tree.rs` 219 + `net/url.rs` 209 + `net/view_model.rs` 517 |
+| Pure-logic, **new** (editor tokenizer + native highlighter — no Leptos counterpart, see below) | 297 | `editor/tokens.rs` 193 + `editor/highlight_native.rs` 104 |
+| Module-wiring glue | 5 | `net/mod.rs` |
+| View/reactivity LOC (both web + desktop, one crate) | 1369 | `app.rs` 471 + `components/*` 267 + `desktop_boot.rs` 155 + `editor/mod.rs` 110 + `main.rs` 13 + `transport/*` 353 |
+| **Total** | **2616** | |
+
+**The critical apples-to-oranges nuance, stated explicitly:** `ui/`'s editor (`components/editor_pane.rs`,
+78 LOC) is a thin wrapper around the **external** `kode-leptos = "0.5.4"` crate dependency, which does
+the buffer rendering **and** the actual syntax highlighting itself (via its own `arborium`/
+`arborium-highlight` dependencies — confirmed present in `ui/`'s own dependency tree when built for
+this task, see Build/toolchain below). None of that highlighting engine's code is counted in `ui/src`
+at all — it's off-the-books, reused from crates.io. `ui-dioxus`'s editor, by contrast, is **entirely
+self-built**: `editor/mod.rs` (110 LOC, the textarea-over-`pre` overlay + scroll-sync view shell) plus
+`editor/tokens.rs` (193 LOC — `Span`/`plain_spans`/`segment_lines`, hand-written) plus
+`editor/highlight_native.rs` (104 LOC — the tree-sitter grammar/query/capture-classification wiring,
+hand-written) for a total of 407 in-tree LOC doing what `ui/` gets for 78 LOC plus an invisible external
+dependency. A raw total-LOC comparison (2616 vs 2173) therefore penalizes Dioxus for work Leptos never
+had to do in-repo; the fair comparison isolates the shared pure-logic seam (identical both sides, zero
+marginal cost) and treats the 297 LOC of new editor pure-logic as its own line item — see Priority gate ②.
 
 ## Narrative evidence (not scored)
 
 ### DX / reactivity
 _(notes)_
+
+**Synthesis (Task 14) — the model maps cleanly, but it has sharp edges the compiler doesn't guard.**
+Across all ten instrumented slices, Dioxus 0.7.9's signal/component surface needed essentially **zero**
+adaptation from the 0.6-era plan pseudo-code the brief was written against — every task that checked
+(`use_signal`, `.read()`/`.write()`/`.set()`, `use_future` vs `use_resource`, `EventHandler<T>`,
+`#[component]`, event `.value()`) confirmed the API unchanged (Tasks 4, 13; see below). That is a
+genuinely positive stability signal. Set against it, three **real correctness bugs** surfaced during
+this spike — each one compiled clean, shipped no warning, and was caught only by a subsequent human/
+opus-assisted review pass, not by `cargo build` or the host test suite:
+
+1. **Write-guard access silently fails to subscribe an effect (Task 8, slice F).** The handover
+   reconnect used `reconnect_to.write().take()` inside a `use_effect` — a mutation-shaped read that
+   does **not** register as a tracked dependency in Dioxus's reactivity graph. The effect ran once at
+   mount, read `None`, and then never fired again — meaning the promote/demote handover reconnect was
+   **dead on arrival**, silently. The fix is one token different (`reconnect_to()`, a tracked read,
+   read first, then `.set(None)` to clear) — but nothing short of driving the actual handover flow (or
+   a reviewer who knew this exact Dioxus gotcha) would have caught the regression; the build was green
+   throughout.
+2. **A rules-of-hooks violation hidden inside a match arm (Task 9, slice C.1).** `Editor`'s
+   `use_signal`/`use_effect` pair for the text buffer lived **inside** the `FileBody::Text` match arm,
+   after an early return for `None`. Dioxus's hooks are strictly positional (same hooks, same order,
+   every render of a persistent component instance) — this "worked" only because the component's
+   render sequence happened to be stable across the tested open/close sequence, but it was one sibling
+   hook away from an index-mismatch panic, and the pattern would have propagated into every later
+   editor task (C.2/C.3 both add hooks) had it not been hoisted to the top of the component body during
+   review.
+3. **Socket teardown needed an explicit close, not just a dropped reference (Task 4, slice A, fix
+   pass).** The initial per-connection cleanup dropped the `Rc<dyn Sink>` on disconnect, but the raw
+   `web_sys::WebSocket` handlers were `.forget()`'d (leaked, by necessity, so they outlive the closure
+   that installed them) — so dropping the `Rc` did not stop the socket from delivering more events, and
+   a fast reconnect could race a stale event from the *old* connection into the *new* one's state. The
+   fix added a `Sink::close()` (detach handlers, close the socket) plus a `generation: Signal<u64>`
+   guard so any already-in-flight stale event is discarded by generation mismatch even if it slips
+   through before `close()` takes effect. This is not a Dioxus-specific bug (Leptos's own raw-`web_sys`
+   callback pattern has the identical `.forget()`-leak shape and needs the identical discipline — see
+   below) but it is a correctness trap the framework does nothing to prevent or flag.
+
+None of these three bugs are "Dioxus is broken" findings — all three are one-line fixes once diagnosed,
+and the framework's own docs and `context7`-fetched material do document the tracked-read and
+positional-hooks rules explicitly. The finding is narrower and more actionable: **this reactivity model
+has real, non-obvious footguns that the type system and `cargo build` do not catch**, so a team adopting
+it needs either institutional familiarity with these exact rules or a review discipline (as this spike
+used) that specifically checks for them — "it compiles" is not evidence of correctness for effect
+dependencies or hook placement in the way it is for most other Rust code.
 
 **Slice A (this task).** The Dioxus analogue of Leptos's `forget()`-leaked-closures-writing-signals
 pattern is a single long-running `use_future` that owns a `loop { … }` draining an
@@ -112,8 +185,74 @@ well under a minute each on this machine — no `dx serve`/wasm-bundle-size data
 task's gate is compile-only (manual browser/desktop drive is explicitly deferred to a later joint
 pass per the task instructions).
 
+**WASM bundle size (Task 14 — hard numbers, method disclosed).** Neither crate has `dx`/`trunk`
+installed in this environment, so both were measured the same way for a fair comparison: a plain
+`cargo build --release --target wasm32-unknown-unknown` (with `--no-default-features --features web`
+for `ui-dioxus`), then the raw `.wasm` artifact `rustc`/`wasm-bindgen`'s backend emits directly in
+`target/wasm32-unknown-unknown/release/*.wasm`, measured with `wc -c`. This is the **pre-`wasm-bindgen`-
+JS-glue, pre-`wasm-opt`, pre-gzip** number — i.e. a directional, apples-to-apples "how much code did
+the compiler emit" figure, not the final asset a browser would fetch (both `dx bundle` and `trunk
+build --release` run `wasm-opt` and/or strip further, and any real deployment gzips over the wire;
+neither post-processing step was run here for either crate).
+
+| Crate | Command | Raw `.wasm` size |
+|---|---|---|
+| `ui-dioxus` (web feature) | `cargo build --release --no-default-features --features web --target wasm32-unknown-unknown` | 2,450,223 bytes (~2.45 MB) |
+| `ui` (Leptos CSR) | `cargo build --release --target wasm32-unknown-unknown` | 3,081,572 bytes (~3.08 MB) |
+
+Both builds completed cleanly (`ui-dioxus` in ~45s from a warm registry cache; `ui` in ~1m19s, pulling
+in `leptos`/`kode-leptos`/`gloo-net` and, notably, `kode-leptos`'s own `arborium`/`arborium-highlight`
+dependencies — the crate that gives `ui/`'s editor its highlighting for free, see the Leptos-baseline
+LOC table above). The raw Dioxus artifact is **~21% smaller** than the raw Leptos artifact — but this
+is not a clean "framework overhead" comparison: `ui-dioxus`'s web build ships **zero** highlighting
+logic (it falls back to `plain_spans`, see Ecosystem/editor), whereas `ui/`'s number already includes
+a real, working syntax highlighter (`arborium`) compiled in. Some — not necessarily all — of Leptos's
+extra ~630 KB is that highlighter's cost, not framework overhead; disentangling the two would require
+building a highlighting-disabled `ui/` variant, which was out of scope here. Stated plainly: this is a
+real, measured, disclosed-method data point in Dioxus's favor, but it should not be read as "Dioxus's
+runtime is 21% leaner than Leptos's" without that caveat.
+
+**Toolchain (`dx` vs `trunk`).** This spike never invoked `dx serve`/`dx bundle` (Dioxus's own CLI) —
+every gate across all 14 tasks used plain `cargo build`/`cargo test`, deliberately, since no GUI/browser
+is drivable in this headless environment. So the `dx`-vs-`trunk` developer-loop comparison (hot reload,
+asset pipeline, `Dioxus.toml`'s `[web.resource]` — flagged as unexercised back in Task 1) stays
+**untested** by this spike; only the underlying `cargo`-level compile experience was compared, and on
+that axis both toolchains behaved identically (ordinary `rustc`/`cargo` diagnostics, no custom build
+step required for either target to type-check).
+
+**Desktop build.** `cargo build --no-default-features --features desktop` for `ui-dioxus` compiles
+clean with no separate wrapper crate or second toolchain — contrast with the Leptos axis, which needs
+a `trunk build` of `ui/` **plus** a separate `cargo tauri build`/`tauri build` of `desktop/src-tauri`
+(two toolchains, two build invocations, a static-bundle handoff via `ui/dist`) to produce a native
+artifact. Task 11 recorded the desktop feature's tree-sitter-grammar compile cost specifically: ~11s
+cold-cache, ~3s warm-cache incremental, for all 5 native grammars + `tree-sitter-highlight`. No
+installer/signed-bundle size was produced or measured for either axis (`dx bundle` was not run; neither
+was a full `tauri build` in this task) — packaging-artifact size is an open question for both sides,
+not just Dioxus.
+
 ### Ecosystem / editor
 _(notes)_
+
+**Synthesis (Task 14) — the headline editor asymmetry, and one honesty check on it.** Desktop gets real
+tree-sitter highlighting (5 native grammars, `highlight_native.rs`, Task 11); web falls back to
+unhighlighted `plain_spans` (Task 12, fallback taken after a rigorous feasibility spike, not a timebox
+punt). This is a **permanent**, not temporary, platform asymmetry: `web-tree-sitter` is a JS library
+wrapping a separately-compiled Emscripten wasm module with no Rust-native API and no reusable
+highlight-iterator, so closing the gap would mean hand-rolling wasm-bindgen JS interop and
+reimplementing a chunk of `tree-sitter-highlight`'s capture-classification logic against an unverifiable
+(no-browser-here) runtime — real multi-day work, not a binding fix. One honesty check worth recording
+explicitly: building `ui/` for the bundle-size measurement above surfaced that `kode-leptos` (the
+external crate `ui/`'s editor wraps) pulls in `arborium`/`arborium-highlight` — meaning **a Rust-native,
+wasm-compatible highlighting path does exist in the ecosystem**; it wasn't reused here because this
+spike's brief specifically charged the Dioxus editor with reusing `retrieval`'s own tree-sitter grammar
+set (Rust/JS/TS/Python/Go) for a same-repo apples-to-apples comparison, not with picking a different
+Rust-native highlighter that would fragment the grammar/query set from what `retrieval` already vendors.
+So the finding is accurately scoped as "the specific tree-sitter-based approach this spike targeted does
+not have a wasm-compatible path today," not "no Rust UI framework can highlight code in the browser" —
+the latter is contradicted by `ui/`'s own dependency tree. `.go` files also render unhighlighted on
+desktop (a pre-existing, accepted parity constraint: `net::tree::language_for_path`, verbatim-ported
+from `ui/` for byte-identical parity, has no `.go` arm — fixing it would mean diverging from the ported
+seam, so it was left as a known, minor limitation rather than "fixed" out of scope).
 
 **Slice C.2 (fix pass) — scroll-sync interop maturity data point.** The textarea-over-`pre`
 controlled-highlight editor requires mirroring the input textarea's scroll offset onto the
@@ -268,6 +407,18 @@ and Dioxus's idle/connected runtime-poll profile now matches Leptos's zero-poll 
 a win worth recording — the drain-loop-over-a-signal-held-receiver pattern is *not* required; a
 per-connection spawned task is both simpler and free of the idle spin.
 
+**Synthesis (Task 14) — what is and isn't measured here.** The one runtime-perf data point this spike
+actually produced is the idle-poll-loop finding above (a real, fixed regression, confirmed by
+construction and code-reading, not by instrumented timing). Everything else this section's scope calls
+for — event-stream render latency under sustained load, and editor typing latency (keystroke →
+highlighted-span repaint) for both the textarea-overlay web path and the tree-sitter desktop path — is
+**unmeasured**. This spike ran entirely headless (no browser, no drivable desktop GUI in this
+environment; every gate across all 14 tasks was `cargo build`/`cargo test`/`cargo fmt --check`), so no
+frame-timing or input-latency data was collectable here for either target, on either framework. This is
+a real gap in the scorecard, not a claim that Dioxus performs comparably to Leptos at runtime — it is
+simply the one narrative dimension where this spike has no evidence at all, disclosed rather than
+backfilled with plausible-sounding estimates.
+
 ## Priority gate ① — Multi-target unification
 _(% shared tree, edge-gate total, and the yes/no: does the one crate replace `ui/` + `desktop/` + Tauri?)_
 
@@ -341,8 +492,126 @@ compile-only gate cannot verify or claim to have replaced. The logic-level repla
 genuine parity with the shipped Tauri path (readiness handshake included); the operational
 (window-close kill) and packaging replacements are, respectively, untested and not attempted.
 
+**Gate ① headline numbers (Task 14, final).**
+
+- **`cfg`-edge-gate total: 14**, per the per-slice ledger tracked live throughout the spike (11 after
+  the transport seam in Task 3, +3 then −3 net-zero for the Task-4 fix pass, +1 for the C.3 editor
+  span-source split → 12, +2 for the Task-13 `desktop_boot` module gate + `app.rs` mount block → 14).
+  A direct `grep -rn '#\[cfg(feature\|#\[cfg(not(any(feature' src/` cross-check on the final tree
+  returns **18** individual attribute lines — the two numbers differ because the ledger counts
+  logical decision points (e.g. "the editor's span-source split" as one edge even where it's written
+  as three `#[cfg]` arms), while the grep counts every attribute literally. Both are disclosed here so
+  neither reads as cherry-picked; either way, the edges are concentrated in exactly the four places one
+  would expect (transport, the editor's highlight backend, the `desktop_boot` module, and one
+  desktop-only mount block in `app.rs`) and nowhere else in the ~2600-line crate.
+- **% shared component tree:** classifying by file (any file compiled for only one target counts as
+  platform-specific; files containing inline `#[cfg]` arms but a shared majority count as shared),
+  the fully single-target files are `transport/web.rs` (115) + `transport/desktop.rs` (137) +
+  `editor/highlight_native.rs` (104, desktop-only) + `desktop_boot.rs` (155, desktop-only) = 511 LOC
+  of 2616 total → **~80% of the crate is genuinely shared** across both targets (2105/2616), with the
+  remaining ~20% concentrated in transport backends, the native highlighter, and the desktop boot
+  sequence — exactly the "edges only" shape the design's unification mechanics called for.
+- **Yes/no — does the one crate replace `ui/` + `desktop/` + Tauri?** **Structurally and
+  mechanically, yes, with two named, unclosed gaps.** One crate, one `cargo build` per target, no
+  wrapper crate, no static-bundle handoff, no second toolchain (`ui/` + `desktop/`'s Tauri axis needs
+  `trunk build` **and** `tauri build`, two crates, two build systems). The web editor's permanent
+  unhighlighted state (see Ecosystem/editor) is a **feature gap**, not a build/toolchain gap — "one
+  `cfg` graph" does not mean "one feature set," and that distinction matters for anyone reading "yes"
+  as "byte-for-byte capability parity." The desktop sidecar's window-close-kill behavior and any
+  packaging/signing/updater story are **runtime-unverified / not attempted** respectively — real,
+  named gaps, not glossed over.
+
 ## Priority gate ② — Parity effort
 _(total view/reactivity LOC + wall-clock vs the Leptos baseline)_
 
+**Where the view/pure-logic line was drawn (method).** Per the design's explicit instruction, the
+shared `net::{url,tree,view_model}` module (945 LOC, reused **byte-identical** from `ui/`'s
+`url.rs`/`tree.rs`/`view_model.rs` — confirmed line-for-line equal in the Leptos-baseline table above)
+is excluded from both sides' "effort" figures: it cost the Dioxus side nothing to port (a mechanical
+copy in Task 2, with 45 pre-existing host tests carrying over unchanged) and it's the *same* code the
+Leptos baseline already paid for, so counting it on either side would double-count shared work as if it
+were framework-specific effort. What's left after that subtraction is genuinely comparable "did this
+framework's view/reactivity layer cost more or less to build": **view/reactivity LOC** (the `rsx!`/
+signal/effect layer, transport backends, and desktop boot sequence) and, as its own line item, **new
+pure-logic LOC that had no Leptos counterpart at all** (the self-built editor tokenizer/highlighter,
+297 LOC — see the apples-to-oranges editor note in the Leptos-baseline section above).
+
+**The numbers, three ways:**
+
+| Comparison | Dioxus (one crate, both targets) | Leptos + Tauri (two crates, two toolchains) | Delta |
+|---|---|---|---|
+| View/reactivity LOC only | 1369 | 994 (`ui/`) + 234 (`desktop/`) = 1228 | +141 LOC (+11%) |
+| + new pure-logic with no Leptos counterpart (self-built editor engine) | 1369 + 297 = 1666 | 1228 + 0 (offloaded to external `kode-leptos`/`arborium`) | +438 LOC (+36%) |
+| Shared pure-logic seam (reused both sides, zero marginal cost) | 945 | 945 | 0 |
+
+Read narrowly (view/reactivity only, editor-authoring-approach held equal), unifying both targets into
+one Dioxus crate cost **~11% more original LOC** than Leptos's browser crate plus Tauri's native
+wrapper combined — a modest "unification tax" for collapsing two crates and two toolchains into one.
+Read broadly (counting the editor engine Dioxus had to hand-write because no wasm-compatible
+tree-sitter path existed for the exact grammar set this spike targeted), the gap widens to **~36%
+more original LOC** — but that entire widening is one identifiable line item (297 LOC), not diffuse
+overhead, and it's a direct consequence of the editor-approach decision (§The editor, design doc), not
+of Dioxus's component/reactivity model being more verbose.
+
+**Wall-clock.** Summed `subagent-min` across the ten Leptos-parity-mapped slices (A, B, D, E, F, C.1–
+C.4, and Task 13's desktop auto-connect — i.e. every row with a direct Leptos-slice analogue, excluding
+Tasks 1–3's one-time scaffold/pure-logic-port/transport-seam infrastructure, which has no per-slice
+Leptos counterpart to compare against): 50+15+20+20+20+25+25+20+25+30 = **~250 subagent-minutes
+(~4.2 hours)** to reach full A–F + editor + desktop-autoconnect parity across both targets, several
+rows inclusive of a review fix-pass. **No comparable Leptos wall-clock baseline exists** — `ui/` and
+`desktop/` were built in an earlier plan/session with no time instrumentation, so gate ② can report the
+Dioxus-side wall-clock as an absolute data point but cannot honestly compute a ratio against Leptos;
+stating a fabricated Leptos wall-clock to force a ratio would be exactly the kind of false precision
+the design's verdict-form note warns against.
+
 ## Verdict
 _(keep-Leptos / adopt-Dioxus / inconclusive, + the evidence that drove it)_
+
+**Finding #1, as the design asked to surface explicitly: there was none.** No protocol change and no
+engine change was needed anywhere in this spike. The Dioxus client rides the *exact* same server
+surface the Leptos client already proved — the same `/ws` bearer-token connect, the same
+`Command`/`Event`/`ServerMessage`/`CapabilitiesManifest` wire types, the same gated `POST /workspace`/
+`/promote`/`/export` RPCs. This is a genuinely positive result: it means the protocol/engine boundary
+otto already built is client-agnostic in practice, not just in intent, and a second, independently-built
+UI client validates that boundary without needing to bend it.
+
+**Verdict: inconclusive, leaning keep-Leptos for now — qualified, not a clean "adopt" or "keep."**
+
+The two priority gates point in different directions and neither is decisively strong enough to settle
+the question alone:
+
+- **Gate ① (unification) favors adopting Dioxus.** ~80% of the crate is genuinely shared, the
+  `cfg`-edge count (14, or 18 by raw grep) is small and concentrated exactly at platform edges, and
+  Task 13 proved — compile-verified, logic-ported from the shipped Tauri reference — that one crate can
+  structurally replace `ui/` + `desktop/` + Tauri's build topology (one `cargo build` per target instead
+  of two toolchains and a static-bundle handoff). This is the strongest result in Dioxus's favor and it
+  is real, not aspirational.
+- **Gate ② (parity effort) is roughly a wash, trending slightly against Dioxus.** ~11% more
+  view/reactivity LOC to cover *both* targets in one crate versus Leptos-browser + Tauri-native
+  combined is a genuinely modest unification tax — arguably a good trade for one crate instead of two.
+  But the honest total (counting the self-built editor engine) is ~36% more original LOC, and roughly
+  4.2 subagent-hours were spent reaching parity with no comparable Leptos baseline to say whether that
+  is fast or slow by comparison.
+
+**What tips this to "inconclusive, leaning keep" rather than "adopt":** the unification gate's
+strongest evidence — Task 13's desktop auto-connect — is explicitly **compile-verified, not
+runtime-verified**. The one thing this spike cannot claim is that the Dioxus client actually *works* end
+to end for a human: no browser was ever opened, no desktop window was ever driven, no folder picker was
+ever clicked, no file was ever actually typed into either editor. Every one of the three real
+reactivity bugs this spike caught (the dead handover reconnect, the latent hooks-panic, the socket
+teardown race) compiled clean and would have shipped invisibly without a review pass built specifically
+to look for Dioxus's exact tracked-read and positional-hooks rules — which means there is a live,
+unquantified risk that further such bugs exist in code that has likewise never been exercised at
+runtime (the sidecar's window-close-kill behavior is the most concrete named instance, but not
+necessarily the only one). Similarly, the web editor's unhighlighted state is a genuine, permanent
+capability gap versus `ui/`'s highlighted editor (via `kode-leptos`), not a "coming soon" — so "one
+codebase, two targets" does not currently mean "one codebase, one feature set."
+
+**Given that:** this spike does not produce enough evidence to recommend migrating the shipped `ui/` +
+`desktop/` + Tauri stack to Dioxus today. It *does* produce enough evidence to say Dioxus is a
+credible, ecosystem-mature, low-API-churn candidate worth a **second, runtime-driven spike** — one that
+actually opens a browser and a desktop window and drives the flows this one could only compile-check —
+before any adoption decision is made. Keep `ui/` as the shipped client; treat `ui-dioxus/` as a
+validated-but-unproven parallel candidate, not dead-end throwaway work: the transport seam, the pure
+port of `net::{url,tree,view_model}`, and the desktop-native highlighter are all real, working,
+tested code that a follow-up runtime-verification pass could build on directly rather than redo.
