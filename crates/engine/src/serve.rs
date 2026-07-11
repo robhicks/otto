@@ -935,9 +935,9 @@ async fn handle_handover(
         .lock()
         .unwrap()
         .get(&(session, to_remote))
-        .map(|h| h.endpoint.clone());
-    let endpoint = match existing {
-        Some(endpoint) => endpoint,
+        .map(|h| (h.endpoint.clone(), h.token.clone()));
+    let (endpoint, tok) = match existing {
+        Some((endpoint, tok)) => (endpoint, tok),
         None => {
             let target: Box<dyn otto_remote::RemoteTarget> =
                 match &cfg.mode {
@@ -989,6 +989,7 @@ async fn handle_handover(
                 }
             };
             let endpoint = handle.endpoint.clone();
+            let tok = handle.token.clone();
             // Retain BEFORE replying: for loopback, dropping the handle aborts the provisioned
             // engine; for vps the handle's shutdown is None, so retention is cheap and harmless.
             state
@@ -996,11 +997,19 @@ async fn handle_handover(
                 .lock()
                 .unwrap()
                 .insert((session, to_remote), handle);
-            endpoint
+            (endpoint, tok)
         }
     };
     let msg = if to_remote {
-        ServerMessage::Promoted { session, endpoint }
+        // Deliver a token only when the remote uses a different bearer than the source (Fly mints
+        // a fresh per-session token); reuse-targets (loopback/vps/microvm) carry cfg.token, so send
+        // None.
+        let handover_token = (tok != cfg.token).then(|| tok.clone());
+        ServerMessage::Promoted {
+            session,
+            endpoint,
+            token: handover_token,
+        }
     } else {
         ServerMessage::Demoted { session, endpoint }
     };
