@@ -99,6 +99,22 @@ pub fn gemma_prompt(user: &str, raw: bool) -> String {
     }
 }
 
+/// Build candle's sampler from our config: greedy (argmax) by default, or
+/// temperature / temperature+top-p when configured.
+pub(crate) fn build_logits_processor(
+    cfg: &GenConfig,
+) -> candle_transformers::generation::LogitsProcessor {
+    use candle_transformers::generation::{LogitsProcessor, Sampling};
+    let sampling = match cfg.temperature {
+        None => Sampling::ArgMax,
+        Some(t) => match cfg.top_p {
+            Some(p) => Sampling::TopP { p, temperature: t },
+            None => Sampling::All { temperature: t },
+        },
+    };
+    LogitsProcessor::from_sampling(cfg.seed, sampling)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +203,40 @@ mod tests {
     #[test]
     fn gemma_prompt_raw_passes_through() {
         assert_eq!(gemma_prompt("hello", true), "hello");
+    }
+
+    #[test]
+    fn argmax_sampling_picks_highest_logit() {
+        use candle_core::{Device, Tensor};
+        let cfg = GenConfig {
+            temperature: None,
+            ..GenConfig::default()
+        };
+        let mut lp = build_logits_processor(&cfg);
+        let logits = Tensor::new(&[0.1f32, 5.0, 0.2, 0.3], &Device::Cpu).unwrap();
+        let token = lp.sample(&logits).unwrap();
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn temperature_sampling_is_deterministic_for_a_fixed_seed() {
+        use candle_core::{Device, Tensor};
+        let cfg = GenConfig {
+            temperature: Some(0.8),
+            top_p: Some(0.95),
+            seed: 7,
+            ..GenConfig::default()
+        };
+        let logits = Tensor::new(&[0.1f32, 5.0, 0.2, 0.3], &Device::Cpu).unwrap();
+        let a = {
+            let mut lp = build_logits_processor(&cfg);
+            lp.sample(&logits).unwrap()
+        };
+        let b = {
+            let mut lp = build_logits_processor(&cfg);
+            lp.sample(&logits).unwrap()
+        };
+        assert_eq!(a, b);
+        assert!((a as usize) < 4);
     }
 }
