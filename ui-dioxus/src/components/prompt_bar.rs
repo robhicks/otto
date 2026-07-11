@@ -5,11 +5,15 @@ use crate::net::view_model::ConnState;
 #[component]
 pub fn PromptBar(
     conn: Signal<ConnState>,
+    paused: Signal<bool>,
     on_send: EventHandler<String>,
     on_abort: EventHandler<()>,
+    on_pause: EventHandler<()>,
+    on_resume: EventHandler<()>,
 ) -> Element {
     let mut text = use_signal(String::new);
     let connected = matches!(*conn.read(), ConnState::Connected { .. });
+    let is_paused = *paused.read();
     rsx! {
         div { class: "prompt-bar",
             input {
@@ -27,6 +31,11 @@ pub fn PromptBar(
                     }
                 },
                 "Send"
+            }
+            button {
+                disabled: !connected,
+                onclick: move |_| if is_paused { on_resume.call(()) } else { on_pause.call(()) },
+                if is_paused { "Resume" } else { "Pause" }
             }
             button {
                 disabled: !connected,

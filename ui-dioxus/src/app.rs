@@ -28,6 +28,12 @@ pub fn App() -> Element {
     // The pending diff awaiting Approve/Reject, if any; None when idle or disconnected (cleared
     // on TurnComplete, on a server Error, on the decision itself, and on every disconnect path).
     let mut pending_approval = use_signal(|| None::<PendingApproval>);
+    // Running token/cost meter for the current turn; None until the first TokenCostMeter event
+    // (reset at the start of every new turn and on every disconnect path, matching `ui/`).
+    let mut meter = use_signal(|| None::<(u64, u64)>);
+    // Whether the current turn is paused (set by pause/resume; reset on a new turn and on every
+    // disconnect path, matching `ui/`).
+    let mut paused = use_signal(|| false);
     // Monotonic connection id. Bumped on every connect/disconnect; each per-connection drain task
     // captures the value current when it was spawned and bails the instant `generation` moves on,
     // so a superseded socket's already-queued event can never write the new connection's state.
@@ -53,6 +59,8 @@ pub fn App() -> Element {
         }
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
+        paused.set(false);
 
         conn.set(ConnState::Connecting);
         match connect(&target) {
@@ -93,6 +101,13 @@ pub fn App() -> Element {
                                             new.clone(),
                                         )));
                                     }
+                                    if let EventKind::TokenCostMeter {
+                                        input_tokens,
+                                        output_tokens,
+                                    } = &event.kind
+                                    {
+                                        meter.set(Some((*input_tokens, *output_tokens)));
+                                    }
                                     // The turn ending resolves any outstanding approval (the
                                     // orchestrator parks on the approval *before* emitting
                                     // TurnComplete, so this never clears a genuinely pending
@@ -100,13 +115,19 @@ pub fn App() -> Element {
                                     // request whose turn already finished fail-closed.
                                     if let EventKind::TurnComplete { .. } = &event.kind {
                                         pending_approval.set(None);
+                                        paused.set(false);
                                     }
                                     rows.write().push(describe_event(&event.kind));
                                 }
                             }
                             SocketEvent::Message(Ok(ServerMessage::Error { message })) => {
                                 rows.write().push(error_row(&message));
+                                // An Error frame is turn-terminal (the orchestrator emits
+                                // TurnComplete only on success), so clear turn-scoped state here
+                                // too — otherwise Pause/Resume would stay stuck on "Resume" until
+                                // the next turn or reconnect.
                                 pending_approval.set(None);
+                                paused.set(false);
                             }
                             SocketEvent::Message(Ok(_)) => {}
                             SocketEvent::Message(Err(detail)) => {
@@ -119,6 +140,8 @@ pub fn App() -> Element {
                                 sink.set(None);
                                 capabilities.set(None);
                                 pending_approval.set(None);
+                                meter.set(None);
+                                paused.set(false);
                                 break;
                             }
                         }
@@ -141,6 +164,8 @@ pub fn App() -> Element {
         conn.set(ConnState::Disconnected);
         capabilities.set(None);
         pending_approval.set(None);
+        meter.set(None);
+        paused.set(false);
     };
 
     let mut send = move |cmd: Command| {
@@ -154,6 +179,8 @@ pub fn App() -> Element {
     let mut send_prompt = move |text: String| {
         if let Some(sid) = session.read().clone() {
             if let Ok(uuid) = Uuid::parse_str(&sid) {
+                meter.set(None); // a new turn starts fresh
+                paused.set(false);
                 send(Command::SendPrompt {
                     session: SessionId(uuid),
                     text,
@@ -167,6 +194,27 @@ pub fn App() -> Element {
                 send(Command::Abort {
                     session: SessionId(uuid),
                 });
+                paused.set(false); // the aborted turn is gone; don't leave the button on "Resume"
+            }
+        }
+    };
+    let mut pause = move |_| {
+        if let Some(sid) = session.read().clone() {
+            if let Ok(uuid) = Uuid::parse_str(&sid) {
+                send(Command::Pause {
+                    session: SessionId(uuid),
+                });
+                paused.set(true);
+            }
+        }
+    };
+    let mut resume = move |_| {
+        if let Some(sid) = session.read().clone() {
+            if let Ok(uuid) = Uuid::parse_str(&sid) {
+                send(Command::Resume {
+                    session: SessionId(uuid),
+                });
+                paused.set(false);
             }
         }
     };
@@ -196,7 +244,7 @@ pub fn App() -> Element {
 
     rsx! {
         div { class: "app",
-            StatusLine { conn, last_seq, capabilities }
+            StatusLine { conn, last_seq, capabilities, meter }
             EventLog { rows }
             ApprovalPanel {
                 pending: pending_approval,
@@ -204,8 +252,11 @@ pub fn App() -> Element {
             }
             PromptBar {
                 conn,
+                paused,
                 on_send: move |t| send_prompt(t),
                 on_abort: abort,
+                on_pause: move |p| pause(p),
+                on_resume: move |r| resume(r),
             }
             ConnectionForm {
                 url, token, conn,

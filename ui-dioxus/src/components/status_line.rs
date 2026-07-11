@@ -1,17 +1,20 @@
 use dioxus::prelude::*;
 use otto_protocol::CapabilitiesManifest;
 
-use crate::net::view_model::{capability_segments, short_session, status_label, ConnState};
+use crate::net::view_model::{
+    capability_segments, cost_estimate, format_meter, short_session, status_label, ConnState,
+};
 
 /// Status strip: the transport half (connection state · session · seq) plus the engine/LLM/
-/// sandbox capability segments. Capability segments render only while connected with a
-/// manifest present; degraded segments carry the `cap-degraded` class so lost capability is
-/// visible (offline-deterministic LLM, absent sandbox).
+/// sandbox capability segments, plus the token/cost meter. Capability and meter segments render
+/// only while connected; degraded capability segments carry the `cap-degraded` class so lost
+/// capability is visible (offline-deterministic LLM, absent sandbox).
 #[component]
 pub fn StatusLine(
     conn: Signal<ConnState>,
     last_seq: Signal<Option<u64>>,
     capabilities: Signal<Option<CapabilitiesManifest>>,
+    meter: Signal<Option<(u64, u64)>>,
 ) -> Element {
     let c = conn.read();
     let seq = (*last_seq.read())
@@ -29,6 +32,16 @@ pub fn StatusLine(
                         span {
                             class: if seg.degraded { "cap cap-degraded" } else { "cap" },
                             "{seg.label}: {seg.value}"
+                        }
+                    }
+                }
+                // Token/cost meter: tokens always shown once set; the dollar estimate only when
+                // a remote (billable) model is configured.
+                if let Some((i, o)) = *meter.read() {
+                    span { class: "meter", "{format_meter(i, o)}" }
+                    if let Some(m) = capabilities.read().as_ref() {
+                        if let Some(cost) = cost_estimate(i, o, m.remote_llm) {
+                            span { class: "meter-cost", "${cost:.4}" }
                         }
                     }
                 }
