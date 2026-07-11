@@ -38,9 +38,9 @@ pub use mcp::{
     connect_lsp as mcp_connect_lsp, connect_plugin_server as mcp_connect_plugin_server,
 };
 pub use otto_remote::{
-    MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode, ProvisionedMachine,
-    Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget, export_bundle,
-    promote,
+    FlyConfig, FlyTarget, MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode,
+    ProvisionedMachine, Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget,
+    export_bundle, promote,
 };
 pub use policy_gate::PolicyGate;
 pub use serve::{

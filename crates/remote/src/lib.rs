@@ -10,6 +10,9 @@ mod firecracker;
 #[cfg(feature = "firecracker")]
 pub use firecracker::FirecrackerProvisioner;
 
+mod fly;
+pub use fly::{FlyConfig, FlyTarget};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,6 +42,9 @@ pub enum PromoteMode {
     /// drop. `config` is read from `OTTO_FC_*` by the CLI; without the `firecracker` feature the
     /// handover builds `UnsupportedProvisioner` and refuses honestly.
     Microvm { config: MicrovmConfig },
+    /// Provision a fresh Fly Machine (one Fly app per session), restore the bundle into it, and
+    /// destroy the app on demote/stop. `config` is read from `OTTO_FLY_*` by the CLI.
+    Fly { config: FlyConfig },
 }
 
 /// Firecracker microVM parameters, read from `OTTO_FC_*` at the CLI edge (never in this crate) and
@@ -207,7 +213,7 @@ fn build_promote_client() -> reqwest::Client {
 
 /// Map a `ws://`/`wss://` endpoint to its HTTP base for the promote/export POSTs
 /// (`ws→http`, `wss→https`); an unrecognized scheme passes through verbatim.
-fn http_base(endpoint: &str) -> String {
+pub(crate) fn http_base(endpoint: &str) -> String {
     if let Some(rest) = endpoint.strip_prefix("wss://") {
         format!("https://{rest}")
     } else if let Some(rest) = endpoint.strip_prefix("ws://") {

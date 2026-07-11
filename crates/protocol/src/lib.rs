@@ -78,8 +78,8 @@ pub enum Command {
         session: SessionId,
     },
     /// Hand this session off to a freshly-provisioned remote engine. The engine replies with
-    /// `ServerMessage::Promoted { endpoint }`; the client reconnects there (same token + session
-    /// + last_seq). Handled only between turns.
+    /// `ServerMessage::Promoted { endpoint, token }`; the client reconnects there (using `token`
+    /// when present, else the same token, plus session + last_seq). Handled only between turns.
     PromoteToRemote {
         session: SessionId,
     },
@@ -157,11 +157,16 @@ pub enum ServerMessage {
         message: String,
     },
     /// Handover framing: the session has been provisioned onto a remote engine reachable at
-    /// `endpoint` (a `ws://host:port` base). The client reconnects there reusing its token,
-    /// session, and last_seq. Not a sequenced `Event` — never persisted/replayed from the store.
+    /// `endpoint` (a `ws://host:port` base). The client reconnects there, session and last_seq
+    /// unchanged. `token` is `Some` when the remote requires a DIFFERENT bearer than the source
+    /// (e.g. a Fly-minted per-session token): the client must switch to it before reconnecting.
+    /// `None` means reuse the current token (same trust domain — loopback/vps/microvm). Not a
+    /// sequenced `Event` — never persisted/replayed from the store.
     Promoted {
         session: SessionId,
         endpoint: String,
+        #[serde(default)]
+        token: Option<String>,
     },
     /// Handover framing for the reverse trip: the session is now on a local engine at `endpoint`.
     Demoted {
@@ -417,6 +422,7 @@ mod tests {
             ServerMessage::Promoted {
                 session: s,
                 endpoint: "ws://127.0.0.1:9000".into(),
+                token: None,
             },
             ServerMessage::Demoted {
                 session: s,
@@ -430,9 +436,27 @@ mod tests {
         let json = serde_json::to_string(&ServerMessage::Promoted {
             session: s,
             endpoint: "x".into(),
+            token: None,
         })
         .unwrap();
         assert!(json.contains("\"type\":\"promoted\""));
+    }
+
+    #[test]
+    fn promoted_with_token_round_trips() {
+        let s = SessionId::new();
+        let msg = ServerMessage::Promoted {
+            session: s,
+            endpoint: "ws://127.0.0.1:9000".into(),
+            token: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msg);
+        match back {
+            ServerMessage::Promoted { token, .. } => assert_eq!(token.as_deref(), Some("abc")),
+            _ => panic!("expected Promoted"),
+        }
     }
 
     #[test]

@@ -1,0 +1,18 @@
+# Reference base config for the otto-serve image. FlyTarget sets per-machine services via the
+# Machines API; this file documents intent and supports a manual `fly deploy` of a base app.
+app = "otto-serve"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[[services]]
+  internal_port = 8787
+  protocol = "tcp"
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]

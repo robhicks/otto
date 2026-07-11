@@ -118,8 +118,22 @@ pub fn App() -> impl IntoView {
                 paused.set(false);
                 pending_approval.set(None);
             }
-            Ok(ServerMessage::Promoted { endpoint, .. })
-            | Ok(ServerMessage::Demoted { endpoint, .. }) => {
+            Ok(ServerMessage::Promoted {
+                endpoint,
+                token: new_token,
+                ..
+            }) => {
+                // A remote requiring a different bearer (e.g. a Fly-minted per-session token)
+                // delivers it here; switch to it BEFORE reconnecting so the Effect below (which
+                // reads `token.get()`) dials with the correct credential. Reuse-targets send `None`.
+                if let Some(t) = new_token {
+                    token.set(t);
+                }
+                // Reconnect to the handed-off engine, reusing session + last_seq. The new engine's
+                // manifest flips the status strip local↔remote. Deferred to an Effect.
+                reconnect_to.set(Some(endpoint));
+            }
+            Ok(ServerMessage::Demoted { endpoint, .. }) => {
                 // Reconnect to the handed-back engine, reusing token + session + last_seq. The new
                 // engine's manifest flips the status strip local↔remote. Deferred to an Effect.
                 reconnect_to.set(Some(endpoint));

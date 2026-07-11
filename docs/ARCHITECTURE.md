@@ -37,7 +37,7 @@ otto-next/
 │   ├── retrieval        # Persistent inverted index + tree-sitter symbol chunking behind the Retriever seam (shipped). git-history selection, vector index = later/v2.
 │   ├── workspace        # LocalWorkspace + RemoteWorkspace impls of the Workspace trait.
 │   ├── persistence      # Session store: sqlite (local) / postgres (remote, optional).
-│   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated). LoopbackTarget stays in engine.
+│   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated) + fly (on-demand Fly.io). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   │                    #   Slice 1 shipped: custom agents; slices 2-3 shipped: commands, skills.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
@@ -241,6 +241,21 @@ via the shared `export_bundle` (`POST /export`) and restores it locally with `ac
 (overwriting its own copy via `SessionStore::restore_over`, sensitive-floor first); pull/restore
 failures leave the VM running. Without the `firecracker` feature the serve-level happy path is not
 CI-able (same boundary as microVM promote), but the seam-level pull+dispose is tested in-process.
+
+On-demand provisioning against a real cloud API is **shipped** too: `FlyTarget` (also in the
+`remote` crate, always-compiled — HTTP only, no cargo feature) provisions one Fly.io app +
+machine per session over the Fly Machines REST API (create app / create machine / delete app)
+plus the Fly GraphQL API (shared-IPv4 allocation is GraphQL-only), mints a fresh per-session
+bearer token injected via the machine's `env`, and applies a Fly-native idle backstop
+(`autostop=suspend`, which halts compute billing on an idle machine — an orphaned machine, e.g.
+a crashed source engine that never demotes, stays suspended rather than being reaped, since
+`auto_destroy` only fires once a machine fully stops; reclaiming it is the manual `fly apps
+destroy` sweep documented in `deploy/fly/`), and polls the new `wss://<app>.fly.dev` until ready
+before handing the client its `RemoteHandle`. Demote mirrors vps/microvm — pull the bundle back
+via `export_bundle`, restore locally, then tear down — but teardown here actually deletes the
+Fly app rather than being a no-op. It is wiremock-tested against the Fly APIs in CI (no
+live-Fly integration test runs there); the container image and deploy walkthrough live in
+`deploy/fly/`.
 
 ## Protocol message catalog
 

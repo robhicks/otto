@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::loopback::LoopbackTarget;
 use crate::service::{EngineService, EventSink, TurnControls};
-use otto_remote::{PromoteConfig, RemoteHandle, promote};
+use otto_remote::{PromoteConfig, RemoteHandle, RemoteTarget, promote};
 
 #[derive(Deserialize, Default)]
 struct ConnectParams {
@@ -689,7 +689,7 @@ async fn handle_handover(
             writer,
             &ServerMessage::Error {
                 message:
-                    "remote provisioning unavailable (start otto serve with --promote-loopback or --promote-vps)"
+                    "remote provisioning unavailable (start otto serve with --promote-loopback, --promote-vps, --promote-microvm, or --promote-fly)"
                         .to_string(),
             },
         )
@@ -834,6 +834,97 @@ async fn handle_handover(
             }
             return;
         }
+        if let otto_remote::PromoteMode::Fly { config } = &cfg.mode {
+            // Source the live app endpoint+token from the handle a prior promote stored under
+            // (session, true). Clone out under the lock, release before awaiting.
+            let live = state
+                .remotes
+                .lock()
+                .unwrap()
+                .get(&(session, true))
+                .map(|h| (h.endpoint.clone(), h.token.clone()));
+            let Some((endpoint, token)) = live else {
+                let _ = send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: "no active fly handover for this session; promote first"
+                            .to_string(),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Pull the current bundle off the Fly machine. On failure, leave it running and report.
+            let bundle = match otto_remote::export_bundle(&endpoint, &token, session).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(e) = state.service.accept_demotion(&bundle).await {
+                let msg = match e {
+                    crate::service::AcceptError::Refused(m) => m,
+                    crate::service::AcceptError::Failed(err) => err.to_string(),
+                    // unreachable: accept_demotion uses restore_over (overwrite), never AlreadyExists
+                    crate::service::AcceptError::AlreadyExists => {
+                        "demote restore conflict".to_string()
+                    }
+                };
+                let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
+                return;
+            }
+
+            // Success: destroy the Fly app (we own it), then drop the handle and tell the client to
+            // reconnect to us. teardown deletes the app parsed from the endpoint.
+            let target = otto_remote::FlyTarget::new(config.clone());
+            if let Err(e) = target
+                .teardown(otto_remote::RemoteHandle::new(endpoint, token))
+                .await
+            {
+                // Restore already committed; a failed delete only risks an orphan (idle-suspended,
+                // auto_destroy-reaped). Report it but the session is local again.
+                let _ = send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: format!("session demoted but fly app cleanup failed: {e}"),
+                    },
+                )
+                .await;
+                state.remotes.lock().unwrap().remove(&(session, true));
+                return;
+            }
+            state.remotes.lock().unwrap().remove(&(session, true));
+            match &state.public_ws_base {
+                Some(base) => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Demoted {
+                            session,
+                            endpoint: base.clone(),
+                        },
+                    )
+                    .await;
+                }
+                None => {
+                    let _ = send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: "demote target has no public ws base configured".to_string(),
+                        },
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
     }
 
     // Reuse an existing handover for this session (idempotent): provisioning again would drop the
@@ -844,9 +935,9 @@ async fn handle_handover(
         .lock()
         .unwrap()
         .get(&(session, to_remote))
-        .map(|h| h.endpoint.clone());
-    let endpoint = match existing {
-        Some(endpoint) => endpoint,
+        .map(|h| (h.endpoint.clone(), h.token.clone()));
+    let (endpoint, tok) = match existing {
+        Some((endpoint, tok)) => (endpoint, tok),
         None => {
             let target: Box<dyn otto_remote::RemoteTarget> =
                 match &cfg.mode {
@@ -873,6 +964,9 @@ async fn handle_handover(
                         };
                         Box::new(otto_remote::MicrovmTarget::new(provisioner))
                     }
+                    otto_remote::PromoteMode::Fly { config } => {
+                        Box::new(otto_remote::FlyTarget::new(config.clone()))
+                    }
                 };
             let handle = match promote(
                 state.service.store(),
@@ -895,6 +989,7 @@ async fn handle_handover(
                 }
             };
             let endpoint = handle.endpoint.clone();
+            let tok = handle.token.clone();
             // Retain BEFORE replying: for loopback, dropping the handle aborts the provisioned
             // engine; for vps the handle's shutdown is None, so retention is cheap and harmless.
             state
@@ -902,11 +997,19 @@ async fn handle_handover(
                 .lock()
                 .unwrap()
                 .insert((session, to_remote), handle);
-            endpoint
+            (endpoint, tok)
         }
     };
     let msg = if to_remote {
-        ServerMessage::Promoted { session, endpoint }
+        // Deliver a token only when the remote uses a different bearer than the source (Fly mints
+        // a fresh per-session token); reuse-targets (loopback/vps/microvm) carry cfg.token, so send
+        // None.
+        let handover_token = (tok != cfg.token).then(|| tok.clone());
+        ServerMessage::Promoted {
+            session,
+            endpoint,
+            token: handover_token,
+        }
     } else {
         ServerMessage::Demoted { session, endpoint }
     };
