@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [features]
 firecracker = ["otto-remote/firecracker"]
+candle = ["otto-providers/candle"]
+candle-cuda = ["candle", "otto-providers/candle-cuda"]
+candle-metal = ["candle", "otto-providers/candle-metal"]
 
 [dependencies]
 otto-protocol = { path = "../protocol" }
