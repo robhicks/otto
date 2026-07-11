@@ -7,8 +7,8 @@ edition = "2021"
 
 [features]
 default = []
-web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
-desktop = ["dioxus/desktop", "dep:tokio", "dep:tokio-tungstenite", "dep:reqwest", "dep:rfd", "dep:futures-util"]
+web = ["dioxus/web", "dep:web-sys", "dep:gloo-net", "dep:gloo-timers", "dep:wasm-bindgen", "dep:getrandom", "uuid/js"]
+desktop = ["dioxus/desktop", "dep:tokio", "dep:tokio-tungstenite", "dep:reqwest", "dep:rfd"]
 
 [dependencies]
 dioxus = "0.7"
@@ -21,10 +21,14 @@ uuid = { version = "1", features = ["v4"] }
 # Delivers inbound SocketEvents to the reactivity spine on both targets (transport/mod.rs).
 # Non-optional: both `web` and `desktop` transport impls depend on it.
 futures-channel = "0.3"
+# `StreamExt` (the drain loop's `.next()`) is used by app.rs on both targets — non-optional
+# (previously desktop-only, promoted here since the reactivity spine needs it unconditionally).
+futures-util = "0.3"
 
 # web transport (only compiled with --features web)
 wasm-bindgen = { version = "0.2", optional = true }
 gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
+gloo-timers = { version = "0.3", features = ["futures"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 web-sys = { version = "0.3", features = [
     "Window",
@@ -41,4 +45,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optio
 tokio-tungstenite = { version = "0.24", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 rfd = { version = "0.15", optional = true }
-futures-util = { version = "0.3", optional = true }
