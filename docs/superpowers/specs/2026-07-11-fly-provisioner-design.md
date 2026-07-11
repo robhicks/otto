@@ -47,7 +47,9 @@ struct FlyConfig {
     app_prefix: String,       // OTTO_FLY_APP_PREFIX (default "otto-session")
     internal_port: u16,       // OTTO_FLY_PORT (default 8787) — otto serve's in-guest port
     boot_timeout: Duration,   // OTTO_FLY_BOOT_TIMEOUT_MS (default ~30s)
-    api_base: String,         // default "https://api.machines.dev/v1"; overridable for wiremock
+    api_base: String,         // Machines REST base; default "https://api.machines.dev/v1"; overridable for wiremock
+    graphql_base: String,     // GraphQL base (IP allocation); default "https://api.fly.io/graphql"; overridable for wiremock
+    public_base_override: Option<String>, // test/advanced only: overrides "wss://<app>.fly.dev" so readiness + /promote hit a mock
 }
 ```
 
@@ -57,10 +59,11 @@ A thin reqwest client (`Bearer api_token`, `api_base` injectable for tests) expo
 calls we need:
 
 - `create_app(app_name, org_slug)`
-- `ensure_public_ip(app_name)` — allocate shared IPv4 + IPv6 so `<app>.fly.dev` resolves.
-  **Tracked risk:** this may require a Fly GraphQL `allocateIpAddress` mutation rather than a
-  Machines-REST endpoint; `ensure_public_ip` encapsulates it (still `Bearer`-auth'd, still
-  wiremockable). The exact endpoint is confirmed during planning; the design does not hinge on it.
+- `allocate_shared_ip(app_name)` — allocate a shared IPv4 so `<app>.fly.dev` resolves.
+  **Resolved:** IP allocation is **GraphQL-only** (Fly's `allocateIpAddress` mutation with
+  `type: shared_v4`); the Machines REST API cannot do it. So `FlyApi` talks to two bases — the
+  Machines REST base (apps/machines/delete) and a GraphQL base (`https://api.fly.io/graphql`, IP
+  allocation) — both `Bearer`-auth'd and both injectable so wiremock can mock them.
 - `create_machine(app_name, spec)` — see request body below.
 - `wait_ready(app_name, boot_timeout)` — poll `https://<app>.fly.dev/` until any HTTP status
   (every route is gated → 401/404 means "serve is listening") or timeout.
