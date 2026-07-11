@@ -39,12 +39,22 @@ pub trait HookExecutor: Send + Sync {
     ) -> anyhow::Result<HookOutcome>;
 }
 
-/// Does `matcher` select `tool_name`? `None`/`""`/`"*"` match everything; otherwise the matcher
-/// is split on `|` and each token compared for exact equality (trimmed).
+/// Does `matcher` select `tool_name`? `None`/`""`/`"*"` match everything; otherwise the matcher is
+/// split on `|` and each trimmed token compared: an `mcp__…` token resolves against a plugin MCP
+/// tool name via `mcp_name::mcp_specifier_matches`, every other token by exact equality.
 pub fn matcher_selects(matcher: &Option<String>, tool_name: &str) -> bool {
     match matcher.as_deref() {
         None | Some("") | Some("*") => true,
-        Some(pat) => pat.split('|').any(|t| t.trim() == tool_name),
+        Some(pat) => pat.split('|').any(|t| {
+            let t = t.trim();
+            // An `mcp__…` token addresses a plugin-bundled MCP tool via the shared bridge; every
+            // other token is an exact tool-name match (regex matchers are a later slice).
+            if t.starts_with("mcp__") {
+                crate::mcp_name::mcp_specifier_matches(t, tool_name)
+            } else {
+                t == tool_name
+            }
+        }),
     }
 }
 
@@ -128,5 +138,31 @@ mod tests {
             .map(|h| h.command)
             .collect();
         assert_eq!(post, vec!["d"]);
+    }
+
+    #[test]
+    fn mcp_matcher_selects_plugin_tool() {
+        assert!(matcher_selects(
+            &Some("mcp__acme".to_string()),
+            "plugin__acme__srv__search"
+        ));
+        assert!(matcher_selects(
+            &Some("mcp__acme__search".to_string()),
+            "plugin__acme__s2__search"
+        ));
+        assert!(!matcher_selects(
+            &Some("mcp__acme".to_string()),
+            "plugin__other__srv__search"
+        ));
+        assert!(!matcher_selects(&Some("mcp__acme".to_string()), "bash"));
+    }
+
+    #[test]
+    fn mcp_matcher_in_alternation() {
+        assert!(matcher_selects(
+            &Some("bash|mcp__acme".to_string()),
+            "plugin__acme__srv__x"
+        ));
+        assert!(matcher_selects(&Some("bash|mcp__acme".to_string()), "bash"));
     }
 }
