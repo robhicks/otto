@@ -239,32 +239,51 @@ asset pipeline, `Dioxus.toml`'s `[web.resource]` — flagged as unexercised back
 that axis both toolchains behaved identically (ordinary `rustc`/`cargo` diagnostics, no custom build
 step required for either target to type-check).
 
-**Styling is unconnected — the copied `ui/` chrome stylesheet is effectively orphaned (a known
-limitation of the compile-only spike).** The whole-branch review surfaced that this is materially
-bigger than the couple of class-name differences earlier slice notes recorded (e.g. `diff-context` vs
-`ui/`'s `diff-ctx`): when all of slices A–F are assembled, effectively **none** of the app-chrome CSS
-classes the Dioxus components emit have a matching rule in the verbatim-copied `ui/style.css`. The
-Dioxus components emit `status-line`, `prompt-bar`, `event-log`, `connection-form`, `approval-panel`,
-`meter`/`meter-cost`, `handover`, `status-conn`/`status-session`/`status-seq`, `tree-dir`, `tree-file`
-(names chosen fresh while porting each component's `rsx!`); the copied stylesheet instead defines the
-original `ui/` names — `status`, `prompt`, `log`, `conn-form`, `cap-*`, `row-*`,
-`tree-dir-row`/`tree-file-row`. The **only** classes that actually connect are the editor +
-`tok-*` classes, which were added fresh to *both* sides in C.2/C.3 (that's why the editor is the one
-place styling was exercised at all, and only in the highlight-span layer). Net effect: a real
-`dx serve` visual drive would render the entire app **chrome unstyled** until the class names are
-reconciled (either rename the components' classes to match `ui/style.css`, or extend the stylesheet to
-the new names). Two related facts compound this and are worth stating together: (1) `style.css` is
-pulled in **only** via `Dioxus.toml`'s `[web.resource]` entry — a `dx`-CLI/web-only asset path that no
-`cargo build` gate ever exercises (flagged as unexercised since Task 1) — and (2) the **desktop**
-webview includes **no stylesheet at all** (no `asset!`/`document::Stylesheet` wiring was added), so
-neither target's styling is exercised by any build gate this spike ran. This is a documentation-only
-finding: reconciling the class names / wiring the desktop stylesheet is correctly **deferred to the
-runtime-driven follow-up the verdict already recommends** (it is exactly the kind of thing a visual
-drive would catch on the first frame and a compile-only gate structurally cannot). It does **not**
-change the "functionally wired + compile-verified" framing used elsewhere in this report: the client's
-*behavior* — connect, stream events, approve diffs, promote/demote, open files into the editor — is
-wired and compile-verified; what is unconnected is the app-chrome *presentation* layer. Keep that
-distinction crisp: working client logic, unstyled chrome, pending the recommended runtime pass.
+**Styling has been reconciled to the copied `ui/` chrome stylesheet (post-review fix; this supersedes
+an earlier draft of this note that called the stylesheet "orphaned").** The whole-branch review
+surfaced that, as first assembled across slices A–F, effectively none of the app-chrome CSS classes the Dioxus components emitted had a matching
+rule in the verbatim-copied `ui/style.css` — the components had invented fresh names (`status-line`,
+`prompt-bar`, `event-log`, `connection-form`, `tree-dir`, `tree-file`, plus unclassed `<input>`s) while
+the stylesheet defines the original `ui/` names (`status`, `prompt`, `log`, `conn-form`, `url-input`/
+`token-input`/`prompt-input`, `tree-row tree-dir-row`/`tree-row tree-file-row`). This has now been fixed
+by **renaming the component-emitted classes to match the stylesheet** (the stylesheet, copied verbatim
+from the shipped `ui/`, is treated as authoritative — not the other way around): `ConnectionForm`'s root
+`connection-form` → `conn-form` (with its URL/token inputs now carrying `url-input`/`token-input`);
+`EventLog`'s root `event-log` → `log` (and each row now also carries the shared `row` base class
+alongside its `net::view_model`-supplied `row-*` color class, matching `ui/`'s `format!("row {}", ...)`
+composition, so the `.row` white-space/line-height rule actually applies); `PromptBar`'s root
+`prompt-bar` → `prompt` (with its text input now carrying `prompt-input`); `StatusLine`'s root
+`status-line` → `status`; and `FileTree`/`FileTreeNode`'s directory/file rows, previously bare `tree-dir`/
+`tree-file`, now emit `tree-row tree-dir-row`/`tree-row tree-file-row` (matching `ui/src/components/
+file_tree.rs`'s combined-class convention), with the per-node collapse/expand toggle behavior untouched.
+`net::view_model.rs` (verbatim-copied, off-limits) was not touched — its `describe_event`/`error_row`
+already emitted matching `row-*`/`cap`/`cap-degraded`/`tok-*`/`editor-*` classes. A full
+class-by-class audit (every literal and computed `class:` site in `ui-dioxus/src`, cross-referenced
+against `ui-dioxus/style.css`'s selectors) confirms only a small, pre-existing, non-regressing set of
+classes remain without a stylesheet rule — identically unstyled in the shipped `ui/` today: `approval-
+panel`/`approval-head`/`approval-diff`/`approval-actions` and the per-line `diff-add`/`diff-del`/
+`diff-context` (`ui/` uses `diff-ctx` instead of `diff-context`, an inert naming difference — neither
+name has a stylesheet rule on either side), `handover`, `status-conn`/`status-session`/`status-seq`,
+`meter`/`meter-cost`, and the `net::view_model`-supplied `row-approval`/`row-meter` (verified present,
+equally unstyled, in `ui/src/view_model.rs` too). None of these were invented by the port; all are
+carried over from `ui/`'s own unstyled state, so leaving them alone is not a regression. Two related
+facts from the original finding are also now addressed: (1) `style.css` was pulled in only via
+`Dioxus.toml`'s `[web.resource]` entry (a `dx`-CLI/web-only asset path); the `[web.resource]` entry has
+been removed in favor of (2) a single cross-target `document::Stylesheet { href: asset!("/style.css") }`
+in `App` (`src/app.rs`), which — via Dioxus 0.7's built-in `document`/manganis `asset!` machinery (no
+extra crate feature needed; `dioxus = "0.7"` already ships it) — loads the same stylesheet on **both**
+the `web` and `desktop` targets from one call site, closing the "desktop loads no stylesheet at all"
+gap. Both `cargo build --features web --target wasm32-unknown-unknown` and `cargo build --features
+desktop` compile clean with this change. What remains open, and is correctly left for the recommended
+runtime-driven follow-up: **pixel-level correctness**. No GUI is drivable in this headless environment,
+so while every chrome class now has a byte-identical-name counterpart in the stylesheet (by static
+grep/inspection) and both targets now issue the `<link>`/stylesheet load, whether the layout actually
+*looks* right — box sizing, overflow, the two-layer editor's caret/highlight alignment under real
+`window.getComputedStyle`, etc. — has never been visually observed and is deferred to that pass. This
+does not change the "functionally wired + compile-verified" framing used elsewhere in this report: the
+client's *behavior* — connect, stream events, approve diffs, promote/demote, open files into the editor
+— was already wired and compile-verified; the app-chrome *presentation* layer's class-name wiring is now
+also reconciled and compile-verified, with only pixel-level visual correctness left to the runtime pass.
 
 **Desktop build.** `cargo build --no-default-features --features desktop` for `ui-dioxus` compiles
 clean with no separate wrapper crate or second toolchain — contrast with the Leptos axis, which needs

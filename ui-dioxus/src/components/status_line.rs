@@ -21,7 +21,7 @@ pub fn StatusLine(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "—".into());
     rsx! {
-        div { class: "status-line",
+        div { class: "status",
             span { class: "status-conn", "{status_label(&c)}" }
             if let ConnState::Connected { session } = &*c {
                 span { class: "status-session", "{short_session(session)}" }

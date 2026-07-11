@@ -15,8 +15,9 @@ pub fn PromptBar(
     let connected = matches!(*conn.read(), ConnState::Connected { .. });
     let is_paused = *paused.read();
     rsx! {
-        div { class: "prompt-bar",
+        div { class: "prompt",
             input {
+                class: "prompt-input",
                 value: "{text}",
                 disabled: !connected,
                 oninput: move |e| text.set(e.value()),

@@ -4,5 +4,6 @@ name = "otto-ui-dioxus"
 [web.app]
 title = "otto (Dioxus)"
 
-[web.resource]
-style = ["/style.css"]
+# style.css is now loaded on both targets via `document::Stylesheet { href: asset!("/style.css") }`
+# in `App` (src/app.rs), so it no longer needs a web-only `[web.resource]` entry here (that path
+# is never read by the desktop build).

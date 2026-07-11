@@ -13,13 +13,15 @@ pub fn ConnectionForm(
     let connected = matches!(*conn.read(), ConnState::Connected { .. });
     let connecting = matches!(*conn.read(), ConnState::Connecting);
     rsx! {
-        div { class: "connection-form",
+        div { class: "conn-form",
             input {
+                class: "url-input",
                 value: "{url}",
                 placeholder: "ws://127.0.0.1:8787",
                 oninput: move |e| url.set(e.value()),
             }
             input {
+                class: "token-input",
                 value: "{token}",
                 r#type: "password",
                 placeholder: "token",

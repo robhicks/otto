@@ -29,7 +29,7 @@ fn FileTreeNode(node: TreeNode, on_open: EventHandler<PathBuf>) -> Element {
         rsx! {
             li {
                 span {
-                    class: "tree-dir",
+                    class: "tree-row tree-dir-row",
                     onclick: move |_| expanded.toggle(),
                     if *expanded.read() { "▾ " } else { "▸ " }
                     "{node.name}"
@@ -48,7 +48,7 @@ fn FileTreeNode(node: TreeNode, on_open: EventHandler<PathBuf>) -> Element {
         rsx! {
             li {
                 span {
-                    class: "tree-file",
+                    class: "tree-row tree-file-row",
                     onclick: move |_| on_open.call(path.clone()),
                     "{node.name}"
                 }

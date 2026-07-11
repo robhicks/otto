@@ -17,6 +17,12 @@ use crate::net::view_model::{
 };
 use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 
+// Cross-target stylesheet: `document::Stylesheet` + the `asset!()` manganis macro load
+// `style.css` on BOTH the `web` (wasm) and `desktop` (native webview) targets, so neither
+// build depends on the web-only `Dioxus.toml` `[web.resource]` path alone (which the desktop
+// target never reads). The path is relative to this crate's `Cargo.toml`.
+static STYLE_CSS: Asset = asset!("/style.css");
+
 #[component]
 pub fn App() -> Element {
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
@@ -419,6 +425,7 @@ pub fn App() -> Element {
     }
 
     rsx! {
+        document::Stylesheet { href: STYLE_CSS }
         div { class: "app",
             StatusLine { conn, last_seq, capabilities, meter }
             div { class: "workspace",
