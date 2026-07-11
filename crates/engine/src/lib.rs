@@ -66,14 +66,67 @@ pub fn build_default_registry() -> AgentRegistry {
     registry
 }
 
+/// Which provider fills the local router slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSlot {
+    Candle,
+    Ollama,
+    Local,
+}
+
+/// Precedence for the local slot: candle (in-process) > ollama (HTTP) > offline Local.
+fn choose_local_slot(candle_on: bool, ollama_on: bool) -> LocalSlot {
+    if candle_on {
+        LocalSlot::Candle
+    } else if ollama_on {
+        LocalSlot::Ollama
+    } else {
+        LocalSlot::Local
+    }
+}
+
 /// Construct the local provider slot from the environment (shared by both router builders).
 fn build_local_provider() -> Arc<dyn Provider> {
-    if std::env::var("OTTO_OLLAMA").as_deref() == Ok("1") {
-        let model =
-            std::env::var("OTTO_OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
-        Arc::new(OllamaProvider::local_default(model))
-    } else {
-        Arc::new(LocalProvider::new())
+    // `OTTO_CANDLE` is honored only when the `candle` feature is compiled in.
+    let candle_on = cfg!(feature = "candle") && std::env::var("OTTO_CANDLE").as_deref() == Ok("1");
+    let ollama_on = std::env::var("OTTO_OLLAMA").as_deref() == Ok("1");
+    if candle_on && ollama_on {
+        eprintln!(
+            "warning: both OTTO_CANDLE and OTTO_OLLAMA are set; using the in-process candle provider"
+        );
+    }
+    match choose_local_slot(candle_on, ollama_on) {
+        LocalSlot::Candle => {
+            #[cfg(feature = "candle")]
+            {
+                build_candle_provider()
+            }
+            #[cfg(not(feature = "candle"))]
+            {
+                unreachable!("candle_on is false without the candle feature")
+            }
+        }
+        LocalSlot::Ollama => {
+            let model = std::env::var("OTTO_OLLAMA_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
+            Arc::new(OllamaProvider::local_default(model))
+        }
+        LocalSlot::Local => Arc::new(LocalProvider::new()),
+    }
+}
+
+/// Build the candle provider from `OTTO_CANDLE_*` env vars, falling back to the offline
+/// `LocalProvider` (with a warning) if the model can't be loaded.
+#[cfg(feature = "candle")]
+fn build_candle_provider() -> Arc<dyn Provider> {
+    use otto_providers::candle::{CandleProvider, GenConfig, resolve_model_source, select_device};
+    let source = resolve_model_source(std::env::var("OTTO_CANDLE_MODEL").ok());
+    match CandleProvider::new(source, GenConfig::from_env(), select_device()) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("warning: candle provider unavailable ({e}); using offline LocalProvider");
+            Arc::new(LocalProvider::new())
+        }
     }
 }
 
@@ -496,6 +549,14 @@ mod tests {
     use super::*;
     use otto_engine_core::RouteHints;
     use otto_engine_core::types::CompleteRequest;
+
+    #[test]
+    fn local_slot_precedence_candle_wins_over_ollama() {
+        assert_eq!(choose_local_slot(true, true), LocalSlot::Candle);
+        assert_eq!(choose_local_slot(true, false), LocalSlot::Candle);
+        assert_eq!(choose_local_slot(false, true), LocalSlot::Ollama);
+        assert_eq!(choose_local_slot(false, false), LocalSlot::Local);
+    }
 
     #[tokio::test]
     async fn default_build_router_is_offline_and_deterministic() {
