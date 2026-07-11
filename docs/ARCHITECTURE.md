@@ -246,12 +246,15 @@ On-demand provisioning against a real cloud API is **shipped** too: `FlyTarget` 
 `remote` crate, always-compiled — HTTP only, no cargo feature) provisions one Fly.io app +
 machine per session over the Fly Machines REST API (create app / create machine / delete app)
 plus the Fly GraphQL API (shared-IPv4 allocation is GraphQL-only), mints a fresh per-session
-bearer token injected via the machine's `env`, applies a Fly-native idle backstop
-(`autostop=suspend` + machine-level `auto_destroy`), and polls the new `wss://<app>.fly.dev`
-until ready before handing the client its `RemoteHandle`. Demote mirrors vps/microvm — pull the
-bundle back via `export_bundle`, restore locally, then tear down — but teardown here actually
-deletes the Fly app rather than being a no-op. It is wiremock-tested against the Fly APIs in CI
-(no live-Fly integration test runs there); the container image and deploy walkthrough live in
+bearer token injected via the machine's `env`, and applies a Fly-native idle backstop
+(`autostop=suspend`, which halts compute billing on an idle machine — an orphaned machine, e.g.
+a crashed source engine that never demotes, stays suspended rather than being reaped, since
+`auto_destroy` only fires once a machine fully stops; reclaiming it is the manual `fly apps
+destroy` sweep documented in `deploy/fly/`), and polls the new `wss://<app>.fly.dev` until ready
+before handing the client its `RemoteHandle`. Demote mirrors vps/microvm — pull the bundle back
+via `export_bundle`, restore locally, then tear down — but teardown here actually deletes the
+Fly app rather than being a no-op. It is wiremock-tested against the Fly APIs in CI (no
+live-Fly integration test runs there); the container image and deploy walkthrough live in
 `deploy/fly/`.
 
 ## Protocol message catalog

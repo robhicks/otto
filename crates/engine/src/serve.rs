@@ -873,6 +873,7 @@ async fn handle_handover(
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
+                    // unreachable: accept_demotion uses restore_over (overwrite), never AlreadyExists
                     crate::service::AcceptError::AlreadyExists => {
                         "demote restore conflict".to_string()
                     }

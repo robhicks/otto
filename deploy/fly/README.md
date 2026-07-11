@@ -25,8 +25,11 @@ otto serve --promote-fly
 ```
 Promoting a session then creates an app with a unique random suffix (e.g.
 `otto-session-<random>.fly.dev` — the suffix is a random 12-hex string, not the session id),
-runs `otto serve` on it, and the client reconnects. Demote/stop destroys the app. Idle machines
-suspend (`autostop=suspend`) and `auto_destroy` reaps stopped orphans.
+runs `otto serve` on it, and the client reconnects. Demote/stop destroys the app immediately.
+Idle machines suspend (`autostop=suspend`), which halts compute billing; an orphaned machine
+(e.g. the source engine crashes and the client never demotes) stays suspended — reclaimed by
+the manual `fly apps destroy` sweep below, since `auto_destroy` only fires once a machine fully
+stops.
 
 ## Limitations
 The bundled image includes `git` but not `gh` (GitHub CLI), so `git.pr_open` (opening GitHub
@@ -40,7 +43,8 @@ commit/branch/checkout/push/etc.) work fine. If PR-opening is needed, extend the
 `OTTO_FLY_BOOT_TIMEOUT_MS` (30000).
 
 ## Cleanup of orphan empty apps (follow-up)
-After `auto_destroy` reaps a machine, its (free) app remains. Sweep periodically:
+A suspended orphan machine's (free) app remains until swept — `auto_destroy` doesn't apply
+since the machine never reaches the stopped state. Sweep periodically:
 ```bash
 fly apps list | grep otto-session- | awk '{print $1}' | xargs -n1 fly apps destroy -y
 ```
