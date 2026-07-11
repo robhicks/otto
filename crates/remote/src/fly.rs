@@ -109,6 +109,10 @@ impl FlyApi {
 
     /// Allocate a shared IPv4 (GraphQL-only) so `<app>.fly.dev` resolves. Fly's GraphQL accepts the
     /// app name as `appId` for app-scoped mutations.
+    ///
+    /// Fly's GraphQL endpoint answers a failed mutation (bad appId, IP-quota exceeded, org
+    /// mismatch) with **HTTP 200** and a body of `{"errors":[...]}` — `bail_on_error`'s
+    /// status-only check would treat that as success, so this also inspects the body.
     async fn allocate_shared_ip(&self, app: &str) -> anyhow::Result<()> {
         let query = "mutation($input: AllocateIPAddressInput!) { \
                      allocateIpAddress(input: $input) { ipAddress { address } } }";
@@ -122,7 +126,20 @@ impl FlyApi {
             }))
             .send()
             .await?;
-        Self::bail_on_error(resp).await
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("HTTP {status}: {body}");
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+            if v.get("errors")
+                .and_then(|e| e.as_array())
+                .is_some_and(|a| !a.is_empty())
+            {
+                anyhow::bail!("Fly GraphQL error: {body}");
+            }
+        }
+        Ok(())
     }
 
     async fn create_machine(&self, app: &str, cfg: &FlyConfig, token: &str) -> anyhow::Result<()> {
@@ -329,6 +346,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
+            .and(header("authorization", "Bearer fly-tok"))
             .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":{}}"#))
             .expect(1)
             .mount(&server)
@@ -338,10 +356,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allocate_shared_ip_surfaces_graphql_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"errors":[{"message":"quota exceeded"}]}"#),
+            )
+            .mount(&server)
+            .await;
+        let api = FlyApi::from_config(&cfg_for(&server));
+        let err = api
+            .allocate_shared_ip("otto-session-x")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("quota exceeded"), "{err}");
+    }
+
+    #[tokio::test]
     async fn create_machine_posts_to_app_machines() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/apps/otto-session-x/machines"))
+            .and(header("authorization", "Bearer fly-tok"))
             .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"abc"}"#))
             .expect(1)
             .mount(&server)
@@ -369,6 +408,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/apps/otto-session-x"))
+            .and(header("authorization", "Bearer fly-tok"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
