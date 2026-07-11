@@ -337,8 +337,9 @@ format:
   *below* the permission gate (deny-only). Enforced on every entrypoint (spine, serve, and the
   `--command`/`--agent` subpaths, all via the shared `build_composed_tools`) — including
   plugin-bundled MCP tools, which register before `register_hooks` and can be selected by an
-  `mcp__<plugin>[__<tool>]` matcher. Lifecycle hooks, JSON-stdout control, regex matchers, and
-  `settings.local.json` are pending.
+  `mcp__<plugin>[__<tool>]` matcher. Note that otto namespaces by plugin name, so addressing
+  differs from Claude Code's `mcp__<server>__…` format when server and plugin names differ.
+  Lifecycle hooks, JSON-stdout control, regex matchers, and `settings.local.json` are pending.
 - `settings.json` permissions → composed into the Layer-2 permission gate.
 - plugins (`.claude-plugin/plugin.json`) → discovered from on-disk marketplaces under
   `.claude/plugins/marketplaces/`, gated by the `enabledPlugins` allowlist in `settings.json`, and

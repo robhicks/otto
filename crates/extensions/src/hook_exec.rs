@@ -1,7 +1,8 @@
 //! Hook matching + the execution seam. `extensions` stays hermetic by depending only on a
 //! `HookExecutor` trait; the engine binary supplies the sandboxed implementation. Matching is
 //! intentionally simple this slice: `None`/`""`/`"*"` selects every tool, otherwise the matcher
-//! is a `|`-separated list of exact tool names (regex is future work).
+//! is a `|`-separated list of exact tool names; tokens beginning `mcp__` resolve against
+//! plugin-bundled MCP tool names via `mcp_specifier_matches` (regex is future work).
 
 use std::time::Duration;
 
