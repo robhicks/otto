@@ -3821,6 +3821,7 @@ name = "otto-ui-dioxus"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "futures-channel",
  "futures-util",
  "getrandom 0.4.3",
  "gloo-net",

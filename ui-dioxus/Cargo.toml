@@ -18,12 +18,23 @@ urlencoding = "2.1"
 # uuid's `js` feature (getrandom via wasm) is wasm-only — enabled only under the
 # `web` feature above so it never applies to the native `desktop` build.
 uuid = { version = "1", features = ["v4"] }
+# Delivers inbound SocketEvents to the reactivity spine on both targets (transport/mod.rs).
+# Non-optional: both `web` and `desktop` transport impls depend on it.
+futures-channel = "0.3"
 
 # web transport (only compiled with --features web)
 wasm-bindgen = { version = "0.2", optional = true }
 gloo-net = { version = "0.6", features = ["http", "websocket"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-web-sys = { version = "0.3", features = ["Window", "Location", "History"], optional = true }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "History",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+], optional = true }
 
 # desktop transport (only compiled with --features desktop)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
