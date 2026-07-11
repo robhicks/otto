@@ -24,6 +24,13 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
     // app.rs writes a new seed on open_path — keeping the textarea in sync with the newly-opened
     // file (a write-guard access would never subscribe).
     use_effect(move || buf.set(seed.read().clone()));
+    // Element ref to the highlight `pre`, captured via `onmounted` below. HOISTED here (positional
+    // hooks: every render must call the same hooks in the same order/count regardless of `open`),
+    // exactly like `buf`/the re-seed effect. Used by the textarea's `onscroll` to mirror the
+    // overlay's scroll offset onto the underlying highlight layer so the two never desync on a file
+    // taller/wider than the viewport (the classic textarea-over-pre gotcha). Both `dioxus-web` and
+    // `dioxus-desktop` implement `MountedData::scroll`, so this is one cross-target path — no cfg.
+    let mut highlight_ref = use_signal(|| None::<MountedEvent>);
 
     let Some((path, body)) = open.read().clone() else {
         return rsx! { div { class: "editor-empty", "No file open" } };
@@ -41,7 +48,9 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
                 div { class: "editor",
                     div { class: "editor-path", "{path.display()}" }
                     div { class: "editor-stack",
-                        pre { class: "editor-highlight",
+                        pre {
+                            class: "editor-highlight",
+                            onmounted: move |e| highlight_ref.set(Some(e)),
                             for line in spans {
                                 div { class: "hl-line",
                                     for sp in line {
@@ -51,9 +60,26 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
                             }
                         }
                         textarea {
-                            class: "editor-area editor-overlay",
+                            class: "editor-overlay",
                             value: "{buf}",
                             oninput: move |e| buf.set(e.value()),
+                            // Mirror the overlay textarea's scroll offset onto the highlight `pre`
+                            // beneath it. `scroll` is scrollTo-absolute (returns a future, so
+                            // spawn it); `ScrollBehavior::Instant` keeps the layers locked frame
+                            // for frame with no smooth-scroll lag. x = scroll_left, y = scroll_top.
+                            onscroll: move |e| {
+                                let (top, left) = (e.scroll_top(), e.scroll_left());
+                                if let Some(hl) = highlight_ref() {
+                                    spawn(async move {
+                                        let _ = hl
+                                            .scroll(
+                                                dioxus::html::geometry::PixelsVector2D::new(left, top),
+                                                ScrollBehavior::Instant,
+                                            )
+                                            .await;
+                                    });
+                                }
+                            },
                         }
                     }
                 }

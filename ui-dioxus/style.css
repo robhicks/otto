@@ -143,6 +143,11 @@ button:hover:not(:disabled) { border-color: var(--accent); }
   pointer-events: none;
   overflow: hidden;
 }
+/* NOTE for the highlighting tasks (11/12): this `1.5em` and the shared block's unitless
+   `line-height: 1.5` resolve to the same pixel height today, keeping the overlay caret aligned
+   row-for-row. If a future per-span `font-size` is introduced, `1.5em` (relative to THIS
+   element's font-size) and the inherited unitless line-height would drift apart — keep both
+   line metrics in lock-step (identical computed line height on both layers) if you do that. */
 .hl-line { min-height: 1.5em; }
 .editor-overlay {
   position: relative;
