@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>] [--agent <name>]` — run a single turn (or a named custom agent) and print output.
-//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 //! `otto plugin marketplace add|remove|update|list` / `otto plugin install|uninstall|list` — manage Claude Code plugin marketplaces under `~/.claude/plugins/marketplaces/`.
 
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
+                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
             );
             std::process::exit(2);
         }
@@ -134,6 +134,37 @@ fn microvm_config_from_env() -> otto_engine::MicrovmConfig {
         vcpus: num("OTTO_FC_VCPUS", 2),
         mem_mib: num("OTTO_FC_MEM_MIB", 1024),
         boot_timeout: std::time::Duration::from_secs(num("OTTO_FC_BOOT_TIMEOUT_SECS", 30) as u64),
+    }
+}
+
+/// Read Fly provisioning parameters from `OTTO_FLY_*` / `FLY_API_TOKEN`. Missing `FLY_API_TOKEN`
+/// yields an empty token; provisioning then fails at the first API call with a clear 401 — the CLI
+/// need not special-case it here.
+fn fly_config_from_env() -> otto_engine::FlyConfig {
+    fn num(key: &str, default: u32) -> u32 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+    otto_engine::FlyConfig {
+        api_token: std::env::var("FLY_API_TOKEN").unwrap_or_default(),
+        org_slug: std::env::var("OTTO_FLY_ORG").unwrap_or_else(|_| "personal".to_string()),
+        region: std::env::var("OTTO_FLY_REGION").unwrap_or_else(|_| "iad".to_string()),
+        image: std::env::var("OTTO_FLY_IMAGE").unwrap_or_default(),
+        vm_cpus: num("OTTO_FLY_CPUS", 1),
+        vm_mem_mib: num("OTTO_FLY_MEM_MIB", 1024),
+        app_prefix: std::env::var("OTTO_FLY_APP_PREFIX")
+            .unwrap_or_else(|_| "otto-session".to_string()),
+        internal_port: num("OTTO_FLY_PORT", 8787) as u16,
+        boot_timeout: std::time::Duration::from_millis(
+            num("OTTO_FLY_BOOT_TIMEOUT_MS", 30_000) as u64
+        ),
+        api_base: std::env::var("OTTO_FLY_API_BASE")
+            .unwrap_or_else(|_| "https://api.machines.dev/v1".to_string()),
+        graphql_base: std::env::var("OTTO_FLY_GRAPHQL_BASE")
+            .unwrap_or_else(|_| "https://api.fly.io/graphql".to_string()),
+        public_base_override: std::env::var("OTTO_FLY_PUBLIC_BASE").ok(),
     }
 }
 
@@ -541,6 +572,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut accept_promotions = false;
     let mut promote_vps: Option<String> = None;
     let mut promote_microvm = false;
+    let mut promote_fly = false;
     let mut it = positional.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -576,6 +608,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                 }
             },
             "--promote-microvm" => promote_microvm = true,
+            "--promote-fly" => promote_fly = true,
             _ => {}
         }
     }
@@ -611,14 +644,19 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         .with_retriever(retriever)
         .with_extensions(Arc::new(ext));
     let capabilities = otto_engine::build_capabilities();
-    let promote = match (promote_loopback, promote_vps, promote_microvm) {
-        (l, v, m) if (l as u8) + (v.is_some() as u8) + (m as u8) > 1 => {
+    let promote = match (
+        promote_loopback,
+        promote_vps.clone(),
+        promote_microvm,
+        promote_fly,
+    ) {
+        (l, v, m, f) if (l as u8) + (v.is_some() as u8) + (m as u8) + (f as u8) > 1 => {
             eprintln!(
-                "error: --promote-loopback, --promote-vps, and --promote-microvm are mutually exclusive"
+                "error: --promote-loopback, --promote-vps, --promote-microvm, and --promote-fly are mutually exclusive"
             );
             std::process::exit(2);
         }
-        (true, _, _) => Some(otto_engine::PromoteConfig {
+        (true, _, _, _) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
             // provisioned engine's restored store/workspace under here is never recursively
@@ -627,17 +665,23 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                 base_dir: root.join(".otto-remotes"),
             },
         }),
-        (_, Some(endpoint), _) => Some(otto_engine::PromoteConfig {
+        (_, Some(endpoint), _, _) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             mode: otto_engine::PromoteMode::Vps { endpoint },
         }),
-        (_, _, true) => Some(otto_engine::PromoteConfig {
+        (_, _, true, _) => Some(otto_engine::PromoteConfig {
             token: token.clone(),
             mode: otto_engine::PromoteMode::Microvm {
                 config: microvm_config_from_env(),
             },
         }),
-        (false, None, false) => None,
+        (_, _, _, true) => Some(otto_engine::PromoteConfig {
+            token: token.clone(),
+            mode: otto_engine::PromoteMode::Fly {
+                config: fly_config_from_env(),
+            },
+        }),
+        (false, None, false, false) => None,
     };
     // Resolve TLS: both flags -> wss; neither -> ws; one -> error (fail-closed). Resolved before
     // building the app so the scheme (and thus our own public ws base) is known up front.
