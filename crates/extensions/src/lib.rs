@@ -14,6 +14,7 @@ mod hooked_tool;
 mod markdown_agent;
 mod marketplace_def;
 mod marketplace_install;
+mod mcp_name;
 mod permission_def;
 mod plugin_def;
 mod skill_def;

@@ -248,9 +248,10 @@ async fn build_tools_preferring_mcp(
 
 /// The tool-registry composition every entrypoint shares (`otto run`, `otto run --command`,
 /// `otto run --agent`, `otto serve`): the permission/approval gate from
-/// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then
-/// hook-wrapping on top via `register_hooks`, then bundled plugin MCP servers via
-/// `mcp_connect_plugin_server`. `approve_edits` is true only for `otto serve --approve-edits`.
+/// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then bundled plugin
+/// MCP servers via `mcp_connect_plugin_server`, then hook-wrapping over all of them via
+/// `register_hooks` (so hooks fire on plugin tools too). `approve_edits` is true only for
+/// `otto serve --approve-edits`.
 async fn build_composed_tools(
     ext: &otto_extensions::Extensions,
     tools_workspace: Arc<dyn Workspace>,
@@ -265,10 +266,9 @@ async fn build_composed_tools(
     )
     .await;
     register_skills(&mut tools, &ext.skills);
-    register_hooks(&mut tools, &ext.hooks, &root);
-    // Bundled plugin MCP servers register AFTER register_hooks, mirroring cmd_run exactly: plugin
-    // tools are gate-guarded but not hook-wrapped this slice (see cmd_run's identical loop). A
-    // server that won't spawn is logged and skipped — additive, never fatal.
+    // Bundled plugin MCP servers register BEFORE register_hooks so hook-wrapping covers them too:
+    // a `PreToolUse`/`PostToolUse` hook (matched via an `mcp__…` matcher or `*`) fires on plugin
+    // tool calls. A server that won't spawn is logged and skipped — additive, never fatal.
     for spec in &ext.mcp_servers {
         match mcp_connect_plugin_server(spec).await {
             Ok((conn, mcp_tools)) => {
@@ -283,6 +283,7 @@ async fn build_composed_tools(
             ),
         }
     }
+    register_hooks(&mut tools, &ext.hooks, &root);
     (tools, conns)
 }
 
@@ -1589,7 +1590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_composed_tools_plugin_tools_are_gate_guarded_but_not_hook_wrapped() {
+    async fn build_composed_tools_hook_wraps_plugin_mcp_tools() {
         use otto_extensions::PluginMcpServer;
         use otto_workspace::LocalWorkspace;
 
@@ -1621,9 +1622,8 @@ mod tests {
         )
         .unwrap();
 
-        // A "*" PreToolUse hook blocks every tool that exists in the registry at the time
-        // register_hooks wraps it. fs.read is registered before the wrap; the plugin tool is
-        // registered after — so this hook must block the former and NOT the latter.
+        // A "*" PreToolUse hook blocks every tool in the registry when register_hooks wraps it.
+        // Both fs.read and the plugin tool register before the wrap now, so both must be blocked.
         let mut ext = otto_extensions::discover(proj.path(), home.path());
         assert!(!ext.hooks.is_empty());
         ext.mcp_servers.push(PluginMcpServer {
@@ -1649,18 +1649,92 @@ mod tests {
             "got: {blocked}"
         );
 
-        // The plugin tool was registered after the hook wrap — the same "*" hook must NOT block
-        // it, matching the documented tradeoff (gate-guarded, not hook-wrapped, this slice).
-        let out = tools
+        // The plugin tool now registers BEFORE the hook wrap — the same "*" hook must block it too.
+        let plugin_blocked = tools
             .call(
                 "plugin__testplugin__fs__fs.read",
                 serde_json::json!({ "path": "target.txt" }),
             )
             .await
+            .unwrap_err();
+        assert!(
+            plugin_blocked
+                .to_string()
+                .contains("blocked by PreToolUse hook"),
+            "expected the wrapped plugin tool to be blocked, got: {plugin_blocked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_composed_tools_mcp_matcher_hook_fires_on_plugin_tool_only() {
+        use otto_extensions::PluginMcpServer;
+        use otto_workspace::LocalWorkspace;
+
+        if !otto_tools::os_sandbox_available() {
+            eprintln!(
+                "skipping mcp-matcher hook test: no OS sandbox backend, hooks would be skipped"
+            );
+            return;
+        }
+
+        let bin = escargot::CargoBuild::new()
+            .package("otto-mcp-fs")
+            .bin("mcp-fs")
+            .run()
+            .expect("build mcp-fs")
+            .path()
+            .to_path_buf();
+
+        let proj = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
+        let claude = proj.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        // Matcher targets ONLY this plugin's MCP tools — fs.read must be untouched.
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"hooks": { "PreToolUse": [
+                {"matcher": "mcp__testplugin", "hooks": [{"type": "command", "command": "exit 2"}]}
+            ] }}"#,
+        )
+        .unwrap();
+
+        let mut ext = otto_extensions::discover(proj.path(), home.path());
+        assert!(!ext.hooks.is_empty());
+        ext.mcp_servers.push(PluginMcpServer {
+            namespace: "testplugin".to_string(),
+            server_key: "fs".to_string(),
+            command: bin.to_string_lossy().into_owned(),
+            args: vec![proj.path().to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: None,
+        });
+
+        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
+        let (tools, _conns) =
+            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
+
+        // fs.read is NOT selected by the mcp__testplugin matcher → it runs.
+        let ok = tools
+            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
+            .await
             .unwrap();
         assert!(
-            out.to_string().contains("hi"),
-            "expected the unwrapped plugin tool call to succeed, got: {out}"
+            ok.to_string().contains("hi"),
+            "fs.read should not be blocked, got: {ok}"
+        );
+
+        // The plugin tool IS selected → blocked.
+        let blocked = tools
+            .call(
+                "plugin__testplugin__fs__fs.read",
+                serde_json::json!({ "path": "target.txt" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked.to_string().contains("blocked by PreToolUse hook"),
+            "expected the plugin tool to be blocked by the mcp__ matcher, got: {blocked}"
         );
     }
 }

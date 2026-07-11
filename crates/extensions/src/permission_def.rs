@@ -76,6 +76,10 @@ fn parse_rule(s: &str) -> Option<Rule> {
 /// Build a specifier from the parenthesized text. `bash` → a command-prefix; every other tool →
 /// a path glob (validated at parse time, stored raw).
 fn build_specifier(tool: &str, inner: &str) -> Option<Specifier> {
+    // MCP tools are not path/command-vetted; a specifier on an `mcp__…` rule is malformed → drop.
+    if tool.starts_with("mcp__") {
+        return None;
+    }
     if tool == "bash" {
         let (prefix, wildcard) = match inner.strip_suffix(":*") {
             Some(p) => (p.trim().to_string(), true),
@@ -148,6 +152,11 @@ impl PermissionRules {
 impl Rule {
     /// True if this rule governs `(tool, args)`.
     fn matches(&self, tool: &str, args: &Value) -> bool {
+        // An `mcp__…` rule addresses a plugin-bundled MCP tool (`plugin__…` runtime name) via the
+        // shared bridge; it carries no path/command specifier (guaranteed by `build_specifier`).
+        if self.tool.starts_with("mcp__") {
+            return crate::mcp_name::mcp_specifier_matches(&self.tool, tool);
+        }
         if self.tool != tool {
             return false;
         }
@@ -415,6 +424,44 @@ mod tests {
         assert_eq!(
             a.decision("fs.read", &json!({"path": "src/x"})),
             Some(Decision::Allow)
+        );
+    }
+
+    #[test]
+    fn mcp_deny_plugin_level_matches_any_tool_of_that_plugin() {
+        let rules = parse_permissions(r#"{"permissions":{"deny":["mcp__acme"]}}"#);
+        assert_eq!(
+            rules.decision("plugin__acme__srv__search", &json!({})),
+            Some(Decision::Deny)
+        );
+        assert_eq!(
+            rules.decision("plugin__other__srv__search", &json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_allow_tool_level_matches_that_tool_across_servers() {
+        let rules = parse_permissions(r#"{"permissions":{"allow":["mcp__acme__search"]}}"#);
+        assert_eq!(
+            rules.decision("plugin__acme__s1__search", &json!({})),
+            Some(Decision::Allow)
+        );
+        assert_eq!(
+            rules.decision("plugin__acme__s2__search", &json!({})),
+            Some(Decision::Allow)
+        );
+        assert_eq!(rules.decision("plugin__acme__s1__list", &json!({})), None);
+    }
+
+    #[test]
+    fn mcp_rule_with_a_specifier_is_dropped() {
+        // A parenthesized specifier is meaningless for an MCP tool → the whole rule is dropped,
+        // so it neither denies nor widens.
+        let rules = parse_permissions(r#"{"permissions":{"deny":["mcp__acme(foo)"]}}"#);
+        assert_eq!(
+            rules.decision("plugin__acme__srv__search", &json!({})),
+            None
         );
     }
 }
