@@ -153,6 +153,7 @@ fn fly_config_from_env() -> otto_engine::FlyConfig {
         region: std::env::var("OTTO_FLY_REGION").unwrap_or_else(|_| "iad".to_string()),
         image: std::env::var("OTTO_FLY_IMAGE").unwrap_or_default(),
         vm_cpus: num("OTTO_FLY_CPUS", 1),
+        vm_cpu_kind: std::env::var("OTTO_FLY_CPU_KIND").unwrap_or_else(|_| "shared".to_string()),
         vm_mem_mib: num("OTTO_FLY_MEM_MIB", 1024),
         app_prefix: std::env::var("OTTO_FLY_APP_PREFIX")
             .unwrap_or_else(|_| "otto-session".to_string()),

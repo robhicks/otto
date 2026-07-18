@@ -4,11 +4,29 @@
 `otto-serve` image. Steps:
 
 ## 1. Build & push the image
+The registry repo is tied to a Fly app, so create the app first (once) — it is only the
+registry namespace and needs no running machine:
+```bash
+fly apps create otto-serve --org personal   # once; the image repo `registry.fly.io/otto-serve`
+```
+
+Then build and push. With Docker:
 ```bash
 fly auth docker
 docker build -t registry.fly.io/otto-serve:latest -f deploy/fly/Dockerfile .
 docker push registry.fly.io/otto-serve:latest
 ```
+
+Or with **podman** (no Docker daemon needed — same registry protocol):
+```bash
+podman login registry.fly.io -u x -p "$(fly auth token)"
+podman build -t registry.fly.io/otto-serve:latest -f deploy/fly/Dockerfile .
+podman push registry.fly.io/otto-serve:latest
+```
+If a push fails with `name unknown: app repository not found`, the registry credential has
+lapsed — re-run the `login` line (`fly auth token` is short-lived) and push again.
+`.dockerignore` keeps `target/` out of the build context, so the container does a clean
+`--release` build (~a few minutes cold).
 
 ## 2. Configure the source engine
 ```bash
@@ -26,6 +44,9 @@ otto serve --promote-fly
 Promoting a session then creates an app with a unique random suffix (e.g.
 `otto-session-<random>.fly.dev` — the suffix is a random 12-hex string, not the session id),
 runs `otto serve` on it, and the client reconnects. Demote/stop destroys the app immediately.
+The first machine off a freshly-pushed image cold-pulls the whole image (~219 MB) before
+`otto serve` starts, which can exceed the 30 s default boot budget — bump
+`OTTO_FLY_BOOT_TIMEOUT_MS` (e.g. `180000`) when you have just re-pushed the image.
 Idle machines suspend (`autostop=suspend`), which halts compute billing; an orphaned machine
 (e.g. the source engine crashes and the client never demotes) stays suspended — reclaimed by
 the manual `fly apps destroy` sweep below, since `auto_destroy` only fires once a machine fully
@@ -48,7 +69,8 @@ otherwise defaults to binding `127.0.0.1` for safe local use.
 
 ## Env reference
 `FLY_API_TOKEN`, `OTTO_FLY_ORG`, `OTTO_FLY_REGION`, `OTTO_FLY_IMAGE`, `OTTO_FLY_CPUS` (1),
-`OTTO_FLY_MEM_MIB` (1024), `OTTO_FLY_APP_PREFIX` (otto-session), `OTTO_FLY_PORT` (8787),
+`OTTO_FLY_CPU_KIND` (shared; or `performance` — the Machines API requires one), `OTTO_FLY_MEM_MIB`
+(1024), `OTTO_FLY_APP_PREFIX` (otto-session), `OTTO_FLY_PORT` (8787),
 `OTTO_FLY_BOOT_TIMEOUT_MS` (30000).
 
 ## Cleanup of orphan empty apps (follow-up)

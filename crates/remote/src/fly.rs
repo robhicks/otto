@@ -14,6 +14,9 @@ pub struct FlyConfig {
     pub region: String,
     pub image: String,
     pub vm_cpus: u32,
+    /// Fly guest CPU tier: `"shared"` or `"performance"`. Required by the Machines API — omitting
+    /// it is a hard 400 (`invalid config.guest.cpu_kind`). Default `"shared"` (shared-cpu-1x).
+    pub vm_cpu_kind: String,
     pub vm_mem_mib: u32,
     pub app_prefix: String,
     pub internal_port: u16,
@@ -196,7 +199,7 @@ pub(crate) fn create_machine_body(cfg: &FlyConfig, token: &str) -> serde_json::V
                 "OTTO_PORT": cfg.internal_port.to_string(),
                 "OTTO_ROOT": "/workspace",
             },
-            "guest": { "cpus": cfg.vm_cpus, "memory_mb": cfg.vm_mem_mib },
+            "guest": { "cpus": cfg.vm_cpus, "cpu_kind": cfg.vm_cpu_kind, "memory_mb": cfg.vm_mem_mib },
             "services": [{
                 "protocol": "tcp",
                 "internal_port": cfg.internal_port,
@@ -275,6 +278,7 @@ mod tests {
             region: "iad".into(),
             image: "registry.fly.io/otto-serve:latest".into(),
             vm_cpus: 1,
+            vm_cpu_kind: "shared".into(),
             vm_mem_mib: 1024,
             app_prefix: "otto-session".into(),
             internal_port: 8787,
@@ -294,6 +298,8 @@ mod tests {
         assert_eq!(body["config"]["env"]["OTTO_PORT"], "8787");
         assert_eq!(body["config"]["env"]["OTTO_ROOT"], "/workspace");
         assert_eq!(body["config"]["guest"]["cpus"], 1);
+        // Required by the Machines API: omitting cpu_kind is a hard 400.
+        assert_eq!(body["config"]["guest"]["cpu_kind"], "shared");
         assert_eq!(body["config"]["guest"]["memory_mb"], 1024);
         let svc = &body["config"]["services"][0];
         assert_eq!(svc["internal_port"], 8787);
