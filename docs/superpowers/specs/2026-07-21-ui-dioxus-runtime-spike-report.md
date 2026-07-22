@@ -74,13 +74,14 @@ invisibly until the client was actually run — direct vindication of this spike
 
 ## 4. Measurements
 
-Full table in [`summary.md`](../spikes/2026-07-21-ui-runtime/results/summary.md). Headlines (web,
-3-rep medians):
+Full table in [`summary.md`](../spikes/2026-07-21-ui-runtime/results/summary.md). Headlines (web;
+timings are 3-rep medians, bundle size and build wall-clock are single measurements):
 
 - **First paint:** identical (72 ms both).
 - **Event render latency:** comparable (leptos 56.8 ms, dioxus 59.1 ms).
 - **Reconnect replay:** comparable (leptos 4.9 ms, dioxus 3.5 ms).
-- **Build wall-clock:** Dioxus faster (49 s vs 62 s).
+- **Build wall-clock:** Dioxus faster (36 s clean build vs 62 s; an earlier 48.6 s probe figure
+  included a one-time `wasm-opt` download and is not representative).
 - **wasm bundle:** Dioxus larger — but **its `wasm-opt` crashed**, so it shipped unoptimized wasm
   against an optimized Leptos wasm. The raw ~38% / gzip ~19% gaps overstate the real difference and
   must be re-measured with a working `wasm-opt` before counting as a con.

@@ -57,7 +57,7 @@ Notes:
 | Cold → connected | 2584 ms (2496–2715)⁷ | ~51 ms warm (51–57)⁷ | ❌ method-mismatch⁷ |
 | Event render latency | 56.8 ms (54–58) | 59.1 ms (57–71) | ✅ comparable |
 | Reconnect replay | 4.9 ms (4.8–5.2) | 3.5 ms (3.3–4.0) | ✅ comparable |
-| Build wall-clock | 62 s | 49 s | ✅ Dioxus faster |
+| Build wall-clock | 62 s | 36 s⁹ | ✅ Dioxus faster |
 | Desktop RSS | n/a (web) | n/a (web) | — never measured⁸ |
 | Desktop binary size | 13,748,208 B (Tauri `app`)⁸ | 25,543,536 B⁸ | build-time only⁸ |
 
@@ -73,6 +73,11 @@ Notes:
    the connect already complete before the first poll — confirming the reference number is a
    tool-latency floor, not real boot time. **This row cannot decide anything; if cold-start matters,
    re-measure both clients with the in-page method.**
+9. **Build wall-clock:** the Dioxus figure is **36 s** — the clean `cargo clean` + `dx build`
+   (`/usr/bin/time -v`) recorded in `dioxus-web.md`. An earlier toolchain-probe figure of 48.6 s
+   included a one-time `wasm-opt` tool download and is not representative; the 36 s clean-build number
+   is the fair comparison against Leptos's 62 s. (Both are single measurements, not 3-rep medians.)
+
 8. **Desktop RSS never measured** (no desktop run completed). Binary sizes are build-time only: the
    Dioxus desktop binary (24.4 MiB) is a single self-contained executable; the Tauri `app` binary
    (13.1 MiB) additionally needs the ~27 MB `otto` sidecar + system WebKitGTK, so a straight
