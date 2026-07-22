@@ -424,6 +424,41 @@ pub fn App() -> Element {
         });
     }
 
+    // Web-only: on mount, read the browser query string and, if it carries an autoconnect
+    // bootstrap (`?ws=…&token=…&autoconnect=1`), point the URL/token signals at it and connect
+    // through the same hardened `do_connect` the manual button uses — reproducing the Leptos
+    // client's web startup Effect (`ui/src/app.rs`'s `parse_launch_params` mount Effect). Without
+    // this the `parse_launch_params` helper (ported byte-identical, host-tested) is never reached
+    // on web, so URL-param autoconnect silently does nothing. `use_future` runs the body exactly
+    // once on mount and never restarts on signal changes (same run-once primitive the desktop
+    // `boot()` block above relies on), so the signal reads inside `do_connect` can't turn this
+    // into a resubscribing loop. The bearer token is scrubbed out of the visible URL via
+    // `history.replaceState` once read (no navigation, no reload), matching `ui/`.
+    #[cfg(feature = "web")]
+    {
+        use_future(move || async move {
+            let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+                return;
+            };
+            if let Some(params) = crate::net::url::parse_launch_params(&search) {
+                url.set(params.ws);
+                token.set(params.token);
+                let mut do_connect = do_connect;
+                do_connect();
+                if let Some(win) = web_sys::window() {
+                    if let (Ok(history), Ok(pathname)) = (win.history(), win.location().pathname())
+                    {
+                        let _ = history.replace_state_with_url(
+                            &wasm_bindgen::JsValue::NULL,
+                            "",
+                            Some(&pathname),
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     rsx! {
         document::Stylesheet { href: STYLE_CSS }
         div { class: "app",
