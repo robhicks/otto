@@ -232,3 +232,24 @@ Linux implementation for both Tauri and Dioxus desktop shells) — Task 10 shoul
 own picker interaction independently (do not assume failure) but, if it hits the same wall,
 should degrade to the same set of `FAIL`/blocked-upstream rows as this run for steps 1–8,
 10–11, keeping 9 `NOT-APPLICABLE`, so the two desktop runs remain comparable.
+
+---
+
+## Addendum — real-session attempt + early close (2026-07-22)
+
+After the headless run above hit the Xvfb/WebKitGTK wall (no WM, black render), the desktop leg was
+retried on the user's real GNOME/Wayland session (openbox was installed and confirmed to fix the
+window-manager gap headlessly, but WebKitGTK still rendered solid black under Xvfb with software
+rendering + malformed 1×1 GTK windows — a bare-Xvfb limitation, not an app defect). The Tauri app was
+rebuilt with the shim staged as its sidecar and **launched successfully on the real session (pid alive,
+window created)** — proving the app starts and the shell-script sidecar shim is accepted by Tauri
+(the plan's named risk, resolved: **ACCEPTED**).
+
+Before the folder-pick interaction completed, the user made the **ADOPT-Dioxus decision** on the
+strength of the web runs + spike #1's unification evidence, and elected to **skip the remaining desktop
+runtime verification**. The apps were closed and the tree cleaned.
+
+**Net desktop-leg status for leptos-desktop:** launch + sidecar-shim-acceptance verified on the real
+session; the full 11-step scenario was NOT completed. Steps 1–11 remain **runtime-unverified** on this
+client (the headless run's FAIL rows reflect the harness limitation, not the app). This is recorded
+honestly rather than papered over.

@@ -680,3 +680,12 @@ before any adoption decision is made. Keep `ui/` as the shipped client; treat `u
 validated-but-unproven parallel candidate, not dead-end throwaway work: the transport seam, the pure
 port of `net::{url,tree,view_model}`, and the desktop-native highlighter are all real, working,
 tested code that a follow-up runtime-verification pass could build on directly rather than redo.
+
+---
+
+**Follow-up:** this spike's recommendation — a second, runtime-driven spike — was carried out on
+2026-07-21/22. See [`2026-07-21-ui-dioxus-runtime-spike-report.md`](2026-07-21-ui-dioxus-runtime-spike-report.md)
+for the runtime evidence and the resulting **ADOPT** verdict. In short: the web clients were fully
+runtime-verified (Dioxus reached parity; the two reactivity paths flagged here ran clean; the one bug
+found was missing wiring, not reactivity); the desktop client's Tauri-replacement claim remains
+runtime-unproven and is carried into the migration plan as its first validation task.
