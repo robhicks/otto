@@ -68,6 +68,11 @@ Independent fixes, each shippable on its own, no cutover risk. Each needs a test
 - [ ] **Add an automated test for web autoconnect** — the spike's one runtime bug (dead-code parser,
       no web call site) shipped because only an isolated unit test existed. A wasm integration test
       covering the web mount→connect path would have caught it; add it so the class can't recur.
+- [ ] **Add an automated test for the desktop sidecar `PR_SET_PDEATHSIG` teardown** (Phase 0 Gate-E
+      follow-up; deferred from PR #95's review — finding #4). Gate E was verified manually
+      (operator window-close). A subprocess integration test — spawn a helper that installs the guard
+      on a child, kill the helper, assert the grandchild dies — would convert the one-time manual
+      check into a regression-checked invariant. Same class as the web-autoconnect test above.
 
 ---
 

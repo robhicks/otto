@@ -120,16 +120,37 @@ pub async fn boot() -> BootOutcome {
 /// falls back to `kill_on_drop` alone (macOS desktop teardown is revisited if it ever ships).
 #[cfg(target_os = "linux")]
 fn install_pdeathsig(command: &mut Command) {
+    // Captured before fork so the child can tell whether its parent is still this app. Checking
+    // `getppid() != app_pid` (rather than `getppid() == 1`) closes the race under a child-subreaper
+    // (systemd --user, `dx serve`, tini): if the parent dies in the fork→prctl window the child
+    // reparents to the *subreaper's* pid, not init's 1, so a `== 1` test would miss it — but any
+    // ppid other than this app's own pid still means the app is gone.
+    let app_pid = std::process::id();
     // SAFETY: the closure runs in the forked child before exec and calls only async-signal-safe
-    // syscalls (`prctl`, `getppid`, `raise`); it captures nothing and allocates nothing.
+    // syscalls (`prctl`, `getppid`, `raise`); it captures only a copied integer, allocates nothing,
+    // and `io::Error::last_os_error()` on the failure path only wraps errno (no heap allocation).
+    //
+    // Note: PR_SET_PDEATHSIG arms against death of the *thread* that forked, not the process. That
+    // is safe here because `dioxus::launch` owns a single long-lived `rt-multi-thread` runtime whose
+    // worker threads live for the app's lifetime, so thread-death and process-death coincide; if the
+    // spawn ever moved onto an ephemeral (e.g. `spawn_blocking`) thread, this assumption would need
+    // revisiting.
     unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {
+        command.pre_exec(move || {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
-            // If the parent already exited before prctl took effect, PR_SET_PDEATHSIG will never
-            // fire — reparented to init means ppid == 1 — so self-terminate instead of orphaning.
-            if libc::getppid() == 1 {
+            // If the parent already exited in the fork→prctl window, PR_SET_PDEATHSIG never fires,
+            // so self-terminate instead of orphaning. `!= app_pid` catches reparenting to init (1)
+            // *and* to any subreaper.
+            if libc::getppid() != app_pid as libc::pid_t {
                 libc::raise(libc::SIGKILL);
             }
             Ok(())
