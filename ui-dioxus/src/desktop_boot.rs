@@ -63,12 +63,15 @@ pub async fn boot() -> BootOutcome {
     let root = handle.path().to_path_buf();
     let token = uuid::Uuid::new_v4().to_string();
     // `otto` must be on PATH (or point OTTO_BIN at it); mirrors desktop/'s sidecar contract. Fixed
-    // port 8787 to match the LaunchParams the web path also uses. `kill_on_drop(true)` makes the
-    // sidecar die when the stored `Child` is dropped — the tokio-provided equivalent of a manual
-    // kill-on-drop guard, so the child is killed on window close *if* the shutdown path drops the
-    // signal holding it (unverified without a live run — see the Task 13 report's Priority-① gate).
+    // port 8787 to match the LaunchParams the web path also uses. `kill_on_drop(true)` kills the
+    // sidecar when the stored `Child` is dropped — but Drop only runs if the app *unwinds* on close.
+    // Phase 0 Gate E proved a non-unwinding teardown (SIGKILL / `exit` / the `dx serve` dev
+    // supervisor) skips Drop and orphans the sidecar, so `install_pdeathsig` below adds a
+    // kernel-level guard that does not depend on Drop running. The two are complementary:
+    // `kill_on_drop` handles the graceful in-app disconnect, `PR_SET_PDEATHSIG` handles hard exits.
     let bin = std::env::var("OTTO_BIN").unwrap_or_else(|_| "otto".into());
-    let mut child = match Command::new(&bin)
+    let mut command = Command::new(&bin);
+    command
         .arg("serve")
         .arg("--port")
         .arg("8787")
@@ -76,9 +79,9 @@ pub async fn boot() -> BootOutcome {
         .arg(&root)
         .env("OTTO_TOKEN", &token)
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    install_pdeathsig(&mut command);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             // Surface spawn failure both to the terminal/log and (via the returned variant) to the
@@ -100,6 +103,64 @@ pub async fn boot() -> BootOutcome {
         },
     )
 }
+
+/// Attach a kernel-level parent-death guard to the sidecar so it cannot outlive this process,
+/// independent of whether the app's teardown runs destructors.
+///
+/// `kill_on_drop(true)` alone is insufficient: it fires only when the stored `Child` is *dropped*,
+/// which a non-unwinding teardown (SIGKILL, `std::process::exit`, or the `dx serve` dev supervisor
+/// killing the app) skips entirely — the Phase 0 Gate-E failure, where a closed window orphaned the
+/// `otto serve` sidecar. `PR_SET_PDEATHSIG` is set in the child between fork and exec (so it is
+/// established before `otto serve` ever runs) and tells the kernel to `SIGKILL` the child the moment
+/// its parent dies for *any* reason. The `getppid() == 1` check closes the race where the parent
+/// already died in the window between fork and the `prctl` call. Only `prctl`/`getppid`/`raise` —
+/// all async-signal-safe — run inside the `pre_exec` closure.
+///
+/// Linux-only: `PR_SET_PDEATHSIG` is Linux-specific. On other targets this is a no-op and the app
+/// falls back to `kill_on_drop` alone (macOS desktop teardown is revisited if it ever ships).
+#[cfg(target_os = "linux")]
+fn install_pdeathsig(command: &mut Command) {
+    // Captured before fork so the child can tell whether its parent is still this app. Checking
+    // `getppid() != app_pid` (rather than `getppid() == 1`) closes the race under a child-subreaper
+    // (systemd --user, `dx serve`, tini): if the parent dies in the fork→prctl window the child
+    // reparents to the *subreaper's* pid, not init's 1, so a `== 1` test would miss it — but any
+    // ppid other than this app's own pid still means the app is gone.
+    let app_pid = std::process::id();
+    // SAFETY: the closure runs in the forked child before exec and calls only async-signal-safe
+    // syscalls (`prctl`, `getppid`, `raise`); it captures only a copied integer, allocates nothing,
+    // and `io::Error::last_os_error()` on the failure path only wraps errno (no heap allocation).
+    //
+    // Note: PR_SET_PDEATHSIG arms against death of the *thread* that forked, not the process. That
+    // is safe here because `dioxus::launch` owns a single long-lived `rt-multi-thread` runtime whose
+    // worker threads live for the app's lifetime, so thread-death and process-death coincide; if the
+    // spawn ever moved onto an ephemeral (e.g. `spawn_blocking`) thread, this assumption would need
+    // revisiting.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // If the parent already exited in the fork→prctl window, PR_SET_PDEATHSIG never fires,
+            // so self-terminate instead of orphaning. `!= app_pid` catches reparenting to init (1)
+            // *and* to any subreaper.
+            if libc::getppid() != app_pid as libc::pid_t {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Non-Linux fallback: no `PR_SET_PDEATHSIG` equivalent wired, so `kill_on_drop` is the only guard.
+#[cfg(not(target_os = "linux"))]
+fn install_pdeathsig(_command: &mut Command) {}
 
 /// Block until the sidecar signals readiness on stderr, or the safety cap elapses. If stderr
 /// wasn't piped (shouldn't happen — we always request it), fall back to a short fixed grace
