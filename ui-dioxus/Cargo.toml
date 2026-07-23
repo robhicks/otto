@@ -14,6 +14,7 @@ desktop = [
     "dep:tokio-tungstenite",
     "dep:reqwest",
     "dep:rfd",
+    "dep:libc",
     "dep:tree-sitter",
     "dep:tree-sitter-highlight",
     "dep:tree-sitter-rust",
@@ -67,6 +68,11 @@ tokio = { version = "1", features = [
 tokio-tungstenite = { version = "0.24", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 rfd = { version = "0.15", optional = true }
+# Sidecar teardown guard (`PR_SET_PDEATHSIG`): used in `desktop_boot::boot`'s `pre_exec` so the
+# kernel kills the `otto serve` sidecar when this process dies for ANY reason — including the
+# non-unwinding teardowns (SIGKILL/`exit`) that `kill_on_drop` cannot catch. See the Phase 0
+# Gate-E finding (`docs/superpowers/spikes/2026-07-21-ui-runtime/results/dioxus-desktop.md`).
+libc = { version = "0.2", optional = true }
 
 # desktop-native syntax highlighting (only compiled with --features desktop; the web build keeps
 # `tokens::plain_spans` — Task 12 handles web highlighting separately). Versions match
