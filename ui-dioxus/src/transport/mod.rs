@@ -36,9 +36,11 @@ mod web;
 /// passed, autoconnect silently did nothing, and it shipped. Asserting on parser output can never
 /// catch that; asserting that `connect` was reached can.
 ///
-/// Compiled only under `cfg(test)`, so the shipped `web`/`desktop` builds contain neither the
-/// recorder nor the `record` call — runtime behavior is unchanged.
-#[cfg(test)]
+/// Compiled only under `cfg(test)` on the wasm target — the shipped `web`/`desktop` builds
+/// contain neither the recorder nor the `record` call (runtime behavior is unchanged), and a host
+/// `cargo test` doesn't compile it either (its only consumer is the wasm-only `web_mount_test`, so
+/// a bare `cfg(test)` gate would emit `dead_code` warnings on the default developer command).
+#[cfg(all(test, target_arch = "wasm32"))]
 pub mod connect_probe {
     use std::cell::RefCell;
 
@@ -55,7 +57,9 @@ pub mod connect_probe {
         ATTEMPTS.with(|a| a.borrow().clone())
     }
 
-    /// Clear the record. Call at the start of each test — wasm tests share one thread.
+    /// Clear the record. Call at the start of each test: this recorder is process-global, and
+    /// `wasm-bindgen-test` runs tests serialized (`CONCURRENCY = 1`), so each test starts from the
+    /// previous one's leftovers rather than racing it.
     pub fn reset() {
         ATTEMPTS.with(|a| a.borrow_mut().clear());
     }
@@ -71,7 +75,7 @@ pub fn connect(
     ),
     String,
 > {
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "wasm32"))]
     connect_probe::record(ws_url);
 
     #[cfg(feature = "web")]

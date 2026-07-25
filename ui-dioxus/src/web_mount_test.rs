@@ -30,9 +30,18 @@ use crate::transport::connect_probe;
 wasm_bindgen_test_configure!(run_in_browser);
 
 /// Bounded drive budget for the mounted VirtualDom: 200 × 5ms ≈ 1s. Bounded on purpose — a
-/// regression must fail the test, never hang the browser runner.
+/// regression must fail the test, never hang the browser runner. The negative-control tests
+/// deliberately burn the whole budget: shortening it for them would let a merely *slow* connect
+/// slip past and make "did not connect" pass vacuously.
 const DRIVE_STEPS: usize = 200;
 const DRIVE_STEP_MS: u32 = 5;
+
+/// Host/port used by the launch URLs below. Deliberately NOT the desktop wrapper's fixed 8787
+/// sidecar port: `connect` records the URL and then dispatches to the real transport, which
+/// really does construct a browser `WebSocket`. Pointing at a port nothing listens on keeps the
+/// test from firing a bogus-token connection at a developer's live `otto serve`.
+const TEST_WS_BASE: &str = "ws://127.0.0.1:65533";
+const TEST_TOKEN: &str = "probe-token-123";
 
 /// Overwrite the page's query string in place (no navigation, no reload) so the mounted `App`
 /// observes it through the ordinary `web_sys::window().location().search()` call it makes in
@@ -49,6 +58,15 @@ fn set_query(query: &str) {
         .expect("history")
         .replace_state_with_url(&JsValue::NULL, "", Some(&url))
         .expect("replaceState");
+}
+
+/// The desktop wrapper's launch query, with `autoconnect` set to `flag` ("1" opts in).
+fn launch_query(flag: &str) -> String {
+    format!(
+        "ws={}&token={}&autoconnect={flag}",
+        urlencoding::encode(TEST_WS_BASE),
+        urlencoding::encode(TEST_TOKEN),
+    )
 }
 
 fn current_search() -> String {
@@ -82,13 +100,13 @@ async fn mount_app_and_drive() {
 #[wasm_bindgen_test]
 async fn autoconnects_from_launch_params_on_mount() {
     connect_probe::reset();
-    set_query("ws=ws%3A%2F%2F127.0.0.1%3A8787&token=probe-token-123&autoconnect=1");
+    set_query(&launch_query("1"));
 
     mount_app_and_drive().await;
 
     assert_eq!(
         connect_probe::attempts(),
-        vec!["ws://127.0.0.1:8787/ws?token=probe-token-123".to_string()],
+        vec![format!("{TEST_WS_BASE}/ws?token={TEST_TOKEN}")],
         "mounting App with an autoconnect launch URL must reach transport::connect exactly once \
          with the built ws target — an empty vec means the mount→connect call site is missing \
          (the exact bug this test exists to catch), not that the parser is wrong"
@@ -126,7 +144,7 @@ async fn plain_visit_does_not_autoconnect() {
 #[wasm_bindgen_test]
 async fn params_without_autoconnect_flag_do_not_connect() {
     connect_probe::reset();
-    set_query("ws=ws%3A%2F%2F127.0.0.1%3A8787&token=probe-token-123&autoconnect=0");
+    set_query(&launch_query("0"));
 
     mount_app_and_drive().await;
 
