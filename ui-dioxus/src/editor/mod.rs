@@ -6,17 +6,27 @@ use dioxus::prelude::*;
 use crate::net::tree::language_for_path;
 use crate::net::tree::FileBody;
 
+pub mod dirty;
 pub mod tokens;
 
 #[cfg(feature = "desktop")]
 mod highlight_native;
 
+pub use dirty::DirtyState;
+
 /// The unhighlighted (plain-`textarea`) controlled-buffer editor. `open` is the currently-open
 /// file (path + classified body); `seed` is the initial document text set once at open time (a
 /// later part swaps this for a styled-span highlighted render — the diff-first non-goal means no
-/// VSCode-scale features here). No persistence in this slice.
+/// VSCode-scale features here); `dirty` is the unsaved-buffer flag app.rs clears on every open and
+/// this component latches on the first keystroke, rendered as a "●" beside the path (see
+/// `dirty::DirtyState` for the semantics, which mirror `ui/src/components/editor_pane.rs`).
+/// No persistence in this slice.
 #[component]
-pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -> Element {
+pub fn Editor(
+    open: Signal<Option<(PathBuf, FileBody)>>,
+    seed: Signal<String>,
+    mut dirty: Signal<DirtyState>,
+) -> Element {
     // Dioxus hooks are POSITIONAL: this persistent (never-remounted) `Editor` instance must call
     // the same hooks in the same order/count on EVERY render, regardless of `open`. So both the
     // buffer signal and the re-seed effect are declared UNCONDITIONALLY at the top of the body,
@@ -36,6 +46,11 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
     // taller/wider than the viewport (the classic textarea-over-pre gotcha). Both `dioxus-web` and
     // `dioxus-desktop` implement `MountedData::scroll`, so this is one cross-target path — no cfg.
     let mut highlight_ref = use_signal(|| None::<MountedEvent>);
+
+    // Not a hook — a plain TRACKED read, which is what subscribes this component to `dirty` so the
+    // marker actually re-renders when `oninput` latches the flag (a `.peek()`/write-guard access
+    // would never subscribe). Hoisted above the early return so the subscription is unconditional.
+    let dirty_marker = dirty().marker();
 
     let Some((path, body)) = open.read().clone() else {
         return rsx! { div { class: "editor-empty", "No file open" } };
@@ -67,7 +82,7 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
             let spans = tokens::plain_spans(&buf.read());
             rsx! {
                 div { class: "editor",
-                    div { class: "editor-path", "{path.display()}" }
+                    div { class: "editor-path", "{path.display()}{dirty_marker}" }
                     div { class: "editor-stack",
                         pre {
                             class: "editor-highlight",
@@ -83,7 +98,15 @@ pub fn Editor(open: Signal<Option<(PathBuf, FileBody)>>, seed: Signal<String>) -
                         textarea {
                             class: "editor-overlay",
                             value: "{buf}",
-                            oninput: move |e| buf.set(e.value()),
+                            oninput: move |e| {
+                                buf.set(e.value());
+                                // Latch the unsaved marker — unconditionally, and without
+                                // comparing against `seed`, which is exactly what makes an
+                                // edit-then-revert stay dirty (see `dirty::DirtyState`). Note the
+                                // re-seed effect above writes `buf` directly and never fires
+                                // `oninput`, so opening a file can't mark it dirty.
+                                dirty.write().mark_edited();
+                            },
                             // Mirror the overlay textarea's scroll offset onto the highlight `pre`
                             // beneath it. `scroll` is scrollTo-absolute (returns a future, so
                             // spawn it); `ScrollBehavior::Instant` keeps the layers locked frame
