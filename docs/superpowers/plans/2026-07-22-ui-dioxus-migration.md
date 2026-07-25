@@ -30,25 +30,41 @@ replacement of Tauri — the structural point of adopting Dioxus — was never r
 spike. This phase validates that assumption before any incumbent code is retired. **If it fails,
 migration pauses here and the verdict is revisited.**
 
-- [ ] Launch `ui-dioxus --features desktop` on a real desktop session (native rendering; the headless
+- [x] Launch `ui-dioxus --features desktop` on a real desktop session (native rendering; the headless
       Xvfb path is confirmed non-viable — WebKitGTK renders black under Xvfb, see spike report §1).
-- [ ] Verify the folder picker provisions a workspace root and the bundled `otto serve` sidecar
+      — Operator run 2026-07-23 on a real GNOME/Wayland session; recorded in
+      `../spikes/2026-07-21-ui-runtime/results/dioxus-desktop.md`.
+- [x] Verify the folder picker provisions a workspace root and the bundled `otto serve` sidecar
       auto-spawns and the webview auto-connects (spike #1 compile-verified only — `desktop_boot.rs`).
-- [ ] Verify **window-close kills the sidecar** (the `kill_on_drop` claim in `desktop_boot.rs`, spike
+      — Step 1 **PASS** (auto-connected after folder pick, no manual URL/token entry).
+- [x] Verify **window-close kills the sidecar** (the `kill_on_drop` claim in `desktop_boot.rs`, spike
       #1's named unresolved risk) — close the window, confirm no orphaned `otto serve` process.
-- [ ] Drive the 11-step scenario contract on desktop (native rendering makes the picker/editor
+      — Gate E **FAIL → PASS**: root-caused to `kill_on_drop` not running on a non-unwinding
+      teardown, fixed with `PR_SET_PDEATHSIG` and re-verified clean. Closed by PR #95 (`35545d2`);
+      converted from a one-time manual check into a regression test by PR #98 (`ec041e5`).
+- [x] Drive the 11-step scenario contract on desktop (native rendering makes the picker/editor
       drivable): connect, prompt→events, tree, open file (**confirm desktop syntax highlighting
       actually renders** — the one editor capability web lacks), promote/demote.
-- [ ] Record the results as `dioxus-desktop.md`, replacing its current NOT-RUN status.
+      — Steps 1, 2, 3, 6, 7, 11 **PASS** (incl. native tree-sitter highlighting and
+      promote→loopback→demote). Steps 4/5/10 (abort, reconnect-replay, pause/resume) **NOT-RUN**,
+      explicitly deferred to the Phase 3 re-run below; step 8 NOT-VERIFIABLE externally; step 9
+      NOT-APPLICABLE (the offline Coder proposes no edits, so no diff-approval was raised).
+- [x] Record the results as `dioxus-desktop.md`, replacing its current NOT-RUN status.
+      — `../spikes/2026-07-21-ui-runtime/results/dioxus-desktop.md` now reads
+      "RUN AT RUNTIME (2026-07-23) — ALL GATES PASS (Gate E after a fix)".
 
 **Exit criterion:** the Dioxus desktop app launches, auto-connects, runs a turn, and cleans up its
 sidecar on close, on a real session. Only then does Phase 1 begin.
+**MET** 2026-07-23 (see the results doc's §Status). Phase 1 proceeded.
 
 ---
 
 ## Phase 1 — Close the concrete gaps the spike surfaced
 
 Independent fixes, each shippable on its own, no cutover risk. Each needs a test and a commit.
+
+**Status: COMPLETE** — all six items shipped as PRs #96–#101 (see the per-item merge notes below).
+Phase 2 (build & serve story) is next and still needs its own design pass.
 
 - [x] **Fix the `wasm-opt` crash.** ~~Dioxus's build ships unoptimized wasm (SIGABRT/DWARF crash in
       `wasm-opt` on this toolchain) — the web bundle is ~2.16 MB unoptimized vs a fair optimized target.
@@ -87,25 +103,43 @@ Independent fixes, each shippable on its own, no cutover risk. Each needs a test
       A/B of *this* fix, not a standing figure — every other Phase 1 item moves it. Already true by
       the time this landed: rebased onto the dirty-marker item, the same command measures
       797,380 / 318,370.
-- [ ] **Close the web syntax-highlighting gap** (spike #1's deferred Task 12). The Dioxus web editor
+      — Closed by PR #100 (`c17a70a`).
+- [x] **Close the web syntax-highlighting gap** (spike #1's deferred Task 12). The Dioxus web editor
       renders plain text; desktop highlights via native tree-sitter. Options (own mini-design):
       `web-tree-sitter` wasm via JS interop, or a lighter web highlighter. Reaching "one codebase, one
       feature set" requires this — until then web is a permanent capability step below desktop.
-- [ ] **Add the editor dirty/unsaved marker** to the Dioxus editor (step 8 PARTIAL in the spike — the
+      — Closed by PR #99 (`f706e0e`): a dependency-free web lexer (`src/editor/highlight_web.rs`)
+      covering the same five languages, with a test asserting both backends agree on vocabulary and
+      line structure.
+- [x] **Add the editor dirty/unsaved marker** to the Dioxus editor (step 8 PARTIAL in the spike — the
       Leptos editor shows `path ●`, Dioxus shows nothing).
-- [ ] **Wire desktop-sidecar capability flags.** Both shipped desktop apps spawn `otto serve` with no
+      — Closed by PR #96 (`8fc7d07`); render tests in `src/editor/dirty.rs`.
+- [x] **Wire desktop-sidecar capability flags.** Both shipped desktop apps spawn `otto serve` with no
       `--approve-edits`/`--promote-loopback`, so diff-approval and promote/demote are unreachable on
       desktop (`ui-dioxus/src/desktop_boot.rs:70-77`). Decide the desktop capability policy and pass the
       flags (the spike used an external shim; the real fix is in the app's spawn args). Applies to the
       Dioxus desktop app going forward.
+      — **Policy decided by the repo owner: pass BOTH flags.** Diff approval is a safety feature and
+      defaulting it off on desktop is the wrong default; leaving promote/demote off would leave the
+      shipped sub-project-F promote UI dead on desktop. Closed by PR #101: the argv is
+      built by a new pure `serve_command()` in `desktop_boot.rs` and unit-tested (both flags present,
+      full argv pinned, exactly one promote mode, and a source guard that `boot()` still routes
+      through it). `--accept-promotions` is deliberately **not** passed — it opens inbound
+      `/promote`+`/export` for *other* machines, which loopback promotion does not need.
+      The spike's `otto-shim.sh` is now redundant for this purpose.
 - [x] **Add an automated test for web autoconnect** — the spike's one runtime bug (dead-code parser,
       no web call site) shipped because only an isolated unit test existed. A wasm integration test
       covering the web mount→connect path would have caught it; add it so the class can't recur.
-- [ ] **Add an automated test for the desktop sidecar `PR_SET_PDEATHSIG` teardown** (Phase 0 Gate-E
+      — Closed by PR #97 (`5f0e2e6`): `src/web_mount_test.rs`, a `wasm-bindgen-test` browser test
+      driving the real mount→autoconnect path.
+- [x] **Add an automated test for the desktop sidecar `PR_SET_PDEATHSIG` teardown** (Phase 0 Gate-E
       follow-up; deferred from PR #95's review — finding #4). Gate E was verified manually
       (operator window-close). A subprocess integration test — spawn a helper that installs the guard
       on a child, kill the helper, assert the grandchild dies — would convert the one-time manual
       check into a regression-checked invariant. Same class as the web-autoconnect test above.
+      — Closed by PR #98 (`ec041e5`): a `spawn_guarded` choke point plus `desktop_boot::pdeathsig_tests`
+      covering both the ordinary path and the fork→prctl race, each paired with an unguarded control
+      so a vacuous pass fails.
 
 ---
 

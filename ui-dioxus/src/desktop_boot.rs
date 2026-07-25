@@ -3,6 +3,7 @@
 //! port 8787, generated token. This whole module is desktop-only — it is `mod`-gated behind
 //! `#[cfg(feature = "desktop")]` in `main.rs`, so it never compiles into (or is referenced by)
 //! the web build.
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -10,6 +11,10 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 
 use crate::net::url::LaunchParams;
+
+/// Fixed local port the sidecar binds and the webview then connects to. Single source of truth for
+/// both, so the spawn argv and the `LaunchParams` URL cannot drift apart.
+const SIDECAR_PORT: &str = "8787";
 
 /// Upper bound on how long `boot()` waits for the sidecar's readiness line before connecting
 /// anyway. This is a *safety cap*, not the expected wait: `otto serve` prints its readiness line
@@ -62,24 +67,18 @@ pub async fn boot() -> BootOutcome {
     };
     let root = handle.path().to_path_buf();
     let token = uuid::Uuid::new_v4().to_string();
-    // `otto` must be on PATH (or point OTTO_BIN at it); mirrors desktop/'s sidecar contract. Fixed
-    // port 8787 to match the LaunchParams the web path also uses. `kill_on_drop(true)` kills the
-    // sidecar when the stored `Child` is dropped — but Drop only runs if the app *unwinds* on close.
+    // `otto` must be on PATH (or point OTTO_BIN at it); mirrors desktop/'s sidecar contract. The
+    // argv itself (port, root, and the two capability flags) is built by `serve_command`, which
+    // documents why each flag is there and is unit-tested.
+    //
+    // `kill_on_drop(true)` (set there) kills the sidecar when the stored `Child` is dropped — but
+    // Drop only runs if the app *unwinds* on close.
     // Phase 0 Gate E proved a non-unwinding teardown (SIGKILL / `exit` / the `dx serve` dev
     // supervisor) skips Drop and orphans the sidecar, so `install_pdeathsig` below adds a
     // kernel-level guard that does not depend on Drop running. The two are complementary:
     // `kill_on_drop` handles the graceful in-app disconnect, `PR_SET_PDEATHSIG` handles hard exits.
     let bin = std::env::var("OTTO_BIN").unwrap_or_else(|_| "otto".into());
-    let mut command = Command::new(&bin);
-    command
-        .arg("serve")
-        .arg("--port")
-        .arg("8787")
-        .arg("--root")
-        .arg(&root)
-        .env("OTTO_TOKEN", &token)
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut command = serve_command(&bin, &root, &token);
     let mut child = match spawn_guarded(&mut command) {
         Ok(child) => child,
         Err(e) => {
@@ -97,10 +96,60 @@ pub async fn boot() -> BootOutcome {
     BootOutcome::Ready(
         child,
         LaunchParams {
-            ws: "ws://127.0.0.1:8787".into(),
+            ws: format!("ws://127.0.0.1:{SIDECAR_PORT}"),
             token,
         },
     )
+}
+
+/// Build the `otto serve` sidecar command for a workspace at `root`, authenticated with `token`.
+///
+/// Split out of `boot()` so the argv is assertable without spawning a process or opening the folder
+/// picker `boot()` starts with (see the tests at the bottom of this file). `boot()` is the only
+/// caller; the split exists for testability, not reuse.
+///
+/// ## Why the two capability flags
+///
+/// `otto serve` defaults both of these **off**, and a sidecar launched without them silently
+/// disables two already-shipped UI surfaces on desktop:
+///
+/// - `--approve-edits` installs the `ApprovalModeGate`, which upgrades ordinary (non-sensitive)
+///   `fs.write` from `Allow` to an interactive `Ask`. That `Ask` is what makes the orchestrator emit
+///   the `ApprovalRequest` event `components::approval_panel::ApprovalPanel` renders. Without it the
+///   panel is dead code on desktop and edits apply unreviewed — the wrong default for a safety
+///   feature.
+/// - `--promote-loopback` installs the `PromoteConfig`/`LoopbackTarget` that `Command::PromoteToRemote`
+///   needs. Without it the shipped Promote/Demote buttons have no target.
+///
+/// The two compose: `cmd_serve` parses them independently, and its mutual-exclusivity check covers
+/// only the four *promote modes* (`--promote-loopback`/`--promote-vps`/`--promote-microvm`/
+/// `--promote-fly`), of which this names exactly one.
+///
+/// Deliberately **not** passed: `--accept-promotions`. That opens the inbound `POST /promote` and
+/// `POST /export` endpoints so *other* machines can push sessions onto this one, which the desktop
+/// app has no use for — loopback promotion provisions its target in-process. Passing it would widen
+/// the local server's attack surface for no feature gain.
+///
+/// Until now these flags were reachable only through an external shim script
+/// (`docs/superpowers/spikes/2026-07-21-ui-runtime/otto-shim.sh`, injected via `OTTO_BIN`) that the
+/// Phase 0 runtime gate used; that shim is redundant for this purpose now.
+///
+/// `stderr` is piped because `wait_for_ready` reads the readiness line from it, and
+/// `kill_on_drop(true)` pairs with `spawn_guarded`'s kernel-level guard (see `install_pdeathsig`).
+fn serve_command(bin: &str, root: &Path, token: &str) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .arg("serve")
+        .arg("--port")
+        .arg(SIDECAR_PORT)
+        .arg("--root")
+        .arg(root)
+        .arg("--approve-edits")
+        .arg("--promote-loopback")
+        .env("OTTO_TOKEN", token)
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
 }
 
 /// Install the parent-death guard, then spawn. The single spawn path for the sidecar.
@@ -209,6 +258,124 @@ fn is_ready_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    /// Every promote-mode flag `cmd_serve` accepts. It rejects more than one with exit 2
+    /// (`crates/engine/src/main.rs`: "--promote-loopback, --promote-vps, --promote-microvm, and
+    /// --promote-fly are mutually exclusive"), so the sidecar argv must name exactly one.
+    const PROMOTE_MODE_FLAGS: [&str; 4] = [
+        "--promote-loopback",
+        "--promote-vps",
+        "--promote-microvm",
+        "--promote-fly",
+    ];
+
+    /// The sidecar argv as owned strings, for assertions.
+    fn argv_of(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// THE test for this change: the desktop sidecar must be launched with both capability flags.
+    ///
+    /// Without them `otto serve` runs with diff-approval and promote/demote *off*, which silently
+    /// disables two shipped UI surfaces on desktop — the `ApprovalPanel` never receives an
+    /// `ApprovalRequest`, and the Promote/Demote buttons have no target. The Phase 0 runtime gate
+    /// only reached those paths through an external shim script
+    /// (`docs/superpowers/spikes/2026-07-21-ui-runtime/otto-shim.sh`); this pins the capability set
+    /// into the app itself so it cannot regress to the shim-dependent state.
+    #[test]
+    fn serve_command_passes_both_desktop_capability_flags() {
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
+        for flag in ["--approve-edits", "--promote-loopback"] {
+            assert!(
+                argv.iter().any(|a| a == flag),
+                "desktop sidecar argv is missing `{flag}` — the matching UI surface is unreachable \
+                 on desktop; got {argv:?}"
+            );
+        }
+    }
+
+    /// Pins the whole invocation, not just the presence of the two flags. Catches a dropped
+    /// `--root`/`--port` pair or a flag that landed as a value of the preceding option (e.g.
+    /// `--root --approve-edits`), which a `contains` check alone would happily accept.
+    #[test]
+    fn serve_command_argv_is_the_expected_serve_invocation() {
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
+        assert_eq!(
+            argv,
+            vec![
+                "serve",
+                "--port",
+                SIDECAR_PORT,
+                "--root",
+                "/tmp/ws",
+                "--approve-edits",
+                "--promote-loopback",
+            ]
+        );
+    }
+
+    /// A second promote mode would make the sidecar exit 2 before binding, so the app would come up
+    /// with a dead connection and no diagnostic beyond a failed connect. Fails loudly here instead.
+    #[test]
+    fn serve_command_names_exactly_one_promote_mode() {
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
+        let modes: Vec<_> = argv
+            .iter()
+            .filter(|a| PROMOTE_MODE_FLAGS.contains(&a.as_str()))
+            .collect();
+        assert_eq!(
+            modes.len(),
+            1,
+            "`otto serve` rejects more than one promote mode with exit 2; argv names {modes:?}"
+        );
+    }
+
+    /// The sidecar's program, workspace root, and token are the caller's, not hardcoded — the token
+    /// especially, since it is the bearer credential the webview then authenticates with.
+    #[test]
+    fn serve_command_carries_the_given_binary_root_and_token() {
+        let command = serve_command("/custom/otto", Path::new("/tmp/other-ws"), "s3cret");
+        assert_eq!(command.as_std().get_program(), OsStr::new("/custom/otto"));
+        assert!(argv_of(&command).contains(&"/tmp/other-ws".to_string()));
+        let token = command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == OsStr::new("OTTO_TOKEN"))
+            .and_then(|(_, v)| v);
+        assert_eq!(token, Some(OsStr::new("s3cret")));
+    }
+
+    /// Guards the same gap `boot_spawns_through_the_guarded_path` guards for the spawn choke point:
+    /// the tests above exercise `serve_command`, but `boot()` itself cannot be run headless (it
+    /// opens a folder picker), so nothing else would fail if `boot()` went back to assembling its
+    /// own argv inline — the capability flags would be silently dropped with every test still green.
+    ///
+    /// Same two fail-safe limits as that test: the positive assertion is the load-bearing one, and
+    /// slicing a file that contains this test's own literals is safe because the FIRST occurrence of
+    /// the marker is the real definition above.
+    #[test]
+    fn boot_builds_its_sidecar_command_through_serve_command() {
+        let source = include_str!("desktop_boot.rs");
+        let body = source
+            .split_once("pub async fn boot()")
+            .expect("boot() is still defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("boot() has a closing brace at column 0")
+            .0;
+        assert!(
+            body.contains("serve_command(&bin, &root, &token)"),
+            "boot() no longer builds its sidecar command via serve_command — the \
+             --approve-edits/--promote-loopback capability flags asserted above would not reach \
+             the spawned sidecar"
+        );
+    }
 
     #[test]
     fn ready_line_matches_otto_serves_own_readiness_message() {
