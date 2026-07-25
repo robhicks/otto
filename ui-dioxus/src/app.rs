@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::components::{
     ApprovalPanel, ConnectionForm, EventLog, FileTree, PendingApproval, PromptBar, StatusLine,
 };
-use crate::editor::Editor;
+use crate::editor::{DirtyState, Editor};
 use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
@@ -65,6 +65,10 @@ pub fn App() -> Element {
     let mut tree = use_signal(Vec::<TreeNode>::new);
     let mut open_file = use_signal(|| None::<(PathBuf, FileBody)>);
     let mut editor_seed = use_signal(String::new);
+    // Unsaved-buffer marker state. Owned here (not inside `Editor`) so it survives the component's
+    // re-render on open and is cleared from the file-open flow, matching `ui/src/app.rs`'s
+    // app-level `editor_dirty` RwSignal.
+    let mut editor_dirty = use_signal(DirtyState::default);
 
     let mut do_connect = move || {
         let base = url.read().clone();
@@ -344,10 +348,14 @@ pub fn App() -> Element {
                     let body = decode_or_binary(&bytes);
                     // Only text files seed the editor; for Binary/TooLarge, Editor shows a
                     // notice instead of mounting the buffer, so a stale `editor_seed` is never
-                    // read (matches `ui/src/app.rs`'s open_path comment).
+                    // read (matches `ui/src/app.rs`'s open_path comment). The dirty flag, by
+                    // contrast, resets on EVERY successful open regardless of body type — same as
+                    // `ui/`, where only text re-seeds the editor but `editor_dirty.set(false)` is
+                    // unconditional.
                     if let FileBody::Text(ref s) = body {
                         editor_seed.set(s.clone());
                     }
+                    editor_dirty.set(DirtyState::clean());
                     open_file.set(Some((path, body)));
                 }
                 Err(e) => rows.write().push(client_error_row(&e)),
@@ -476,7 +484,7 @@ pub fn App() -> Element {
                         on_open: move |p| open_path(p),
                     }
                 }
-                Editor { open: open_file, seed: editor_seed }
+                Editor { open: open_file, seed: editor_seed, dirty: editor_dirty }
             }
             EventLog { rows }
             ApprovalPanel {
