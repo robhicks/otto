@@ -314,6 +314,21 @@ pub fn path_to_file_uri(path: &std::path::Path) -> anyhow::Result<lsp_types::Uri
 }
 
 /// Spawn `bin args…` as a child process and wire an `LspClient` to its stdio.
+///
+/// ## Teardown invariant — `kill_on_drop` is the *weaker* of the two guards here
+///
+/// `kill_on_drop(true)` covers the ordinary path (a client evicted mid-run). It does **not** cover
+/// this process dying: mcp-lsp is itself a stdio MCP server, so when its parent (`otto serve`) is
+/// hard-killed, mcp-lsp exits on its own stdin EOF — and an exit skips destructors just as `SIGKILL`
+/// does, so `kill_on_drop` is not what saves the language server.
+///
+/// What saves it is that the language server is *also* on stdio: piping its stdin below means the
+/// pipe closes when mcp-lsp goes, the server reads EOF, and it exits. A language server launched
+/// over a socket, or one that ignores stdin EOF, would survive as an orphan — which for
+/// `rust-analyzer` means leaking a process that can hold gigabytes.
+///
+/// `crates/engine/tests/mcp_child_teardown.rs` pins the full `otto serve` → `mcp-lsp` →
+/// `rust-analyzer` cascade, including the case where mcp-lsp is killed by EOF rather than a signal.
 pub fn spawn_process(
     bin: &str,
     args: &[&str],

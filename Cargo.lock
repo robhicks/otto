@@ -2531,6 +2531,7 @@ dependencies = [
  "dirs",
  "escargot",
  "futures-util",
+ "libc",
  "otto-agents",
  "otto-engine-core",
  "otto-extensions",

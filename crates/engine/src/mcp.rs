@@ -109,6 +109,22 @@ fn to_gate_name(server_name: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Core connect: spawn `command`, list tools, map each server tool name to a gate name via `map`.
+///
+/// ## Teardown invariant — keep these servers on **stdio**
+///
+/// otto's own process can be `SIGKILL`ed (the desktop app's `PR_SET_PDEATHSIG` guard does exactly
+/// that when its window closes), and `SIGKILL` runs no destructor. Nothing in this module's cleanup
+/// survives that: rmcp reaps the child from `ChildWithCleanup::drop`, which not only needs `Drop` to
+/// run but defers the kill to a `tokio::spawn`ed task a dying process will never poll.
+///
+/// What actually reaps these servers is **stdio pipe EOF** — `TokioChildProcess` pipes the child's
+/// stdin, so when this process dies the pipe closes, the server reads EOF and exits. That cascades
+/// through grandchildren (`mcp-lsp` → `rust-analyzer`) for the same reason.
+///
+/// So the safety property here is a consequence of the *transport*, not of any cleanup code: a
+/// server reached over rmcp's HTTP/SSE transports instead — or one that ignores stdin EOF — would
+/// orphan on every hard kill. `crates/engine/tests/mcp_child_teardown.rs` pins this, including a
+/// control proving the assertion can distinguish death from survival.
 async fn connect_mapped(
     command: tokio::process::Command,
     map: impl Fn(&str) -> String,
