@@ -2,3 +2,12 @@
 # to the `wasm_js` feature. Applies only to the wasm target; host `cargo build` is unaffected.
 [target.wasm32-unknown-unknown]
 rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
+# Runs `cargo test --target wasm32-unknown-unknown --features web` (i.e. `src/web_mount_test.rs`)
+# in a real headless browser. Affects `cargo test`/`cargo run` only — `cargo build --target
+# wasm32-unknown-unknown` and the native `--features desktop` build are untouched.
+#
+# Prerequisites (one-off, host tooling — not cargo deps):
+#   - `wasm-bindgen-test-runner` on PATH, version-matched to the `wasm-bindgen` in Cargo.lock
+#     (prebuilt: the wasm-bindgen release tarball, or `cargo install wasm-bindgen-cli --version <v>`)
+#   - a browser + matching webdriver, selected via `CHROMEDRIVER=…` or `GECKODRIVER=…`
+runner = "wasm-bindgen-test-runner"

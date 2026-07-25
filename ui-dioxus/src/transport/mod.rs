@@ -29,6 +29,38 @@ mod desktop;
 #[cfg(feature = "web")]
 mod web;
 
+/// Test-only observation seam. `connect` records every target URL here before dispatching to the
+/// real transport, so a test can assert that a *call site* — not merely a helper in isolation —
+/// actually reached the transport. This exists because the runtime spike's one real bug was a
+/// launch-params parser that was unit-tested and correct but had **no web call site**: the parser
+/// passed, autoconnect silently did nothing, and it shipped. Asserting on parser output can never
+/// catch that; asserting that `connect` was reached can.
+///
+/// Compiled only under `cfg(test)`, so the shipped `web`/`desktop` builds contain neither the
+/// recorder nor the `record` call — runtime behavior is unchanged.
+#[cfg(test)]
+pub mod connect_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static ATTEMPTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(ws_url: &str) {
+        ATTEMPTS.with(|a| a.borrow_mut().push(ws_url.to_string()));
+    }
+
+    /// Every URL passed to `connect` since the last `reset`, in call order.
+    pub fn attempts() -> Vec<String> {
+        ATTEMPTS.with(|a| a.borrow().clone())
+    }
+
+    /// Clear the record. Call at the start of each test — wasm tests share one thread.
+    pub fn reset() {
+        ATTEMPTS.with(|a| a.borrow_mut().clear());
+    }
+}
+
 /// Open a socket to `ws_url`. Returns the outbound sink and a stream of inbound events.
 pub fn connect(
     ws_url: &str,
@@ -39,6 +71,9 @@ pub fn connect(
     ),
     String,
 > {
+    #[cfg(test)]
+    connect_probe::record(ws_url);
+
     #[cfg(feature = "web")]
     {
         web::connect_impl(ws_url)

@@ -65,7 +65,7 @@ Independent fixes, each shippable on its own, no cutover risk. Each needs a test
       desktop (`ui-dioxus/src/desktop_boot.rs:70-77`). Decide the desktop capability policy and pass the
       flags (the spike used an external shim; the real fix is in the app's spawn args). Applies to the
       Dioxus desktop app going forward.
-- [ ] **Add an automated test for web autoconnect** — the spike's one runtime bug (dead-code parser,
+- [x] **Add an automated test for web autoconnect** — the spike's one runtime bug (dead-code parser,
       no web call site) shipped because only an isolated unit test existed. A wasm integration test
       covering the web mount→connect path would have caught it; add it so the class can't recur.
 - [ ] **Add an automated test for the desktop sidecar `PR_SET_PDEATHSIG` teardown** (Phase 0 Gate-E
