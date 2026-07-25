@@ -116,23 +116,33 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 # failure, which is why the release bundle was 2.16 MB instead of 795 KB.
 #
 # `strip = "debuginfo"` is the line that fixes it: the DWARF is dropped before wasm-opt ever sees
-# it. Note `debug = false` does NOT work here and is deliberately absent — this profile already
-# resolves to `debug = false` via `inherits = "release"`, yet the DWARF still appeared, so it is
-# not the profile's debuginfo setting putting it there (dx drives rustc through a
-# RUSTC_WORKSPACE_WRAPPER). Verified by A/B build: with `debug = false` and no `strip`, wasm-opt
-# still aborts; with `strip` and no `debug`, it runs clean.
+# it. `debug = false` does NOT work here and is deliberately absent — this profile already
+# resolves to `debug = false` via `inherits = "release"`, and the DWARF appears anyway, so
+# something other than the profile's debuginfo setting is emitting it (dx runs cargo with a
+# RUSTC_WORKSPACE_WRAPPER and leaves artifacts in `target/dx/.captured-args/`, but the exact
+# source was not pinned down — treat that as the open question, not as established). What IS
+# established, by A/B build: with `debug = false` and no `strip`, wasm-opt still aborts; with
+# `strip` and no `debug`, it runs clean.
 #
 # `opt-level = "s"` restores a dx default rather than choosing a new one. dx synthesizes
 # `profile.wasm-release.{inherits,opt-level}` on the cargo command line ONLY when this manifest
 # does not define the profile; defining it here suppresses that, which would silently drop the
 # build to `release`'s `opt-level = 3` and cost ~92 KB (887,715 vs 795,188 bytes of wasm).
-# dx's own `--config profile.wasm-release.strip=false` is passed on every build, but the manifest
-# value is what takes effect — again verified by A/B build, not assumed.
+# (Captured from the real cargo invocation, not inferred.)
+#
+# One caveat worth knowing: dx still passes `--config profile.wasm-release.strip=false` on every
+# build, and cargo documents config-level profile settings as outranking manifest ones — yet the
+# manifest `strip` is demonstrably what the build ends up using. That is an observation, not an
+# explanation; do not read a general cargo precedence rule out of it. If a dx upgrade ever makes
+# its `--config` win, guards 2-4 in scripts/measure-web-bundle.sh are what will catch it.
 #
 # Scope: `wasm-release` is reachable only via `--profile wasm-release`, i.e. release web builds
 # (`dx build/serve/bundle --release --platform web`). `cargo test`, `cargo build --target
 # wasm32-unknown-unknown`, and dev `dx serve` use dev/release and are unaffected — dev hot-reload
-# keeps its debug info.
+# keeps its debug info. This block also depends on `ui-dioxus/` being its own workspace root (the
+# `[workspace]` table at the top of this file): cargo honors `[profile.*]` only in a workspace
+# ROOT manifest, so folding this crate into the top-level workspace would silently make the
+# profile inert and bring the SIGABRT back.
 #
 # Measure with `./scripts/measure-web-bundle.sh`, which fails rather than report an untrustworthy
 # figure if wasm-opt regresses.

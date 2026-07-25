@@ -77,11 +77,16 @@ Independent fixes, each shippable on its own, no cutover risk. Each needs a test
       | `style…css` | 3,021 / — | 3,021 / 1,125 |
       | **total** | 2,227,933 / — | **858,136 / 333,405** |
 
-      wasm raw **−63.3%**, gzip **−44.4%**; the whole bundle drops 2.23 MB → 0.86 MB raw (decimal
-      MB throughout). The fix touches only the wasm — the JS shim and CSS are byte-identical in size
-      before and after (their pre-fix gzip figures were not captured, hence the dashes; the post-fix
-      column is the one Phase 3 should quote). Nothing was tuned for size beyond making wasm-opt
-      actually run: its `-Oz` and rustc's `opt-level = "s"` are both dx's own defaults.
+      wasm raw **−63.3%**, gzip **−44.4%**; the bundle drops 2.23 MB → 0.86 MB raw (decimal MB
+      throughout). Both columns come from the same tree differing only by this fix, and the same
+      command, so the delta is attributable to the fix alone. The JS shim and CSS are unchanged in
+      raw size (their pre-fix gzip figures were not captured, hence the dashes). Nothing was tuned
+      for size beyond making wasm-opt actually run: wasm-opt's `-Oz` and rustc's `opt-level = "s"`
+      are both dx's own defaults.
+      **Phase 3 should re-run the script rather than quote these bytes.** They are a point-in-time
+      A/B of *this* fix, not a standing figure — every other Phase 1 item moves it. Already true by
+      the time this landed: rebased onto the dirty-marker item, the same command measures
+      797,380 / 318,370.
 - [ ] **Close the web syntax-highlighting gap** (spike #1's deferred Task 12). The Dioxus web editor
       renders plain text; desktop highlights via native tree-sitter. Options (own mini-design):
       `web-tree-sitter` wasm via JS interop, or a lighter web highlighter. Reaching "one codebase, one

@@ -34,7 +34,17 @@ command -v dx >/dev/null 2>&1 || {
     exit 1
 }
 
-# BSD/macOS mktemp requires an explicit template.
+# Everything below assumes the build lands in ./target; CARGO_TARGET_DIR would relocate it and
+# make `rm -rf target/dx` a no-op, so the run would fail later with a confusing "asset dir not
+# found" instead of naming the cause.
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    echo "error: CARGO_TARGET_DIR is set ($CARGO_TARGET_DIR); this script expects ./target." >&2
+    echo "       Unset it and re-run." >&2
+    exit 1
+fi
+
+# GNU `mktemp -t` requires the trailing X's; BSD/macOS treats the whole string as a filename
+# prefix and appends its own suffix. This form works on both.
 log=$(mktemp -t measure-web-bundle.XXXXXX)
 trap 'rm -f "$log"' EXIT
 
@@ -57,13 +67,15 @@ fi
 assets="target/dx/otto-ui-dioxus/release/web/public/assets"
 [ -d "$assets" ] || { echo "error: expected asset dir not found: $assets" >&2; exit 1; }
 
-mapfile -t wasms < <(find "$assets" -maxdepth 1 -name '*.wasm' -type f)
-[ "${#wasms[@]}" -eq 1 ] || {
-    echo "error: expected exactly one .wasm in $assets, found ${#wasms[@]}:" >&2
-    printf '  %s\n' "${wasms[@]}" >&2
+# Deliberately not `mapfile` — that is a bash 4 builtin and macOS still ships bash 3.2.
+# `$(( ))` normalizes BSD `wc`'s leading whitespace.
+wasm=$(find "$assets" -maxdepth 1 -name '*.wasm' -type f)
+wasm_count=$(( $(printf '%s' "$wasm" | grep -c . || true) ))
+if [ "$wasm_count" -ne 1 ]; then
+    echo "error: expected exactly one .wasm in $assets, found $wasm_count:" >&2
+    printf '  %s\n' $wasm >&2
     exit 1
-}
-wasm="${wasms[0]}"
+fi
 
 # 3. DWARF in the shipped wasm means the Cargo.toml `strip` is gone — wasm-opt will have aborted.
 if grep -aq '\.debug_info' "$wasm"; then
@@ -73,8 +85,8 @@ if grep -aq '\.debug_info' "$wasm"; then
     exit 1
 fi
 
-# 4. The one guard that cannot fail open.
-wasm_bytes=$(wc -c <"$wasm")
+# 4. The one guard that cannot fail open. `$(( ))` strips BSD `wc`'s leading whitespace.
+wasm_bytes=$(( $(wc -c <"$wasm") ))
 if [ "$wasm_bytes" -gt "$MAX_WASM_BYTES" ]; then
     echo >&2
     echo "error: wasm is $wasm_bytes B, over the $MAX_WASM_BYTES B ceiling — wasm-opt most likely" >&2
@@ -82,19 +94,23 @@ if [ "$wasm_bytes" -gt "$MAX_WASM_BYTES" ]; then
     exit 1
 fi
 
+# Every emitted asset, not just wasm/js/css — a future item (e.g. web syntax highlighting via JS
+# interop) can add an `assets/snippets/` tree, and a TOTAL that quietly skipped it would be an
+# understatement waiting to be quoted.
 echo
 echo "==> bundle: $assets"
 printf '%-46s %12s %12s\n' "FILE" "RAW" "GZIP(-9)"
 total_raw=0
 total_gz=0
-for f in "$wasm" "$assets"/*.js "$assets"/*.css; do
-    [ -f "$f" ] || continue
-    raw=$(wc -c <"$f")
-    gz=$(gzip -9 -c "$f" | wc -c)
+while IFS= read -r f; do
+    raw=$(( $(wc -c <"$f") ))
+    gz=$(( $(gzip -9 -c "$f" | wc -c) ))
     total_raw=$((total_raw + raw))
     total_gz=$((total_gz + gz))
     printf '%-46s %12s %12s\n' "$(basename "$f")" "$raw" "$gz"
-done
+done <<EOF
+$(find "$assets" -type f | sort)
+EOF
 printf '%-46s %12s %12s\n' "TOTAL" "$total_raw" "$total_gz"
 echo
-echo "(dir: $assets)"
+echo "(dir: $assets — excludes the generated index.html, which lives one level up in public/)"
