@@ -101,4 +101,58 @@ mod tests {
         let found = out.iter().flatten().any(|sp| sp.class == "tok-keyword");
         assert!(found, "expected a tok-keyword span, got {out:?}");
     }
+
+    /// Pins this backend's exact output so adding the web highlighter (or any later change to the
+    /// shared `segment_lines` seam) cannot silently alter what desktop renders. If tree-sitter's
+    /// grammars/queries are upgraded this may legitimately need re-pinning — but it should never
+    /// change as a side effect of work on the other target.
+    ///
+    /// Note what this pins: `1` is `tok-plain`, NOT `tok-number`. `tree_sitter_rust`'s
+    /// `HIGHLIGHTS_QUERY` has no `number` capture, so integer literals go unclassified on desktop
+    /// for Rust. The web lexer does classify them, so the two targets genuinely differ here — a
+    /// fidelity difference in web's favour on this one point. Recorded rather than papered over.
+    #[test]
+    fn desktop_output_is_pinned_for_a_fixed_input() {
+        let out = highlight("// c\nfn f() -> u32 { 1 }", "rust");
+        let rendered: Vec<Vec<(&str, String)>> = out
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|s| (s.class, s.text.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                vec![("tok-comment", "// c".to_string())],
+                vec![
+                    ("tok-keyword", "fn".to_string()),
+                    ("tok-plain", " f() -> ".to_string()),
+                    ("tok-type", "u32".to_string()),
+                    ("tok-plain", " { 1 }".to_string()),
+                ],
+            ]
+        );
+    }
+
+    /// Both backends must draw from the same class vocabulary, since one `style.css` styles both.
+    /// A class desktop emits but web never does (or vice versa) would render unstyled on one target.
+    #[test]
+    fn both_backends_share_one_class_vocabulary() {
+        const VOCAB: [&str; 6] = [
+            "tok-plain",
+            "tok-keyword",
+            "tok-string",
+            "tok-comment",
+            "tok-type",
+            "tok-number",
+        ];
+        let src = "// c\nfn f(x: u32) -> String { let s = \"a\"; 1 }";
+        for lang in ["rust", "javascript", "typescript", "python", "go"] {
+            for span in highlight(src, lang).iter().flatten() {
+                assert!(VOCAB.contains(&span.class), "{lang}: stray class {span:?}");
+            }
+        }
+    }
 }
