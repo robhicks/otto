@@ -74,9 +74,11 @@ rfd = { version = "0.15", optional = true }
 # Gate-E finding (`docs/superpowers/spikes/2026-07-21-ui-runtime/results/dioxus-desktop.md`).
 libc = { version = "0.2", optional = true }
 
-# desktop-native syntax highlighting (only compiled with --features desktop; the web build keeps
-# `tokens::plain_spans` — Task 12 handles web highlighting separately). Versions match
-# crates/retrieval/Cargo.toml so the grammar set stays consistent across the workspace.
+# desktop-native syntax highlighting (only compiled with --features desktop). The web build cannot
+# share these — tree-sitter's grammars are C built through cc-rs and wasm32-unknown-unknown has no
+# libc — so it highlights the same five languages with a dependency-free lexer instead
+# (src/editor/highlight_web.rs). Versions match crates/retrieval/Cargo.toml so the grammar set
+# stays consistent across the workspace.
 tree-sitter = { version = "0.26.9", optional = true }
 tree-sitter-highlight = { version = "0.26.10", optional = true }
 tree-sitter-rust = { version = "0.24.2", optional = true }

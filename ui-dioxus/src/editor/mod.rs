@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
-#[cfg(feature = "desktop")]
+// Both highlight backends need this; neither is compiled when the crate is built with no target
+// feature (`cargo build --no-default-features`, the pure `editor::tokens`/`net::` seam check), so
+// the import is gated to match or it warns as unused there.
+#[cfg(any(feature = "desktop", feature = "web"))]
 use crate::net::tree::language_for_path;
 use crate::net::tree::FileBody;
 
@@ -12,12 +15,19 @@ pub mod tokens;
 #[cfg(feature = "desktop")]
 mod highlight_native;
 
+// The web highlighter is a dependency-free lexer, so unlike `highlight_native` there is no dep to
+// feature-gate. It is still gated on `web` so the desktop binary doesn't carry code only the web
+// arm below calls — but `test` is OR'd in deliberately, so its tests run under the crate's ordinary
+// `cargo test --features desktop` rather than needing a wasm test runner.
+#[cfg(any(feature = "web", test))]
+mod highlight_web;
+
 pub use dirty::DirtyState;
 
-/// The unhighlighted (plain-`textarea`) controlled-buffer editor. `open` is the currently-open
-/// file (path + classified body); `seed` is the initial document text set once at open time (a
-/// later part swaps this for a styled-span highlighted render — the diff-first non-goal means no
-/// VSCode-scale features here); `dirty` is the unsaved-buffer flag app.rs clears on every open and
+/// The controlled-buffer editor: a transparent `textarea` overlaid on a syntax-highlighted `pre`.
+/// `open` is the currently-open file (path + classified body); `seed` is the initial document text
+/// set once at open time (the diff-first non-goal means no VSCode-scale features here — no
+/// persistence, no completion); `dirty` is the unsaved-buffer flag app.rs clears on every open and
 /// this component latches on the first keystroke, rendered as a "●" beside the path (see
 /// `dirty::DirtyState` for the semantics, which mirror `ui/src/components/editor_pane.rs`).
 /// No persistence in this slice.
@@ -61,20 +71,23 @@ pub fn Editor(
         FileBody::Text(_) => {
             // Span source is a plain function call, not a hook — safe to call here inside the
             // `Text` arm (unlike `buf`/the re-seed effect above, which must stay hoisted and
-            // unconditional; see the comment at the top of this component). Desktop gets real
-            // tree-sitter-classified spans; web keeps `plain_spans` permanently — Task 12 spiked
-            // `web-tree-sitter` and found a hard architectural mismatch (no Rust-native API, no
-            // reusable highlight-iterator, unverifiable JS interop in this environment), recorded
-            // as a headline native/wasm divergence rather than a gap a later slice closes. See
-            // docs/superpowers/specs/2026-07-11-ui-dioxus-spike-report.md, Ecosystem/editor,
-            // slice C.4.
+            // unconditional; see the comment at the top of this component). BOTH targets highlight
+            // now, over the same five languages and emitting the same `tok-*` classes, so one
+            // `style.css` serves both. They differ only in fidelity: desktop classifies with native
+            // tree-sitter, while web uses a dependency-free lexer because tree-sitter's C grammars
+            // cannot build for `wasm32-unknown-unknown` and every wasm-capable alternative measured
+            // at +1.5 MB or worse against a sub-800 KB bundle. See
+            // docs/superpowers/specs/2026-07-24-ui-dioxus-web-highlighting-design.md.
             #[cfg(feature = "desktop")]
             let spans = {
                 let lang = language_for_path(&path);
                 highlight_native::highlight(&buf.read(), lang)
             };
             #[cfg(feature = "web")]
-            let spans = tokens::plain_spans(&buf.read());
+            let spans = {
+                let lang = language_for_path(&path);
+                highlight_web::highlight(&buf.read(), lang)
+            };
             // Neither target feature enabled (e.g. `cargo test --no-default-features` for the
             // pure `editor::tokens`/`net::` seams): the crate still needs to type-check, so fall
             // back to the plain baseline rather than fail to compile.
