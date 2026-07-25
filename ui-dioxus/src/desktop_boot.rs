@@ -103,12 +103,14 @@ pub async fn boot() -> BootOutcome {
     )
 }
 
-/// The **only** way the sidecar is spawned: install the parent-death guard, then spawn.
+/// Install the parent-death guard, then spawn. The single spawn path for the sidecar.
 ///
-/// Funnelling `install_pdeathsig` + `spawn` through one function makes "the sidecar is always
-/// spawned guarded" structural rather than a convention `boot()` has to remember — and gives the
-/// regression tests below a call site that exercises exactly what `boot()` does, so dropping the
-/// guard from the spawn path fails the suite instead of silently re-opening the Gate-E orphan bug.
+/// This is a **convention with a tested choke point**, not a structural guarantee: nothing stops a
+/// future `boot()` from calling `command.spawn()` directly. What the tests below buy is that
+/// (a) removing `install_pdeathsig` from *this* function fails the suite, and (b)
+/// `boot_spawns_through_the_guarded_path` fails if `boot()` stops routing through it. Making the
+/// invariant genuinely structural would mean a newtype whose only `spawn` installs the guard —
+/// deliberately not done here, since this change is coverage for the Gate-E fix, not a redesign.
 fn spawn_guarded(command: &mut Command) -> std::io::Result<Child> {
     install_pdeathsig(command);
     command.spawn()
@@ -122,9 +124,10 @@ fn spawn_guarded(command: &mut Command) -> std::io::Result<Child> {
 /// killing the app) skips entirely — the Phase 0 Gate-E failure, where a closed window orphaned the
 /// `otto serve` sidecar. `PR_SET_PDEATHSIG` is set in the child between fork and exec (so it is
 /// established before `otto serve` ever runs) and tells the kernel to `SIGKILL` the child the moment
-/// its parent dies for *any* reason. The `getppid() == 1` check closes the race where the parent
-/// already died in the window between fork and the `prctl` call. Only `prctl`/`getppid`/`raise` —
-/// all async-signal-safe — run inside the `pre_exec` closure.
+/// its parent dies for *any* reason. The `getppid() != app_pid` check closes the race where the
+/// parent already died in the window between fork and the `prctl` call — see the inline note below
+/// for why it is not the naive `getppid() == 1`. Only `prctl`/`getppid`/`raise` — all
+/// async-signal-safe — run inside the `pre_exec` closure.
 ///
 /// Linux-only: `PR_SET_PDEATHSIG` is Linux-specific. On other targets this is a no-op and the app
 /// falls back to `kill_on_drop` alone (macOS desktop teardown is revisited if it ever ships).
@@ -234,14 +237,18 @@ mod tests {
 /// ```text
 ///   cargo test  ──spawn──▶  helper (this binary, --exact <helper test>)
 ///                              └──spawn_guarded──▶  grandchild ("the sidecar")
+///                 ◀──pid───  handshake (stdout marker, or a pidfile for the race scenario)
 ///   cargo test  ──SIGKILL──▶  helper                      (a non-unwinding death: no Drop, no
 ///                                                          kill_on_drop, no destructors at all)
 ///   cargo test  ──poll /proc─▶ grandchild must be gone
 /// ```
 ///
+/// That is scenario 1's *guarded* path; its control is identical except that `spawn_guarded` is
+/// swapped for a bare `Command::spawn`.
+///
 /// SIGKILL is what makes this a real test of `PR_SET_PDEATHSIG` rather than of `kill_on_drop`: an
 /// uncatchable signal guarantees the helper runs no teardown code, so the *only* thing that can
-/// reap the grandchild is the kernel guard. Each death assertion is paired with an unguarded
+/// kill the grandchild is the kernel guard. Each death assertion is paired with an unguarded
 /// control that spawns the identical grandchild **without** the guard and asserts it survives —
 /// without that pairing a vacuous test (e.g. one whose grandchild died on its own) would pass.
 ///
@@ -252,6 +259,17 @@ mod tests {
 ///
 /// Linux-only (`PR_SET_PDEATHSIG` is Linux-specific, and the liveness probe reads `/proc`), and
 /// desktop-only (the whole module is `#[cfg(feature = "desktop")]`), so other targets stay green.
+///
+/// **`desktop` is not a default feature, so a bare `cargo test` compiles none of this.** Run these
+/// with `cargo test --features desktop` from `ui-dioxus/`. The repo has no CI, so that invocation
+/// is currently the only thing that exercises the guard — see the PR discussion for the follow-up.
+///
+/// Two known limits of what this covers, both worth keeping in view:
+/// - It exercises `spawn_guarded`, and separately asserts `boot()` routes through it; it does not
+///   run `boot()` itself (which opens a folder picker).
+/// - `PR_SET_PDEATHSIG` arms against death of the forking *thread* (see `install_pdeathsig`'s
+///   note). The helper forks from a thread that lives until SIGKILL, so thread-death and
+///   process-death coincide here and that caveat is not exercised.
 #[cfg(all(test, target_os = "linux"))]
 mod pdeathsig_tests {
     use super::*;
@@ -278,26 +296,37 @@ mod pdeathsig_tests {
     /// Line the guarded/unguarded helper prints so the test learns the grandchild's pid.
     const PID_MARKER: &str = "OTTO_TEST_GRANDCHILD_PID=";
 
-    /// How long a correct guard may take to reap the grandchild. The kernel signals at parent
+    /// How long a correct guard may take to kill the grandchild. The kernel signals at parent
     /// death, so the real latency is sub-millisecond; this is a generous ceiling that keeps the
     /// test from being timing-sensitive on a loaded machine.
     const DEATH_TIMEOUT: Duration = Duration::from_secs(10);
-    /// How long an *unguarded* grandchild must stay alive for the control to count. It only has to
+    /// How long a grandchild must stay alive for a survival assertion to count. It only has to
     /// outlast the moment a guard would have killed it (sub-millisecond), so this is already ~3
     /// orders of magnitude of margin; keeping it small keeps the suite fast.
-    const SURVIVAL_WINDOW: Duration = Duration::from_secs(2);
+    const SURVIVAL_WINDOW: Duration = Duration::from_millis(500);
     /// Ceiling on waiting for a helper to report its grandchild's pid (a cold re-exec of this
     /// binary plus process startup).
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-    /// Ceiling on the race helper's in-child wait for its parent to die, as an iteration count of
-    /// 2 ms naps. Bounds the fork→prctl window so a wedged test can never leave a spinning child.
-    const RACE_SPIN_LIMIT: u32 = 5_000; // ~10s
+    /// Ceiling on the race helper's in-child wait for its parent to die. Bounds the artificially
+    /// held-open fork→prctl window so a wedged test can never leave a child spinning forever.
+    ///
+    /// Measured against `CLOCK_MONOTONIC` rather than counting 2 ms naps: `nanosleep` returns
+    /// early on `EINTR` without resuming the remainder, so an iteration count is only a lower
+    /// bound on elapsed time. Under signal pressure a count-based limit could expire in
+    /// milliseconds, abort the spawn, and flake the unguarded race control.
+    const RACE_WAIT_SECS: libc::time_t = 10;
 
     // ---------------------------------------------------------------- re-exec entry points
 
     /// Entry point for the spawned helper process: build a grandchild, report its pid, then park
-    /// until the parent test SIGKILLs us. A no-op in a normal test run.
+    /// until the parent test SIGKILLs us.
+    ///
+    /// `#[ignore]` because this is a subprocess role, not a test — it asserts nothing, and a
+    /// normal run must never execute it (if `MODE_ENV` ever leaked into a developer's shell it
+    /// would spawn a grandchild and sleep for two minutes with no diagnostic). The spawner opts in
+    /// with `--ignored`.
     #[test]
+    #[ignore = "subprocess role, driven by the tests below via --exact --ignored"]
     fn pdeathsig_helper_process() {
         let Some(mode) = std::env::var_os(MODE_ENV) else {
             return;
@@ -321,8 +350,9 @@ mod pdeathsig_tests {
 
     /// Entry point for the grandchild — the stand-in for `otto serve`. Parks long enough to outlast
     /// any assertion window, with a self-terminating cap so a crashed test run cannot strand it.
-    /// A no-op in a normal test run.
+    /// `#[ignore]`d for the same reason as the helper.
     #[test]
+    #[ignore = "subprocess role, driven by the tests below via --exact --ignored"]
     fn pdeathsig_sleeper_process() {
         if std::env::var_os(SLEEPER_ENV).is_none() {
             return;
@@ -342,6 +372,8 @@ mod pdeathsig_tests {
         command
             .arg(SLEEPER_TEST)
             .arg("--exact")
+            // The entry point is `#[ignore]`d so a normal run can't execute it; opt in here.
+            .arg("--ignored")
             .arg("--test-threads=1")
             .env(SLEEPER_ENV, "1")
             .env_remove(MODE_ENV)
@@ -383,20 +415,21 @@ mod pdeathsig_tests {
         let my_pid = std::process::id() as libc::pid_t;
         let mut command = sleeper_command();
         // SAFETY: runs in the forked child before exec. Only `open`/`write`/`close`/`getpid`/
-        // `getppid`/`nanosleep` — all async-signal-safe — are called, nothing is allocated, and
-        // the captured `CString`/pid were built before the fork. Errors are returned as raw errno
-        // values so even the failure path allocates nothing.
+        // `getppid`/`nanosleep`/`clock_gettime` — all async-signal-safe — are called, nothing is
+        // allocated, and the captured `CString`/pid were built before the fork.
+        // `Error::last_os_error`/`from_raw_os_error` only wrap errno, so even the failure path
+        // allocates nothing (unlike `Error::new`/`Error::other`, which std's `pre_exec` docs warn
+        // against for exactly this reason).
         unsafe {
             command.pre_exec(move || {
                 if !write_pid_raw(pidfile.as_ptr(), libc::getpid()) {
                     return Err(std::io::Error::last_os_error());
                 }
-                let mut spins = 0u32;
+                let deadline = monotonic_secs() + RACE_WAIT_SECS;
                 while libc::getppid() == my_pid {
-                    if spins >= RACE_SPIN_LIMIT {
+                    if monotonic_secs() >= deadline {
                         return Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
                     }
-                    spins += 1;
                     let nap = libc::timespec {
                         tv_sec: 0,
                         tv_nsec: 2_000_000,
@@ -417,19 +450,44 @@ mod pdeathsig_tests {
         } else {
             command.spawn()
         };
+        // Unreachable in the happy path — we are SIGKILLed inside `spawn` above. If we DO get
+        // here, the closure bailed (`ETIMEDOUT`: the parent outlived the race window, or the
+        // pidfile write failed), so say so on stderr: the parent test is dead and cannot read it,
+        // but a developer running the helper by hand gets a real diagnostic instead of silence.
+        if let Err(e) = &child {
+            eprintln!("race helper: spawn failed before the parent died: {e}");
+        }
         std::thread::sleep(Duration::from_secs(120));
         drop(child);
     }
 
+    /// `CLOCK_MONOTONIC` seconds. Async-signal-safe, allocation-free — usable inside `pre_exec`.
+    ///
+    /// # Safety
+    /// None beyond the `clock_gettime` call itself, which cannot fail for `CLOCK_MONOTONIC`.
+    unsafe fn monotonic_secs() -> libc::time_t {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts.tv_sec
+    }
+
     /// Write `pid` as 4 native-endian bytes to `path`. Async-signal-safe: no allocation, no
     /// formatting, no stdio.
+    ///
+    /// `O_EXCL | O_NOFOLLOW` because the path is predictable and lives in a shared `/tmp`:
+    /// `ScratchPath` guarantees the file is absent, so anything already there is someone else's —
+    /// possibly a planted symlink aimed at a file this user can write. Refusing to open it turns a
+    /// symlink-follow truncation into a spawn failure.
     ///
     /// # Safety
     /// `path` must be a valid NUL-terminated C string that outlives the call.
     unsafe fn write_pid_raw(path: *const libc::c_char, pid: libc::pid_t) -> bool {
         let fd = libc::open(
             path,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
             0o600 as libc::c_int,
         );
         if fd < 0 {
@@ -444,13 +502,46 @@ mod pdeathsig_tests {
 
     // ---------------------------------------------------------------- test-side plumbing
 
-    /// Kills a pid on drop so a panicking assertion can never strand a 120-second sleeper.
-    struct Reaper(i32);
-    impl Drop for Reaper {
-        fn drop(&mut self) {
-            // SAFETY: `kill` on a possibly-dead pid is defined; a stale pid just yields ESRCH.
-            unsafe { libc::kill(self.0, libc::SIGKILL) };
+    /// Kills the grandchild on drop, so a panicking assertion does not leave it running out its
+    /// 120-second self-cap. (The self-cap, not this guard, is what bounds the window between the
+    /// grandchild starting and this guard being constructed.)
+    ///
+    /// Kills, never reaps: the grandchild is not this process's child, so it can never be
+    /// `wait()`ed on here — which is exactly why the pid can be **recycled** once whatever
+    /// inherited it does the reaping. A bare `kill(pid, SIGKILL)` would then hit an unrelated
+    /// process. `is_our_sleeper` re-checks identity immediately before signalling, and the
+    /// constructor rejects pids that cannot be a real child — `kill(0, ...)` signals the whole
+    /// process group and `kill(-1, ...)` every process the user owns, so a corrupt handshake must
+    /// never reach `kill` at all.
+    struct KillOnDrop(i32);
+    impl KillOnDrop {
+        fn new(pid: i32) -> Self {
+            assert!(
+                pid > 1,
+                "implausible grandchild pid {pid}: refusing to build a killer that could signal a \
+                 process group or every process on the machine"
+            );
+            Self(pid)
         }
+    }
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if is_our_sleeper(self.0) {
+                // SAFETY: plain `kill`; the pid was just confirmed to still be our sleeper.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// True when `pid` is still the grandchild we spawned, rather than a recycled pid.
+    ///
+    /// `/proc/<pid>/cmdline` is NUL-separated argv; our sleeper was exec'd with the sleeper test
+    /// name as its first argument, which no unrelated process on the machine will carry.
+    fn is_our_sleeper(pid: i32) -> bool {
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        String::from_utf8_lossy(&cmdline).contains(SLEEPER_TEST)
     }
 
     /// True while `pid` names a process that has not yet died.
@@ -460,21 +551,28 @@ mod pdeathsig_tests {
     /// subreaper) reaps it, and `kill(pid, 0)` succeeds for zombies. Reading the state field of
     /// `/proc/<pid>/stat` distinguishes "still running" from "dead, not yet reaped", which is what
     /// makes the death assertion reliable regardless of who the reaper is.
+    /// Only a genuinely absent `/proc` entry counts as dead. Any other read error (EMFILE, ENOMEM,
+    /// a permissions oddity) is reported as *live*, because "dead" is the answer that makes the
+    /// death assertions pass — an unrelated I/O failure must not be able to manufacture a green run.
     fn process_is_live(pid: i32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
         };
         // `comm` (field 2) is parenthesised and may itself contain spaces and parens, so the state
         // character is the first token after the LAST ')'.
         let Some((_, rest)) = stat.rsplit_once(')') else {
-            return false;
+            return true;
         };
-        match rest.trim_start().chars().next() {
-            Some('Z') | Some('X') | None => false,
-            Some(_) => true,
-        }
+        // 'X'/'x' are both "dead"; modern kernels only emit 'X', but 2.6.33–3.13 emitted 'x'.
+        !matches!(rest.trim_start().chars().next(), Some('Z' | 'X' | 'x'))
     }
 
+    /// Poll until `pid` is gone, up to `timeout`. Returns whether it died.
+    ///
+    /// The re-check after the loop is deliberate: without it, a final nap that straddles the
+    /// deadline would report a failure for a process that died microseconds before the check.
     fn wait_until_dead(pid: i32, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -493,8 +591,11 @@ mod pdeathsig_tests {
         command
             .arg(HELPER_TEST)
             .arg("--exact")
+            // The entry point is `#[ignore]`d so a normal run can't execute it; opt in here.
+            .arg("--ignored")
             // Without `--nocapture` libtest buffers the helper's stdout until the test returns —
-            // which it never does — so the pid marker would never reach us.
+            // which it never does — so the pid marker would never reach us. (The immediacy comes
+            // from the explicit flush in `helper_simple`; `--nocapture` is what lets it out at all.)
             .arg("--nocapture")
             .arg("--test-threads=1")
             .env(MODE_ENV, mode)
@@ -511,6 +612,10 @@ mod pdeathsig_tests {
 
     /// Read the grandchild pid off the helper's stdout, bounded so a mis-filtered helper (which
     /// would exit having run zero tests) fails loudly instead of hanging the suite.
+    ///
+    /// The parsed value is validated before it can reach `KillOnDrop`: a truncated or absent
+    /// marker must never yield 0 or -1, which `kill` interprets as "the whole process group" and
+    /// "every process this user owns".
     fn read_grandchild_pid(helper: &mut StdChild) -> i32 {
         let stdout = helper.stdout.take().expect("helper stdout piped");
         let (tx, rx) = mpsc::channel();
@@ -535,7 +640,13 @@ mod pdeathsig_tests {
             }
         });
         match rx.recv_timeout(HANDSHAKE_TIMEOUT) {
-            Ok(pid) => pid.parse().expect("grandchild pid is an integer"),
+            Ok(pid) => {
+                let pid: i32 = pid
+                    .parse()
+                    .unwrap_or_else(|e| panic!("grandchild pid {pid:?} is not an integer: {e}"));
+                assert!(pid > 1, "implausible grandchild pid {pid} from the marker");
+                pid
+            }
             Err(e) => {
                 let _ = helper.kill();
                 panic!("helper never reported a grandchild pid ({e}); is {HELPER_TEST} still the right test path?");
@@ -543,15 +654,24 @@ mod pdeathsig_tests {
         }
     }
 
-    /// Kill the helper outright and reap it. SIGKILL is the point of the test: it guarantees the
-    /// helper executes no teardown, so `kill_on_drop` cannot be what cleans up the grandchild.
+    /// Kill the helper outright and reap it. SIGKILL is the premise of the whole suite: it
+    /// guarantees the helper executes no teardown, so `kill_on_drop` cannot be what cleans up the
+    /// grandchild.
+    ///
+    /// The exit status is checked for the **signal**, not merely for non-success: a helper that
+    /// panicked would also exit non-zero (libtest exit 101) — but a panic *unwinds*, running the
+    /// destructors this test exists to bypass. Accepting that would silently invalidate every
+    /// assertion downstream.
     fn sigkill_and_reap(helper: &mut StdChild) {
-        // SAFETY: `helper.id()` is a live child of this process until we wait on it below.
+        // SAFETY: plain `kill`. `helper` has not been waited on yet, so its pid is still reserved
+        // by the (possibly already-zombie) child and cannot have been recycled.
         unsafe { libc::kill(helper.id() as libc::pid_t, libc::SIGKILL) };
         let status = helper.wait().expect("reap helper");
-        assert!(
-            !status.success(),
-            "helper should have died from SIGKILL, not exited normally: {status:?}"
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "helper must have died from SIGKILL (running no teardown); got {status:?}"
         );
     }
 
@@ -562,7 +682,10 @@ mod pdeathsig_tests {
         fn new(tag: &str) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("otto-pdeathsig-{tag}-{}.pid", std::process::id()));
-            // A leftover from an earlier crashed run would otherwise be read as this run's pid.
+            // The name embeds this process's pid, so a leftover only collides if the test-binary
+            // pid was recycled — but `write_pid_raw` opens `O_EXCL`, so any leftover at all would
+            // fail the spawn. Clearing it up front keeps that from turning into a confusing
+            // handshake timeout.
             let _ = std::fs::remove_file(&path);
             Self(path)
         }
@@ -578,8 +701,11 @@ mod pdeathsig_tests {
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         while Instant::now() < deadline {
             if let Ok(bytes) = std::fs::read(path) {
-                if bytes.len() == 4 {
-                    return i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                if let Ok(raw) = <[u8; 4]>::try_from(bytes.as_slice()) {
+                    let pid = i32::from_ne_bytes(raw);
+                    // Same guard as `read_grandchild_pid`: 0 and -1 must never reach `kill`.
+                    assert!(pid > 1, "implausible grandchild pid {pid} in {path:?}");
+                    return pid;
                 }
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -590,9 +716,16 @@ mod pdeathsig_tests {
 
     // ---------------------------------------------------------------- the tests
 
-    /// Guards the two `--exact` filters above: if either entry point is renamed or moved, the
-    /// subprocess tests would silently run zero tests and hang until their handshake timeout.
-    /// This turns that into an instant, obvious failure.
+    /// Guards the two `--exact` filters above. Renaming or moving either entry point makes its
+    /// filter match zero tests, and each name then fails in its own confusing way — a stale
+    /// `HELPER_TEST` exits instantly with no marker (so `read_grandchild_pid` reports a channel
+    /// disconnect and blames the timeout it never hit), while a stale `SLEEPER_TEST` produces a
+    /// grandchild that exits immediately, so the guarded test trips its *pre-kill* liveness check
+    /// and both controls report "died on its own". This turns all of that into one obvious failure
+    /// naming the actual cause.
+    ///
+    /// Depends on libtest's `--list` format (`<name>: test`), which is not a stability guarantee;
+    /// if a toolchain bump changes it, this test fails loudly and this is the line to read.
     #[test]
     fn helper_test_names_resolve() {
         let exe = std::env::current_exe().expect("current_exe");
@@ -601,28 +734,68 @@ mod pdeathsig_tests {
                 .arg(name)
                 .arg("--exact")
                 .arg("--list")
+                // The entry points are `#[ignore]`d, so they only appear under `--ignored`.
+                .arg("--ignored")
                 .env_remove(MODE_ENV)
                 .env_remove(SLEEPER_ENV)
                 .output()
                 .expect("list tests");
             let listing = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                listing.contains(&format!("{name}: test")),
-                "`{name}` does not name a real test; --list said:\n{listing}"
+            let matches: Vec<_> = listing.lines().filter(|l| l.ends_with(": test")).collect();
+            assert_eq!(
+                matches,
+                vec![format!("{name}: test")],
+                "`{name}` must name exactly one real test; --list said:\n{listing}"
             );
         }
     }
 
+    /// Pins the one thing the subprocess tests structurally cannot reach: that **`boot()` actually
+    /// routes through `spawn_guarded`**.
+    ///
+    /// The tests below call `spawn_guarded` directly, because `boot()` opens a folder picker and
+    /// cannot run headless. That leaves a live regression path — inlining `command.spawn()` back
+    /// into `boot()` would re-open the Gate-E orphan bug with every other test still green. Reading
+    /// the source is a blunt instrument, but it is the only thing that fails on that specific
+    /// edit, and it is precise about which edit it objects to.
+    #[test]
+    fn boot_spawns_through_the_guarded_path() {
+        let source = include_str!("desktop_boot.rs");
+        let body = source
+            .split_once("pub async fn boot()")
+            .expect("boot() is still defined in this file")
+            .1
+            .split_once("\n}\n")
+            .expect("boot() has a closing brace at column 0")
+            .0;
+        assert!(
+            body.contains("spawn_guarded(&mut command)"),
+            "boot() no longer spawns the sidecar through spawn_guarded — the PR_SET_PDEATHSIG \
+             guard would be skipped, re-opening the Phase 0 Gate-E sidecar orphan bug"
+        );
+        assert!(
+            !body.contains("command.spawn()"),
+            "boot() spawns the sidecar directly, bypassing spawn_guarded and the \
+             PR_SET_PDEATHSIG guard"
+        );
+    }
+
     /// THE regression test: a sidecar spawned the way `boot()` spawns it must not survive a
     /// non-unwinding death of its parent. Fails if `install_pdeathsig` ever leaves the spawn path.
+    ///
+    /// The assertion is deliberately two-sided. A guard that killed the sidecar *eagerly* would
+    /// break the desktop app for every user while still satisfying "the grandchild died", so the
+    /// grandchild must first be shown to survive a normal `SURVIVAL_WINDOW` with its parent alive.
     #[test]
     fn guarded_child_dies_when_parent_is_sigkilled() {
         let mut helper = spawn_helper("guarded", None);
         let grandchild = read_grandchild_pid(&mut helper);
-        let _reaper = Reaper(grandchild);
+        let _killer = KillOnDrop::new(grandchild);
+        std::thread::sleep(SURVIVAL_WINDOW);
         assert!(
             process_is_live(grandchild),
-            "grandchild {grandchild} should be running before the parent is killed"
+            "guarded grandchild {grandchild} died while its parent was still alive — the guard \
+             must not kill the sidecar during normal operation"
         );
 
         sigkill_and_reap(&mut helper);
@@ -641,7 +814,7 @@ mod pdeathsig_tests {
     fn unguarded_child_survives_parent_sigkill() {
         let mut helper = spawn_helper("unguarded", None);
         let grandchild = read_grandchild_pid(&mut helper);
-        let _reaper = Reaper(grandchild);
+        let _killer = KillOnDrop::new(grandchild);
 
         sigkill_and_reap(&mut helper);
 
@@ -662,7 +835,7 @@ mod pdeathsig_tests {
         let pidfile = ScratchPath::new("race-guarded");
         let mut helper = spawn_helper("race-guarded", Some(&pidfile.0));
         let grandchild = read_pidfile(&pidfile.0, &mut helper);
-        let _reaper = Reaper(grandchild);
+        let _killer = KillOnDrop::new(grandchild);
 
         // Kill the parent while the child is still parked in `pre_exec`, before `prctl` runs.
         sigkill_and_reap(&mut helper);
@@ -681,7 +854,7 @@ mod pdeathsig_tests {
         let pidfile = ScratchPath::new("race-unguarded");
         let mut helper = spawn_helper("race-unguarded", Some(&pidfile.0));
         let grandchild = read_pidfile(&pidfile.0, &mut helper);
-        let _reaper = Reaper(grandchild);
+        let _killer = KillOnDrop::new(grandchild);
 
         sigkill_and_reap(&mut helper);
 
