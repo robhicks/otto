@@ -304,15 +304,40 @@ mod tests {
     /// a comment either** — prose counts, `include_str!` reads the whole file. The test below
     /// (`marker_occurs_exactly_once_in_this_file`) enforces that.
     pub(super) fn boot_body() -> &'static str {
-        let source = include_str!("desktop_boot.rs");
-        let marker = concat!("pub async fn ", "boot()");
-        source
-            .split_once(marker)
+        SOURCE
+            .split_once(BOOT_MARKER)
             .expect("boot() is still defined in this file")
             .1
             .split_once("\n}\n")
             .expect("boot() has a closing brace at column 0")
             .0
+    }
+
+    /// This file's own text. Both the slice and the uniqueness check below must read the *same*
+    /// bytes and search for the *same* marker, so both are defined once here rather than re-derived
+    /// per test: if a re-derived copy drifted, the uniqueness test could pass while checking a
+    /// string nobody slices on, leaving both guards quietly vacuous — the exact state this
+    /// machinery exists to prevent.
+    const SOURCE: &str = include_str!("desktop_boot.rs");
+    const BOOT_MARKER: &str = concat!("pub async fn ", "boot()");
+
+    /// `boot()`'s body with line comments removed, for the *negative* assertions in the guard below.
+    ///
+    /// Those assertions ban needles like `Command::new` from `boot()`'s body, and `boot_body()`
+    /// returns raw source — so a purely explanatory comment mentioning one would fail the test with
+    /// a message asserting the opposite of what the code does. Stripping comments makes the ban
+    /// apply to code only.
+    ///
+    /// The stripping is deliberately naive (truncate each line at the first `//`), which also cuts
+    /// string literals containing `//` — `boot()`'s `"ws://…"` becomes `"ws:`. That is fine *for the
+    /// negative assertions*, whose needles never appear inside a string literal, and it is why the
+    /// positive assertions keep reading the full `boot_body()` instead.
+    fn boot_code_without_comments() -> String {
+        boot_body()
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Makes `boot_body()`'s marker-uniqueness property a checked invariant instead of a convention.
@@ -325,10 +350,8 @@ mod tests {
     /// prose) rather than relaxing the assertion — the guards silently stop guarding otherwise.
     #[test]
     fn marker_occurs_exactly_once_in_this_file() {
-        let source = include_str!("desktop_boot.rs");
-        let marker = concat!("pub async fn ", "boot()");
         assert_eq!(
-            source.matches(marker).count(),
+            SOURCE.matches(BOOT_MARKER).count(),
             1,
             "the boot() source-slice marker must appear exactly once (its real definition); \
              another occurrence makes `split_once` able to re-target the slice, which would let \
@@ -435,20 +458,25 @@ mod tests {
              --approve-edits/--promote-loopback capability flags asserted above would not reach \
              the spawned sidecar"
         );
+        // Names the const rather than a particular interpolation spelling: `{SIDECAR_PORT}`,
+        // `{}`-with-an-argument, and a helper taking the const are all equally correct, and only a
+        // literal port (which cannot name it) is the regression worth failing on.
         assert!(
-            !body.contains("Command::new"),
+            body.contains("SIDECAR_PORT"),
+            "boot() no longer derives the connect URL from SIDECAR_PORT — the port it tells the \
+             webview to connect to can now drift from the one it spawns the sidecar on"
+        );
+        // Code only — see `boot_code_without_comments` for why a comment must not trip these.
+        let code = boot_code_without_comments();
+        assert!(
+            !code.contains("Command::new"),
             "boot() constructs its own Command instead of using serve_command's — the capability \
              flags asserted above would not reach the spawned sidecar"
         );
         assert!(
-            !body.contains(".arg("),
+            !code.contains(".arg("),
             "boot() adds arguments to the sidecar argv after serve_command built it, so the argv \
              asserted above is not the one that gets spawned"
-        );
-        assert!(
-            body.contains("{SIDECAR_PORT}"),
-            "boot() no longer derives the connect URL from SIDECAR_PORT — the port it tells the \
-             webview to connect to can now drift from the one it spawns the sidecar on"
         );
     }
 
@@ -460,9 +488,15 @@ mod tests {
     /// `otto serve` takes longer than `FALLBACK_GRACE` to bind.
     ///
     /// `std::process::Command` exposes no getter for its stdio configuration, so the only way to
-    /// observe it is to spawn something and look at the handle. `/bin/sh` stands in for `otto`: it
-    /// rejects the `serve` argv immediately and exits, which is all this needs — the assertion is
-    /// about the pipe, not the process. Unix-gated for `/bin/sh`.
+    /// observe it is to spawn something and look at the handle. `/bin/echo` stands in for `otto`: it
+    /// prints the `serve …` argv and exits 0, which is all this needs — the assertion is about the
+    /// pipe, not the process.
+    ///
+    /// `/bin/echo` specifically, not `/bin/sh`: `serve_command` hardcodes `serve` as argv[1], so
+    /// `sh` would try to *execute a script named `serve`* relative to the test's working directory.
+    /// None exists today (so `sh` exits 127 and the test is correct either way), but if one ever
+    /// appeared it would be run with `OTTO_TOKEN` set. `echo` never interprets an argument as a path.
+    /// Unix-gated for the absolute binary path.
     #[test]
     #[cfg(unix)]
     fn serve_command_pipes_stderr_so_readiness_detection_works() {
@@ -472,8 +506,8 @@ mod tests {
             .build()
             .expect("build test runtime");
         rt.block_on(async {
-            let mut command = serve_command("/bin/sh", Path::new("/tmp"), "tok");
-            let mut child = spawn_guarded(&mut command).expect("spawn /bin/sh stand-in");
+            let mut command = serve_command("/bin/echo", Path::new("/tmp"), "tok");
+            let mut child = spawn_guarded(&mut command).expect("spawn /bin/echo stand-in");
             assert!(
                 child.stderr.is_some(),
                 "sidecar stderr is not piped — wait_for_ready cannot see otto serve's readiness \
