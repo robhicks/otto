@@ -3,8 +3,9 @@
 //! The desktop build highlights with native tree-sitter (`highlight_native`), which cannot be
 //! reused here — tree-sitter's grammars are C built through `cc-rs`, and `wasm32-unknown-unknown`
 //! ships no libc, so they fail to compile for the web target. The wasm-capable alternatives were
-//! measured and rejected on bundle size (arborium +5.27 MB, syntect +1.50 MB, against a 2.54 MB
-//! app). See `docs/superpowers/specs/2026-07-24-ui-dioxus-web-highlighting-design.md`.
+//! measured and rejected on bundle size — arborium +5.27 MB, syntect +1.50 MB, against a whole
+//! optimized app bundle under 800 KB; this lexer costs +12 KB. See
+//! `docs/superpowers/specs/2026-07-24-ui-dioxus-web-highlighting-design.md`.
 //!
 //! What makes a lexer sufficient: the shared token model has only five classes, and
 //! `highlight_native` already collapses tree-sitter's full capture vocabulary down to those same

@@ -76,7 +76,7 @@ pub fn Editor(
             // `style.css` serves both. They differ only in fidelity: desktop classifies with native
             // tree-sitter, while web uses a dependency-free lexer because tree-sitter's C grammars
             // cannot build for `wasm32-unknown-unknown` and every wasm-capable alternative measured
-            // at +1.5 MB or worse on a 2.54 MB bundle. See
+            // at +1.5 MB or worse against a sub-800 KB bundle. See
             // docs/superpowers/specs/2026-07-24-ui-dioxus-web-highlighting-design.md.
             #[cfg(feature = "desktop")]
             let spans = {

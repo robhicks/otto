@@ -24,11 +24,10 @@ size-optimized profile (`opt-level = "z"`, `lto = true`, `codegen-units = 1`, `p
 `strip = true`), and its `.wasm` compared against an empty control crate built the same way. The
 control is **117 bytes**, so the reported figure is effectively the candidate's whole cost.
 
-Reference point for judging those numbers: `ui-dioxus`'s own release wasm today is **2,537,702
-bytes** (`cargo build --release --target wasm32-unknown-unknown --features web`). That figure is
-pre-`wasm-opt`; a sibling Phase 1 item is fixing the `wasm-opt` crash separately, so no claim here
-depends on the optimized number — the *deltas* are what matter and they are measured on the same
-footing.
+Reference point for judging those numbers: `ui-dioxus`'s shipped, `wasm-opt`-optimized web bundle
+is **797,362 bytes** of wasm (318,315 gzipped), measured with
+`ui-dioxus/scripts/measure-web-bundle.sh`. A megabyte-scale addition would therefore not be a
+regrettable increment — it would make the highlighter larger than the entire application.
 
 ## Options considered
 
@@ -80,12 +79,12 @@ give web genuine AST-accurate highlighting.
 | `arborium` + rust only | 3,008,459 |
 | `arborium` + rust/js/ts/python/go | **5,524,663** |
 
-That is **+5.27 MB** on a 2.54 MB application — the highlighter would be more than twice the size of
-everything else in the app combined. And trimming the language set is not a fix: a *single*-grammar
-build still costs +3.00 MB, because the runtime, the bundled sysroot and the regex engine are a
-fixed floor before any grammar is added, with each additional grammar's parse tables layered on top.
-Even a Rust-only web editor would more than double the bundle. No amount of correctness justifies
-that for a read-mostly code viewer.
+That is **+5.27 MB** on an application whose whole optimized bundle is under 800 KB — the
+highlighter would be roughly seven times the size of everything else combined. And trimming the
+language set is not a fix: a *single*-grammar build still costs +3.00 MB, because the runtime, the
+bundled sysroot and the regex engine are a fixed floor before any grammar is added, with each
+additional grammar's parse tables layered on top. Even a Rust-only web editor would be dominated by
+its highlighter. No amount of correctness justifies that for a read-mostly code viewer.
 
 ### D. A pure-Rust regex/lexer highlighter (e.g. a `syntect` subset)
 
@@ -97,7 +96,7 @@ that for a read-mostly code viewer.
 | empty control | 117 |
 | `syntect` (default-syntaxes, default-themes, regex-fancy) | **1,498,268** |
 
-**+1.50 MB, a 59% increase** on the current bundle, almost all of it the embedded Sublime syntax
+**+1.50 MB — nearly twice the entire current bundle**, almost all of it the embedded Sublime syntax
 dumps for ~100 languages we do not need. Trimming to five hand-picked syntax definitions is possible
 in principle but means vendoring and maintaining `.sublime-syntax` assets, and syntect's scope model
 would still have to be collapsed down to our five classes — so the remaining cost buys accuracy we
@@ -117,8 +116,8 @@ structural fidelity that `class_for` throws away one function later.
 
 A per-language lexer answers those five questions directly, with **zero new dependencies**:
 
-- **Size:** measured at **+8,624 bytes** on the release wasm (see "Measured result" below) —
-  0.34% of the bundle, against +59% for syntect and +218% for arborium.
+- **Size:** measured at **+12,168 bytes** on the shipped optimized bundle (+6,260 gzipped) — see
+  "Measured result" below. Roughly 1/120th of syntect's cost and 1/450th of arborium's.
 - **Shares the existing seam exactly.** It emits the same `class_per_byte` map that
   `highlight_native` builds and hands it to the same `tokens::segment_lines`, so both targets
   converge on identical `Vec<Vec<Span>>` construction, the same class vocabulary, and one
@@ -132,10 +131,12 @@ A per-language lexer answers those five questions directly, with **zero new depe
 structural. Concretely, `tok-type` is assigned by convention (known primitive/builtin type names,
 plus identifiers beginning with an uppercase letter) rather than by resolving a type position, so a
 constant like `MAX_LEN` is coloured as a type and a lowercase type alias is not. JS regex literals
-are not distinguished from division and are left plain rather than risk a runaway string. This is
-the standard accuracy floor of lightweight editor highlighting, it is bounded and local (a wrong
-colour on one token, never a runaway highlight state), and it is the correct trade for a diff-first
-editor whose stated non-goal is VSCode-scale features.
+are not distinguished from division and are left plain rather than risk a runaway string — though a
+backslash outside a literal is still consumed with the character it escapes, so an escaped slash in
+`split(/\//)` cannot pair with the regex's closing slash to open a spurious comment. This is the
+standard accuracy floor of lightweight editor highlighting, it is bounded and local (a wrong colour
+on one token, never a runaway highlight state), and it is the correct trade for a diff-first editor
+whose stated non-goal is VSCode-scale features.
 
 **Desktop is untouched.** The native tree-sitter path remains the higher-fidelity backend on the
 target that can afford it; the deliberate asymmetry is now one of *fidelity*, not of *capability*,
@@ -158,20 +159,23 @@ Two notes on how it is wired:
 
 ## Measured result
 
-A controlled A/B on base `35545d2` — same toolchain, same profile, only this change differing:
+Measured on the **shipped** bundle via `ui-dioxus/scripts/measure-web-bundle.sh`, the sanctioned
+tool that runs the full `dx` pipeline including `wasm-opt` and refuses to report a figure it can't
+trust. A controlled A/B against `origin/main` at `c17a70a` — which already carries the `wasm-opt`
+crash fix, so these are genuinely optimized numbers, not the old unoptimized ones:
 
-| build | `.wasm` bytes | delta |
+| build | `.wasm` raw | gzip -9 |
 |---|---|---|
-| `--release --target wasm32-unknown-unknown --features web`, before | 2,537,702 | — |
-| same, after | 2,546,326 | **+8,624 (+0.34%)** |
+| `origin/main` (no web highlighting) | 797,362 | 318,315 |
+| this branch | 809,530 | 324,575 |
+| **delta** | **+12,168 (+1.53%)** | **+6,260 (+1.97%)** |
 
-(The branch was later rebased onto `8fc7d07`, which adds the editor dirty marker, so the current
-absolute figure is 2,554,269. The +8,624 above is the isolated cost of *this* change and is the
-number to quote; the absolute total moves with whatever else lands.)
+Twelve kilobytes, gzipping to six, to highlight five languages in the browser.
 
-For comparison at the same 2.54 MB base: arborium would have been +5,524,546 (**+218%**), syntect
-+1,498,151 (**+59%**). Highlighting five languages on the web target therefore costs about
-1/600th of what the next-cheapest working option would have.
+For scale against the rejected options, whose costs were measured as standalone
+`wasm32-unknown-unknown` cdylibs under a size-optimized profile (empty control = 117 bytes):
+arborium would have added **+5,524,546** and syntect **+1,498,151** — respectively ~450× and ~120×
+this lexer's cost, on an app whose entire optimized bundle is under 800 KB.
 
 ### An asymmetry the pinning test surfaced
 
@@ -182,6 +186,20 @@ Writing the desktop no-regression pin turned up something worth recording: `tree
 the desktop path's fidelity is bounded by each grammar's shipped highlights query, not by
 tree-sitter itself. Both behaviours are now pinned by tests
 (`highlight_native::tests::desktop_output_is_pinned_for_a_fixed_input`).
+
+## Known characteristic: cost scales with buffer size, not edit size
+
+The editor re-lexes the **whole buffer on every keystroke** — the render body calls `highlight` on
+`buf` unconditionally — and then rebuilds the full `Vec<Vec<Span>>` and lets Dioxus diff the line
+nodes. Measured at roughly 140 ns/byte, which at the editor's `MAX_EDITABLE_BYTES` cap of 512 KB is
+tens of milliseconds per keystroke, before wasm's slowdown and before the DOM diff.
+
+Recorded rather than fixed, for two reasons: the desktop tree-sitter path has exactly the same
+shape and already ships, so this is not a regression this change introduces; and the obvious
+mitigations (incremental re-lex from the edit point, or falling back to `plain_spans` above a size
+threshold) are behaviour decisions that deserve their own design pass rather than being smuggled in
+here. Worth measuring against a real large file before deciding it needs one — most files in a
+source tree are three orders of magnitude below the cap.
 
 ## Revisiting this
 
