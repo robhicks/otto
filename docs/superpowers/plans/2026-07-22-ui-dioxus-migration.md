@@ -50,10 +50,43 @@ sidecar on close, on a real session. Only then does Phase 1 begin.
 
 Independent fixes, each shippable on its own, no cutover risk. Each needs a test and a commit.
 
-- [ ] **Fix the `wasm-opt` crash.** Dioxus's build ships unoptimized wasm (SIGABRT/DWARF crash in
+- [x] **Fix the `wasm-opt` crash.** ~~Dioxus's build ships unoptimized wasm (SIGABRT/DWARF crash in
       `wasm-opt` on this toolchain) — the web bundle is ~2.16 MB unoptimized vs a fair optimized target.
       Diagnose (DWARF version mismatch is the likely cause) and get `wasm-opt` running, then re-measure
-      bundle size for a fair figure. **Gates any bundle-size claim.**
+      bundle size for a fair figure.~~ **Gates any bundle-size claim — now unblocked.**
+      **Root cause:** not a DWARF *version* mismatch. The `wasm-release` cargo profile dx uses for
+      release web builds emitted ~1.24 MB of DWARF-4 sections, and dx then ran
+      `wasm-opt … -Oz --debuginfo`. `--debuginfo` makes dx's bundled binaryen (reports "version 127")
+      parse that DWARF, and it aborts with `compile unit size was incorrect (this may be an
+      unsupported version of DWARF)` → SIGABRT. `dx` logs that and **still exits 0**, copying the
+      unoptimized wasm through — a silent failure.
+      **Fix:** `[profile.wasm-release]` in `ui-dioxus/Cargo.toml` — `strip = "debuginfo"` drops the
+      DWARF before wasm-opt sees it, plus `opt-level = "s"` because dx only injects its own
+      `inherits`/`opt-level` when the manifest does *not* define the profile, so defining it would
+      otherwise have silently dropped the build to `release`'s `opt-level = 3` (a ~92 KB regression).
+      `debug = false` is deliberately **not** used: it does not work here (A/B verified — the profile
+      already resolves to `debug = false` and the DWARF appears anyway).
+      **Measured** with `ui-dioxus/scripts/measure-web-bundle.sh` (wipes `target/dx`, then fails
+      rather than print a figure if wasm-opt errored, if DWARF survives, or if the wasm blows a size
+      ceiling; prints raw + `gzip -9` bytes):
+
+      | Artifact | Before (raw / gzip) | After (raw / gzip) |
+      |---|---|---|
+      | `otto-ui-dioxus_bg…wasm` | 2,164,985 / 571,929 | **795,188 / 318,320** |
+      | `otto-ui-dioxus…js` | 59,927 / — | 59,927 / 13,960 |
+      | `style…css` | 3,021 / — | 3,021 / 1,125 |
+      | **total** | 2,227,933 / — | **858,136 / 333,405** |
+
+      wasm raw **−63.3%**, gzip **−44.4%**; the bundle drops 2.23 MB → 0.86 MB raw (decimal MB
+      throughout). Both columns come from the same tree differing only by this fix, and the same
+      command, so the delta is attributable to the fix alone. The JS shim and CSS are unchanged in
+      raw size (their pre-fix gzip figures were not captured, hence the dashes). Nothing was tuned
+      for size beyond making wasm-opt actually run: wasm-opt's `-Oz` and rustc's `opt-level = "s"`
+      are both dx's own defaults.
+      **Phase 3 should re-run the script rather than quote these bytes.** They are a point-in-time
+      A/B of *this* fix, not a standing figure — every other Phase 1 item moves it. Already true by
+      the time this landed: rebased onto the dirty-marker item, the same command measures
+      797,380 / 318,370.
 - [ ] **Close the web syntax-highlighting gap** (spike #1's deferred Task 12). The Dioxus web editor
       renders plain text; desktop highlights via native tree-sitter. Options (own mini-design):
       `web-tree-sitter` wasm via JS interop, or a lighter web highlighter. Reaching "one codebase, one
