@@ -22,6 +22,11 @@ tokio = { workspace = true, features = ["time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { workspace = true }
 
+# `proc_guard`'s PR_SET_PDEATHSIG guard (prctl/getppid/raise) and its tests' kill(2). Linux-only —
+# the guard is a no-op elsewhere, so no other target needs the dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = "0.6"

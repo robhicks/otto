@@ -10,6 +10,11 @@ mod firecracker;
 #[cfg(feature = "firecracker")]
 pub use firecracker::FirecrackerProvisioner;
 
+// Compiled unconditionally, though only the (default-off) `firecracker` feature has a caller: the
+// guard is the kind of code that must not rot unnoticed behind a feature flag nobody builds, so its
+// tests run on every `cargo test --workspace`.
+mod proc_guard;
+
 mod fly;
 pub use fly::{FlyConfig, FlyTarget};
 
