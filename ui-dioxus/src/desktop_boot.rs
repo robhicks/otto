@@ -463,8 +463,14 @@ mod pdeathsig_tests {
 
     /// `CLOCK_MONOTONIC` seconds. Async-signal-safe, allocation-free — usable inside `pre_exec`.
     ///
+    /// The return code is ignored because `clock_gettime(CLOCK_MONOTONIC, …)` cannot fail on Linux
+    /// (it is a vDSO call with a valid clock id and a valid pointer). If it somehow did, `ts` stays
+    /// zeroed and the caller's deadline never trips — the wait would then be bounded only by the
+    /// parent's death, which is the expected path anyway, so the failure mode is a lost backstop
+    /// rather than a hang or a wrong answer.
+    ///
     /// # Safety
-    /// None beyond the `clock_gettime` call itself, which cannot fail for `CLOCK_MONOTONIC`.
+    /// None beyond the `clock_gettime` call itself.
     unsafe fn monotonic_secs() -> libc::time_t {
         let mut ts = libc::timespec {
             tv_sec: 0,
@@ -533,15 +539,23 @@ mod pdeathsig_tests {
         }
     }
 
-    /// True when `pid` is still the grandchild we spawned, rather than a recycled pid.
+    /// True when `pid` is still a process this suite created, rather than a recycled pid.
     ///
-    /// `/proc/<pid>/cmdline` is NUL-separated argv; our sleeper was exec'd with the sleeper test
-    /// name as its first argument, which no unrelated process on the machine will carry.
+    /// `/proc/<pid>/cmdline` is NUL-separated argv. **Both** entry-point names are accepted, and
+    /// the second is not redundant: in the race scenario the child is killed (or parked) inside
+    /// `pre_exec` and never execs, so until exec it still shows the *helper's* inherited argv
+    /// (`HELPER_TEST`), not the sleeper's. Matching only `SLEEPER_TEST` would make the killer a
+    /// no-op for a child caught in that window — which is exactly when a red run needs it, since
+    /// such a child goes on to exec and become a 120-second orphan.
+    ///
+    /// Either name is unique to this test binary, so neither can match an unrelated process; the
+    /// pid-recycling protection this exists for is unaffected by accepting both.
     fn is_our_sleeper(pid: i32) -> bool {
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             return false;
         };
-        String::from_utf8_lossy(&cmdline).contains(SLEEPER_TEST)
+        let cmdline = String::from_utf8_lossy(&cmdline);
+        cmdline.contains(SLEEPER_TEST) || cmdline.contains(HELPER_TEST)
     }
 
     /// True while `pid` names a process that has not yet died.
@@ -685,8 +699,13 @@ mod pdeathsig_tests {
             // The name embeds this process's pid, so a leftover only collides if the test-binary
             // pid was recycled — but `write_pid_raw` opens `O_EXCL`, so any leftover at all would
             // fail the spawn. Clearing it up front keeps that from turning into a confusing
-            // handshake timeout.
-            let _ = std::fs::remove_file(&path);
+            // handshake timeout — and if the removal itself fails, say so *here* rather than
+            // letting it resurface 30 seconds later as "the helper never published a pid".
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("cannot clear stale handshake file {path:?}: {e}"),
+            }
             Self(path)
         }
     }
@@ -758,6 +777,13 @@ mod pdeathsig_tests {
     /// into `boot()` would re-open the Gate-E orphan bug with every other test still green. Reading
     /// the source is a blunt instrument, but it is the only thing that fails on that specific
     /// edit, and it is precise about which edit it objects to.
+    ///
+    /// Two limits, both fail-safe. The positive assertion is the load-bearing one: the negative is
+    /// evadable by reformatting (`command\n.spawn()`, renaming the local), so treat it as a nudge,
+    /// not a barrier. And this slices a file containing the test's own marker literals — if
+    /// `boot()` were ever moved *below* this module the first marker would latch onto the literal
+    /// here, but the resulting body then contains `command.spawn()` and the test fails rather than
+    /// passing.
     #[test]
     fn boot_spawns_through_the_guarded_path() {
         let source = include_str!("desktop_boot.rs");
