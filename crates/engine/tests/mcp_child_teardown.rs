@@ -8,10 +8,16 @@
 //! not `tokio`'s `kill_on_drop`, not rmcp's `ChildWithCleanup::drop` (which is weaker still — it
 //! defers the kill to a `tokio::spawn`ed task that a dying process will never poll).
 //!
-//! What actually reaps the tree is **stdio pipe EOF**. Every long-lived child otto spawns is a
+//! What reaps the top of the tree is **stdio pipe EOF**. Every long-lived child otto spawns is a
 //! stdio server holding a pipe to its parent; when the parent dies by any means the pipe closes,
 //! the child reads EOF, and its serve loop exits. That cascades: `otto serve` → `mcp-lsp` →
 //! `rust-analyzer` all collapse in order.
+//!
+//! Below the first hop the two guards overlap: `mcp-lsp` ends its own EOF-driven shutdown by
+//! *returning* from `main`, which does run destructors, so its `kill_on_drop` handle would also fire
+//! there. These tests deliberately assert the **observable** (the whole chain is gone) rather than
+//! attributing it to one mechanism — the point is that the tree collapses even at the top, where
+//! `SIGKILL` provably rules every destructor out.
 //!
 //! That property is **load-bearing but implicit** — it is a consequence of choosing stdio
 //! transports, not something any code asserts. rmcp also offers HTTP/SSE transports, and a server
@@ -33,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -258,6 +265,23 @@ fn descendants(root: i32) -> Vec<(i32, String)> {
     out
 }
 
+/// Assert every tracked child is alive *right now*, immediately before the parent is killed.
+///
+/// The snapshot that produced `kids` only proves they existed at handshake time. Without this, a
+/// child that had already exited on its own — a crashed `mcp-fs`, a `rust-analyzer` that gave up —
+/// would sail through the death assertions afterwards and the scenario would confirm nothing. The
+/// death check is only meaningful as the second half of a live→dead transition, which is why
+/// `ui-dioxus`'s equivalent is likewise two-sided.
+fn assert_all_live_before_kill(kids: &[(i32, String)]) {
+    for (pid, comm) in kids {
+        assert!(
+            process_is_live(*pid),
+            "{comm} (pid {pid}) was already dead before the parent was killed, so the death \
+             assertion that follows would pass without proving anything about teardown"
+        );
+    }
+}
+
 /// Poll until `pid` is gone, up to `timeout`. Returns whether it died.
 ///
 /// The re-check after the loop is deliberate: without it, a final nap that straddles the deadline
@@ -277,18 +301,48 @@ fn wait_until_dead(pid: i32, timeout: Duration) -> bool {
 /// out its self-cap.
 ///
 /// Kills, never reaps: these are not this process's children, so they can never be `wait()`ed on
-/// here — which is why a pid could in principle be **recycled** before the kill lands. The
-/// `pid > 1` floor matters independently of that: `kill(0, …)` signals this whole process group and
+/// here — which is exactly why a pid can be **recycled** once whatever inherited it does the
+/// reaping. A liveness check alone does not close that: the pid would still look alive, just as
+/// somebody else. So each pid is re-identified against the `comm` recorded when the tree was
+/// snapshotted, immediately before signalling. `ui-dioxus/src/desktop_boot.rs`'s `KillOnDrop` learned
+/// this the same way (its `is_our_sleeper` check); dropping it here would reintroduce a fixed bug.
+///
+/// The `pid > 1` floor matters independently: `kill(0, …)` signals this whole process group and
 /// `kill(-1, …)` every process the user owns, so an implausible pid must never reach `kill`.
-struct ReapOnDrop(Vec<i32>);
+///
+/// `comm` is compared against `/proc/<pid>/comm`, the same 15-char-truncated field `process_table`
+/// read it from, so the two always agree on truncation.
+struct ReapOnDrop(Vec<(i32, String)>);
+
+impl ReapOnDrop {
+    /// Track every descendant in `kids`, recording the name each pid had when it was seen.
+    fn new(kids: &[(i32, String)]) -> Self {
+        Self(kids.to_vec())
+    }
+}
+
 impl Drop for ReapOnDrop {
     fn drop(&mut self) {
-        for &pid in &self.0 {
-            if pid > 1 && process_is_live(pid) {
-                // SAFETY: plain `kill(2)` with a validated positive pid.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
+        for (pid, comm) in &self.0 {
+            if *pid > 1 && still_named(*pid, comm) {
+                // SAFETY: plain `kill(2)`; the pid was just re-identified as the process we
+                // recorded, and validated positive so it cannot be a group/broadcast target.
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
             }
         }
+    }
+}
+
+/// True when `pid` is still the process that was recorded under `comm` — i.e. live, and not a
+/// recycled pid now belonging to something else.
+fn still_named(pid: i32, comm: &str) -> bool {
+    if !process_is_live(pid) {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(current) => current.trim_end() == comm,
+        // Vanished between the two reads, or unreadable — either way, do not signal it.
+        Err(_) => false,
     }
 }
 
@@ -309,9 +363,23 @@ impl Holder {
 
     /// `SIGKILL` the holder and reap it — precisely the signal, and the abruptness, that the
     /// desktop `PR_SET_PDEATHSIG` guard delivers to `otto serve`.
+    ///
+    /// Asserting the exit was *by `SIGKILL`* is the load-bearing part, not a formality. If the
+    /// holder had already died on its own — a panic in the subprocess role exits 101, and a panic
+    /// **unwinds**, running the `Drop` impls (rmcp's `ChildWithCleanup`, tokio's `kill_on_drop`)
+    /// that this whole file exists to bypass — then its children would die for the wrong reason and
+    /// every death assertion below would pass while proving nothing. `ui-dioxus`'s
+    /// `sigkill_and_reap` was corrected to this same check for this same reason; `!success()` is
+    /// not enough, because exit-101 satisfies that too.
     fn hard_kill(&mut self) {
         self.0.kill().expect("SIGKILL holder");
-        self.0.wait().expect("reap holder");
+        let status = self.0.wait().expect("reap holder");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "holder did not die by SIGKILL (status {status:?}) — it exited on its own first, so \
+             its destructors ran and any child death below proves nothing about hard-kill teardown"
+        );
     }
 }
 
@@ -360,7 +428,12 @@ fn start_holder(mode: &str, bin: &str, root: &str) -> (Holder, Vec<(i32, String)
 
     let holder = Holder(holder);
     if rx.recv_timeout(HANDSHAKE_TIMEOUT).is_err() {
-        // `holder` drops here, killing it.
+        // A timed-out holder may already have spawned children (a cold `rust-analyzer` is the slow
+        // case this timeout exists for). Reap them explicitly rather than leaving it to the EOF
+        // cascade — relying on the property under test to clean up after its own failed setup would
+        // be circular, and a stranded `rust-analyzer` can hold hundreds of MB.
+        let _reaper = ReapOnDrop::new(&descendants(holder.pid()));
+        // `holder` drops here too, killing it.
         panic!("holder ({mode}) never signalled readiness within {HANDSHAKE_TIMEOUT:?}");
     }
 
@@ -432,7 +505,7 @@ fn mcp_server_dies_when_parent_is_hard_killed() {
         bin.to_str().expect("utf-8 bin path"),
         root.path().to_str().expect("utf-8 root"),
     );
-    let _reaper = ReapOnDrop(kids.iter().map(|(pid, _)| *pid).collect());
+    let _reaper = ReapOnDrop::new(&kids);
 
     assert!(
         kids.iter().any(|(_, comm)| comm.contains("mcp-fs")),
@@ -440,6 +513,7 @@ fn mcp_server_dies_when_parent_is_hard_killed() {
          Descendants: {kids:?}"
     );
 
+    assert_all_live_before_kill(&kids);
     holder.hard_kill();
 
     for (pid, comm) in &kids {
@@ -472,7 +546,7 @@ fn language_server_grandchild_dies_when_parent_is_hard_killed() {
         bin.to_str().expect("utf-8 bin path"),
         fixture.path().to_str().expect("utf-8 root"),
     );
-    let _reaper = ReapOnDrop(kids.iter().map(|(pid, _)| *pid).collect());
+    let _reaper = ReapOnDrop::new(&kids);
 
     assert!(
         kids.iter().any(|(_, comm)| comm.contains("rust-analyz")),
@@ -480,6 +554,7 @@ fn language_server_grandchild_dies_when_parent_is_hard_killed() {
          Descendants: {kids:?}"
     );
 
+    assert_all_live_before_kill(&kids);
     holder.hard_kill();
 
     for (pid, comm) in &kids {
@@ -503,13 +578,14 @@ fn control_child_ignoring_stdin_eof_survives_hard_kill() {
     // Same harness, same signal as the scenarios above — the only variable is that this child never
     // reads the pipe it holds. `bin`/`root` are unused by the control role.
     let (mut holder, kids) = start_holder("control", "", "");
-    let _reaper = ReapOnDrop(kids.iter().map(|(pid, _)| *pid).collect());
+    let _reaper = ReapOnDrop::new(&kids);
     let sleeper = kids
         .iter()
         .map(|(pid, _)| *pid)
         .next()
         .expect("control holder spawned no child");
 
+    assert_all_live_before_kill(&kids);
     holder.hard_kill();
 
     // Give it at least as long as a real cascade would have taken to kill it.
