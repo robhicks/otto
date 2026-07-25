@@ -68,7 +68,7 @@ pub fn App() -> Element {
     // Unsaved-buffer marker state. Owned here (not inside `Editor`) so it survives the component's
     // re-render on open and is cleared from the file-open flow, matching `ui/src/app.rs`'s
     // app-level `editor_dirty` RwSignal.
-    let mut editor_dirty = use_signal(DirtyState::default);
+    let mut editor_dirty = use_signal(DirtyState::clean);
 
     let mut do_connect = move || {
         let base = url.read().clone();

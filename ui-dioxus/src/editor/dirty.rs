@@ -1,8 +1,8 @@
-//! Unsaved-buffer ("dirty") state for the editor, as a pure value type.
+//! Unsaved-buffer ("dirty") state for the editor: a pure value type plus the tests that pin both
+//! its semantics and the rendered marker.
 //!
-//! Kept out of `editor/mod.rs` so the semantics are unit-testable without a rendered component
-//! (this crate has no headless Dioxus render harness — every other test here is likewise a pure
-//! host-side test).
+//! Kept out of `editor/mod.rs` so the semantics are testable as plain values, and so the concurrent
+//! highlighting work in that file stays conflict-free.
 
 /// Whether the open file's local buffer has unsaved edits.
 ///
@@ -18,7 +18,7 @@
 ///   incumbent's behavior and this port keeps it. A content-comparing "truly modified" check would
 ///   be a deliberate behavior change, and buffer persistence — the feature that would make the
 ///   distinction observable — is out of scope here exactly as it is in `ui/`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirtyState {
     dirty: bool,
 }
@@ -43,7 +43,7 @@ impl DirtyState {
     /// The marker appended to the open file's path label — `" ●"` when dirty, empty when clean.
     /// Matches `ui/`'s `if dirty.get() { " ●" } else { "" }` byte for byte.
     pub fn marker(self) -> &'static str {
-        if self.dirty {
+        if self.is_dirty() {
             " ●"
         } else {
             ""
@@ -60,8 +60,6 @@ mod tests {
         let state = DirtyState::clean();
         assert!(!state.is_dirty());
         assert_eq!(state.marker(), "");
-        // `Default` must agree with `clean()` — app.rs seeds the signal via `DirtyState::default`.
-        assert_eq!(DirtyState::default(), state);
     }
 
     #[test]
@@ -84,11 +82,68 @@ mod tests {
     }
 
     #[test]
-    fn opening_another_file_clears_a_dirty_buffer() {
+    fn clean_is_the_only_way_back_from_dirty() {
+        // `mark_edited` has no inverse — the ONLY un-latch is app.rs replacing the whole value
+        // with `DirtyState::clean()` from the file-open flow (`app.rs`'s `open_path`).
         let mut state = DirtyState::clean();
         state.mark_edited();
-        state = DirtyState::clean(); // app.rs resets on every successful open
-        assert!(!state.is_dirty());
-        assert_eq!(state.marker(), "");
+        assert_eq!(DirtyState::clean(), DirtyState::clean());
+        assert_ne!(state, DirtyState::clean());
+    }
+}
+
+/// Headless render tests for the wiring — the value type above can't prove the marker actually
+/// reaches the DOM, which is the regression this slice fixes (the Dioxus editor rendered no marker
+/// at all). Mounts the real `Editor` in a `VirtualDom` with no renderer and asserts on the
+/// server-rendered markup.
+#[cfg(test)]
+mod render_tests {
+    use super::DirtyState;
+    use crate::editor::Editor;
+    use crate::net::tree::FileBody;
+    use dioxus::prelude::*;
+    use std::path::PathBuf;
+
+    const PATH: &str = "src/lib.rs";
+    const BODY: &str = "fn main() {}";
+
+    /// Owns the signals `Editor` takes as props — they must be created inside a reactive scope,
+    /// so the test can't build them directly.
+    #[component]
+    fn Harness(dirty: DirtyState) -> Element {
+        let open = use_signal(|| Some((PathBuf::from(PATH), FileBody::Text(BODY.to_string()))));
+        let seed = use_signal(|| BODY.to_string());
+        let dirty = use_signal(|| dirty);
+        rsx! { Editor { open, seed, dirty } }
+    }
+
+    fn render(dirty: DirtyState) -> String {
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { dirty });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn clean_buffer_renders_the_path_with_no_marker() {
+        let html = render(DirtyState::clean());
+        assert!(html.contains(PATH), "path label missing: {html}");
+        assert!(
+            !html.contains('●'),
+            "clean buffer must not show a marker: {html}"
+        );
+    }
+
+    #[test]
+    fn dirty_buffer_renders_the_marker_after_the_path() {
+        let mut state = DirtyState::clean();
+        state.mark_edited();
+        let html = render(state);
+        // The marker is appended into the existing `.editor-path` text node, exactly as `ui/`
+        // appends it to its `.editor-header` — so path and marker land adjacent, not in a
+        // separate element.
+        assert!(
+            html.contains(&format!("{PATH} ●")),
+            "expected `{PATH} ●` in: {html}"
+        );
     }
 }

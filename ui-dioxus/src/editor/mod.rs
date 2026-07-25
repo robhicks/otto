@@ -100,15 +100,12 @@ pub fn Editor(
                             value: "{buf}",
                             oninput: move |e| {
                                 buf.set(e.value());
-                                // Latch the unsaved marker. Guarded so an already-dirty buffer
-                                // doesn't signal a needless re-render on every keystroke; `dirty()`
-                                // copies the value out and drops the borrow before `.write()` takes
-                                // it mutably (holding both at once would panic). Note the re-seed
-                                // effect above writes `buf` directly and never fires `oninput`, so
-                                // opening a file can't mark it dirty.
-                                if !dirty().is_dirty() {
-                                    dirty.write().mark_edited();
-                                }
+                                // Latch the unsaved marker — unconditionally, and without
+                                // comparing against `seed`, which is exactly what makes an
+                                // edit-then-revert stay dirty (see `dirty::DirtyState`). Note the
+                                // re-seed effect above writes `buf` directly and never fires
+                                // `oninput`, so opening a file can't mark it dirty.
+                                dirty.write().mark_edited();
                             },
                             // Mirror the overlay textarea's scroll offset onto the highlight `pre`
                             // beneath it. `scroll` is scrollTo-absolute (returns a future, so
