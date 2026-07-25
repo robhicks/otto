@@ -158,10 +158,16 @@ Two notes on how it is wired:
 
 ## Measured result
 
+A controlled A/B on base `35545d2` — same toolchain, same profile, only this change differing:
+
 | build | `.wasm` bytes | delta |
 |---|---|---|
 | `--release --target wasm32-unknown-unknown --features web`, before | 2,537,702 | — |
 | same, after | 2,546,326 | **+8,624 (+0.34%)** |
+
+(The branch was later rebased onto `8fc7d07`, which adds the editor dirty marker, so the current
+absolute figure is 2,554,269. The +8,624 above is the isolated cost of *this* change and is the
+number to quote; the absolute total moves with whatever else lands.)
 
 For comparison at the same 2.54 MB base: arborium would have been +5,524,546 (**+218%**), syntect
 +1,498,151 (**+59%**). Highlighting five languages on the web target therefore costs about
