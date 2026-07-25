@@ -13,9 +13,10 @@
 //! and hand it to the same `tokens::segment_lines`, so web and desktop emit identical span classes
 //! and share one `style.css`.
 //!
-//! This module is deliberately NOT `#[cfg]`-gated: it adds no dependency to gate, so compiling it
-//! everywhere lets its tests run under the crate's ordinary `cargo test --features desktop`. Only
-//! the `#[cfg(feature = "web")]` arm in `editor/mod.rs` calls it.
+//! Unlike `highlight_native` there is no dependency here to feature-gate, so the module is gated
+//! `#[cfg(any(feature = "web", test))]` in `editor/mod.rs`: kept out of the desktop binary, which
+//! never calls it, but compiled under `test` on purpose so these tests run with the crate's
+//! ordinary `cargo test --features desktop` rather than needing a wasm test runner.
 //!
 //! Accuracy is heuristic where tree-sitter's is structural — most visibly, `tok-type` is assigned
 //! by convention (known builtin type names, plus an uppercase initial) rather than by resolving a
@@ -849,5 +850,89 @@ mod tests {
         assert!(highlight("", "rust").is_empty());
         assert_eq!(highlight("\n\n", "rust").len(), 2);
         assert_eq!(highlight("   ", "rust")[0][0].class, PLAIN);
+    }
+
+    #[test]
+    fn truncated_literals_at_end_of_input_do_not_panic() {
+        // Every opener, cut off exactly where its scanner would want to read further. These are
+        // the off-by-one panics a lexer is most likely to have.
+        for src in [
+            "'",
+            "\"",
+            "`",
+            "r",
+            "r#",
+            "r#\"",
+            "/*",
+            "/",
+            "\\",
+            "#",
+            "1",
+            "1e",
+            "1e-",
+            "0x",
+            ".",
+            "'\\",
+            "'a",
+            "\"\"",
+            "\"\"\"",
+            "''",
+            "'''",
+            "é",
+            "\\é",
+            "\"\\é",
+            "r##\"x\"#",
+        ] {
+            for lang in ["rust", "javascript", "typescript", "python", "go"] {
+                // Must not panic, and must never claim more classes than there are bytes.
+                assert_eq!(
+                    class_map(src, spec(lang).unwrap()).len(),
+                    src.len(),
+                    "{lang} on {src:?}"
+                );
+                let _ = highlight(src, lang);
+            }
+        }
+    }
+
+    /// Property test over pseudo-random strings built from the characters most likely to break a
+    /// lexer (quotes, escapes, comment markers, hashes, newlines, CRLF, multibyte). Asserts the two
+    /// invariants that matter: the scanner terminates without panicking, and the spans reproduce
+    /// the source exactly — so no input can silently drop or duplicate the user's text.
+    ///
+    /// Deterministic (fixed-seed xorshift) so a failure is reproducible and CI can't flake.
+    #[test]
+    fn fuzz_spans_always_reproduce_the_source_and_never_panic() {
+        const ALPHABET: [&str; 24] = [
+            "'", "\"", "`", "\\", "/", "*", "#", "\n", "\r\n", " ", "r", "e", "1", ".", "-", "_",
+            "é", "漢", "fn", "//", "/*", "*/", "\"\"\"", "0x",
+        ];
+        let mut state = 0x2026_0724_u64;
+        let mut next = move || {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..3000 {
+            let len = (next() % 40) as usize;
+            let src: String = (0..len)
+                .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize])
+                .collect();
+            for lang in ["rust", "javascript", "typescript", "python", "go"] {
+                let out = highlight(&src, lang);
+                let rebuilt = out
+                    .iter()
+                    .map(|line| line.iter().map(|s| s.text.as_str()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // segment_lines drops line terminators and yields no element after a trailing
+                // newline, so normalize the source the same way before comparing.
+                let normalized = src.replace("\r\n", "\n");
+                let expected = normalized.strip_suffix('\n').unwrap_or(&normalized);
+                assert_eq!(rebuilt, expected, "{lang} lost text on input {src:?}");
+            }
+        }
     }
 }
