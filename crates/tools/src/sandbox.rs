@@ -5,6 +5,28 @@
 //! etc. are not writable), then `--bind root root` re-mounts only the workspace writable;
 //! `--unshare-net` removes network access and `--unshare-pid/--ipc/--new-session` isolate
 //! process, IPC, and session namespaces.
+//!
+//! ## Teardown is NOT at parity between the two backends
+//!
+//! Confinement is equivalent; *reaping* is not, and the difference is structural rather than an
+//! oversight to be tidied up later.
+//!
+//! - **Linux is covered on every path.** `--unshare-pid` makes the child pid 1 of a new namespace,
+//!   so killing it collapses the whole subtree, and `--die-with-parent` arms `PR_SET_PDEATHSIG` on
+//!   `bwrap` itself, so the sandbox dies even when otto is `SIGKILL`ed and no destructor runs.
+//! - **macOS is covered on the ordinary paths only.** There is no PID namespace, so
+//!   `lead_own_process_group` + `sweep_process_group` supply the equivalent by hand: the child leads
+//!   its own group and the group is swept after the command finishes or times out.
+//! - **macOS is NOT covered when otto is hard-killed.** The sweep is code *we* run, and a `SIGKILL`
+//!   runs none of it. macOS has no `PR_SET_PDEATHSIG` equivalent, and the alternatives (a watchdog
+//!   process or thread per sandboxed command) buy a narrow case at a cost in moving parts. So a
+//!   `SIGKILL`ed otto on macOS can strand a running sandboxed command and its descendants.
+//!
+//! Do not "simplify" the macOS process-group handling into parity with Linux by deleting it: the two
+//! backends need different mechanisms to reach the same place, and the macOS one is the weaker of
+//! the two even with it. Note also that the macOS path is exercised by nobody's test run — the suite
+//! is realistically Linux-only and the repo has no CI — which is why `macos_argv` is factored out as
+//! a pure function and asserted from any host.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -43,6 +65,97 @@ pub fn os_sandbox_available() -> bool {
     } else {
         false
     }
+}
+
+/// Put the sandboxed child in its own process group so its whole subtree can be reaped together.
+///
+/// ## Why macOS needs this and Linux does not
+///
+/// On Linux the sandboxed command runs under `bwrap --unshare-pid`, so the child is pid 1 of a fresh
+/// PID namespace: when it dies the kernel tears down every process in that namespace. Killing the
+/// one child really does kill the whole tree.
+///
+/// macOS has no such namespace. `sandbox-exec -p … sh -c '…'` applies the profile and then *execs*
+/// the shell, so killing that pid kills only the shell — anything it spawned (a backgrounded job, a
+/// dev server, a compiler) is a separate process that keeps running. That makes it a leak on the
+/// **ordinary timeout path**, not just on a hard kill: every `bash` tool call that times out could
+/// strand descendants. Leading its own process group gives `sweep_process_group` a handle on the
+/// entire subtree.
+///
+/// `setpgid(0, 0)` is called in the child between fork and exec, so the group exists before the
+/// sandboxed command runs and no descendant can be created outside it.
+#[cfg(target_os = "macos")]
+fn lead_own_process_group(cmd: &mut tokio::process::Command) {
+    // No `std::os::unix::process::CommandExt` import: `pre_exec` here is tokio's own inherent
+    // method on `tokio::process::Command`, not the std extension trait (which applies to
+    // `std::process::Command`). Importing the trait compiles but warns as unused.
+    //
+    // SAFETY: runs in the forked child before exec and calls only `setpgid`, which is
+    // async-signal-safe. Captures nothing, allocates nothing, takes no locks.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// `SIGKILL` every process still in `pgid`, sweeping descendants the leader left behind.
+///
+/// ## Why this is safe to call after the leader has been reaped
+///
+/// POSIX guarantees a process group ID is not reused while any process remains in the group. So in
+/// the case this exists for — descendants outlived the shell — the group is still populated, the
+/// pgid is therefore still reserved, and the signal cannot reach anything else. If instead nothing
+/// survived, the group no longer exists and `kill` fails with `ESRCH`, which is a no-op.
+///
+/// The residual race is the narrow one where the group is genuinely empty *and* the pid has since
+/// been recycled *and* the new owner has made itself a group leader. That is the same exposure every
+/// process supervisor accepts (`timeout(1)`, tmux, `subprocess` with `start_new_session`), and it is
+/// bounded by calling this immediately after the wait rather than at some later cleanup point.
+///
+/// `pgid > 1` is checked because `kill(0, …)` signals *our own* process group and `kill(-1, …)`
+/// every process the user owns — a malformed pgid must never reach `kill`.
+#[cfg(target_os = "macos")]
+fn sweep_process_group(pgid: i32) {
+    if pgid > 1 {
+        // SAFETY: plain `kill(2)` with a validated positive pgid, negated to address the group.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+}
+
+/// Build the `sandbox-exec` argv confining writes to `root`.
+///
+/// Deliberately a free function rather than an inline branch: the `cfg!(target_os = "macos")` arm in
+/// `build_argv` is a *runtime* condition, so on Linux it compiles but is unreachable — which is why
+/// the macOS profile had no test coverage at all while the two `bwrap` assertions did. As a plain
+/// function it is assertable from any host (see `macos_argv_*` in the tests), so a change to the
+/// confinement profile can't slip through on the platform nobody runs the suite on.
+fn macos_argv(root_str: &str, allow_net: bool, command: &str) -> (String, Vec<String>) {
+    let net = if allow_net {
+        "(allow network*)"
+    } else {
+        "(deny network*)"
+    };
+    let root_escaped = root_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let profile = format!(
+        "(version 1)(allow default)(deny file-write*)\
+         (allow file-write* (subpath \"{root_escaped}\"))\
+         (allow file-write* (subpath \"/dev\"))\
+         (allow file-write* (subpath \"/tmp\")){net}"
+    );
+    (
+        "sandbox-exec".to_string(),
+        vec![
+            "-p".to_string(),
+            profile,
+            "sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ],
+    )
 }
 
 /// Build the `(program, args)` to spawn for running `command` under `policy`, confined to
@@ -93,28 +206,7 @@ pub fn build_argv(
                 if !which("sandbox-exec") {
                     anyhow::bail!("OS sandbox requested but 'sandbox-exec' is not available");
                 }
-                let net = if *allow_net {
-                    "(allow network*)"
-                } else {
-                    "(deny network*)"
-                };
-                let root_escaped = root_str.replace('\\', "\\\\").replace('"', "\\\"");
-                let profile = format!(
-                    "(version 1)(allow default)(deny file-write*)\
-                     (allow file-write* (subpath \"{root_escaped}\"))\
-                     (allow file-write* (subpath \"/dev\"))\
-                     (allow file-write* (subpath \"/tmp\")){net}"
-                );
-                Ok((
-                    "sandbox-exec".to_string(),
-                    vec![
-                        "-p".to_string(),
-                        profile,
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        command.to_string(),
-                    ],
-                ))
+                Ok(macos_argv(&root_str, *allow_net, command))
             } else {
                 anyhow::bail!("OS sandbox is not supported on this platform")
             }
@@ -185,11 +277,24 @@ pub async fn run_sandboxed_with_stdin(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // macOS only: the child leads its own process group so the whole subtree can be swept below.
+    // Linux needs nothing here — `bwrap --unshare-pid` already makes the child a namespace init, so
+    // killing it collapses the tree. See `lead_own_process_group`.
+    #[cfg(target_os = "macos")]
+    lead_own_process_group(&mut cmd);
+
     let mut child = cmd.spawn()?;
+
+    // Captured before `child` moves into the future below, because the sweep has to happen on the
+    // timeout path too — where the future (and the handle) are already gone. The child is its own
+    // group leader, so its pid *is* the pgid.
+    #[cfg(target_os = "macos")]
+    let pgid = child.id().map(|id| id as i32);
+
     // Wrap the entire write + shutdown + wait in ONE timeout so that a hook that never reads
     // stdin (and stays alive with a large payload filling the pipe buffer) cannot block forever.
     // On timeout the future is dropped → `child` is dropped → killed via kill_on_drop.
-    let output = tokio::time::timeout(timeout, async move {
+    let outcome = tokio::time::timeout(timeout, async move {
         if let Some(payload) = stdin {
             // `Stdio::piped()` is set above whenever `stdin.is_some()`, so the handle is present.
             let mut handle = child
@@ -208,8 +313,25 @@ pub async fn run_sandboxed_with_stdin(
         }
         child.wait_with_output().await.map_err(Into::into)
     })
-    .await
-    .map_err(|_| anyhow::anyhow!("bash command timed out after {} ms", timeout.as_millis()))??;
+    .await;
+
+    // Sweep on BOTH paths, before returning either way.
+    //
+    // The timeout path is the obvious one: `kill_on_drop` has just killed the shell, and anything it
+    // spawned would otherwise be left running. But the *success* path needs it just as much — a
+    // command that backgrounds a job and exits 0 leaves that job behind exactly the same way, and
+    // that case never reaches a timeout at all.
+    //
+    // Ordering matters: on timeout the future has already been dropped, so the leader is dead and
+    // only descendants remain — which is precisely when POSIX still reserves the pgid for us.
+    #[cfg(target_os = "macos")]
+    if let Some(pgid) = pgid {
+        sweep_process_group(pgid);
+    }
+
+    let output = outcome.map_err(|_| {
+        anyhow::anyhow!("bash command timed out after {} ms", timeout.as_millis())
+    })??;
 
     Ok(json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
@@ -318,6 +440,62 @@ mod tests {
             build_argv(&SandboxPolicy::None, &PathBuf::from("/work"), "echo hi").unwrap();
         assert_eq!(prog, "sh");
         assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    // The `macos_argv_*` tests below run on EVERY host, not just macOS. That is the point: the
+    // macOS arm of `build_argv` is behind a runtime `cfg!`, so on Linux it compiles but never
+    // executes, and it went uncovered while the two `bwrap` cases were asserted. Testing the pure
+    // argv builder directly is the only way this confinement profile gets checked at all, given the
+    // suite is realistically only ever run on Linux.
+
+    #[test]
+    fn macos_argv_confines_writes_to_root_and_denies_net_by_default() {
+        let (prog, args) = macos_argv("/work", false, "echo hi");
+        assert_eq!(prog, "sandbox-exec");
+        assert_eq!(args[0], "-p");
+        let profile = &args[1];
+        assert!(profile.contains("(deny file-write*)"), "{profile}");
+        assert!(
+            profile.contains("(allow file-write* (subpath \"/work\"))"),
+            "{profile}"
+        );
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        // The command must stay a separate argv element — never interpolated into the profile.
+        assert_eq!(
+            args[2..],
+            ["sh".to_string(), "-c".to_string(), "echo hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn macos_argv_allows_net_only_when_requested() {
+        let (_, args) = macos_argv("/work", true, "echo hi");
+        assert!(args[1].contains("(allow network*)"), "{}", args[1]);
+        assert!(!args[1].contains("(deny network*)"), "{}", args[1]);
+    }
+
+    #[test]
+    fn macos_argv_escapes_quotes_in_the_root_path() {
+        // An unescaped `"` would close the subpath string and let the rest of the path inject
+        // profile syntax — i.e. widen the sandbox from a directory name.
+        let (_, args) = macos_argv("/work/ev\"il", false, "echo hi");
+        assert!(
+            args[1].contains(r#"(subpath "/work/ev\"il")"#),
+            "quote not escaped: {}",
+            args[1]
+        );
+    }
+
+    #[test]
+    fn macos_argv_escapes_backslashes_before_quotes() {
+        // Backslash must be escaped first, else `\"` in a path would be rewritten into an escaped
+        // quote and the profile would still break out.
+        let (_, args) = macos_argv(r"/work/a\b", false, "echo hi");
+        assert!(
+            args[1].contains(r#"(subpath "/work/a\\b")"#),
+            "backslash not escaped: {}",
+            args[1]
+        );
     }
 
     #[cfg(target_os = "linux")]

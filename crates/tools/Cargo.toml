@@ -12,6 +12,11 @@ anyhow.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["process", "time", "io-util", "rt"] }
 
+# macOS only: `setpgid`/`kill` for the sandbox's process-group sweep. Linux gets the same guarantee
+# from `bwrap --unshare-pid`, so it needs no libc here.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 otto-workspace = { path = "../workspace" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }

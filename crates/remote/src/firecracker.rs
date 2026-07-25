@@ -144,12 +144,27 @@ impl Provisioner for FirecrackerProvisioner {
         cfg_file.write_all(&serde_json::to_vec_pretty(&cfg)?)?;
 
         // Spawn firecracker with the config file.
-        let child = std::process::Command::new(&self.config.fc_bin)
+        //
+        // Spawned through `spawn_guarded`, not `Command::spawn`, because `FirecrackerGuard` below is
+        // a `Drop` guard and a `SIGKILL`ed otto runs no destructors. Unlike otto's MCP/language
+        // servers — stdio children that exit on their own when the parent's pipe closes — firecracker
+        // watches no pipe and would simply keep running, holding its vCPUs and guest memory. This is
+        // the one place in the tree where `Drop` was the only thing standing between a hard kill and
+        // a leak. `spawn_guarded` adds the kernel-level `PR_SET_PDEATHSIG` backstop; the two are
+        // complementary (Drop covers ordinary disposal, PDEATHSIG covers hard kills).
+        //
+        // Known residual leak, deliberately not addressed here: `jail_dir` is removed only in
+        // `FirecrackerGuard::drop`, so a hard kill also strands the scratch directory — including
+        // `vm-config.json`, which embeds the bearer token (mode 0o600, in a shared temp dir). The VM
+        // itself is the urgent part; reaping the directory needs a startup sweep rather than a spawn
+        // flag, since by definition no code of ours runs at kill time.
+        let mut command = std::process::Command::new(&self.config.fc_bin);
+        command
             .arg("--no-api")
             .arg("--config-file")
             .arg(&cfg_path)
-            .current_dir(&jail_dir)
-            .spawn()
+            .current_dir(&jail_dir);
+        let child = crate::proc_guard::spawn_guarded(&mut command)
             .map_err(|e| anyhow::anyhow!("failed to spawn firecracker: {e}"))?;
 
         let guard = FirecrackerGuard { child, jail_dir };
