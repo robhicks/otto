@@ -555,8 +555,22 @@ mod pdeathsig_tests {
         );
     }
 
-    fn unique_pidfile(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("otto-pdeathsig-{tag}-{}.pid", std::process::id()))
+    /// A scratch path that removes itself on drop, so a panicking assertion cannot leave the
+    /// handshake file behind in the temp dir.
+    struct ScratchPath(PathBuf);
+    impl ScratchPath {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("otto-pdeathsig-{tag}-{}.pid", std::process::id()));
+            // A leftover from an earlier crashed run would otherwise be read as this run's pid.
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+    }
+    impl Drop for ScratchPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     /// Poll for the race helper's `pre_exec` to publish the grandchild pid.
@@ -645,10 +659,9 @@ mod pdeathsig_tests {
     /// `prctl` call itself still succeeds.
     #[test]
     fn race_guard_self_kills_when_parent_dies_before_prctl() {
-        let pidfile = unique_pidfile("race-guarded");
-        let _ = std::fs::remove_file(&pidfile);
-        let mut helper = spawn_helper("race-guarded", Some(&pidfile));
-        let grandchild = read_pidfile(&pidfile, &mut helper);
+        let pidfile = ScratchPath::new("race-guarded");
+        let mut helper = spawn_helper("race-guarded", Some(&pidfile.0));
+        let grandchild = read_pidfile(&pidfile.0, &mut helper);
         let _reaper = Reaper(grandchild);
 
         // Kill the parent while the child is still parked in `pre_exec`, before `prctl` runs.
@@ -659,17 +672,15 @@ mod pdeathsig_tests {
             "child {grandchild} survived a parent that died inside the fork→prctl window — the \
              getppid() race guard is missing"
         );
-        let _ = std::fs::remove_file(&pidfile);
     }
 
     /// Control for the race test: with no guard installed the child completes `pre_exec`, execs,
     /// and becomes exactly the orphan the guard exists to prevent.
     #[test]
     fn unguarded_race_child_becomes_an_orphan() {
-        let pidfile = unique_pidfile("race-unguarded");
-        let _ = std::fs::remove_file(&pidfile);
-        let mut helper = spawn_helper("race-unguarded", Some(&pidfile));
-        let grandchild = read_pidfile(&pidfile, &mut helper);
+        let pidfile = ScratchPath::new("race-unguarded");
+        let mut helper = spawn_helper("race-unguarded", Some(&pidfile.0));
+        let grandchild = read_pidfile(&pidfile.0, &mut helper);
         let _reaper = Reaper(grandchild);
 
         sigkill_and_reap(&mut helper);
@@ -680,6 +691,5 @@ mod pdeathsig_tests {
             "unguarded race child {grandchild} died without the guard — the assertion in \
              race_guard_self_kills_when_parent_dies_before_prctl would be vacuous"
         );
-        let _ = std::fs::remove_file(&pidfile);
     }
 }
