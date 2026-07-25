@@ -5,6 +5,25 @@ pub struct Span {
     pub text: String,
 }
 
+/// The class vocabulary, defined once here because it is a contract between three places that must
+/// agree: the desktop backend (`highlight_native`), the web backend (`highlight_web`), and the
+/// `.tok-*` rules in `style.css`. Both backends emit these constants rather than their own string
+/// literals, so a class can't be invented on one target and render unstyled on the other.
+pub const PLAIN: &str = "tok-plain";
+pub const KEYWORD: &str = "tok-keyword";
+pub const STRING: &str = "tok-string";
+pub const COMMENT: &str = "tok-comment";
+pub const TYPE: &str = "tok-type";
+pub const NUMBER: &str = "tok-number";
+
+/// Every class either backend may emit. Kept next to the constants so adding one without adding its
+/// `style.css` rule is a visible edit here rather than a silently unstyled span.
+///
+/// `cfg(test)` because it exists to be asserted against, not consumed: production code uses the
+/// individual constants above. Without the gate it is dead code in the web build.
+#[cfg(test)]
+pub const VOCAB: [&str; 6] = [PLAIN, KEYWORD, STRING, COMMENT, TYPE, NUMBER];
+
 /// The no-highlight baseline: one plain span per line. The highlight backends replace this with a
 /// tokenized version behind the same `(text, lang) -> Vec<Vec<Span>>` shape.
 pub fn plain_spans(text: &str) -> Vec<Vec<Span>> {
@@ -34,8 +53,16 @@ pub fn segment_lines(text: &str, class_per_byte: &[&'static str]) -> Vec<Vec<Spa
         // Visible content = the line minus its terminator (`\n`, and a `\r` before it for CRLF).
         // `byte` still advances by the FULL `line_with_term.len()` below, so the terminator bytes
         // are accounted for exactly and the next line's class lookups stay aligned.
-        let content = line_with_term.strip_suffix('\n').unwrap_or(line_with_term);
-        let content = content.strip_suffix('\r').unwrap_or(content);
+        //
+        // The `\r` is stripped ONLY as part of a CRLF pair. Stripping it unconditionally also ate a
+        // BARE `\r` — one not followed by `\n` — which silently deleted that character from the
+        // rendered `pre` while the textarea overlaid on top still counted it, so every following
+        // line's colours shifted a row against the caret. Nesting the strip inside the `\n` match
+        // keeps a lone CR as ordinary content.
+        let content = match line_with_term.strip_suffix('\n') {
+            Some(without_lf) => without_lf.strip_suffix('\r').unwrap_or(without_lf),
+            None => line_with_term,
+        };
         let mut spans: Vec<Span> = Vec::new();
         // Group consecutive chars whose class (looked up at their absolute byte offset) is equal.
         // Iterating `char_indices` guarantees every cut lands on a char boundary.
@@ -159,6 +186,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn segment_lines_keeps_a_bare_cr_as_content() {
+        // A `\r` NOT followed by `\n` is ordinary content, not a line terminator. Stripping it
+        // unconditionally deleted the character from the rendered `pre` while the textarea layered
+        // over it still counted it — so every line below rendered its colours one row out of
+        // alignment with the caret, for the rest of the file.
+        let text = "a\rb";
+        let out = segment_lines(text, &[PLAIN; 3]);
+        assert_eq!(out.len(), 1, "a bare CR must not split the line");
+        assert_eq!(out[0][0].text, "a\rb", "the CR must survive as content");
+
+        // A trailing bare CR likewise survives; only a real CRLF pair is consumed.
+        assert_eq!(segment_lines("a\r", &[PLAIN; 2])[0][0].text, "a\r");
+        assert_eq!(segment_lines("a\r\n", &[PLAIN; 3])[0][0].text, "a");
     }
 
     #[test]

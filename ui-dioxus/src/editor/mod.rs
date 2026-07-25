@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
+// Both highlight backends need this; neither is compiled when the crate is built with no target
+// feature (`cargo build --no-default-features`, the pure `editor::tokens`/`net::` seam check), so
+// the import is gated to match or it warns as unused there.
+#[cfg(any(feature = "desktop", feature = "web"))]
 use crate::net::tree::language_for_path;
 use crate::net::tree::FileBody;
 
@@ -20,10 +24,10 @@ mod highlight_web;
 
 pub use dirty::DirtyState;
 
-/// The unhighlighted (plain-`textarea`) controlled-buffer editor. `open` is the currently-open
-/// file (path + classified body); `seed` is the initial document text set once at open time (a
-/// later part swaps this for a styled-span highlighted render — the diff-first non-goal means no
-/// VSCode-scale features here); `dirty` is the unsaved-buffer flag app.rs clears on every open and
+/// The controlled-buffer editor: a transparent `textarea` overlaid on a syntax-highlighted `pre`.
+/// `open` is the currently-open file (path + classified body); `seed` is the initial document text
+/// set once at open time (the diff-first non-goal means no VSCode-scale features here — no
+/// persistence, no completion); `dirty` is the unsaved-buffer flag app.rs clears on every open and
 /// this component latches on the first keystroke, rendered as a "●" beside the path (see
 /// `dirty::DirtyState` for the semantics, which mirror `ui/src/components/editor_pane.rs`).
 /// No persistence in this slice.

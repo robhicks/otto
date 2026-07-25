@@ -1,10 +1,17 @@
-//! Desktop-native syntax highlighting via tree-sitter. Compiled only under `--features desktop`
-//! (the web build stays on `tokens::plain_spans` — Task 12 handles web highlighting separately).
+//! Desktop-native syntax highlighting via tree-sitter. Compiled only under `--features desktop`;
+//! the web build uses `highlight_web`'s lexer instead, because tree-sitter's C grammars cannot be
+//! built for `wasm32-unknown-unknown`. Both backends cover the same five languages and emit the
+//! same `tokens::VOCAB` classes, so they differ in fidelity rather than capability — see
+//! `docs/superpowers/specs/2026-07-24-ui-dioxus-web-highlighting-design.md`.
 //!
 //! `highlight` MUST fall back to `plain_spans` on any failure (unsupported language, a query/parse
 //! error, anything) — highlighting is best-effort and must never break the editor.
 
-use crate::editor::tokens::{plain_spans, segment_lines, Span};
+// Class constants come from `tokens`, shared with `highlight_web`, so the two backends cannot
+// drift apart on the vocabulary that `style.css` styles.
+use crate::editor::tokens::{
+    plain_spans, segment_lines, Span, COMMENT, KEYWORD, NUMBER, PLAIN, STRING, TYPE,
+};
 
 /// Map a `language_for_path` id to its loaded grammar + highlights query; `None` => no
 /// highlighting (unsupported language — caller falls back to `plain_spans`). Mirrors the
@@ -41,12 +48,12 @@ const CAPTURES: [&str; 5] = ["keyword", "string", "comment", "type", "number"];
 
 fn class_for(idx: usize) -> &'static str {
     match CAPTURES.get(idx).copied().unwrap_or("") {
-        "keyword" => "tok-keyword",
-        "string" => "tok-string",
-        "comment" => "tok-comment",
-        "type" => "tok-type",
-        "number" => "tok-number",
-        _ => "tok-plain",
+        "keyword" => KEYWORD,
+        "string" => STRING,
+        "comment" => COMMENT,
+        "type" => TYPE,
+        "number" => NUMBER,
+        _ => PLAIN,
     }
 }
 
@@ -68,13 +75,13 @@ fn highlight_inner(
     let mut cfg = HighlightConfiguration::new(language, "editor", query, "", "").ok()?;
     cfg.configure(&CAPTURES);
     let mut hl = Highlighter::new();
-    let mut cur = "tok-plain";
-    let mut class_per_byte = vec!["tok-plain"; text.len()];
+    let mut cur = PLAIN;
+    let mut class_per_byte = vec![PLAIN; text.len()];
     let events = hl.highlight(&cfg, text.as_bytes(), None, |_| None).ok()?;
     for ev in events {
         match ev.ok()? {
             HighlightEvent::HighlightStart(h) => cur = class_for(h.0),
-            HighlightEvent::HighlightEnd => cur = "tok-plain",
+            HighlightEvent::HighlightEnd => cur = PLAIN,
             HighlightEvent::Source { start, end } => {
                 for b in start..end.min(class_per_byte.len()) {
                     class_per_byte[b] = cur;
@@ -136,23 +143,45 @@ mod tests {
         );
     }
 
-    /// Both backends must draw from the same class vocabulary, since one `style.css` styles both.
-    /// A class desktop emits but web never does (or vice versa) would render unstyled on one target.
+    /// The real cross-backend contract, exercised by running BOTH highlighters over the same input
+    /// (possible here because `highlight_web` is compiled under `cfg(test)` on every target).
+    ///
+    /// An earlier version of this test hardcoded its own copy of the class list and only called the
+    /// native backend, so it could not fail for any input — adding a class to one backend would
+    /// have left it green. It now checks against the single `tokens::VOCAB` both backends import,
+    /// and asserts the two properties that actually make one `style.css` serve both targets:
+    /// neither backend invents a class, and both segment the source into the same lines with the
+    /// same text (only the colours may differ).
     #[test]
-    fn both_backends_share_one_class_vocabulary() {
-        const VOCAB: [&str; 6] = [
-            "tok-plain",
-            "tok-keyword",
-            "tok-string",
-            "tok-comment",
-            "tok-type",
-            "tok-number",
-        ];
-        let src = "// c\nfn f(x: u32) -> String { let s = \"a\"; 1 }";
+    fn both_backends_agree_on_vocabulary_and_line_structure() {
+        use crate::editor::highlight_web;
+        use crate::editor::tokens::VOCAB;
+
+        let src = "// c\nfn f(x: u32) -> String { let s = \"héllo\"; 1 }\r\nlet t = 'a';";
         for lang in ["rust", "javascript", "typescript", "python", "go"] {
-            for span in highlight(src, lang).iter().flatten() {
-                assert!(VOCAB.contains(&span.class), "{lang}: stray class {span:?}");
+            let native = highlight(src, lang);
+            let web = highlight_web::highlight(src, lang);
+            for (backend, out) in [("native", &native), ("web", &web)] {
+                for span in out.iter().flatten() {
+                    assert!(
+                        VOCAB.contains(&span.class),
+                        "{backend}/{lang}: class {:?} is not in tokens::VOCAB, so style.css \
+                         has no rule for it",
+                        span.class
+                    );
+                }
             }
+            let text_of = |out: &Vec<Vec<Span>>| -> Vec<String> {
+                out.iter()
+                    .map(|l| l.iter().map(|s| s.text.as_str()).collect())
+                    .collect()
+            };
+            assert_eq!(
+                text_of(&native),
+                text_of(&web),
+                "{lang}: backends disagree on line structure — the editor overlays a textarea on \
+                 the highlight layer, so differing line counts misalign the caret"
+            );
         }
     }
 }

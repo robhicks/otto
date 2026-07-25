@@ -84,17 +84,24 @@ pub enum FileBody {
     TooLarge,
 }
 
-/// Editor language id for a path, by extension. Returns a stable lowercase id (mapped to a
-/// `kode_leptos::Language` in the editor component); unknown extensions get `"text"`.
+/// Editor language id for a path, by extension. Returns a stable lowercase id; unknown extensions
+/// get `"text"`, which both highlight backends treat as "no highlighting".
+///
+/// This is the ONLY way a language id reaches either highlighter, so an id a backend supports but
+/// this function never returns is dead code — see
+/// `tests::every_highlighted_language_is_reachable_from_an_extension`, which fails if the two drift.
+/// (`.go` was exactly that: both backends have had a Go grammar/spec while no extension mapped to
+/// it, so Go files silently rendered plain on desktop and web alike.)
 pub fn language_for_path(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => "rust",
         Some("toml") => "toml",
         Some("json") => "json",
         Some("md") | Some("markdown") => "markdown",
-        Some("js") | Some("mjs") | Some("cjs") => "javascript",
-        Some("ts") => "typescript",
+        Some("js") | Some("mjs") | Some("cjs") | Some("jsx") => "javascript",
+        Some("ts") | Some("tsx") | Some("mts") | Some("cts") => "typescript",
         Some("py") => "python",
+        Some("go") => "go",
         Some("html") | Some("htm") => "html",
         Some("css") => "css",
         Some("sh") | Some("bash") => "bash",
@@ -153,7 +160,31 @@ mod tests {
         assert_eq!(language_for_path(Path::new("Cargo.toml")), "toml");
         assert_eq!(language_for_path(Path::new("a/b.json")), "json");
         assert_eq!(language_for_path(Path::new("notes.md")), "markdown");
+        assert_eq!(language_for_path(Path::new("main.go")), "go");
+        assert_eq!(language_for_path(Path::new("App.tsx")), "typescript");
+        assert_eq!(language_for_path(Path::new("App.jsx")), "javascript");
         assert_eq!(language_for_path(Path::new("LICENSE")), "text");
+    }
+
+    /// Both highlight backends key off the ids this function returns, so an id they support that
+    /// nothing here emits is unreachable code and the language silently renders plain. That is not
+    /// hypothetical: `.go` had no mapping while both backends carried a Go grammar/spec, so Go
+    /// files rendered unhighlighted on every target. This test fails if the two ever drift again.
+    #[test]
+    fn every_highlighted_language_is_reachable_from_an_extension() {
+        let reachable: Vec<&str> = [
+            "rs", "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "py", "go",
+        ]
+        .iter()
+        .map(|ext| language_for_path(Path::new(&format!("file.{ext}"))))
+        .collect();
+        for lang in ["rust", "javascript", "typescript", "python", "go"] {
+            assert!(
+                reachable.contains(&lang),
+                "{lang} is highlighted by the editor backends but no file extension maps to it, \
+                 so its grammar/spec is dead code"
+            );
+        }
     }
 
     #[test]

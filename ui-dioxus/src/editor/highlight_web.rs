@@ -23,16 +23,12 @@
 //! type position. Errors are bounded to a single mis-coloured token; the scanners below all
 //! terminate, so no input can produce a runaway highlight state.
 
-use crate::editor::tokens::{plain_spans, segment_lines, Span};
-
-/// The class vocabulary, shared with `highlight_native` and `style.css`. Anything not classified
-/// stays `PLAIN`.
-const PLAIN: &str = "tok-plain";
-const KEYWORD: &str = "tok-keyword";
-const STRING: &str = "tok-string";
-const COMMENT: &str = "tok-comment";
-const TYPE: &str = "tok-type";
-const NUMBER: &str = "tok-number";
+// The class constants come from `tokens` rather than being re-declared here, so this backend and
+// `highlight_native` provably emit the same vocabulary instead of each keeping a copy that could
+// drift (and make the "one style.css serves both" contract quietly false).
+use crate::editor::tokens::{
+    plain_spans, segment_lines, Span, COMMENT, KEYWORD, NUMBER, PLAIN, STRING, TYPE,
+};
 
 /// The lexical rules for one language. Everything the scanner branches on lives here, so adding a
 /// language is a table entry rather than new control flow.
@@ -70,10 +66,48 @@ const RUST: LangSpec = LangSpec {
     raw_strings: true,
     lifetimes: true,
     keywords: &[
-        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
-        "true", "type", "union", "unsafe", "use", "where", "while",
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "fn",
+        "for",
+        "gen",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "macro_rules",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "pub",
+        "ref",
+        "return",
+        "Self",
+        "self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "try",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+        "where",
+        "while",
     ],
     types: &[
         "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8",
@@ -152,6 +186,7 @@ const TYPESCRIPT: LangSpec = LangSpec {
     keywords: &[
         "abstract",
         "as",
+        "asserts",
         "async",
         "await",
         "break",
@@ -177,6 +212,7 @@ const TYPESCRIPT: LangSpec = LangSpec {
         "implements",
         "import",
         "in",
+        "infer",
         "instanceof",
         "interface",
         "is",
@@ -186,6 +222,7 @@ const TYPESCRIPT: LangSpec = LangSpec {
         "new",
         "null",
         "of",
+        "override",
         "private",
         "protected",
         "public",
@@ -202,6 +239,7 @@ const TYPESCRIPT: LangSpec = LangSpec {
         "type",
         "typeof",
         "undefined",
+        "unique",
         "var",
         "void",
         "while",
@@ -221,6 +259,10 @@ const PYTHON: LangSpec = LangSpec {
     triple_quotes: true,
     raw_strings: false,
     lifetimes: false,
+    // `match`/`case`/`type` are Python SOFT keywords — they are ordinary identifiers except in one
+    // syntactic position, and a lexer cannot tell the difference. Colouring `match` in
+    // `match = re.search(...)` would be wrong more often than colouring it in a match statement is
+    // right, so they are deliberately omitted rather than overlooked.
     keywords: &[
         "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
         "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import",
@@ -229,12 +271,14 @@ const PYTHON: LangSpec = LangSpec {
     ],
     types: &[
         "bool",
+        "bytearray",
         "bytes",
         "complex",
         "dict",
         "float",
         "frozenset",
         "int",
+        "range",
         "list",
         "object",
         "set",
@@ -270,6 +314,7 @@ const GO: LangSpec = LangSpec {
         "if",
         "import",
         "interface",
+        "iota",
         "map",
         "nil",
         "package",
@@ -294,6 +339,7 @@ const GO: LangSpec = LangSpec {
         "int",
         "int8",
         "int16",
+        "comparable",
         "int32",
         "int64",
         "rune",
@@ -370,6 +416,16 @@ fn class_map(text: &str, spec: &LangSpec) -> Vec<&'static str> {
         } else if let Some(end) = scan_string(b, i, spec) {
             paint(&mut out, i, end, STRING);
             i = end;
+        } else if b[i] == b'\\' {
+            // A backslash outside any literal escapes whatever follows, so step over both. This
+            // exists for one real case: a JS regex containing an escaped slash, `split(/\//)`.
+            // Without it, the `/` after the backslash pairs with the regex's closing `/` to form a
+            // spurious `//` and the rest of the line turns into a comment.
+            //
+            // Advance by the next character's FULL width, never a flat 2 bytes: `i` must stay on a
+            // char boundary because the identifier branch below slices `text[i..end]`, which panics
+            // mid-char. `i + 1` is always a boundary since the backslash itself is ASCII.
+            i += 1 + text[i + 1..].chars().next().map_or(0, char::len_utf8);
         } else if b[i].is_ascii_digit() {
             let end = scan_number(b, i);
             paint(&mut out, i, end, NUMBER);
@@ -386,7 +442,14 @@ fn class_map(text: &str, spec: &LangSpec) -> Vec<&'static str> {
 }
 
 fn paint(out: &mut [&'static str], start: usize, end: usize, class: &'static str) {
-    let end = end.min(out.len());
+    // Clamp against BOTH ends. No current scanner can return `end < start` (each returns at least
+    // `i + 1`), but the module's whole design intent is that adding a language be a table entry —
+    // so enforce the invariant here rather than leave it resting on every future scanner's care.
+    debug_assert!(
+        start <= end,
+        "scanner returned end {end} before start {start}"
+    );
+    let end = end.clamp(start, out.len());
     for slot in &mut out[start..end] {
         *slot = class;
     }
@@ -438,17 +501,25 @@ fn scan_block_comment(b: &[u8], i: usize, spec: &LangSpec) -> Option<usize> {
     Some(b.len())
 }
 
-/// Rust raw strings: `r"…"`, `r#"…"#`, `r##"…"##`. The hash count must match to close, which is
-/// the whole point of the form (it lets the body contain quotes).
+/// Rust raw strings: `r"…"`, `r#"…"#`, `r##"…"##`, and the byte-string forms `br"…"` / `br#"…"#`.
+/// The hash count must match to close, which is the whole point of the form (it lets the body
+/// contain quotes) — and getting it wrong on `br#"a"b"#` leaks the string class to end of line.
 fn scan_raw_string(b: &[u8], i: usize, spec: &LangSpec) -> Option<usize> {
-    if !spec.raw_strings || b[i] != b'r' {
+    if !spec.raw_strings {
         return None;
     }
-    // `foo r"x"` is a raw string but `bar"x"` is not — only a `r` that begins a token counts.
+    // Accept an optional `b` byte-string prefix, so `br"…"` scans as a raw string rather than the
+    // `b` being read as an identifier and the `r"…"` then failing its token-start check below.
+    let r = match b[i] {
+        b'r' => i,
+        b'b' if b.get(i + 1) == Some(&b'r') => i + 1,
+        _ => return None,
+    };
+    // `foo r"x"` is a raw string but `bar"x"` is not — only an `r` that begins a token counts.
     if i > 0 && is_ident_byte(b[i - 1]) {
         return None;
     }
-    let mut j = i + 1;
+    let mut j = r + 1;
     let hash_start = j;
     while j < b.len() && b[j] == b'#' {
         j += 1;
@@ -505,7 +576,11 @@ fn scan_rust_char_literal(text: &str, b: &[u8], i: usize, spec: &LangSpec) -> Op
     if b.get(i + 1) == Some(&b'\\') {
         // Escaped: `'\n'`, `'\''`, `'\u{1F600}'`. Scan to the closing tick, bounded so a stray
         // backslash-quote cannot run away.
-        let mut j = i + 2;
+        //
+        // Start at `i + 3`, PAST the escaped character, not at `i + 2`. Starting at `i + 2` made
+        // `'\''` close on the escaped quote itself — the literal ended a byte early and the real
+        // closing tick was left dangling as plain text.
+        let mut j = i + 3;
         while j < b.len() && j < i + 16 {
             if b[j] == b'\'' {
                 return Some(j + 1);
@@ -610,12 +685,29 @@ mod tests {
     }
 
     /// Assert every byte of `needle` carries exactly `class`.
+    /// Assert every byte of `needle` carries exactly `class` — AND that the class actually STOPS at
+    /// the token, by requiring the byte just past it to differ (unless the needle runs to EOF).
+    ///
+    /// Without that second half the helper is much weaker than it looks: a runaway string or
+    /// comment that painted the entire line would still satisfy "every byte of the needle is
+    /// `tok-string`", so the tests meant to catch runaway highlighting would pass through it.
     fn assert_class(src: &str, lang: &str, needle: &str, class: &str) {
         let got = class_of(src, lang, needle);
         assert!(
             got.iter().all(|c| *c == class),
             "{lang}: expected {needle:?} to be all {class}, got {got:?}"
         );
+        let map = class_map(src, spec(lang).unwrap());
+        let end = src.find(needle).unwrap() + needle.len();
+        if let Some(after) = map.get(end) {
+            assert_ne!(
+                *after,
+                class,
+                "{lang}: {class} does not stop at the end of {needle:?} — it continues into \
+                 {:?}, which is the runaway-highlight failure mode",
+                &src[end..src.len().min(end + 20)]
+            );
+        }
     }
 
     #[test]
@@ -846,6 +938,157 @@ mod tests {
     }
 
     #[test]
+    fn escaped_quote_char_literal_closes_on_the_real_tick() {
+        // `'\''` used to close on the ESCAPED quote, ending the literal a byte early and leaving
+        // the real closing tick dangling as plain text.
+        assert_class("let c = '\\'';", "rust", "'\\''", STRING);
+        assert_class("let c = '\\u{1F600}';", "rust", "'\\u{1F600}'", STRING);
+    }
+
+    #[test]
+    fn byte_and_raw_string_prefixes_are_recognized() {
+        // `br#"a"b"#` without the `b` prefix handled: the `b` scanned as an identifier, the `r"`
+        // then failed its token-start check, and the bare `"a"` closed early — leaking the string
+        // class across the rest of the line.
+        assert_class("let s = br\"x\"; let n = 1;", "rust", "br\"x\"", STRING);
+        assert_class(
+            "let s = br#\"a\"b\"#; let n = 1;",
+            "rust",
+            "br#\"a\"b\"#",
+            STRING,
+        );
+        assert_class("let s = b\"abc\"; let n = 1;", "rust", "\"abc\"", STRING);
+    }
+
+    #[test]
+    fn raw_string_hash_counts_must_match_to_close() {
+        // Zero hashes, and the asymmetric case that is the entire reason hash counting exists:
+        // the inner `"#` must NOT close a `##`-delimited literal.
+        assert_class("let s = r\"a\"; let n = 1;", "rust", "r\"a\"", STRING);
+        assert_class(
+            "let s = r##\"a \"# b\"##; let n = 1;",
+            "rust",
+            "r##\"a \"# b\"##",
+            STRING,
+        );
+        // `r` as an ordinary identifier must not be mistaken for a raw-string opener.
+        let src = "let r = 5; for r in 0..3 {}";
+        let map = class_map(src, spec("rust").unwrap());
+        assert_eq!(map[src.find("r =").unwrap()], PLAIN);
+        assert_class(src, "rust", "5", NUMBER);
+    }
+
+    #[test]
+    fn js_regex_with_escaped_slash_does_not_open_a_comment() {
+        // `/\//` ends in `//` if the escape is ignored, which turned the rest of the line into a
+        // comment — the very runaway class this design set out to avoid.
+        let src = "s.split(/\\//); const n = 1;";
+        assert_class(src, "javascript", "const", KEYWORD);
+        assert_class(src, "javascript", "1", NUMBER);
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_not_comments() {
+        assert_class(
+            "let s = \"// not a comment\"; let n = 1;",
+            "rust",
+            "1",
+            NUMBER,
+        );
+        assert_class("let s = \"/* nope */\"; let n = 1;", "rust", "1", NUMBER);
+        assert_class("x = '# not a comment'\ny = 1", "python", "1", NUMBER);
+    }
+
+    #[test]
+    fn unterminated_multiline_openers_paint_to_end_of_file() {
+        // Pinned, not fixed: running to EOF is what these constructs actually mean. But spans are
+        // recomputed on EVERY keystroke, so the user passes through "just typed `/*`" constantly —
+        // this is the module's most-seen state and it should change only deliberately.
+        for (lang, src, opener) in [
+            ("rust", "/* open\nfn f() {}\nlet n = 1;", "/* open"),
+            ("rust", "let s = r#\"open\nfn f() {}\n", "r#\"open"),
+            ("javascript", "const t = `open\nlet n = 1;\n", "`open"),
+            ("python", "x = \"\"\"open\ny = 1\n", "\"\"\"open"),
+        ] {
+            let map = class_map(src, spec(lang).unwrap());
+            let at = src.find(opener).unwrap();
+            let class = if opener.starts_with("/*") {
+                COMMENT
+            } else {
+                STRING
+            };
+            assert!(
+                map[at..].iter().all(|c| *c == class),
+                "{lang}: an unterminated {opener:?} should paint to EOF as {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn backslash_at_end_of_line_continues_a_string_onto_the_next() {
+        // Correct line-continuation semantics for Rust/JS/Python, so this is a pin rather than a
+        // fix — but it qualifies the "unterminated strings are contained to one line" claim: they
+        // are contained to one line PER trailing backslash.
+        let src = "let s = \"oops\\\nfn g() {}";
+        let map = class_map(src, spec("rust").unwrap());
+        let at = src.find("fn g").unwrap();
+        assert_eq!(
+            map[at], STRING,
+            "a trailing backslash escapes the newline, carrying the string onto the next line"
+        );
+    }
+
+    #[test]
+    fn exponent_signs_and_radix_prefixes_are_part_of_the_literal() {
+        // `1e+3` specifically: the `+` half of the only backwards index in the module (`b[j - 1]`).
+        assert_class("let a = 1e+3;", "rust", "1e+3", NUMBER);
+        assert_class("let a = 1E5;", "rust", "1E5", NUMBER);
+        assert_class("let a = 0b1010;", "rust", "0b1010", NUMBER);
+        assert_class("let a = 0o17;", "rust", "0o17", NUMBER);
+    }
+
+    #[test]
+    fn lifetimes_are_recognized_in_every_shape() {
+        // A char literal and a lifetime on the same line, a named lifetime, and a loop label —
+        // each an independent chance for the `'` to be mistaken for a string opener.
+        let src = "fn f<'a, 'b>(x: &'a str) -> &'static str { let c = 'z'; 'outer: loop {} }";
+        assert_class(src, "rust", "'z'", STRING);
+        let map = class_map(src, spec("rust").unwrap());
+        // In every shape the TICK stays plain — that is what stops it opening a string.
+        for label in ["'a,", "'b>", "'static", "'outer"] {
+            let at = src.find(label).unwrap();
+            assert_eq!(map[at], PLAIN, "the tick of {label:?} should stay plain");
+        }
+        // The name after the tick then scans as an ordinary identifier, so a plain lifetime name
+        // stays plain...
+        for label in ["'a,", "'b>", "'outer"] {
+            let at = src.find(label).unwrap();
+            assert_eq!(
+                map[at + 1],
+                PLAIN,
+                "the name in {label:?} should stay plain"
+            );
+        }
+        // ...while `'static` colours its name as the keyword it genuinely is. Pinned deliberately:
+        // it falls out of treating the name as an ordinary identifier, and it matches how most
+        // editors render `'static`.
+        assert_class(src, "rust", "static", KEYWORD);
+    }
+
+    #[test]
+    fn every_unsupported_language_id_falls_back_to_plain() {
+        // The full set `language_for_path` can emit that no spec covers. Table-driven so adding an
+        // extension without a spec shows up here rather than as a silently unstyled file.
+        let src = "key = value\nother 42";
+        for lang in [
+            "toml", "json", "markdown", "html", "css", "bash", "sql", "yaml", "text",
+        ] {
+            assert!(spec(lang).is_none(), "{lang} unexpectedly has a spec");
+            assert_eq!(highlight(src, lang), plain_spans(src), "{lang}");
+        }
+    }
+
+    #[test]
     fn empty_and_whitespace_input_are_handled() {
         assert!(highlight("", "rust").is_empty());
         assert_eq!(highlight("\n\n", "rust").len(), 2);
@@ -903,9 +1146,12 @@ mod tests {
     /// Deterministic (fixed-seed xorshift) so a failure is reproducible and CI can't flake.
     #[test]
     fn fuzz_spans_always_reproduce_the_source_and_never_panic() {
-        const ALPHABET: [&str; 24] = [
-            "'", "\"", "`", "\\", "/", "*", "#", "\n", "\r\n", " ", "r", "e", "1", ".", "-", "_",
-            "é", "漢", "fn", "//", "/*", "*/", "\"\"\"", "0x",
+        // A BARE "\r" is in here on purpose, separately from "\r\n": stripping a lone CR as though
+        // it were a CRLF terminator used to delete it from the rendered line, which this test's
+        // round-trip assertion catches.
+        const ALPHABET: [&str; 27] = [
+            "'", "\"", "`", "\\", "/", "*", "#", "\n", "\r\n", "\r", " ", "r", "e", "1", ".", "-",
+            "_", "é", "漢", "fn", "//", "/*", "*/", "\"\"\"", "0x", "br", "'''",
         ];
         let mut state = 0x2026_0724_u64;
         let mut next = move || {
