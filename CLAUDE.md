@@ -117,6 +117,13 @@ OTTO_TOKEN=<token> cargo run -p otto-engine -- serve [--port <p>] [--root <path>
 cd ui && cargo test                              # pure host-side unit tests
 cd ui && cargo build --target wasm32-unknown-unknown   # wasm compile check
 cd ui && trunk serve                             # dev server in a browser tab (needs `cargo install trunk`)
+
+# The Dioxus UI (migration target, also workspace-excluded — run from inside ui-dioxus/):
+cd ui-dioxus && cargo test --features desktop                       # host-side unit tests
+cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web   # wasm compile check
+# Browser integration tests (mount→autoconnect). Needs `wasm-bindgen-test-runner` on PATH,
+# version-matched to Cargo.lock's `wasm-bindgen`, plus a webdriver — see ui-dioxus/.cargo/config.toml.
+cd ui-dioxus && CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --features web
 ```
 
 Toolchain is pinned to stable in `rust-toolchain.toml` (edition 2024, rust-version 1.85).

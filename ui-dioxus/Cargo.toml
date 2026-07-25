@@ -87,3 +87,13 @@ tree-sitter-go = { version = "0.25.0", optional = true }
 
 [dev-dependencies]
 dioxus-ssr = "0.7"
+
+# Browser-only test harness for `src/web_mount_test.rs`. Target-gated to wasm32 (NOT just
+# feature-gated) so the native `--features desktop` build never resolves or compiles these —
+# `cargo test --features desktop` on the host is unaffected. Must stay AFTER the plain
+# `[dev-dependencies]` table above: everything following this header belongs to it.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+# `TimeoutFuture` bounds the VirtualDom drive loop so a regression fails the test instead of
+# hanging the browser runner forever.
+gloo-timers = { version = "0.3", features = ["futures"] }
