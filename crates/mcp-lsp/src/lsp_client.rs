@@ -314,6 +314,28 @@ pub fn path_to_file_uri(path: &std::path::Path) -> anyhow::Result<lsp_types::Uri
 }
 
 /// Spawn `bin args…` as a child process and wire an `LspClient` to its stdio.
+///
+/// ## Teardown invariant — two independent guards, and only one of them always holds
+///
+/// `kill_on_drop(true)` covers every path where this process unwinds or returns normally: a client
+/// evicted mid-run, and also mcp-lsp's own ordinary shutdown, since `main` ends by returning from
+/// `service.waiting()` on stdin EOF (an ordinary return, which *does* run destructors — there is no
+/// `process::exit` on that path).
+///
+/// It does **not** cover mcp-lsp being killed abruptly, which is reachable: `otto serve` may be
+/// `SIGKILL`ed by the desktop `PR_SET_PDEATHSIG` guard, and a `SIGKILL` cascade leaves no
+/// opportunity for any destructor to run.
+///
+/// The guard that survives *both* cases is that the language server is itself on stdio: piping its
+/// stdin below means the pipe closes when mcp-lsp's process ends by any means, the server reads EOF,
+/// and it exits. A language server launched over a socket, or one that ignores stdin EOF, would keep
+/// only the `Drop`-dependent guard — and orphan whenever that one cannot run, which for
+/// `rust-analyzer` means leaking a process that can hold gigabytes.
+///
+/// The two overlap on the ordinary path, so a passing test does not tell you which one fired.
+/// `crates/engine/tests/mcp_child_teardown.rs` therefore pins the *observable* — that the full
+/// `otto serve` → `mcp-lsp` → `rust-analyzer` chain collapses when the top is hard-killed — rather
+/// than attributing it to either mechanism.
 pub fn spawn_process(
     bin: &str,
     args: &[&str],

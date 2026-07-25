@@ -42,6 +42,9 @@ futures-util = "0.3"
 
 [dev-dependencies]
 escargot = "0.5"
+# tests/mcp_child_teardown.rs only: `kill(2)` for cleaning up subprocesses that are not this
+# process's children (so `std::process::Child::kill` cannot reach them).
+libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 tempfile.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
