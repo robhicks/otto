@@ -11,9 +11,16 @@
 //! Confinement is equivalent; *reaping* is not, and the difference is structural rather than an
 //! oversight to be tidied up later.
 //!
-//! - **Linux is covered on every path.** `--unshare-pid` makes the child pid 1 of a new namespace,
-//!   so killing it collapses the whole subtree, and `--die-with-parent` arms `PR_SET_PDEATHSIG` on
-//!   `bwrap` itself, so the sandbox dies even when otto is `SIGKILL`ed and no destructor runs.
+//! - **Linux is covered on the paths that matter, by both flags acting together.** The pid we hold
+//!   is the *outer* `bwrap`, which lives outside the namespace; `--unshare-pid` puts a second
+//!   `bwrap` inside as the namespace's pid 1 (its zombie reaper — we do not pass `--as-pid-1`, so
+//!   the shell is pid 2, not pid 1), and `--die-with-parent` is what cascades a kill from the outer
+//!   process down to that inner init, whose death then tears the namespace down. Neither flag is
+//!   sufficient alone. Measured: killing the tracked outer pid leaves nothing behind, including
+//!   grandchildren of the shell. `--die-with-parent` also arms `PR_SET_PDEATHSIG` on `bwrap`, which
+//!   is what covers otto being `SIGKILL`ed with no destructor running — subject to the same narrow
+//!   fork→`prctl` window that `otto-remote`'s `proc_guard` closes explicitly for Firecracker, and
+//!   which bwrap handles internally where we cannot see it.
 //! - **macOS is covered on the ordinary paths only.** There is no PID namespace, so
 //!   `lead_own_process_group` + `sweep_process_group` supply the equivalent by hand: the child leads
 //!   its own group and the group is swept after the command finishes or times out.
@@ -71,9 +78,11 @@ pub fn os_sandbox_available() -> bool {
 ///
 /// ## Why macOS needs this and Linux does not
 ///
-/// On Linux the sandboxed command runs under `bwrap --unshare-pid`, so the child is pid 1 of a fresh
-/// PID namespace: when it dies the kernel tears down every process in that namespace. Killing the
-/// one child really does kill the whole tree.
+/// On Linux the sandboxed command runs under `bwrap --unshare-pid`, which puts a `bwrap` zombie
+/// reaper inside the new namespace as pid 1 (the shell is pid 2 — we do not pass `--as-pid-1`).
+/// Killing the outer `bwrap` we hold cascades to that inner init via `--die-with-parent`, and the
+/// namespace collapses with it, taking every descendant. So on Linux killing the one pid we track
+/// really does kill the whole tree — verified by measurement, not just by reading the flags.
 ///
 /// macOS has no such namespace. `sandbox-exec -p … sh -c '…'` applies the profile and then *execs*
 /// the shell, so killing that pid kills only the shell — anything it spawned (a backgrounded job, a
@@ -278,8 +287,8 @@ pub async fn run_sandboxed_with_stdin(
         .kill_on_drop(true);
 
     // macOS only: the child leads its own process group so the whole subtree can be swept below.
-    // Linux needs nothing here — `bwrap --unshare-pid` already makes the child a namespace init, so
-    // killing it collapses the tree. See `lead_own_process_group`.
+    // Linux needs nothing here — `--unshare-pid` plus `--die-with-parent` already collapse the
+    // sandbox namespace when the tracked pid dies. See `lead_own_process_group`.
     #[cfg(target_os = "macos")]
     lead_own_process_group(&mut cmd);
 

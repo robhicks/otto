@@ -19,8 +19,14 @@
 //! Linux-only. Firecracker requires KVM so it is Linux-only regardless; on other targets the guard
 //! is a no-op and the caller falls back to its `Drop` guard alone.
 
-/// Install the parent-death guard on `command`, then spawn it. The single spawn path for any child
-/// that cannot detect its parent's death by itself.
+/// Install the parent-death guard on `command`, then spawn it.
+///
+/// This is a **convention with a tested choke point**, not a structural guarantee: nothing stops a
+/// future caller from reaching for `Command::spawn` directly and silently losing the guard. What the
+/// tests below buy is that removing `install_pdeathsig` from *this* function fails the suite. Making
+/// the invariant structural would mean a newtype whose only `spawn` installs the guard — not done
+/// here, since there is exactly one caller. (The same wording correction was made to `ui-dioxus`'s
+/// sibling guard in review; claiming enforcement this does not provide is the trap.)
 ///
 /// `dead_code` is allowed because the only production caller is behind the default-off `firecracker`
 /// feature. Keeping the module itself unconditional is the point: a guard that compiles only under a
@@ -87,6 +93,7 @@ fn install_pdeathsig(command: &mut std::process::Command) {
 /// teardown; only the hard-kill case is uncovered, and it is unreachable in practice because the
 /// only caller (Firecracker) requires KVM.
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(feature = "firecracker"), allow(dead_code))]
 fn install_pdeathsig(_command: &mut std::process::Command) {}
 
 #[cfg(all(test, target_os = "linux"))]
@@ -113,6 +120,11 @@ mod tests {
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
     /// Self-cap on every parked subprocess, so an interrupted run cannot strand one.
     const PARK: Duration = Duration::from_secs(120);
+    /// Path the race holder's `pre_exec` publishes the grandchild pid to.
+    const RACE_PIDFILE_ENV: &str = "OTTO_TEST_PROC_GUARD_PIDFILE";
+    /// Ceiling on the race child's in-child wait for its parent to die. Bounds the artificially
+    /// held-open fork→`prctl` window so a wedged run can never leave a child spinning forever.
+    const RACE_WAIT_SECS: libc::time_t = 10;
 
     /// Entry point for the grandchild: park long enough to outlast any assertion window.
     /// `#[ignore]`d because it is a subprocess role, not a test — it asserts nothing, and a normal
@@ -134,8 +146,19 @@ mod tests {
         let Some(mode) = std::env::var_os(HOLDER_ENV) else {
             return;
         };
+        match mode.to_string_lossy().as_ref() {
+            "guarded" => holder_simple(true),
+            "unguarded" => holder_simple(false),
+            "race-guarded" => holder_race(true),
+            "race-unguarded" => holder_race(false),
+            other => panic!("unknown {HOLDER_ENV}: {other}"),
+        }
+    }
+
+    /// Ordinary scenario: spawn the sleeper, announce its pid, park holding it.
+    fn holder_simple(guarded: bool) {
         let mut command = sleeper_command();
-        let child = if mode == *"guarded" {
+        let child = if guarded {
             super::spawn_guarded(&mut command)
         } else {
             // The control: identical in every respect except the guard, so a difference in outcome
@@ -148,6 +171,107 @@ mod tests {
         // Park holding `child` so it is never dropped — no `Drop`-based path can play any part.
         std::thread::sleep(PARK);
         drop(child);
+    }
+
+    /// Race scenario: hold the fork→`prctl` window open until the parent is already dead.
+    ///
+    /// This is what makes the `getppid() != parent_pid` check testable at all. A closure registered
+    /// **before** `install_pdeathsig`'s runs first in the child and blocks until it observes that the
+    /// parent has gone — so by the time `prctl` executes there is no parent left to die and
+    /// `PR_SET_PDEATHSIG` can never fire. The only thing that can still reap the child is the
+    /// `getppid()` re-check. Deleting that check therefore turns `race_guarded_child_still_dies` red
+    /// while leaving every other test here green; without this scenario the check is untested and
+    /// could be dropped silently in a refactor.
+    ///
+    /// The pid is published from *inside* `pre_exec` via a raw write because `spawn()` does not
+    /// return until the child execs, and here the child deliberately blocks before that — so the
+    /// holder cannot report the pid the ordinary way.
+    fn holder_race(guarded: bool) {
+        use std::os::unix::process::CommandExt as _;
+
+        let pidfile = std::env::var(RACE_PIDFILE_ENV).expect("race mode needs a pidfile path");
+        let c_path = std::ffi::CString::new(pidfile).expect("pidfile path has no interior NUL");
+        let holder_pid = std::process::id();
+
+        let mut command = sleeper_command();
+        // SAFETY: runs in the forked child before exec and calls only async-signal-safe syscalls
+        // (`open`/`write`/`close`, `getpid`, `getppid`, `clock_gettime`, `nanosleep`). The `CString`
+        // is built before the fork and only read here; nothing allocates inside the closure.
+        unsafe {
+            command.pre_exec(move || {
+                if !write_pid_raw(c_path.as_ptr(), libc::getpid()) {
+                    return Err(std::io::Error::other("could not publish race pid"));
+                }
+                // Hold the window open until the parent dies. Bounded against CLOCK_MONOTONIC rather
+                // than by counting naps: `nanosleep` returns early on EINTR without finishing the
+                // remainder, so an iteration count is only a lower bound on elapsed time and could
+                // expire in milliseconds under signal pressure — aborting the spawn and flaking the
+                // unguarded control.
+                let mut start: libc::timespec = std::mem::zeroed();
+                libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut start);
+                loop {
+                    if libc::getppid() != holder_pid as libc::pid_t {
+                        break;
+                    }
+                    let mut now: libc::timespec = std::mem::zeroed();
+                    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
+                    if now.tv_sec - start.tv_sec > RACE_WAIT_SECS {
+                        break;
+                    }
+                    let nap = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 2_000_000,
+                    };
+                    libc::nanosleep(&nap, std::ptr::null_mut());
+                }
+                Ok(())
+            });
+        }
+
+        // Registered second, so `install_pdeathsig`'s closure runs *after* the wait above — i.e.
+        // after the parent is already gone, which is the whole point.
+        let child = if guarded {
+            super::spawn_guarded(&mut command)
+        } else {
+            command.spawn()
+        };
+        // Barely reachable: we are normally SIGKILLed while `spawn` is still blocked on the child.
+        if let Ok(child) = child {
+            std::thread::sleep(PARK);
+            drop(child);
+        }
+    }
+
+    /// Write `pid` as 4 native-endian bytes to `path`. Async-signal-safe: no allocation, no
+    /// formatting, no stdio.
+    ///
+    /// `O_EXCL | O_NOFOLLOW` because the path is predictable and lives in a shared temp dir: the
+    /// caller guarantees the file is absent, so anything already there is someone else's — possibly
+    /// a planted symlink aimed at a file this user can write. Refusing to open it turns a
+    /// symlink-follow truncation into a spawn failure.
+    ///
+    /// # Safety
+    /// `path` must be a valid NUL-terminated C string that outlives the call.
+    unsafe fn write_pid_raw(path: *const libc::c_char, pid: libc::pid_t) -> bool {
+        // Edition 2024 no longer treats an `unsafe fn` body as an implicit `unsafe` block, so the
+        // calls are wrapped explicitly. SAFETY: `path` is a valid NUL-terminated C string per this
+        // function's contract; `fd` is checked before use and closed exactly once; the write buffer
+        // is a stack array whose length is passed verbatim.
+        unsafe {
+            let fd = libc::open(
+                path,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600 as libc::c_int,
+            );
+            if fd < 0 {
+                return false;
+            }
+            // `pid_t` is `i32` on Linux, so this is exactly the 4 bytes the reader expects.
+            let bytes = pid.to_ne_bytes();
+            let written = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+            libc::close(fd);
+            written == bytes.len() as isize
+        }
     }
 
     /// The grandchild command: this test binary, re-executed into the sleeper role.
@@ -263,11 +387,114 @@ mod tests {
                 (holder, pid)
             }
             Err(_) => {
+                // The grandchild may already exist even though its pid never reached us (broken
+                // pipe, holder died mid-print). Sweep the holder's children before giving up rather
+                // than leaving an unguarded sleeper to run out its 120s self-cap — the same
+                // failed-setup-cleanup gap flagged on the sibling harness in #102.
+                let orphans = child_pids_of(holder.id() as i32);
                 let _ = holder.kill();
                 let _ = holder.wait();
+                for pid in orphans {
+                    drop(KillOnDrop(pid));
+                }
                 panic!("holder ({mode}) never reported a grandchild pid");
             }
         }
+    }
+
+    /// Pids whose parent is `parent`. Used only for failure-path cleanup, so a best-effort `/proc`
+    /// scan is enough.
+    fn child_pids_of(parent: i32) -> Vec<i32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            // Split at the last ')': `comm` may itself contain spaces and parens.
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let (_state, ppid) = (fields.next(), fields.next());
+            if let Some(Ok(ppid)) = ppid.map(str::parse::<i32>) {
+                if ppid == parent {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    }
+
+    /// Removes its path on drop, so a panicking race test leaves no pidfile behind to make the next
+    /// run's `O_EXCL` open fail.
+    struct ScratchPath(std::path::PathBuf);
+    impl Drop for ScratchPath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Re-exec into a *race* holder role and wait for the grandchild pid to appear in the pidfile.
+    ///
+    /// Cannot reuse `start_holder`: the race child blocks before exec, so `spawn()` never returns in
+    /// the holder and no marker is ever printed to stdout. The pid arrives out-of-band instead.
+    ///
+    /// `zombie_processes` is allowed because the returned `Child` is reaped by the caller — every
+    /// race test passes it to `sigkill_and_reap`, which both kills and `wait`s. The lint cannot see
+    /// across the return.
+    #[allow(clippy::zombie_processes)]
+    fn start_race_holder(mode: &str) -> (std::process::Child, i32, ScratchPath) {
+        let path = std::env::temp_dir().join(format!(
+            "otto-proc-guard-race-{}-{mode}.pid",
+            std::process::id()
+        ));
+        // `write_pid_raw` opens with O_EXCL, so a leftover file from an earlier run would make the
+        // spawn fail rather than silently reuse a stale pid.
+        let _ = std::fs::remove_file(&path);
+        let scratch = ScratchPath(path.clone());
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut holder = Command::new(exe)
+            .arg("proc_guard::tests::pdeathsig_holder_process")
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(HOLDER_ENV, mode)
+            .env(RACE_PIDFILE_ENV, &path)
+            .env_remove(SLEEPER_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn race holder");
+
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        loop {
+            if let Some(pid) = read_pidfile(&path) {
+                assert!(pid > 1, "implausible grandchild pid {pid}");
+                return (holder, pid, scratch);
+            }
+            if Instant::now() >= deadline {
+                let _ = holder.kill();
+                let _ = holder.wait();
+                panic!("race holder ({mode}) never published a grandchild pid");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Read the 4 native-endian bytes `write_pid_raw` wrote, or `None` until they are all there.
+    fn read_pidfile(path: &std::path::Path) -> Option<i32> {
+        let bytes = std::fs::read(path).ok()?;
+        let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+        Some(i32::from_ne_bytes(arr))
     }
 
     /// `SIGKILL` the holder and confirm it died *by that signal*.
@@ -325,6 +552,49 @@ mod tests {
             wait_until_dead(pid, DEATH_TIMEOUT),
             "grandchild (pid {pid}) survived its parent's SIGKILL — PR_SET_PDEATHSIG is not \
              installed, so a hard-killed otto would orphan the microVM"
+        );
+    }
+
+    /// The `getppid()` race guard specifically: when the parent dies *inside* the fork→`prctl`
+    /// window, `PR_SET_PDEATHSIG` can never fire, and only the re-check can still reap the child.
+    ///
+    /// This is the one test that fails if the `getppid() != parent_pid` line is deleted — every
+    /// other test here would stay green, which is exactly why it exists.
+    #[test]
+    fn race_guarded_child_still_dies_when_parent_died_before_prctl() {
+        let (mut holder, pid, _scratch) = start_race_holder("race-guarded");
+        let _cleanup = KillOnDrop(pid);
+        assert!(
+            process_is_live(pid),
+            "grandchild was already dead before the parent was killed, so the assertion below \
+             would prove nothing"
+        );
+
+        sigkill_and_reap(&mut holder);
+
+        assert!(
+            wait_until_dead(pid, DEATH_TIMEOUT),
+            "grandchild (pid {pid}) survived a parent that died inside the fork→prctl window. \
+             PR_SET_PDEATHSIG cannot fire there, so the getppid() re-check is what should have \
+             killed it — it is missing or wrong"
+        );
+    }
+
+    /// Control for the race scenario: same held-open window, no guard at all. Proves the race child
+    /// genuinely outlives its parent unless something reaps it, so the test above is not passing
+    /// because the child happened to exit on its own.
+    #[test]
+    fn race_unguarded_child_survives_when_parent_died_before_prctl() {
+        let (mut holder, pid, _scratch) = start_race_holder("race-unguarded");
+        let _cleanup = KillOnDrop(pid);
+
+        sigkill_and_reap(&mut holder);
+
+        std::thread::sleep(SURVIVAL_WINDOW);
+        assert!(
+            process_is_live(pid),
+            "the unguarded race control died too, so the race test proves nothing about the \
+             getppid() guard — something else is reaping these subprocesses"
         );
     }
 
