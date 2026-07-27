@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::loopback::LoopbackTarget;
@@ -132,6 +133,30 @@ pub fn app_with_base(
         accept_promotions,
         Some(public_ws_base),
     )
+}
+
+/// Serve a pre-built web UI bundle from `dir` as this router's fallback.
+///
+/// Applied *after* construction rather than threaded through `app`/`app_with_base`. Those two
+/// already differ only by one optional argument; a `ui_dir` parameter would make four
+/// constructors and churn all six call sites. This layer changes none of them.
+///
+/// ## Two security invariants, both deliberate
+///
+/// 1. **This route is unauthenticated on purpose.** A browser must fetch `index.html` and the
+///    wasm *before* it has a token to present, so requiring a bearer here would break first
+///    load. It is safe because the bundle is public build output: every path that carries
+///    session data or workspace contents — `/ws`, `/workspace`, `/promote`, `/export` — keeps
+///    its own bearer check, unchanged. Do not "fix" this by adding auth.
+///
+/// 2. **`dir` must never be a workspace root.** `ServeDir` does *not* consult the permission
+///    gate's sensitive-path floor, so pointing this at a workspace would serve `.env`, `.ssh/`,
+///    and `.git/` over plain HTTP — bypassing the single most important invariant in the
+///    codebase. It is operator-supplied via `--ui-dir`, has no default and no env fallback, and
+///    when the flag is absent this layer is never applied and the route does not exist.
+pub fn with_ui_dir(app: AxumRouter, dir: PathBuf) -> AxumRouter {
+    let index = dir.join("index.html");
+    app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
 }
 
 fn app_inner(
