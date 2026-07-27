@@ -7,3 +7,29 @@ title = "otto (Dioxus)"
 # style.css is now loaded on both targets via `document::Stylesheet { href: asset!("/style.css") }`
 # in `App` (src/app.rs), so it no longer needs a web-only `[web.resource]` entry here (that path
 # is never read by the desktop build).
+
+# Desktop packaging (Phase 2 of the Dioxus migration). Ported field-for-field from the Tauri
+# wrapper's tauri.conf.json, which this replaces in Phase 4.
+#
+# `identifier` deliberately matches the Tauri app's, so installing this package upgrades the
+# Tauri one rather than sitting alongside it as a confusing second install.
+#
+# `external_bin` is dx's equivalent of Tauri's `externalBin`: it uses the same
+# target-triple-suffix convention, so `binaries/otto` here resolves to the
+# `binaries/otto-<triple>` that scripts/stage-sidecar.sh produces. Run that script before
+# `dx bundle`, or the bundle ships without a sidecar and a fresh install cannot start a server.
+#
+# `[application] name` stays `otto-ui-dioxus` — scripts/measure-web-bundle.sh hardcodes it in
+# the asset path, and that script is the only guard against re-shipping unoptimized wasm.
+# Renaming to `otto-desktop` belongs to Phase 4, with the one-line script update.
+[bundle]
+identifier = "dev.otto.desktop"
+publisher = "otto"
+icon = [
+    "icons/32x32.png",
+    "icons/128x128.png",
+    "icons/128x128@2x.png",
+    "icons/icon.icns",
+    "icons/icon.ico",
+]
+external_bin = ["binaries/otto"]
