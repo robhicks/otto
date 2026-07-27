@@ -1,5 +1,5 @@
 //! `otto run "<goal>" [--root <path>] [--agent <name>]` — run a single turn (or a named custom agent) and print output.
-//! `otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 //! `otto plugin marketplace add|remove|update|list` / `otto plugin install|uninstall|list` — manage Claude Code plugin marketplaces under `~/.claude/plugins/marketplaces/`.
 
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
+                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
             );
             std::process::exit(2);
         }
@@ -74,6 +74,29 @@ fn parse_agent_flag(args: &[String]) -> (Option<String>, Vec<String>) {
         }
     }
     (name, rest)
+}
+
+/// Parse `--ui-dir <path>` from serve args. `None` means the static UI route is not installed.
+///
+/// SECURITY: deliberately no default and no env fallback. `ServeDir` does not consult the
+/// sensitive-path floor, so a defaulted or inferred value pointing at a workspace root would
+/// serve `.env`/`.ssh/` over plain HTTP. See `serve::with_ui_dir`. Deployments that configure
+/// this through the environment pass it as a flag from their launcher — as
+/// `deploy/fly/Dockerfile`'s `CMD` already does for `OTTO_PORT` and `OTTO_ROOT`.
+fn parse_ui_dir(args: &[String]) -> Option<PathBuf> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--ui-dir" {
+            match it.next() {
+                Some(p) => return Some(PathBuf::from(p)),
+                None => {
+                    eprintln!("error: --ui-dir requires a path");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parse `--command <name>` from args. Returns (Some(name), remaining) or (None, args). The
@@ -562,6 +585,7 @@ async fn run_command_in(
 
 async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let (root, positional) = parse_root(&args);
+    let ui_dir = parse_ui_dir(&positional);
     let mut port: u16 = std::env::var("OTTO_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -709,6 +733,15 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         accept_promotions,
         public_ws_base,
     );
+    // Static UI route: installed only when the operator passed --ui-dir. Absent by default —
+    // see `serve::with_ui_dir` for why this must never be defaulted or inferred.
+    let app = match ui_dir {
+        Some(dir) => {
+            eprintln!("otto serve serving web UI from {}", dir.display());
+            otto_engine::serve_with_ui_dir(app, dir)
+        }
+        None => app,
+    };
 
     // Bind host: default loopback (safe for local/dev — never expose a local serve to the network).
     // Set OTTO_HOST=0.0.0.0 to accept off-host connections, as the Fly deploy image does so Fly's
@@ -744,6 +777,25 @@ mod tests {
         let (name, rest) = parse_agent_flag(&args);
         assert_eq!(name, None);
         assert_eq!(rest, vec!["do it".to_string()]);
+    }
+
+    #[test]
+    fn parse_ui_dir_extracts_path() {
+        let args = vec![
+            "--port".to_string(),
+            "9000".to_string(),
+            "--ui-dir".to_string(),
+            "/srv/otto-ui".to_string(),
+        ];
+        assert_eq!(parse_ui_dir(&args), Some(PathBuf::from("/srv/otto-ui")));
+    }
+
+    /// The security-relevant default: absent flag means the static route is never installed.
+    /// There is deliberately no default path and no env fallback — see `serve::with_ui_dir`.
+    #[test]
+    fn parse_ui_dir_absent_is_none() {
+        let args = vec!["--port".to_string(), "9000".to_string()];
+        assert_eq!(parse_ui_dir(&args), None);
     }
 
     #[tokio::test]
