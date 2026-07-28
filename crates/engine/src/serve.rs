@@ -149,11 +149,21 @@ pub fn app_with_base(
 ///    session data or workspace contents — `/ws`, `/workspace`, `/promote`, `/export` — keeps
 ///    its own bearer check, unchanged. Do not "fix" this by adding auth.
 ///
-/// 2. **`dir` must never be a workspace root.** `ServeDir` does *not* consult the permission
-///    gate's sensitive-path floor, so pointing this at a workspace would serve `.env`, `.ssh/`,
-///    and `.git/` over plain HTTP — bypassing the single most important invariant in the
-///    codebase. It is operator-supplied via `--ui-dir`, has no default and no env fallback, and
-///    when the flag is absent this layer is never applied and the route does not exist.
+/// 2. **Nothing reachable from `dir` — including through symlinks — may lie outside it.**
+///    `ServeDir` does *not* consult the permission gate's sensitive-path floor, and it does
+///    *not* canonicalize the resolved path or verify it stays under `dir`: it only rejects
+///    `..`/root/prefix path *components* in the request itself (confirmed: `/../../etc/passwd`
+///    and both its percent-encoded forms are rejected). A symlink placed *inside* `dir` that
+///    points outside it is followed and served — reproduced end-to-end (`bundle/link-to-env` ->
+///    `<workspace>/.env` served the secret over plain HTTP). `dx build` output contains no
+///    symlinks today, so this is not exploitable through the shipped pipeline, but it means
+///    `dir` must be build output only, never a directory a running session (or anything else)
+///    can write into — pointing this at (or nesting it under) a workspace root would serve
+///    `.env`, `.ssh/`, and `.git/`, bypassing the single most important invariant in the
+///    codebase. `dir` is operator-supplied via `--ui-dir` (validated to exist and be a directory
+///    before this is ever called — see `validate_ui_dir` in `main.rs`), has no default and no env
+///    fallback, and when the flag is absent this layer is never applied and the route does not
+///    exist.
 pub fn with_ui_dir(app: AxumRouter, dir: PathBuf) -> AxumRouter {
     let index = dir.join("index.html");
     app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))

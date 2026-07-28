@@ -165,13 +165,19 @@ async fn existing_routes_are_unaffected_by_the_fallback() {
     );
 }
 
-/// `ServeDir` must not escape the bundle directory. This matters more here than in a normal
-/// static server: the sensitive-path floor that guards every other file access in otto does not
-/// apply to this route.
+/// `ServeDir` must not escape the bundle directory via request-path traversal. This matters more
+/// here than in a normal static server: the sensitive-path floor that guards every other file
+/// access in otto does not apply to this route.
 ///
 /// The bundle is nested one level down inside the tempdir so the "outside" file has somewhere
 /// real to live — putting it in the shared system temp dir under a fixed name would collide
 /// between concurrent test runs.
+///
+/// Asserting only `!body.contains("TOP SECRET")` would pass even if `serve_with_ui_dir` were
+/// replaced with a no-op (`|app, _| app`): the request would hit axum's default fallback, return
+/// 404 with an empty body, and the "traversal blocked" and "no static route exists" cases would
+/// be indistinguishable. So every case here also asserts the status: a 200/404-with-index proves
+/// the route exists, and the body assertion proves traversal did not reach the target.
 #[tokio::test]
 async fn path_traversal_does_not_escape_the_bundle_dir() {
     let outer = tempfile::tempdir().unwrap();
@@ -180,16 +186,69 @@ async fn path_traversal_does_not_escape_the_bundle_dir() {
     std::fs::write(bundle_dir.join("index.html"), b"<html>otto ui</html>").unwrap();
     std::fs::write(outer.path().join("outside-secret.txt"), b"TOP SECRET").unwrap();
 
+    for uri in [
+        "/../outside-secret.txt",
+        "/%2e%2e/%2e%2e/outside-secret.txt",
+        "/..%2foutside-secret.txt",
+    ] {
+        let (app, _dir) = build_app(Some(bundle_dir.clone())).await;
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+
+        // The route exists (proven by the index fallback still firing) and the traversal did
+        // not read the secret. tower-http 0.6 rejects `..`/root/prefix path *components*, so
+        // this resolves to the index fallback (200) rather than a bare 404 — either would prove
+        // the route is live, but asserting the actual observed shape keeps this honest.
+        assert!(
+            status.is_success(),
+            "uri {uri:?}: expected the static route to handle the request (index fallback), got {status}"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "uri {uri:?}: traversal must not read outside the bundle dir"
+        );
+    }
+}
+
+/// Documents `ServeDir`'s real behavior on a symlink placed *inside* the bundle directory that
+/// points *outside* it: it IS followed and served. `ServeDir` only rejects traversal
+/// *components* in the request path (proven above); it never canonicalizes the resolved file or
+/// checks that it stays under the base, so a symlink resolves wherever it points.
+///
+/// This is not a bug in this route — `dx build` output contains no symlinks, so nothing in the
+/// shipped pipeline can produce this case — but it is exactly why `--ui-dir` must only ever point
+/// at trusted build output, never at (or under) any directory a running session can write into.
+/// A test that encodes this real behavior is worth more than one asserting a guarantee `ServeDir`
+/// does not actually provide.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_inside_the_bundle_escapes_it_and_is_served() {
+    let outer = tempfile::tempdir().unwrap();
+    let bundle_dir = outer.path().join("public");
+    std::fs::create_dir_all(&bundle_dir).unwrap();
+    std::fs::write(bundle_dir.join("index.html"), b"<html>otto ui</html>").unwrap();
+    let secret = outer.path().join(".env");
+    std::fs::write(&secret, b"SECRET=TOP SECRET").unwrap();
+    std::os::unix::fs::symlink(&secret, bundle_dir.join("link-to-env")).unwrap();
+
     let (app, _dir) = build_app(Some(bundle_dir)).await;
     let req = axum::http::Request::builder()
-        .uri("/../outside-secret.txt")
+        .uri("/link-to-env")
         .body(axum::body::Body::empty())
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-
+    assert!(resp.status().is_success(), "got {}", resp.status());
     assert!(
-        !body_string(resp).await.contains("TOP SECRET"),
-        "traversal must not read outside the bundle dir"
+        body_string(resp).await.contains("TOP SECRET"),
+        "documents the real (undesirable) behavior: a symlink inside the bundle dir is followed \
+         outside it — this is why the bundle directory must be build output only, never \
+         writable by a running session"
     );
 }

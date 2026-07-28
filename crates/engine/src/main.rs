@@ -2,7 +2,7 @@
 //! `otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
 //! `otto plugin marketplace add|remove|update|list` / `otto plugin install|uninstall|list` — manage Claude Code plugin marketplaces under `~/.claude/plugins/marketplaces/`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use otto_engine::{
@@ -97,6 +97,35 @@ fn parse_ui_dir(args: &[String]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Validate a `--ui-dir` value before it can ever reach `ServeDir`, returning the canonicalized
+/// path on success.
+///
+/// SECURITY (closes a real vulnerability, not a hypothetical one): `ServeDir::new(dir)` resolves
+/// every request path relative to `dir` with **no validation of its own** — an empty `dir`
+/// resolves relative to the process's current working directory, and a nonexistent/non-directory
+/// `dir` silently 404s everything while the CLI still reports success. Both were reproduced
+/// end-to-end against a release binary: `--ui-dir ""` served `.env` and `.ssh/id_rsa` over
+/// unauthenticated plain HTTP (see the design spec / final-fix report for the transcript).
+///
+/// This check lives in its own pure, testable function — not inlined into `parse_ui_dir` (which
+/// has no I/O and stays a cheap arg-extraction helper) and not deferred into `with_ui_dir` (by the
+/// time that runs, the caller has already decided to install the route and log success; validating
+/// there would still let a bad value reach `ServeDir` in tests/other callers that build the app
+/// directly). Doing it once, right after parsing, in `cmd_serve`, means: (1) a bad value is a hard,
+/// fail-closed error before any other server setup runs, and (2) canonicalizing here means the
+/// served base can never be reinterpreted later relative to a changed process CWD.
+fn validate_ui_dir(dir: &Path) -> Result<PathBuf, String> {
+    if dir.as_os_str().is_empty() {
+        return Err("--ui-dir must not be empty".to_string());
+    }
+    let canonical = std::fs::canonicalize(dir)
+        .map_err(|e| format!("--ui-dir {dir:?} does not exist or is not accessible: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("--ui-dir {dir:?} is not a directory"));
+    }
+    Ok(canonical)
 }
 
 /// Parse `--command <name>` from args. Returns (Some(name), remaining) or (None, args). The
@@ -585,7 +614,19 @@ async fn run_command_in(
 
 async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let (root, positional) = parse_root(&args);
-    let ui_dir = parse_ui_dir(&positional);
+    // Validated (and canonicalized) immediately after parsing, before any other server setup, so
+    // a bad --ui-dir fails fast and closed rather than starting a server that looks healthy and
+    // either 404s everything or — worse — serves the process CWD. See `validate_ui_dir`.
+    let ui_dir = match parse_ui_dir(&positional) {
+        Some(raw) => match validate_ui_dir(&raw) {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     let mut port: u16 = std::env::var("OTTO_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -796,6 +837,43 @@ mod tests {
     fn parse_ui_dir_absent_is_none() {
         let args = vec!["--port".to_string(), "9000".to_string()];
         assert_eq!(parse_ui_dir(&args), None);
+    }
+
+    /// C1: an empty `--ui-dir` value must be a hard error, never accepted as "the process CWD".
+    #[test]
+    fn validate_ui_dir_rejects_empty() {
+        let err = validate_ui_dir(Path::new("")).unwrap_err();
+        assert!(err.contains("must not be empty"), "unexpected error: {err}");
+    }
+
+    /// C1 / I2: a nonexistent path must be a hard error, not a server that starts and 404s.
+    #[test]
+    fn validate_ui_dir_rejects_nonexistent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = validate_ui_dir(&missing).unwrap_err();
+        assert!(err.contains("does not exist"), "unexpected error: {err}");
+    }
+
+    /// C1: a file (not a directory) must be rejected — `ServeDir` needs a directory.
+    #[test]
+    fn validate_ui_dir_rejects_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"hello").unwrap();
+        let err = validate_ui_dir(&file).unwrap_err();
+        assert!(
+            err.contains("is not a directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// C1: a valid, existing directory is still accepted, canonicalized.
+    #[test]
+    fn validate_ui_dir_accepts_a_valid_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = validate_ui_dir(dir.path()).unwrap();
+        assert_eq!(canonical, dir.path().canonicalize().unwrap());
     }
 
     #[tokio::test]
