@@ -90,6 +90,8 @@ tree-sitter-go = { version = "0.25.0", optional = true }
 
 [dev-dependencies]
 dioxus-ssr = "0.7"
+# `resolve_otto_bin_in`'s tests (desktop_boot.rs) stage a fake sidecar file in a scratch dir.
+tempfile = "3"
 
 # Browser-only test harness for `src/web_mount_test.rs`. Target-gated to wasm32 (NOT just
 # feature-gated) so the native `--features desktop` build never resolves or compiles these —

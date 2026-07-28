@@ -3882,6 +3882,7 @@ dependencies = [
  "reqwest",
  "rfd 0.15.4",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tree-sitter",

@@ -44,6 +44,64 @@ pub enum BootOutcome {
     Ready(Child, LaunchParams),
 }
 
+/// Resolve the `otto` binary the sidecar is spawned from.
+///
+/// Order, and why each step exists:
+///
+/// 1. **`OTTO_BIN`** — an explicit operator override always wins (dev runs against a
+///    freshly-built binary, unusual installs). An empty value is treated as unset: it is a
+///    misconfiguration, not a request to spawn `""`.
+/// 2. **A sibling of the running executable named `otto-sidecar`** — this is where `dx bundle`'s
+///    `[bundle] external_bin` places the staged binary inside an installed package. VERIFIED by
+///    inspecting a built `.deb` (`ar x` + `tar tzvf`; see the Phase 2 plan, Task 3 Step 7), not
+///    inferred from documentation, which only describes macOS `.app` placement. The staged file
+///    is named `otto-sidecar`, **not** `otto`: `dx` strips the target-triple suffix from
+///    `external_bin` entries at install time (Tauri's `externalBin` kept it), so a staged
+///    `otto` would install as bare `/usr/bin/otto` and collide with — and silently overwrite —
+///    this project's own `otto` CLI. `scripts/stage-sidecar.sh` renamed the staged binary to
+///    `otto-sidecar-<triple>` for exactly that reason (commit `403da7c`), and the installed
+///    layout is `usr/bin/otto-ui-dioxus` (the app) alongside `usr/bin/otto-sidecar` (the
+///    triple-stripped sidecar) — siblings, no suffix.
+/// 3. **Bare `otto` on `PATH`** — preserves the pre-bundle dev behavior this file shipped with.
+///
+/// Split into a pure inner function so the order is unit-testable without an installed bundle.
+fn resolve_otto_bin_in(env_override: Option<String>, exe_dir: Option<&Path>) -> String {
+    if let Some(bin) = env_override.filter(|b| !b.is_empty()) {
+        return bin;
+    }
+    if let Some(dir) = exe_dir {
+        for name in sidecar_candidate_names() {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "otto".to_string()
+}
+
+/// Sidecar filenames to look for beside the running executable, most-specific first.
+///
+/// Windows executables (including the staged sidecar) always carry a `.exe` suffix
+/// (`scripts/stage-sidecar.sh` appends it for a `*windows*` target triple before dx strips the
+/// triple), so a Windows install has `otto-sidecar.exe`, never bare `otto-sidecar`.
+#[cfg(windows)]
+fn sidecar_candidate_names() -> &'static [&'static str] {
+    &["otto-sidecar.exe"]
+}
+
+#[cfg(not(windows))]
+fn sidecar_candidate_names() -> &'static [&'static str] {
+    &["otto-sidecar"]
+}
+
+/// `resolve_otto_bin_in` wired to the real environment. The only caller is `boot()`.
+fn resolve_otto_bin() -> String {
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(Path::parent);
+    resolve_otto_bin_in(std::env::var("OTTO_BIN").ok(), exe_dir)
+}
+
 /// Pick a workspace folder, spawn `otto serve` there, wait for it to bind, and return the live
 /// child + connect params.
 ///
@@ -67,9 +125,10 @@ pub async fn boot() -> BootOutcome {
     };
     let root = handle.path().to_path_buf();
     let token = uuid::Uuid::new_v4().to_string();
-    // `otto` must be on PATH (or point OTTO_BIN at it); mirrors desktop/'s sidecar contract. The
-    // argv itself (port, root, and the two capability flags) is built by `serve_command`, which
-    // documents why each flag is there and is unit-tested.
+    // The sidecar binary is resolved by `resolve_otto_bin`: OTTO_BIN, else a binary staged
+    // beside this executable by `dx bundle`, else `otto` on PATH. See that function for why.
+    // The argv itself (port, root, and the two capability flags) is built by `serve_command`,
+    // which documents why each flag is there and is unit-tested.
     //
     // `kill_on_drop(true)` (set there) kills the sidecar when the stored `Child` is dropped — but
     // Drop only runs if the app *unwinds* on close.
@@ -77,7 +136,7 @@ pub async fn boot() -> BootOutcome {
     // supervisor) skips Drop and orphans the sidecar, so `install_pdeathsig` below adds a
     // kernel-level guard that does not depend on Drop running. The two are complementary:
     // `kill_on_drop` handles the graceful in-app disconnect, `PR_SET_PDEATHSIG` handles hard exits.
-    let bin = std::env::var("OTTO_BIN").unwrap_or_else(|_| "otto".into());
+    let bin = resolve_otto_bin();
     let mut command = serve_command(&bin, &root, &token);
     let mut child = match spawn_guarded(&mut command) {
         Ok(child) => child,
@@ -533,6 +592,56 @@ mod tests {
         assert!(!is_ready_line(""));
         assert!(!is_ready_line("warning: something else"));
         assert!(!is_ready_line("otto run finished"));
+    }
+
+    #[test]
+    fn resolve_otto_bin_prefers_the_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("otto-sidecar");
+        std::fs::write(&sibling, b"#!/bin/sh\n").unwrap();
+
+        let got = resolve_otto_bin_in(Some("/custom/otto".to_string()), Some(dir.path()));
+
+        assert_eq!(
+            got, "/custom/otto",
+            "an explicit OTTO_BIN must win over a bundled sibling"
+        );
+    }
+
+    #[test]
+    fn resolve_otto_bin_finds_the_bundled_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join("otto-sidecar");
+        std::fs::write(&sibling, b"#!/bin/sh\n").unwrap();
+
+        let got = resolve_otto_bin_in(None, Some(dir.path()));
+
+        assert_eq!(
+            got,
+            sibling.to_string_lossy(),
+            "an installed bundle stages `otto-sidecar` beside the app executable"
+        );
+    }
+
+    /// The pre-bundle dev behavior, which must survive: no override, nothing staged beside the
+    /// executable, so fall through to whatever `otto` is on PATH.
+    #[test]
+    fn resolve_otto_bin_falls_back_to_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let got = resolve_otto_bin_in(None, Some(dir.path()));
+
+        assert_eq!(got, "otto");
+    }
+
+    /// An empty OTTO_BIN is a misconfiguration, not an instruction to spawn "".
+    #[test]
+    fn resolve_otto_bin_ignores_an_empty_override() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let got = resolve_otto_bin_in(Some(String::new()), Some(dir.path()));
+
+        assert_eq!(got, "otto");
     }
 }
 
