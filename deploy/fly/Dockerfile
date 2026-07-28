@@ -9,6 +9,20 @@ COPY . .
 RUN cargo build --release \
     -p otto-engine -p otto-mcp-fs -p otto-mcp-grep -p otto-mcp-git
 
+# The web UI bundle. Its own stage: the Dioxus CLI is a heavy, separately-versioned toolchain,
+# and keeping it out of the engine stage means a dx problem cannot break the engine build (and
+# the engine layer stays cached when only the UI changes).
+#
+# dx is pinned to the version this migration was verified against. build-web.sh runs the same
+# four bundle-trust guards it runs locally, so this image cannot ship the unoptimized 2.16 MB
+# wasm even if a future dx regresses wasm-opt.
+FROM rust:1.85-bookworm AS webbuild
+WORKDIR /src
+COPY . .
+RUN rustup target add wasm32-unknown-unknown \
+    && cargo install dioxus-cli --version 0.7.9 --locked
+RUN cd ui-dioxus && ./scripts/build-web.sh
+
 FROM debian:bookworm-slim
 # git backs the served spine's git.* tools (mcp-git shells out to it); ca-certificates for outbound
 # TLS to LLM APIs. `gh` (GitHub CLI) is intentionally omitted: git.pr_open is unavailable on
@@ -22,12 +36,17 @@ COPY --from=build /src/target/release/otto /usr/local/bin/otto
 COPY --from=build /src/target/release/mcp-fs /usr/local/bin/mcp-fs
 COPY --from=build /src/target/release/mcp-grep /usr/local/bin/mcp-grep
 COPY --from=build /src/target/release/mcp-git /usr/local/bin/mcp-git
+# The web UI bundle, served by `otto serve --ui-dir` (see CMD). Built in the `webbuild` stage.
+# SECURITY: this directory must contain only build output. The static route is unauthenticated
+# by design (a browser fetches index.html and the wasm before it has a token), and ServeDir does
+# not consult otto's sensitive-path floor — so OTTO_UI_DIR must never be pointed at /workspace.
+COPY --from=webbuild /src/ui-dioxus/target/dx/otto-ui-dioxus/release/web/public /usr/local/share/otto/ui
 # The session workspace root. create_machine injects OTTO_ROOT=/workspace.
 RUN mkdir -p /workspace
 # OTTO_HOST=0.0.0.0 is load-bearing: Fly's proxy reaches the machine over its network interface,
 # not loopback, so otto serve must NOT bind 127.0.0.1 here (its safe local default). OTTO_TOKEN is
 # injected per-machine by the provisioner.
-ENV OTTO_PORT=8787 OTTO_ROOT=/workspace OTTO_HOST=0.0.0.0
+ENV OTTO_PORT=8787 OTTO_ROOT=/workspace OTTO_HOST=0.0.0.0 OTTO_UI_DIR=/usr/local/share/otto/ui
 # No OS sandbox backend (bwrap) is installed, so `bash`/sandboxed tools stay unregistered on the
 # guest (fail-closed) — a deliberate posture consistent with otto's "no backend -> no bash" rule.
-CMD ["sh", "-c", "otto serve --accept-promotions --port \"$OTTO_PORT\" --root \"$OTTO_ROOT\""]
+CMD ["sh", "-c", "otto serve --accept-promotions --port \"$OTTO_PORT\" --root \"$OTTO_ROOT\" --ui-dir \"$OTTO_UI_DIR\""]
