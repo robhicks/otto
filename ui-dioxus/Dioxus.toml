@@ -15,9 +15,18 @@ title = "otto (Dioxus)"
 # Tauri one rather than sitting alongside it as a confusing second install.
 #
 # `external_bin` is dx's equivalent of Tauri's `externalBin`: it uses the same
-# target-triple-suffix convention, so `binaries/otto` here resolves to the
-# `binaries/otto-<triple>` that scripts/stage-sidecar.sh produces. Run that script before
-# `dx bundle`, or the bundle ships without a sidecar and a fresh install cannot start a server.
+# target-triple-suffix convention, so `binaries/otto-sidecar` here resolves to the
+# `binaries/otto-sidecar-<triple>` that scripts/stage-sidecar.sh produces. Run that script
+# before `dx bundle`, or the bundle ships without a sidecar and a fresh install cannot start a
+# server.
+#
+# The staged name is `otto-sidecar`, NOT `otto`, even though the file it copies is
+# `target/release/otto` (the project's own CLI binary). This is deliberate, not a typo: dx
+# strips the target-triple suffix from `external_bin` entries at install time (Tauri's
+# `externalBin` kept it), so an entry named `binaries/otto` would install as bare `/usr/bin/otto`
+# — colliding with, and on install silently overwriting, this project's own `otto` CLI if the
+# user already has it on their system. `otto-sidecar` avoids that collision. Measured via
+# `ar x` + `tar tzvf` on a built `.deb` — see docs/superpowers/specs/2026-07-27-ui-dioxus-build-serve-design.md §2.
 #
 # `[application] name` stays `otto-ui-dioxus` — scripts/measure-web-bundle.sh hardcodes it in
 # the asset path, and that script is the only guard against re-shipping unoptimized wasm.
@@ -32,4 +41,4 @@ icon = [
     "icons/icon.icns",
     "icons/icon.ico",
 ]
-external_bin = ["binaries/otto"]
+external_bin = ["binaries/otto-sidecar"]

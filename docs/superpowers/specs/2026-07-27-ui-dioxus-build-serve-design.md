@@ -128,11 +128,16 @@ identifier = "dev.otto.desktop"      # same identifier Tauri uses — an upgrade
 publisher  = "otto"
 icon       = ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png",
               "icons/icon.icns", "icons/icon.ico"]
-external_bin = ["binaries/otto"]     # dx appends the host target triple, as Tauri does
+external_bin = ["binaries/otto-sidecar"]   # staged name, NOT "otto" — see below
 ```
 
-`external_bin` is a real Dioxus 0.7 `BundleConfig` field with the same target-triple-suffix
-convention as Tauri's `externalBin`, which is what makes this close to a field-for-field port.
+`external_bin` is a real Dioxus 0.7 `BundleConfig` field, and dx *stages* it under the same
+target-triple-suffix convention Tauri's `externalBin` uses — but that parity is only half the
+story: **dx strips the triple suffix at install time, where Tauri kept it** (measured — see
+below). The entry is named `otto-sidecar`, not `otto`, precisely because of that: an
+`otto`-named entry would install as bare `/usr/bin/otto` and collide with this project's own
+`otto` CLI on the user's system. So this is not a field-for-field port of Tauri's
+`externalBin` convention; it diverges exactly at the one place that matters for naming.
 
 **Sequencing catch:** the icons currently exist only under `desktop/src-tauri/icons/`, which
 **Phase 4 deletes**. Phase 2 copies them to `ui-dioxus/icons/` as an explicit step. Skipping it
@@ -147,8 +152,9 @@ script update, when nothing else is in flight.
 
 `ui-dioxus/scripts/stage-sidecar.sh`, closely following `desktop/build-sidecar.sh`: build
 `-p otto-engine --release` against the root manifest, then copy `target/release/otto` to
-`ui-dioxus/binaries/otto-<host-triple>` (with a `.exe` suffix on Windows triples). `binaries/` is
-added to `.gitignore`.
+`ui-dioxus/binaries/otto-sidecar-<host-triple>` (with a `.exe` suffix on Windows triples). The
+staged name carries `-sidecar` for the collision reason above. `binaries/` is added to
+`.gitignore`.
 
 ### Runtime resolution — the one `ui-dioxus` code change
 
@@ -159,12 +165,21 @@ neither holds. The new order is:
 2. a path resolved relative to the running executable,
 3. bare `otto` on `PATH` (preserves today's dev-run behavior).
 
-**What must be measured rather than assumed.** The Dioxus documentation describes `external_bin`
-placement for macOS `.app` bundles. Where `dx` actually places it inside a Linux `.deb`, and what
-path the running process observes, is **unverified**. The implementation step is therefore: build
-the `.deb`, inspect it (`dpkg-deb -c`), and write step 2 against the observed layout. If the binary
-does not land beside the executable, step 2 changes and this section is corrected to match. No
-resolution path inferred from documentation ships.
+**Measured, not assumed.** The Dioxus documentation only describes `external_bin` placement for
+macOS `.app` bundles; the Linux `.deb` layout was unverified until built and inspected (`ar x` +
+`tar tzvf` on the package — `dpkg-deb` was not available on the build host, and produces
+equivalent output). Measured layout, with `external_bin = ["binaries/otto-sidecar"]`:
+
+```
+usr/bin/otto-ui-dioxus   # app executable
+usr/bin/otto-sidecar     # staged sidecar — sibling of the executable, triple suffix stripped
+```
+
+The sidecar **is** a sibling of the app executable (both directly under `/usr/bin/`), so step 2's
+executable-relative resolution holds. The triple suffix does **not** survive into the installed
+name — `stage-sidecar.sh` writes `otto-sidecar-<triple>`, but dx installs it as plain
+`otto-sidecar`, matching the un-suffixed `external_bin` entry. Runtime resolution must look for a
+bare `otto-sidecar` (or `otto-sidecar.exe`) beside the executable, never a triple-suffixed name.
 
 ### Testing
 
