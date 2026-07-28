@@ -1,6 +1,6 @@
 # Dioxus UI migration, Phase 2 — build & serve story
 
-> **Status:** APPROVED DESIGN, not yet implemented.
+> **Status:** IMPLEMENTED — Phase 2 is COMPLETE (see the migration plan).
 > **Implements:** Phase 2 of `docs/superpowers/plans/2026-07-22-ui-dioxus-migration.md`.
 > **Depends on:** Phase 1 (COMPLETE, PRs #96–#101). **Blocks:** Phase 3 parity sign-off.
 
@@ -197,8 +197,8 @@ Three scripts in `ui-dioxus/scripts/`:
 | Script | Responsibility |
 |---|---|
 | `build-web.sh` | Release web build **plus the trust guards**; prints the output directory for `--ui-dir` |
-| `stage-sidecar.sh` | Builds release `otto`, stages it as `binaries/otto-<triple>` (§2) |
-| `build-desktop.sh` | Runs `stage-sidecar.sh`, then `dx bundle --release --platform desktop --package-types deb --package-types rpm` |
+| `stage-sidecar.sh` | Builds release `otto`, stages it as `binaries/otto-sidecar-<triple>` (§2) |
+| `build-desktop.sh` | Runs `stage-sidecar.sh`, then `dx bundle --release --platform desktop --features desktop --package-types deb` (rpm was dropped — see the script's own comment for the dx 0.7.9 icon-collision bug) |
 
 ### Targeted improvement to `measure-web-bundle.sh`
 
@@ -251,13 +251,17 @@ it caches, and the image is built rarely and by hand.
 ### Exposure
 
 The Fly app already exposes `/ws` and `/workspace` publicly, guarded by the per-session bearer token
-minted by `FlyTarget`. The static route adds only compiled build output: no session data, no
-workspace contents, nothing token-derived. An unauthenticated visitor can load the UI and then do
-nothing with it.
+minted by `FlyTarget`. The static route adds only compiled build output — no session data, no
+workspace contents, nothing token-derived — **but only for a validated, non-empty `--ui-dir`**.
+An empty or nonexistent value is now a hard, fail-closed error at startup (`validate_ui_dir` in
+`crates/engine/src/main.rs`), closing the gap where an empty value would have made `ServeDir`
+resolve against the process's working directory instead. With that validation in place, an
+unauthenticated visitor can load the UI and then do nothing with it.
 
 The invariant that keeps this true is the same one as §1: `OTTO_UI_DIR` points at the image's bundle
 directory and never at `/workspace`. That is why it is an explicit `ENV` in the Dockerfile rather
-than anything inferred at runtime.
+than anything inferred at runtime — and why `validate_ui_dir` now enforces, at startup, that the
+value is non-empty, exists, and is a directory before it is ever handed to `ServeDir`.
 
 ### Verification
 

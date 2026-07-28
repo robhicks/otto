@@ -31,7 +31,7 @@ command -v dx >/dev/null 2>&1 || {
 
 ./scripts/stage-sidecar.sh
 
-echo "==> dx bundle --release --platform desktop --features desktop"
+echo "==> dx bundle --release --platform desktop --features desktop --package-types deb"
 dx bundle --release --platform desktop --features desktop \
     --package-types deb
 

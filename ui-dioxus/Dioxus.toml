@@ -8,8 +8,11 @@ title = "otto (Dioxus)"
 # in `App` (src/app.rs), so it no longer needs a web-only `[web.resource]` entry here (that path
 # is never read by the desktop build).
 
-# Desktop packaging (Phase 2 of the Dioxus migration). Ported field-for-field from the Tauri
-# wrapper's tauri.conf.json, which this replaces in Phase 4.
+# Desktop packaging (Phase 2 of the Dioxus migration). Mapped across from the Tauri wrapper's
+# tauri.conf.json, which this replaces in Phase 4 — NOT a field-for-field port: `external_bin`
+# diverges from Tauri's `externalBin` in exactly the place that matters for naming (dx strips
+# the target-triple suffix at install time, where Tauri kept it; see the comment below on
+# `otto-sidecar`).
 #
 # `identifier` deliberately matches the Tauri app's, so installing this package upgrades the
 # Tauri one rather than sitting alongside it as a confusing second install.
@@ -28,7 +31,7 @@ title = "otto (Dioxus)"
 # user already has it on their system. `otto-sidecar` avoids that collision. Measured via
 # `ar x` + `tar tzvf` on a built `.deb` — see docs/superpowers/specs/2026-07-27-ui-dioxus-build-serve-design.md §2.
 #
-# `[application] name` stays `otto-ui-dioxus` — scripts/measure-web-bundle.sh hardcodes it in
+# `[application] name` stays `otto-ui-dioxus` — scripts/build-web.sh hardcodes it in
 # the asset path, and that script is the only guard against re-shipping unoptimized wasm.
 # Renaming to `otto-desktop` belongs to Phase 4, with the one-line script update.
 [bundle]

@@ -9,9 +9,14 @@ COPY . .
 RUN cargo build --release \
     -p otto-engine -p otto-mcp-fs -p otto-mcp-grep -p otto-mcp-git
 
-# The web UI bundle. Its own stage: the Dioxus CLI is a heavy, separately-versioned toolchain,
-# and keeping it out of the engine stage means a dx problem cannot break the engine build (and
-# the engine layer stays cached when only the UI changes).
+# The web UI bundle. Its own stage: the Dioxus CLI is a heavy, separately-versioned toolchain, and
+# keeping it out of the `build` stage means that stage's `cargo build` does not depend on `dx`
+# being installed or working. This is NOT a caching win — both stages `COPY . .` over the same
+# build context, so a UI-only change busts the `build` stage's copy layer (and its `cargo build`)
+# exactly as much as an engine-only change does; there is no cache isolation between them. It is
+# also not full failure isolation for the image as a whole: the final stage below still
+# `COPY --from=webbuild`s the bundle, so a `dx build` failure still fails the overall image
+# build — just not the engine `cargo build` itself.
 #
 # dx is pinned to the version this migration was verified against. build-web.sh runs the same
 # four bundle-trust guards it runs locally, so this image cannot ship the unoptimized 2.16 MB
