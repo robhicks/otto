@@ -143,7 +143,7 @@ below). The entry is named `otto-sidecar`, not `otto`, precisely because of that
 **Phase 4 deletes**. Phase 2 copies them to `ui-dioxus/icons/` as an explicit step. Skipping it
 leaves a bundle that breaks in Phase 4, after parity has already been signed off.
 
-**`[application] name` stays `otto-ui-dioxus` for now.** `scripts/measure-web-bundle.sh:67`
+**`[application] name` stays `otto-ui-dioxus` for now.** `scripts/build-web.sh`
 hardcodes that name in its asset path, and that script is the only guard against silently
 re-shipping the unoptimized wasm. Rename to `otto-desktop` in Phase 4, together with the one-line
 script update, when nothing else is in flight.
@@ -278,6 +278,6 @@ on external infrastructure, so it lands last.
   — closer to what users actually get.
 - **Phase 4** deletes `ui/` and `desktop/`. Two items in this spec are its prerequisites: the icons
   must already live in `ui-dioxus/icons/` (§2), and the `[application] name` rename plus the
-  `measure-web-bundle.sh` path update happen there, not here.
+  `build-web.sh` path update happen there, not here.
 - The migration plan's Phase 2 bullets should be rewritten against the three premise corrections
   above when this lands.
