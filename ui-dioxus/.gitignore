@@ -1,1 +1,4 @@
 /target
+# Staged `otto` sidecar binaries for `dx bundle` ([bundle] external_bin in Dioxus.toml).
+# Build artifacts produced by scripts/stage-sidecar.sh — never committed.
+/binaries

@@ -45,6 +45,7 @@ pub use otto_remote::{
 pub use policy_gate::PolicyGate;
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,
+    with_ui_dir as serve_with_ui_dir,
 };
 pub use service::{AcceptError, CollectingSink, EngineService, EventSink, TurnControls};
 

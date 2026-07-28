@@ -67,6 +67,18 @@ The image sets `OTTO_HOST=0.0.0.0` so Fly's proxy (which reaches the machine ove
 interface, not loopback) can connect — no operator action needed. Run standalone, `otto serve`
 otherwise defaults to binding `127.0.0.1` for safe local use.
 
+## Browser UI
+
+The image bundles the Dioxus web UI and serves it from the same port as the API
+(`otto serve --ui-dir`, wired through `OTTO_UI_DIR` in the Dockerfile). Once a machine is
+running, open its app URL in a browser — `https://<app>.fly.dev/` — and connect using the
+per-session token the provisioner injected as `OTTO_TOKEN`.
+
+The static route is intentionally unauthenticated: a browser has to load `index.html` and the
+wasm before it has a token to present. Only build output is served this way. Every path that
+touches session data or workspace contents (`/ws`, `/workspace`, `/promote`, `/export`) still
+requires the bearer token, so an unauthenticated visitor can load the UI and do nothing with it.
+
 ## Env reference
 `FLY_API_TOKEN`, `OTTO_FLY_ORG`, `OTTO_FLY_REGION`, `OTTO_FLY_IMAGE`, `OTTO_FLY_CPUS` (1),
 `OTTO_FLY_CPU_KIND` (shared; or `performance` — the Machines API requires one), `OTTO_FLY_MEM_MIB`

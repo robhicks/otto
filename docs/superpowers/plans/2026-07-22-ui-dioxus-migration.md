@@ -64,7 +64,7 @@ sidecar on close, on a real session. Only then does Phase 1 begin.
 Independent fixes, each shippable on its own, no cutover risk. Each needs a test and a commit.
 
 **Status: COMPLETE** — all six items shipped as PRs #96–#101 (see the per-item merge notes below).
-Phase 2 (build & serve story) is next and still needs its own design pass.
+Phase 2 (build & serve story) has since also completed — see its section below.
 
 - [x] **Fix the `wasm-opt` crash.** ~~Dioxus's build ships unoptimized wasm (SIGABRT/DWARF crash in
       `wasm-opt` on this toolchain) — the web bundle is ~2.16 MB unoptimized vs a fair optimized target.
@@ -143,22 +143,70 @@ Phase 2 (build & serve story) is next and still needs its own design pass.
 
 ---
 
-## Phase 2 — Build & serve story (NEEDS ITS OWN DESIGN PASS)
+## Phase 2 — Build & serve story
 
-Replacing `trunk`/`ui/dist` + Tauri's `externalBin` bundling with `dx`. Decisions to settle in a short
-design before bite-sized steps:
+**Status: COMPLETE.** Design pass done: `docs/superpowers/specs/2026-07-27-ui-dioxus-build-serve-design.md`.
+Implemented per `docs/superpowers/plans/2026-07-27-ui-dioxus-build-serve.md`.
 
-- [ ] How `otto serve` finds and serves the Dioxus web bundle (today it serves `ui/dist`; the Dioxus
-      output lives under `target/dx/.../web/public`). Does the engine's static-serve path change, or does
-      the build stage assets into a stable location? (Engine change, if any, must be additive.)
-- [ ] Desktop packaging: `dx bundle` vs the Tauri `.deb`/`.rpm` story `desktop/` ships today; installer
-      parity (icons, identifier, autostart of the sidecar).
-- [ ] CI: replace the `ui/` wasm-build + `desktop/` Tauri-build jobs with the `dx` equivalents; keep the
-      workspace determinism suite untouched (both UI crates stay excluded).
+Three premises in this section's original bullets were wrong, and are corrected here so they are
+not re-derived later:
+
+- [x] **`otto serve` now serves the web bundle** via an additive `--ui-dir` static fallback.
+      The original bullet said "today it serves `ui/dist`" — it did not serve static files at
+      all; its routes were `/ws`, `/workspace`, `/promote`, `/export`, and `tower-http` carried
+      only the `cors` feature. The engine change is one post-construction layer
+      (`serve::with_ui_dir`), so no existing constructor or call site changed. No default and no
+      env fallback: `ServeDir` does not consult the sensitive-path floor.
+- [x] **Desktop packaging moved to `dx bundle`**, `[bundle] external_bin` staging the sidecar as
+      `otto-sidecar`, **not** `otto`. Measuring a built `.deb` found `dx` strips the target-triple
+      suffix from `external_bin` entries at install time (Tauri's `externalBin` kept it), so a
+      sidecar staged as `otto` would install as bare `/usr/bin/otto` and silently overwrite the
+      user's own `otto` CLI — this is the single most likely thing a future reader will "fix"
+      wrongly. Measured installed layout: `usr/bin/otto-ui-dioxus` (app) and `usr/bin/otto-sidecar`
+      (sidecar, sibling, no suffix). The real gap was never build-tool parity — it was that a
+      `dx`-built app had no sidecar and required `otto` on `PATH`. `desktop_boot` now resolves
+      OTTO_BIN → bundled `otto-sidecar` sibling → PATH, written against that measured layout.
+      Icons were copied to `ui-dioxus/icons/` so Phase 4's deletion of `desktop/` cannot break the
+      bundle.
+- [x] **Build scripts, not CI.** The original bullet assumed `ui/` wasm-build and `desktop/`
+      Tauri-build CI jobs existed to replace; the repo has no CI at all. Phase 2 ships
+      `build-web.sh` (build + the four bundle-trust guards), `stage-sidecar.sh`, and
+      `build-desktop.sh`; `measure-web-bundle.sh` became a thin wrapper so the guards exist in
+      one place. Standing up CI is its own project.
+- [x] **The Fly image serves its own UI** — added beyond the original three bullets. A `webbuild`
+      stage builds the bundle in-image and `CMD` passes `--ui-dir`, so a promoted session is
+      browser-reachable at its app URL.
+
+**Package parity: `.deb` only, not `.rpm`.** `--package-types rpm` was dropped from
+`build-desktop.sh` because of a real `dx` 0.7.9 bug, not a missing host tool: `icons/icon.ico`
+carries a 256x256 frame that collides with `icons/128x128@2x.png` (also 256x256) at the same RPM
+icon destination path, so `dx bundle --package-types rpm` fails every time with a duplicate-file
+error. Follow-up: drop the 2x PNG from `[bundle] icon` or file the collision upstream, then
+re-add `--package-types rpm`. Practical consequence: **the repo owner's own machine is Fedora**,
+so `.deb` is currently the only package format this phase produces, and it is not installable on
+that host via `dpkg`/sudo — see the verification gap below for the workaround.
+
+**Two verifications are deliberately outstanding** — real, not signed off:
+
+- The `dx`-bundled desktop app has **never been launched from an installed package with `otto`
+  absent from PATH**. The resolver (`resolve_otto_bin_in`) is unit-tested and the package layout
+  is verified by inspection, but the end-to-end launch needs a real GUI session — WebKitGTK
+  cannot render headless (Phase 0). The `.deb` payload can be extracted to a temp prefix (e.g.
+  `ar x`/`dpkg-deb -x` into a scratch directory) to reproduce the installed layout without
+  `dpkg` or sudo, which matters because this host is Fedora and has neither.
+- The Fly image has **not** been deployed. It was built and verified locally with podman (there
+  is no docker on this host): it serves the UI at `/` and does not expose a runtime-written
+  `/workspace/.env` at `/.env`. A real `fly deploy` plus a browser load against a promoted
+  session is still outstanding.
 
 ---
 
 ## Phase 3 — Parity sign-off
+
+- Phase 2 means this can now run against real artifacts: `otto serve --ui-dir` for web and a
+  built `.deb` for desktop, rather than dev servers — though the `.deb` has not yet been
+  installed and launched (see Phase 2's outstanding verifications); on a host without
+  `dpkg`/sudo, extract the payload to a temp prefix to reproduce the installed layout instead.
 
 - [ ] Re-run the frozen 11-step scenario contract against `ui-dioxus/` on **both** targets (web +
       desktop), now with the Phase 1 gaps closed, and confirm parity with the last recorded `ui/`
@@ -171,6 +219,10 @@ design before bite-sized steps:
 
 Only after Phase 3 signs off.
 
+- Rename `[application] name` from `otto-ui-dioxus` to `otto-desktop` in `ui-dioxus/Dioxus.toml`,
+  and update the hardcoded asset path in `ui-dioxus/scripts/build-web.sh` to match. Deferred from
+  Phase 2 to avoid touching the wasm-opt guard script mid-migration.
+- `desktop/src-tauri/icons/` can be deleted — Phase 2 already copied them to `ui-dioxus/icons/`.
 - [ ] Repoint any docs/build scripts/CI that reference `ui/dist` or the Tauri app to the Dioxus outputs.
 - [ ] Remove `ui/` and `desktop/` (and drop them from the root `Cargo.toml` `exclude` list, leaving
       `ui-dioxus`). Verify `cargo build --workspace` + `cargo test --workspace` still pass.
@@ -185,6 +237,6 @@ Only after Phase 3 signs off.
 - **Spike scaffolding cleanup:** the spike tooling under
   `docs/superpowers/spikes/2026-07-21-ui-runtime/` (fixture, driver, shim, run logs) is the evidence
   trail for this decision; keep it until the migration lands, then it can be pruned or archived.
-- **Phases 0, 1, 3, 4 are concretely scoped** and can proceed to bite-sized task plans as each is
-  reached. **Phase 2 needs a design pass first** (brainstorming → design → plan) because the build/serve
-  cutover has open decisions that shouldn't be guessed.
+- **Phases 0–2 are done; 3 and 4 are concretely scoped** and can proceed to bite-sized task plans
+  as each is reached. Phase 2's design pass (brainstorming → design → plan) is what resolved its
+  build/serve open decisions rather than guessing them.

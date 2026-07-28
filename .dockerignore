@@ -1,3 +1,6 @@
 target/
+ui/target/
+ui-dioxus/target/
+desktop/target/
 .git/
 .superpowers/

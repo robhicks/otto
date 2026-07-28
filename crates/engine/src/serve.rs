@@ -29,6 +29,7 @@ use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::loopback::LoopbackTarget;
@@ -132,6 +133,40 @@ pub fn app_with_base(
         accept_promotions,
         Some(public_ws_base),
     )
+}
+
+/// Serve a pre-built web UI bundle from `dir` as this router's fallback.
+///
+/// Applied *after* construction rather than threaded through `app`/`app_with_base`. Those two
+/// already differ only by one optional argument; a `ui_dir` parameter would make four
+/// constructors and churn all six call sites. This layer changes none of them.
+///
+/// ## Two security invariants, both deliberate
+///
+/// 1. **This route is unauthenticated on purpose.** A browser must fetch `index.html` and the
+///    wasm *before* it has a token to present, so requiring a bearer here would break first
+///    load. It is safe because the bundle is public build output: every path that carries
+///    session data or workspace contents — `/ws`, `/workspace`, `/promote`, `/export` — keeps
+///    its own bearer check, unchanged. Do not "fix" this by adding auth.
+///
+/// 2. **Nothing reachable from `dir` — including through symlinks — may lie outside it.**
+///    `ServeDir` does *not* consult the permission gate's sensitive-path floor, and it does
+///    *not* canonicalize the resolved path or verify it stays under `dir`: it only rejects
+///    `..`/root/prefix path *components* in the request itself (confirmed: `/../../etc/passwd`
+///    and both its percent-encoded forms are rejected). A symlink placed *inside* `dir` that
+///    points outside it is followed and served — reproduced end-to-end (`bundle/link-to-env` ->
+///    `<workspace>/.env` served the secret over plain HTTP). `dx build` output contains no
+///    symlinks today, so this is not exploitable through the shipped pipeline, but it means
+///    `dir` must be build output only, never a directory a running session (or anything else)
+///    can write into — pointing this at (or nesting it under) a workspace root would serve
+///    `.env`, `.ssh/`, and `.git/`, bypassing the single most important invariant in the
+///    codebase. `dir` is operator-supplied via `--ui-dir` (validated to exist and be a directory
+///    before this is ever called — see `validate_ui_dir` in `main.rs`), has no default and no env
+///    fallback, and when the flag is absent this layer is never applied and the route does not
+///    exist.
+pub fn with_ui_dir(app: AxumRouter, dir: PathBuf) -> AxumRouter {
+    let index = dir.join("index.html");
+    app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
 }
 
 fn app_inner(
