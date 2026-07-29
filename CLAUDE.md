@@ -38,40 +38,14 @@ in-process `fs.*`/`bash` tools as fallbacks (`mcp-grep`/`mcp-git` are additive).
 hardened against agent-input argv injection; `mcp-bash` reuses the shared `run_sandboxed` core and
 hardcodes the OS sandbox (the gate + sandbox-only registration are preserved across the move).
 
-The **UI has its first slice** (sub-project A, "app shell + live session"): `ui/` is a
-browser-first **Leptos CSR** app (Rust→WASM, built with `trunk`) that connects to `otto serve`
-over WebSocket, sends a prompt, renders the live `Event` stream, aborts, and reconnects with
-`last_seq` replay. It is a **standalone crate, deliberately excluded from the cargo workspace**
-(`exclude = ["ui"]` in the root `Cargo.toml`), depends **only** on `protocol` (compiled to
-WASM), and is built/tested from inside `ui/` (`cargo test`, `cargo build --target
-wasm32-unknown-unknown`) — so `cargo build --workspace` and the offline determinism suite are
-untouched. Enabling it took two additive changes: the WS framing enum `ServerMessage` now lives
-in `protocol` (so the UI can deserialize it), and `/ws` accepts the bearer token via a `?token=`
-query param (the header path is still preferred). **Sub-project B then shipped** (capabilities +
-status strip): the `Ready` frame now carries a `CapabilitiesManifest` (extended with a `remote_llm`
-field), derived at serve time by `build_capabilities()`, and the UI replaces its plain status line
-with a strip showing engine/LLM/sandbox state — degraded states (offline-deterministic LLM, absent
-sandbox) render visibly. **Sub-project C then shipped** (workspace tree + editor): the UI now lists
-the served workspace via the bearer-authed `POST /workspace` RPC — unblocked by a new **tower-http
-CORS layer** on the engine (the one engine change; not a protocol change) — renders a collapsible
-file tree, and opens files into a **`kode-leptos`** editor (native Leptos CSR, syntax-highlighted)
-with a local, unsaved buffer; persistence stays deferred to sub-project D. `kode-leptos`/`gloo-net`
-are UI-only deps and the `ui/` crate still depends only on `protocol`. **Sub-project D then shipped**
-(diff approval): the opt-in `otto serve --approve-edits` flag wires an `ApprovalModeGate` that
-upgrades ordinary (non-sensitive) `fs.write` from Allow to `Ask`, and the orchestrator's per-edit
-`Ask` branch emits an `ApprovalRequest{id,path,old,new}` event, awaits an async `Approver`, and
-applies the edit only on an explicit `ApproveDiff` command (fail-closed on reject/disconnect; the
-sensitive floor still Denies first; the headless `DenyApprover` default denies). `serve.rs` now reads
-the socket concurrently with the running turn (`split` + `select!`), routing `ApproveDiff` frames
-through a per-connection `ApprovalRegistry`/`InteractiveApprover`, and the UI renders the diff with
-Approve/Reject buttons. **Sub-project E then shipped** (token/cost meter + pause/resume) and
-**sub-project F then shipped** (promote-to-remote UX), and **sub-project G then shipped** (Tauri
-desktop wrapper): a new workspace-excluded `desktop/` crate (zero `otto-*` dependencies) wraps the
-existing `ui/dist` browser build in a native Tauri 2 shell — a folder picker provisions the
-workspace root, a bundled `otto serve` sidecar is auto-launched on a fixed local port, and the
-webview auto-connects with no manual URL/token entry. **All sub-projects A–G are shipped**, closing
-out the UI roadmap. The roadmap and per-slice spec/plan live in
-`docs/superpowers/specs/2026-06-17-ui-roadmap.md`.
+The **UI is a single Dioxus CSR crate** (`ui-dioxus/`, workspace-excluded, `protocol`-only dep)
+compiled to WASM for the browser and natively (via Dioxus Desktop) for a native window — both
+targets produce one binary with no separate wrapper or static-bundle handoff. Desktop auto-launches
+a bundled `otto serve` sidecar and auto-connects (folder picker → workspace root → WebSocket on
+the fixed port). The Dioxus migration replaced the original `ui/` (Leptos CSR) + `desktop/` (Tauri 2)
+stack, retiring two toolchains (`trunk` + `tauri-cli`) in favor of `dx`. The decision record and
+migration plan live in `docs/superpowers/specs/2026-07-21-ui-dioxus-runtime-spike-report.md` and
+`docs/superpowers/plans/2026-07-22-ui-dioxus-migration.md`.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`cli`, etc. — `retrieval`, `extensions`, and `mcp-lsp` are now shipped, see the
@@ -113,17 +87,17 @@ cargo run -p otto-engine -- run "<goal>" [--root <path>]
 # Serve the engine over WebSocket (for the UI / remote clients); token is mandatory:
 OTTO_TOKEN=<token> cargo run -p otto-engine -- serve [--port <p>] [--root <path>]
 
-# The browser UI (standalone, NOT part of the workspace — run from inside ui/):
-cd ui && cargo test                              # pure host-side unit tests
-cd ui && cargo build --target wasm32-unknown-unknown   # wasm compile check
-cd ui && trunk serve                             # dev server in a browser tab (needs `cargo install trunk`)
-
-# The Dioxus UI (migration target, also workspace-excluded — run from inside ui-dioxus/):
+# The browser UI (standalone, NOT part of the workspace — run from inside ui-dioxus/):
 cd ui-dioxus && cargo test --features desktop                       # host-side unit tests
 cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web   # wasm compile check
+cd ui-dioxus && trunk serve                             # dev server in a browser tab (needs `cargo install trunk` and `cargo install dioxus-cli`)
+
 # Browser integration tests (mount→autoconnect). Needs `wasm-bindgen-test-runner` on PATH,
 # version-matched to Cargo.lock's `wasm-bindgen`, plus a webdriver — see ui-dioxus/.cargo/config.toml.
 cd ui-dioxus && CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --features web
+
+# Build the web release bundle (for otto serve --ui-dir):
+cd ui-dioxus && ./scripts/build-web.sh
 ```
 
 Toolchain is pinned to stable in `rust-toolchain.toml` (edition 2024, rust-version 1.85).
@@ -152,7 +126,7 @@ impl crate.
 
 | Crate | Role |
 |---|---|
-| `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`, plus the WS framing enum `ServerMessage` and `CapabilitiesManifest`). No I/O. The crate the `ui/` build shares (compiled to WASM). |
+| `protocol` | Wire types only (`Command`, `Event`/`EventKind`, `Role`, `SessionId`, plus the WS framing enum `ServerMessage` and `CapabilitiesManifest`). No I/O. The crate the `ui-dioxus/` build shares (compiled to WASM). |
 | `engine-core` | The orchestrator state machine + the trait seams: `Agent`, `WorkspaceRead`/`Workspace`, `Provider`, `Router`, `Tool`/`ToolRegistry`/`PermissionGate`, plus `AgentRegistry` and shared `types`. |
 | `agents` | Built-in atomic agents implementing `Agent`: `Planner`, `ContextFinder` (lexical prefilter → LLM rank, with bounded per-turn read budget), `Coder`, `Verifier` (data-driven recipe table; runs the detected ecosystem's test command). All LLM-backed, all with a deterministic offline fallback. |
 | `providers` | `Provider` impls: `LocalProvider` (deterministic), `ScriptedProvider` (canned responses keyed by prompt substring — for testing prompt-and-parse agents), `OllamaProvider`, `AnthropicProvider`, `OpenAiProvider` (Chat Completions; o-series-aware token field), `GeminiProvider` (`generateContent`), and `CandleProvider` (in-process quantized Gemma 3 GGUF via candle, behind the default-off `candle` feature). All three remote providers mirror the same HTTP shape (configurable `base_url`, wiremock-tested, non-2xx surfaced via `error_for_status()`). |

@@ -42,18 +42,18 @@ otto-next/
 │   │                    #   Slice 1 shipped: custom agents; slices 2-3 shipped: commands, skills.
 │   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
 │   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
-└── ui/                  # Tauri 2 + Leptos frontend (separate build).
+└── ui-dioxus/           # Dioxus CSR frontend: WASM (browser) + native (desktop). Replaced the original Leptos+Tauri stack.
 ```
 
 ### Dependency rules
 
 - `protocol` depends on nothing but serde. It is the only crate shared between `engine`
-  and `ui`.
+  and `ui-dioxus`.
 - `engine-core` defines the traits; `agents`, `providers`, `workspace`, `remote`
   implement them. `engine-core` must not depend on concrete impls.
 - MCP tool crates are standalone binaries; the engine talks to them over stdio JSON-RPC,
   never by linking.
-- `ui` depends only on `protocol` (compiled to WASM). It must never link `engine-core`.
+- `ui-dioxus` depends only on `protocol` (compiled to WASM). It must never link `engine-core`.
 
 ## Key trait interfaces
 

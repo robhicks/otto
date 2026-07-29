@@ -1,4 +1,0 @@
-# getrandom >= 0.3 requires selecting the wasm browser backend via this cfg in addition
-# to the `wasm_js` feature. Applies only to the wasm target; host `cargo test` is unaffected.
-[target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

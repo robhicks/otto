@@ -19,7 +19,7 @@ members = [
     "crates/mcp-bash",
     "crates/mcp-lsp",
 ]
-exclude = ["ui", "desktop", "ui-dioxus"]
+exclude = ["ui-dioxus"]
 
 [workspace.package]
 edition = "2024"

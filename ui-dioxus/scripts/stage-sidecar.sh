@@ -3,9 +3,9 @@
 # (ui-dioxus/binaries/otto-sidecar-<target-triple>), per the `[bundle] external_bin` entry in
 # Dioxus.toml.
 #
-# dx uses the same target-triple-suffix convention Tauri's `externalBin` did, which is why this
-# is a near-copy of desktop/build-sidecar.sh — the script it replaces when Phase 4 retires the
-# Tauri wrapper. Keep the two in sync until then.
+# dx uses the same target-triple-suffix convention Tauri's `externalBin` did.
+# Retired the old Tauri wrapper's desktop/build-sidecar.sh in Phase 4 of the
+# Dioxus migration.
 #
 # Staged as `otto-sidecar-<triple>`, NOT `otto-<triple>`, even though the copied file is
 # `target/release/otto`. This is deliberate: dx strips the triple suffix from `external_bin`
