@@ -102,7 +102,7 @@ fn now_unix() -> u64 {
 // Lockfile read/write (thin I/O wrapper around otto_extensions::MarketplaceLockfile)
 // ---------------------------------------------------------------------------
 
-fn read_lockfile(home: &Path) -> otto_extensions::MarketplaceLockfile {
+pub(crate) fn read_lockfile(home: &Path) -> otto_extensions::MarketplaceLockfile {
     let path = lockfile_path(home);
     match std::fs::read_to_string(&path) {
         Ok(text) => otto_extensions::MarketplaceLockfile::parse(&text),
@@ -610,13 +610,14 @@ fn parse_ref_flag(args: &[String]) -> (Option<String>, Vec<String>) {
 }
 
 const USAGE: &str = "usage:\n  \
+    otto plugin                            interactive TUI (default)\n  \
+    otto plugin list\n  \
+    otto plugin install <plugin>@<marketplace>\n  \
+    otto plugin uninstall <plugin>@<marketplace>\n  \
     otto plugin marketplace add <url> [--ref <ref>]\n  \
     otto plugin marketplace remove <name>\n  \
     otto plugin marketplace update [<name>]\n  \
-    otto plugin marketplace list\n  \
-    otto plugin install <plugin>@<marketplace>\n  \
-    otto plugin uninstall <plugin>@<marketplace>\n  \
-    otto plugin list";
+    otto plugin marketplace list";
 
 /// Entry point for `otto plugin ...`, dispatched from `main()`. `home` is the user-global
 /// `.claude/` base (`dirs::home_dir()` at the real CLI edge; an explicit tempdir in tests).
@@ -625,6 +626,7 @@ pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> 
     let sub = it.next().unwrap_or_default();
     let rest: Vec<String> = it.collect();
     match sub.as_str() {
+        "" | "interactive" => super::plugin_tui::interactive_plugin_ui(home).await,
         "marketplace" => cmd_plugin_marketplace(rest, &home).await,
         "install" => {
             let key = rest.into_iter().next().ok_or_else(|| {

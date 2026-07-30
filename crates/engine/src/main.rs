@@ -15,6 +15,7 @@ use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
 mod plugin_cli;
+mod plugin_tui;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         _ => {
             eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
+                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin                                  interactive TUI (default)\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
             );
             std::process::exit(2);
         }
