@@ -1,6 +1,6 @@
 //! The /workspace endpoint must advertise CORS so the browser UI (served from a different
-//! origin by trunk) can make its preflighted cross-origin POST. Tested in-process via
-//! tower's oneshot — no port binding, no network.
+//! origin by the Dioxus dev server or otto serve --ui-dir) can make its preflighted
+//! cross-origin POST. Tested in-process via tower's oneshot — no port binding, no network.
 
 use std::sync::Arc;
 

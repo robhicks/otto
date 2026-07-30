@@ -280,16 +280,16 @@ live-Fly integration test runs there); the container image and deploy walkthroug
 The same `engine` code runs in three shapes, selected at startup:
 
 ```
-EMBEDDED (v1 default)
-  ┌────────── Tauri app ──────────┐
-  │  Leptos UI ──IPC/localhost──► engine (in-process / sidecar) ──► LocalWorkspace
-  └────────────────────────────────┘                          └──► provider pool (local + remote)
+EMBEDDED (default)
+  ┌──────── Dioxus Desktop app ────────┐
+  │  Dioxus UI ──localhost──► engine (sidecar) ──► LocalWorkspace
+  └────────────────────────────────────┘          └──► provider pool (local + remote)
 
-SERVED (v2)
-  Tauri/mobile UI ──WSS──► `otto engine serve` (VPS or microVM) ──► RemoteWorkspace
-                                                                └──► provider pool
+SERVED
+  Dioxus web / Dioxus Desktop ──WSS──► `otto serve` (VPS or microVM) ──► RemoteWorkspace
+                                                                      └──► provider pool
 
-PROMOTED (v2 handover)
+PROMOTED
   UI ──IPC──► local engine ──snapshot SessionState──► RemoteTarget.provision()
   UI ──drops local, reconnects WSS──► remote engine (resumes via Last-Event-ID)
 ```
@@ -380,14 +380,15 @@ format:
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being
 the single registration seam (Plan 1) is what makes this additive rather than invasive.
 
-## Editor interop (frontend)
+## Editor (frontend)
 
-CodeMirror 6 (JS) is mounted into a Leptos-owned DOM node, not reimplemented in Rust. A
-bundled JS glue ES-module exposes `mountEditor(element, opts)`, `getDoc()`, `setDoc(text)`,
-and an `onChange` callback; Rust imports it via `#[wasm_bindgen(module = "...")]`. A Leptos
-component owns the mount element through a `node_ref`, instantiates the editor in a creation
-effect, tears it down on unmount, and bridges changes into Leptos signals via `onChange`. The
-same module is used unchanged in the Tauri desktop and Tauri 2 mobile webviews.
+The `ui-dioxus/` crate provides a native-Rust editor built on Dioxus primitives, with two
+rendering paths sharing a common model: the web target uses a hand-rolled dependency-free
+syntax lexer (`highlight_web.rs`), while the desktop target uses the native tree-sitter
+bindings for full highlighting. Both backends agree on vocabulary and line structure
+(enforced by a cross-backend test). The editor manages an in-memory buffer with a dirty/unsaved
+marker (`path ●`), synced to the engine's workspace on explicit save. No JS glue, no
+CodeMirror — the editor is pure Rust on both targets.
 
 ## Capability negotiation
 

@@ -98,7 +98,7 @@ excluded from the cargo workspace**, depending only on `protocol`. Build and run
 cd ui-dioxus
 cargo test --features desktop               # host-side unit tests
 cargo build --target wasm32-unknown-unknown --features web  # wasm compile check
-trunk serve                                 # dev server in a browser tab (needs `cargo install trunk dioxus-cli`)
+dx serve                                    # dev server in a browser tab (needs `cargo install dioxus-cli`)
 ```
 
 Desktop auto-launches a bundled `otto serve` sidecar and auto-connects with a folder picker.

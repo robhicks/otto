@@ -90,7 +90,7 @@ OTTO_TOKEN=<token> cargo run -p otto-engine -- serve [--port <p>] [--root <path>
 # The browser UI (standalone, NOT part of the workspace — run from inside ui-dioxus/):
 cd ui-dioxus && cargo test --features desktop                       # host-side unit tests
 cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web   # wasm compile check
-cd ui-dioxus && trunk serve                             # dev server in a browser tab (needs `cargo install trunk` and `cargo install dioxus-cli`)
+cd ui-dioxus && dx serve                                # dev server in a browser tab (needs `cargo install dioxus-cli`)
 
 # Browser integration tests (mount→autoconnect). Needs `wasm-bindgen-test-runner` on PATH,
 # version-matched to Cargo.lock's `wasm-bindgen`, plus a webdriver — see ui-dioxus/.cargo/config.toml.
