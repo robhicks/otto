@@ -1,8 +1,8 @@
 [application]
-name = "otto-ui-dioxus"
+name = "otto-desktop"
 
 [web.app]
-title = "otto (Dioxus)"
+title = "otto"
 
 # style.css is now loaded on both targets via `document::Stylesheet { href: asset!("/style.css") }`
 # in `App` (src/app.rs), so it no longer needs a web-only `[web.resource]` entry here (that path
@@ -31,9 +31,9 @@ title = "otto (Dioxus)"
 # user already has it on their system. `otto-sidecar` avoids that collision. Measured via
 # `ar x` + `tar tzvf` on a built `.deb` — see docs/superpowers/specs/2026-07-27-ui-dioxus-build-serve-design.md §2.
 #
-# `[application] name` stays `otto-ui-dioxus` — scripts/build-web.sh hardcodes it in
-# the asset path, and that script is the only guard against re-shipping unoptimized wasm.
-# Renaming to `otto-desktop` belongs to Phase 4, with the one-line script update.
+# `[application] name` was renamed from `otto-ui-dioxus` to `otto-desktop` in Phase 4
+# of the Dioxus migration (retiring the incumbent `ui/` + `desktop/`). scripts/build-web.sh
+# hardcodes it in the asset path — update both files together.
 [bundle]
 identifier = "dev.otto.desktop"
 publisher = "otto"

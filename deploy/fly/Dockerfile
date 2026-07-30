@@ -45,7 +45,7 @@ COPY --from=build /src/target/release/mcp-git /usr/local/bin/mcp-git
 # SECURITY: this directory must contain only build output. The static route is unauthenticated
 # by design (a browser fetches index.html and the wasm before it has a token), and ServeDir does
 # not consult otto's sensitive-path floor — so OTTO_UI_DIR must never be pointed at /workspace.
-COPY --from=webbuild /src/ui-dioxus/target/dx/otto-ui-dioxus/release/web/public /usr/local/share/otto/ui
+COPY --from=webbuild /src/ui-dioxus/target/dx/otto-desktop/release/web/public /usr/local/share/otto/ui
 # The session workspace root. create_machine injects OTTO_ROOT=/workspace.
 RUN mkdir -p /workspace
 # OTTO_HOST=0.0.0.0 is load-bearing: Fly's proxy reaches the machine over its network interface,

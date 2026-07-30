@@ -13,14 +13,12 @@ be embedded in-process or served over the network.
 > the test suite runs without keys or network. Also landed: **persistence** (sqlite session +
 > event-log store), **`otto serve`** (bearer-authed WebSocket with `Last-Event-ID` reconnect,
 > plaintext or `wss://`), **`RemoteWorkspace`** + `promote()`/`LoopbackTarget`, the **MCP tool
-> servers** (`mcp-fs`/`mcp-grep`/`mcp-git`/`mcp-bash`), and the **first UI slice** — a
-> browser-first Leptos (Rust→WASM) app shell in [`ui/`](ui/) that talks to `otto serve`. On-demand
+> servers** (`mcp-fs`/`mcp-grep`/`mcp-git`/`mcp-bash`/`mcp-lsp`), and the **UI** — a single
+> Dioxus CSR crate ([`ui-dioxus/`](ui-dioxus/)) compiled to WASM for the browser and natively
+> via Dioxus Desktop, replacing the original Leptos + Tauri stack. On-demand
 > Fly.io provisioning has since shipped too (`otto serve --promote-fly`; see [`deploy/fly/`](deploy/fly/)).
-> Still ahead: retrieval, extensions, and UI sub-projects B–F
-> (capabilities strip, workspace tree/editor, diff approval, token meter, promote UX) plus the
-> Tauri desktop wrapper. The full intended design lives in
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`,
-> and the UI roadmap is in [`docs/superpowers/specs/2026-06-17-ui-roadmap.md`](docs/superpowers/specs/2026-06-17-ui-roadmap.md).
+> The full intended design lives in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`.
 
 ## Quick start
 
@@ -91,22 +89,25 @@ The same protocol runs embedded (the `run` command above) or served. `otto serve
 OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787   # prints ws://127.0.0.1:8787/ws
 ```
 
-The first UI slice lives in [`ui/`](ui/) — a browser-first **Leptos CSR** app (Rust→WASM). It
-is a **standalone crate, intentionally excluded from the cargo workspace**, depending only on
-`protocol`, so `cargo build --workspace` and the offline test suite are unaffected. Build and
-run it from inside `ui/`:
+The UI is a single Dioxus CSR crate in [`ui-dioxus/`](ui-dioxus/). It compiles to WASM for the
+browser and natively (via Dioxus Desktop) for a native window — a **standalone crate, intentionally
+excluded from the cargo workspace**, depending only on `protocol`. Build and run it from inside
+`ui-dioxus/`:
 
 ```bash
-cd ui
-cargo test                                  # pure host-side logic tests (no browser)
-cargo build --target wasm32-unknown-unknown # wasm compile check
-trunk serve                                 # dev server in a browser tab (needs `cargo install trunk`)
+cd ui-dioxus
+cargo test --features desktop               # host-side unit tests
+cargo build --target wasm32-unknown-unknown --features web  # wasm compile check
+dx serve                                    # dev server in a browser tab (needs `cargo install dioxus-cli`)
 ```
 
-Then enter the engine's `ws://…/ws` URL and the token, and you get the live event stream with
-`Send`/`Abort` and reconnect-with-replay. See
-[`docs/superpowers/specs/2026-06-17-ui-roadmap.md`](docs/superpowers/specs/2026-06-17-ui-roadmap.md)
-for the UI roadmap.
+Desktop auto-launches a bundled `otto serve` sidecar and auto-connects with a folder picker.
+For the served web UI, pass the bundle to `otto serve --ui-dir <path>` after building it:
+
+```bash
+cd ui-dioxus && ./scripts/build-web.sh      # produces the web release bundle
+OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787 --ui-dir target/dx/otto-desktop/release/web/public
+```
 
 ## Developing
 

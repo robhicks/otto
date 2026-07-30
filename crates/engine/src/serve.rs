@@ -187,8 +187,9 @@ fn app_inner(
         public_ws_base,
         remotes: Mutex::new(HashMap::new()),
     });
-    // CORS for the browser UI: it is served from a different origin (trunk on :8080) and its
-    // POST /workspace carries an `Authorization` header, so the browser sends a preflight.
+    // CORS for the browser UI: it is served from a different origin (dx dev server or
+    // otto serve --ui-dir) and its POST /workspace carries an `Authorization` header,
+    // so the browser sends a preflight.
     // `allow_origin(Any)` matches the loopback/dev posture already accepted for the `?token=`
     // query param on /ws; auth rides the Authorization header (not cookies), so wildcard origin
     // without credentials mode is correct and exposes nothing extra.

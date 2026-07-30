@@ -4,9 +4,7 @@
 # Stray compiler outputs outside target/ (e.g. ad-hoc `rustc` probes)
 *.rlib
 
-# Node / UI
-ui/node_modules
-ui/dist
+# Node / UI (ui/ retired in dioxus Phase 4)
 
 # macOS
 .DS_Store
@@ -21,3 +19,6 @@ ui/dist
 
 # Local git worktrees (isolated feature-branch workspaces)
 /.worktrees
+
+# Playwright MCP debug artifacts
+.playwright-mcp/
