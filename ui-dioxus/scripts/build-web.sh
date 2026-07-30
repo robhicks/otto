@@ -70,7 +70,7 @@ if grep -qi "wasm-opt failed" "$log"; then
     exit 1
 fi
 
-public="target/dx/otto-desktop/release/web/public"
+public="target/dx/otto-ui-dioxus/release/web/public"
 assets="$public/assets"
 [ -d "$assets" ] || { echo "error: expected asset dir not found: $assets" >&2; exit 1; }
 

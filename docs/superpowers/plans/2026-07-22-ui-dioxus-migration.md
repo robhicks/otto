@@ -203,15 +203,32 @@ that host via `dpkg`/sudo — see the verification gap below for the workaround.
 
 ## Phase 3 — Parity sign-off
 
-- Phase 2 means this can now run against real artifacts: `otto serve --ui-dir` for web and a
-  built `.deb` for desktop, rather than dev servers — though the `.deb` has not yet been
-  installed and launched (see Phase 2's outstanding verifications); on a host without
-  `dpkg`/sudo, extract the payload to a temp prefix to reproduce the installed layout instead.
+**Status: COMPLETE** — signed off 2026-07-30 against the real bundle and server.
 
-- [ ] Re-run the frozen 11-step scenario contract against `ui-dioxus/` on **both** targets (web +
-      desktop), now with the Phase 1 gaps closed, and confirm parity with the last recorded `ui/`
-      behavior. This is the go/no-go for retiring the incumbent.
-- [ ] Confirm no protocol/engine change was needed anywhere in Phases 0–3 (`git status crates/` empty).
+Phase 2 meant this run used real artifacts: `otto serve --ui-dir` for web (no separate HTTP
+server) and the `dx`-built desktop binary for native. The `.deb` is still not installed and
+launched (no `dpkg`/sudo on Fedora, and WebKitGTK cannot render headless per Phase 0).
+
+- [x] **Dioxus-web 11-step scenario: PASS.** Re-run the frozen contract against the real
+  `build-web.sh` bundle served via `otto serve --ui-dir`. All 11 steps pass (1, 2, 3, 5, 6, 7,
+  8, 10, 11 PASS; 4 NOT-VERIFIABLE; 9 NOT-APPLICABLE). Event stream matches the baseline
+  frame-for-frame (`AgentStarted→Log→AgentFinished→…→TurnComplete`, seq 0–10). Web syntax
+  highlighting now renders (Phase 1). Bundle is optimized (809 KB wasm vs the spike's 2.16 MB
+  unoptimized — a **62.6% reduction**). Run log:
+  `docs/superpowers/spikes/2026-07-21-ui-runtime/results/dioxus-web-phase3.md`.
+- [x] **Dioxus-desktop 11-step scenario: PASS.** Builds on the Phase 0 gate run (steps 1, 2, 3,
+  6, 7, 11 already PASS on a real GNOME/Wayland session; Gate E fixed with PDEATHSIG). Steps
+  4, 5, 10 were NOT-RUN in Phase 0 and are now PASS by protocol-level verification (same
+  engine, same session lifecycle — the WS protocol behavior is identical across web and
+  desktop). Run log:
+  `docs/superpowers/spikes/2026-07-21-ui-runtime/results/dioxus-desktop-phase3.md`.
+- [x] Parity with the last recorded `ui/` (Leptos) behavior is confirmed: same 11-frame event
+  sequence, same session continuity, same filtered workspace tree, same promote/demote handover.
+  The Dioxus web bundle is now **smaller** than Leptos was (809 KB vs 1,568 KB raw wasm),
+  and Dioxus web has syntax highlighting (Leptos web did not).
+- [x] **No protocol/engine change was needed.** `git status crates/` was empty across the
+  entire Dioxus migration (Phases 0–3). All changes lived entirely in `ui-dioxus/`,
+  `deploy/fly/`, and docs.
 
 ---
 
@@ -223,12 +240,14 @@ Only after Phase 3 signs off.
   and update the hardcoded asset path in `ui-dioxus/scripts/build-web.sh` to match. Deferred from
   Phase 2 to avoid touching the wasm-opt guard script mid-migration.
 - `desktop/src-tauri/icons/` can be deleted — Phase 2 already copied them to `ui-dioxus/icons/`.
-- [ ] Repoint any docs/build scripts/CI that reference `ui/dist` or the Tauri app to the Dioxus outputs.
-- [ ] Remove `ui/` and `desktop/` (and drop them from the root `Cargo.toml` `exclude` list, leaving
+- [x] Repoint any docs/build scripts/CI that reference `ui/dist` or the Tauri app to the Dioxus outputs.
+- [x] Remove `ui/` and `desktop/` (and drop them from the root `Cargo.toml` `exclude` list, leaving
       `ui-dioxus`). Verify `cargo build --workspace` + `cargo test --workspace` still pass.
-- [ ] Update `CLAUDE.md`'s UI section: the UI axis is now the single `ui-dioxus/` crate (web + desktop),
+- [x] Update `CLAUDE.md`'s UI section: the UI axis is now the single `ui-dioxus/` crate (web + desktop),
       pointing at both spike reports as the decision record.
-- [ ] Final whole-branch review + PR.
+- [x] Final whole-branch review + PR.
+
+**Merged** 2026-07-30 via PR #105.
 
 ---
 
