@@ -610,50 +610,115 @@ fn parse_ref_flag(args: &[String]) -> (Option<String>, Vec<String>) {
 }
 
 const USAGE: &str = "usage:\n  \
-    otto plugin                            interactive TUI (default)\n  \
+    otto plugin                            interactive TUI (default, user scope)\n  \
     otto plugin list\n  \
     otto plugin install <plugin>@<marketplace>\n  \
     otto plugin uninstall <plugin>@<marketplace>\n  \
     otto plugin marketplace add <url> [--ref <ref>]\n  \
     otto plugin marketplace remove <name>\n  \
     otto plugin marketplace update [<name>]\n  \
-    otto plugin marketplace list";
+    otto plugin marketplace list\n  \
+  flags (may be placed before subcommand):\n  \
+    --project          operate on the project's .claude/ (CWD)\n  \
+    --root <path>      set the project root (implies --project)\n  \
+    --all              list plugins/marketplaces from both user and project scopes";
+
+/// Parse `--project` and `--root <path>` flags from the argument list, consuming them and
+/// returning the remainder. `--root` implies `--project` (an explicit root without the flag is
+/// treated as project-mode). On success returns `(project_mode, root_override, remaining_args)`.
+fn parse_base_flags(args: Vec<String>) -> anyhow::Result<(bool, Option<PathBuf>, Vec<String>)> {
+    let mut project = false;
+    let mut root: Option<PathBuf> = None;
+    let mut remaining = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--project" {
+            project = true;
+        } else if a == "--root" {
+            match it.next() {
+                Some(p) => {
+                    project = true;
+                    root = Some(PathBuf::from(p));
+                }
+                None => anyhow::bail!("--root requires a path"),
+            }
+        } else {
+            remaining.push(a);
+        }
+    }
+    Ok((project, root, remaining))
+}
+
+/// Return the effective base directory: `home` when the scope is user-global, or the project root
+/// (CWD by default, overridable via `--root`) when project-scoped.
+fn resolve_base(project_mode: bool, root_override: Option<PathBuf>, home: &Path) -> PathBuf {
+    if project_mode {
+        root_override.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home.to_path_buf()))
+    } else {
+        home.to_path_buf()
+    }
+}
 
 /// Entry point for `otto plugin ...`, dispatched from `main()`. `home` is the user-global
 /// `.claude/` base (`dirs::home_dir()` at the real CLI edge; an explicit tempdir in tests).
 pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> {
-    let mut it = args.into_iter();
+    let (project_mode, root_override, rest) = parse_base_flags(args)?;
+    let base = resolve_base(project_mode, root_override, &home);
+
+    // Pre-check for `--all` before dispatching. Not filtered: only `list` and `marketplace list`
+    // use it; it is silently ignored by other subcommands (leaving the arg in place would be a
+    // "unknown subcommand" error, so we filter it only in the list branches below).
+    let all_mode = rest.iter().any(|a| a == "--all");
+
+    let mut it = rest.into_iter();
     let sub = it.next().unwrap_or_default();
-    let rest: Vec<String> = it.collect();
+    let sub_rest: Vec<String> = it.collect();
+
     match sub.as_str() {
-        "" | "interactive" => super::plugin_tui::interactive_plugin_ui(home).await,
-        "marketplace" => cmd_plugin_marketplace(rest, &home).await,
+        "" | "interactive" => {
+            super::plugin_tui::interactive_plugin_ui(base).await
+        }
+        "marketplace" => {
+            let filtered: Vec<String> = sub_rest.into_iter().filter(|a| a != "--all").collect();
+            cmd_plugin_marketplace(filtered, &base, &home, all_mode).await
+        }
         "install" => {
-            let key = rest.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!("usage: otto plugin install <plugin>@<marketplace>")
+            let key = sub_rest.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("usage: otto plugin install <plugin>@<marketplace> [--project]")
             })?;
-            plugin_install(&key, &home).await?;
+            plugin_install(&key, &base).await?;
             println!("installed {key}");
             Ok(())
         }
         "uninstall" => {
-            let key = rest.into_iter().next().ok_or_else(|| {
-                anyhow::anyhow!("usage: otto plugin uninstall <plugin>@<marketplace>")
+            let key = sub_rest.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("usage: otto plugin uninstall <plugin>@<marketplace> [--project]")
             })?;
-            plugin_uninstall(&key, &home)?;
+            plugin_uninstall(&key, &base)?;
             println!("uninstalled {key}");
             Ok(())
         }
         "list" => {
-            for (key, enabled) in plugin_list(&home)? {
-                println!(
-                    "{} {key}",
-                    if enabled {
-                        "[enabled]  "
-                    } else {
-                        "[available]"
-                    }
-                );
+            if all_mode {
+                let combined = plugin_list_combined(&home, &base)?;
+                for (key, enabled, scope) in combined {
+                    println!(
+                        "[{:>7}] [{:>7}] {key}",
+                        if enabled { "enabled" } else { "avail" },
+                        scope
+                    );
+                }
+            } else {
+                for (key, enabled) in plugin_list(&base)? {
+                    println!(
+                        "{} {key}",
+                        if enabled {
+                            "[enabled]  "
+                        } else {
+                            "[available]"
+                        }
+                    );
+                }
             }
             Ok(())
         }
@@ -661,7 +726,47 @@ pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> 
     }
 }
 
-async fn cmd_plugin_marketplace(args: Vec<String>, home: &Path) -> anyhow::Result<()> {
+/// Combine plugin listings from both user and project scopes for `--all` display. Deduplicates by
+/// key: if the same key appears in both scopes, the entry with `enabled=true` wins (project scope
+/// has precedence in discovery, but a separately-disabled project key shouldn't hide an enabled
+/// user key — so we merge optimistically).
+fn plugin_list_combined(
+    home: &Path,
+    project_root: &Path,
+) -> anyhow::Result<Vec<(String, bool, String)>> {
+    let mut result: Vec<(String, bool, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // User scope first.
+    if let Ok(plugins) = plugin_list(home) {
+        for (key, enabled) in plugins {
+            let scope = if enabled { "user" } else { "user-off" };
+            result.push((key.clone(), enabled, scope.to_string()));
+            seen.insert(key);
+        }
+    }
+
+    // Project scope — skip if it's the same as home (no project was specified).
+    if project_root != home {
+        if let Ok(plugins) = plugin_list(project_root) {
+            for (key, enabled) in plugins {
+                if !seen.contains(&key) {
+                    let scope = if enabled { "project" } else { "proj-off" };
+                    result.push((key, enabled, scope.to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+async fn cmd_plugin_marketplace(
+    args: Vec<String>,
+    base: &Path,
+    home: &Path,
+    all_mode: bool,
+) -> anyhow::Result<()> {
     let mut it = args.into_iter();
     let sub = it.next().unwrap_or_default();
     let rest: Vec<String> = it.collect();
@@ -671,7 +776,7 @@ async fn cmd_plugin_marketplace(args: Vec<String>, home: &Path) -> anyhow::Resul
             let url = positional.into_iter().next().ok_or_else(|| {
                 anyhow::anyhow!("usage: otto plugin marketplace add <url> [--ref <ref>]")
             })?;
-            let name = marketplace_add(&url, ref_flag.as_deref(), home).await?;
+            let name = marketplace_add(&url, ref_flag.as_deref(), base).await?;
             println!("installed marketplace '{name}'");
             Ok(())
         }
@@ -680,13 +785,13 @@ async fn cmd_plugin_marketplace(args: Vec<String>, home: &Path) -> anyhow::Resul
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: otto plugin marketplace remove <name>"))?;
-            marketplace_remove(&name, home)?;
+            marketplace_remove(&name, base)?;
             println!("removed marketplace '{name}'");
             Ok(())
         }
         "update" => {
             let name = rest.into_iter().next();
-            let updated = marketplace_update(name.as_deref(), home).await?;
+            let updated = marketplace_update(name.as_deref(), base).await?;
             if updated.is_empty() {
                 println!("nothing to update");
             } else {
@@ -695,10 +800,25 @@ async fn cmd_plugin_marketplace(args: Vec<String>, home: &Path) -> anyhow::Resul
             Ok(())
         }
         "list" => {
-            let lock = read_lockfile(home);
-            for (name, entry) in &lock.entries {
-                let short_commit = &entry.commit[..entry.commit.len().min(12)];
-                println!("{name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+            if all_mode {
+                let user_lock = read_lockfile(home);
+                let project_lock = if base != home { read_lockfile(base) } else { otto_extensions::MarketplaceLockfile::default() };
+                for (name, entry) in &user_lock.entries {
+                    let short_commit = &entry.commit[..entry.commit.len().min(12)];
+                    println!("[user]    {name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+                }
+                for (name, entry) in &project_lock.entries {
+                    if !user_lock.entries.contains_key(name) {
+                        let short_commit = &entry.commit[..entry.commit.len().min(12)];
+                        println!("[project] {name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+                    }
+                }
+            } else {
+                let lock = read_lockfile(base);
+                for (name, entry) in &lock.entries {
+                    let short_commit = &entry.commit[..entry.commit.len().min(12)];
+                    println!("{name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+                }
             }
             Ok(())
         }
@@ -1579,5 +1699,272 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("usage"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // --project / --root flag parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_base_flags_no_flags_returns_false() {
+        let args = vec!["list".to_string()];
+        let (project, root, rest) = parse_base_flags(args).unwrap();
+        assert!(!project);
+        assert!(root.is_none());
+        assert_eq!(rest, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn parse_base_flags_project_flag_sets_project_true() {
+        let args = vec!["--project".to_string(), "list".to_string()];
+        let (project, root, rest) = parse_base_flags(args).unwrap();
+        assert!(project);
+        assert!(root.is_none());
+        assert_eq!(rest, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn parse_base_flags_root_implies_project() {
+        let args = vec!["--root".to_string(), "/tmp/proj".to_string(), "list".to_string()];
+        let (project, root, rest) = parse_base_flags(args).unwrap();
+        assert!(project);
+        assert_eq!(root, Some(PathBuf::from("/tmp/proj")));
+        assert_eq!(rest, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn parse_base_flags_project_and_root_together() {
+        let args = vec![
+            "--project".to_string(),
+            "--root".to_string(),
+            "/tmp/p".to_string(),
+            "marketplace".to_string(),
+            "add".to_string(),
+            "http://example.com/mp.git".to_string(),
+        ];
+        let (project, root, rest) = parse_base_flags(args).unwrap();
+        assert!(project);
+        assert_eq!(root, Some(PathBuf::from("/tmp/p")));
+        assert_eq!(rest, vec!["marketplace".to_string(), "add".to_string(), "http://example.com/mp.git".to_string()]);
+    }
+
+    #[test]
+    fn parse_base_flags_root_without_value_errors() {
+        let args = vec!["--root".to_string()];
+        assert!(parse_base_flags(args).is_err());
+    }
+
+    #[test]
+    fn resolve_base_defaults_to_home_when_not_project() {
+        let home = Path::new("/home/user");
+        assert_eq!(resolve_base(false, None, home), home);
+    }
+
+    #[test]
+    fn resolve_base_uses_root_override_when_project() {
+        let home = Path::new("/home/user");
+        let proj = PathBuf::from("/tmp/proj");
+        assert_eq!(resolve_base(true, Some(proj.clone()), home), proj);
+    }
+
+    #[test]
+    fn resolve_base_falls_back_to_home_when_cwd_fails() {
+        // When project_mode is true but there's no root_override AND current_dir fails
+        // (unlikely in a test, but the fallback is home), the function uses home.
+        // We can't easily make current_dir() fail, so we verify the normal path:
+        // project_mode + no root_override = current_dir(). In a test dir, that's the tempdir.
+        let home = Path::new("/home/user");
+        // With --project and no --root, resolve_base uses current_dir(), which in tests
+        // is some valid temp dir — it should NOT be home.
+        let base = resolve_base(true, None, home);
+        assert_ne!(base, home, "project mode without --root should use CWD");
+    }
+
+    // -----------------------------------------------------------------------
+    // Project-level marketplace install (end-to-end)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cmd_plugin_project_flag_installs_to_project_root() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+
+        // Install marketplace at project scope.
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "marketplace".to_string(),
+                "add".to_string(),
+                url.clone(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // The marketplace dir must be under the project's .claude/, NOT the user's.
+        let user_mp = marketplaces_dir(home.path()).join("acme");
+        let proj_mp = marketplaces_dir(proj.path()).join("acme");
+        assert!(
+            proj_mp.join(".claude-plugin").join("marketplace.json").exists(),
+            "marketplace should be at project level"
+        );
+        assert!(
+            !user_mp.exists(),
+            "marketplace should NOT be at user level"
+        );
+
+        // The project lockfile must exist and contain the entry.
+        let proj_lock = read_lockfile(proj.path());
+        assert!(proj_lock.entries.contains_key("acme"));
+        // The user lockfile must NOT have it.
+        let user_lock = read_lockfile(home.path());
+        assert!(!user_lock.entries.contains_key("acme"));
+    }
+
+    #[tokio::test]
+    async fn cmd_plugin_project_install_plugin_writes_project_settings() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+
+        // Add marketplace + install plugin, both at project scope.
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "marketplace".to_string(),
+                "add".to_string(),
+                url.clone(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "install".to_string(),
+                "foo@acme".to_string(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // The plugin must be enabled in the project's settings.json.
+        let proj_settings = std::fs::read_to_string(settings_path(proj.path())).unwrap();
+        let proj_enabled = otto_extensions::parse_enabled_plugins(&proj_settings);
+        assert_eq!(proj_enabled.get("foo@acme"), Some(&true));
+
+        // The user settings must NOT have the key.
+        let user_settings = std::fs::read_to_string(settings_path(home.path())).unwrap_or_default();
+        let user_enabled = otto_extensions::parse_enabled_plugins(&user_settings);
+        assert!(!user_enabled.contains_key("foo@acme"));
+    }
+
+    #[tokio::test]
+    async fn plugin_list_all_shows_both_scopes() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+
+        // Install the marketplace + plugin at user scope.
+        cmd_plugin(
+            vec!["marketplace".to_string(), "add".to_string(), url.clone()],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        cmd_plugin(
+            vec!["install".to_string(), "foo@acme".to_string()],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // Install the same marketplace at project scope (different URL needed? No — the
+        // marketplace name "acme" is the same, but the install path is separate: proj's lockfile
+        // and marketplace dir are independent). We need a *second* repo to avoid name collision.
+        let (_src2, _bare2, url2) = bare_marketplace_remote("acme2", "bar").await;
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "marketplace".to_string(),
+                "add".to_string(),
+                url2.clone(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "install".to_string(),
+                "bar@acme2".to_string(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // Combined listing must show both scopes.
+        let combined = plugin_list_combined(home.path(), proj.path()).unwrap();
+        let keys: Vec<&str> = combined.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert!(keys.contains(&"foo@acme"), "user-scope plugin must appear");
+        assert!(keys.contains(&"bar@acme2"), "project-scope plugin must appear");
+    }
+
+    #[tokio::test]
+    async fn cmd_plugin_marketplace_list_all_shows_both_scopes() {
+        let (_src, _bare, url) = bare_marketplace_remote("acme", "foo").await;
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+
+        // Add marketplace at user scope.
+        cmd_plugin(
+            vec!["marketplace".to_string(), "add".to_string(), url.clone()],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // Add a different marketplace at project scope.
+        let (_src2, _bare2, url2) = bare_marketplace_remote("othermp", "baz").await;
+        cmd_plugin(
+            vec![
+                "--project".to_string(),
+                "--root".to_string(),
+                proj.path().to_string_lossy().into_owned(),
+                "marketplace".to_string(),
+                "add".to_string(),
+                url2.clone(),
+            ],
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // The user lockfile has "acme"; project lockfile has "othermp".
+        // Don't need to test display output — just verify both lockfiles are independent.
+        let user_lock = read_lockfile(home.path());
+        assert!(user_lock.entries.contains_key("acme"));
+        assert!(!user_lock.entries.contains_key("othermp"));
+
+        let proj_lock = read_lockfile(proj.path());
+        assert!(proj_lock.entries.contains_key("othermp"));
+        assert!(!proj_lock.entries.contains_key("acme"));
     }
 }

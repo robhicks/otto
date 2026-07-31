@@ -14,16 +14,17 @@ use crate::plugin_cli;
 // ---------------------------------------------------------------------------
 
 /// Run the interactive plugin manager. Loops until the user exits.
-/// `home` is the user-global `.claude/` base (same parameter `cmd_plugin` receives).
-pub async fn interactive_plugin_ui(home: PathBuf) -> anyhow::Result<()> {
+/// `base` is the `.claude/` parent directory — either the user's home (user-global scope) or
+/// a project root (project-level scope). It is passed to every `plugin_cli` operation.
+pub async fn interactive_plugin_ui(base: PathBuf) -> anyhow::Result<()> {
     loop {
-        let choice = main_menu()?;
+        let choice = main_menu(&base)?;
         match choice {
-            MainChoice::ListPlugins => list_plugins(&home)?,
-            MainChoice::InstallPlugin => install_plugin(&home).await?,
-            MainChoice::UninstallPlugin => uninstall_plugin(&home).await?,
-            MainChoice::TogglePlugins => toggle_plugins(&home).await?,
-            MainChoice::ManageMarketplaces => marketplace_menu(&home).await?,
+            MainChoice::ListPlugins => list_plugins(&base)?,
+            MainChoice::InstallPlugin => install_plugin(&base).await?,
+            MainChoice::UninstallPlugin => uninstall_plugin(&base).await?,
+            MainChoice::TogglePlugins => toggle_plugins(&base).await?,
+            MainChoice::ManageMarketplaces => marketplace_menu(&base).await?,
             MainChoice::Exit => break,
         }
         if !confirm_return_to_menu()? {
@@ -46,7 +47,13 @@ enum MainChoice {
     Exit,
 }
 
-fn main_menu() -> anyhow::Result<MainChoice> {
+fn main_menu(base: &Path) -> anyhow::Result<MainChoice> {
+    let is_project = base != &dirs::home_dir().unwrap_or_default();
+    let title = if is_project {
+        "Plugin Manager (project scope)"
+    } else {
+        "Plugin Manager (user scope)"
+    };
     let choices = vec![
         "List plugins",
         "Install a plugin",
@@ -55,7 +62,7 @@ fn main_menu() -> anyhow::Result<MainChoice> {
         "Manage marketplaces",
         "Exit",
     ];
-    let selected = Select::new("Plugin Manager", choices)
+    let selected = Select::new(title, choices)
         .with_vim_mode(true)
         .prompt()?;
     Ok(match selected {
@@ -84,7 +91,7 @@ fn list_plugins(home: &Path) -> anyhow::Result<()> {
         if have_marketplaces {
             println!("All plugins are installed. Use 'Enable/Disable' to toggle them.");
         } else {
-            println!("No marketplaces found. Add one with 'Manage marketplaces > Add a marketplace'.");
+            println!("No marketplaces in this scope. Add one with 'Manage marketplaces > Add a marketplace'.");
         }
         return Ok(());
     }
@@ -114,7 +121,7 @@ async fn install_plugin(home: &Path) -> anyhow::Result<()> {
         if have_marketplaces {
             println!("All available plugins are already installed.");
         } else {
-            println!("No marketplaces found. Add a marketplace first.");
+            println!("No marketplaces in this scope. Add a marketplace first.");
         }
         return Ok(());
     }
@@ -179,7 +186,7 @@ async fn uninstall_plugin(home: &Path) -> anyhow::Result<()> {
 async fn toggle_plugins(home: &Path) -> anyhow::Result<()> {
     let plugins = plugin_cli::plugin_list(home)?;
     if plugins.is_empty() {
-        println!("No plugins available. Add a marketplace first.");
+        println!("No plugins in this scope. Add a marketplace first.");
         return Ok(());
     }
 
@@ -264,16 +271,18 @@ async fn marketplace_menu(home: &Path) -> anyhow::Result<()> {
 fn list_marketplaces(home: &Path) -> anyhow::Result<()> {
     let lock = plugin_cli::read_lockfile(home);
     if lock.entries.is_empty() {
-        println!("No marketplaces installed.");
+        println!("No marketplaces in this scope.");
         return Ok(());
     }
+    let is_project = home != &dirs::home_dir().unwrap_or_default();
+    let scope_tag = if is_project { "[project]" } else { "[user]" };
     println!();
     for (name, entry) in &lock.entries {
         let short_commit = &entry.commit[..entry.commit.len().min(12)];
-        println!("  {name}");
-        println!("    url:    {}", entry.url);
-        println!("    ref:    {}", entry.git_ref);
-        println!("    commit: {short_commit}");
+        println!("  {scope_tag} {name}");
+        println!("           url:    {}", entry.url);
+        println!("           ref:    {}", entry.git_ref);
+        println!("           commit: {short_commit}");
     }
     println!(
         "\n{} marketplace(s) total, {} materialized plugin(s)",
