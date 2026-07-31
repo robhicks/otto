@@ -9,6 +9,13 @@ license.workspace = true
 name = "otto"
 path = "src/main.rs"
 
+# `test = true` so `cargo test` runs the converter's own tests. Cargo builds examples during a
+# test run but does not run their `#[cfg(test)]` modules unless the target opts in.
+[[example]]
+name = "bake-art"
+path = "examples/bake-art.rs"
+test = true
+
 [features]
 firecracker = ["otto-remote/firecracker"]
 candle = ["otto-providers/candle"]
