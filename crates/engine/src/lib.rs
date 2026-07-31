@@ -22,6 +22,8 @@ use otto_tools::{
 };
 
 mod approval;
+/// otto's terminal mark. Public so any tty frontend — and the `bake-art` example — can reach it.
+pub mod banner;
 mod hooks;
 mod loopback;
 mod mcp;

@@ -9,6 +9,13 @@ license.workspace = true
 name = "otto"
 path = "src/main.rs"
 
+# `test = true` so `cargo test` runs the converter's own tests. Cargo builds examples during a
+# test run but does not run their `#[cfg(test)]` modules unless the target opts in.
+[[example]]
+name = "bake-art"
+path = "examples/bake-art.rs"
+test = true
+
 [features]
 firecracker = ["otto-remote/firecracker"]
 candle = ["otto-providers/candle"]
@@ -43,6 +50,9 @@ inquire = "0.7"
 
 [dev-dependencies]
 escargot = "0.5"
+# examples/bake-art.rs only: decode/encode the PNG the terminal mark is baked from. PNG codec
+# only — the shipped `otto` binary never links this.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # tests/mcp_child_teardown.rs only: `kill(2)` for cleaning up subprocesses that are not this
 # process's children (so `std::process::Child::kill` cannot reach them).
 libc = "0.2"

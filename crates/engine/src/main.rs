@@ -29,6 +29,10 @@ async fn main() -> anyhow::Result<()> {
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         _ => {
             eprintln!(
+                "{}\n",
+                otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
+            );
+            eprintln!(
                 "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin                                  interactive TUI (default)\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
             );
             std::process::exit(2);
