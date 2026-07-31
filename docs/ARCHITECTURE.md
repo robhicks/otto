@@ -373,8 +373,13 @@ format:
   `~/.claude/plugins/repos/<marketplace>/<plugin>/`, records it in the lockfile's `plugins` map, and
   discovery folds it from there. Plugin MCP tools hook-wrap (they register before `register_hooks`) and are addressable from
   `permissions` rules and hook matchers via the `mcp__<plugin>[__<tool>]` idiom (server key
-  wildcarded), bridged by `mcp_specifier_matches`. A project-level (non-user-global) marketplace
-  install and an interactive `/plugin` UX are still pending.
+  wildcarded), bridged by `mcp_specifier_matches`. Bare `otto plugin` (or `otto plugin interactive`)
+  launches an inquire-based TUI — list/install/uninstall, batch enable-disable, and marketplace
+  management (add/remove/update/list) — with the active scope (`user` vs `project`) shown in its
+  menu title. `--project`/`--root <path>` scope every `otto plugin` action (TUI included) to a
+  project's `.claude/` instead of `~/.claude/`, each scope keeping its own lockfile,
+  `enabledPlugins`, and materialized clones, with `list --all` / `marketplace list --all` merging
+  user + project scopes.
 
 `extensions` depends on `engine-core` (registry/traits), the MCP client, and the permission
 gate. It therefore lands as a dedicated plan after those seams exist. The `Agent` trait being

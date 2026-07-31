@@ -61,6 +61,8 @@ The spec covers the full model; it ships as two reviewable plans on the project'
   disk** under `.claude/plugins/marketplaces/`. A marketplace entry whose `source` is remote and not
   present on disk is **skipped with a warning** (not installed). This mirrors how prior slices deferred
   the serve-path wiring and network/install mechanics while shipping the on-disk behavior.
+  *(Shipped since: marketplace install/lockfile 2026-07-06, remote plugin-source materialization
+  2026-07-10, interactive `/plugin` TUI + project-level installs 2026-07-30.)*
 - **`model`/`allowed-tools` enforcement.** Plugin-contributed agents/commands carry these fields exactly
   as user/project ones do; they remain parsed-but-inert until the permissions slice (the gate stays the
   sole authority).

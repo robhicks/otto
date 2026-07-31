@@ -37,6 +37,8 @@ In scope:
 Out of scope (unchanged, still deferred where noted elsewhere):
 
 - Interactive `/plugin` UX; project-level (non-user-global) marketplace installs.
+  *(Both shipped 2026-07-30 — an inquire-based TUI and `--project`/`--root` scoping, see the
+  install slice's deferral.)*
 - Hook regex matchers, lifecycle hooks, JSON-stdout control, `settings.local.json` (the general
   hooks-slice deferrals — this slice only adds `mcp__` token handling to the existing exact matcher).
 - Renaming the internal `plugin__…` gate names (they stay the stable identity).
