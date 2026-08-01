@@ -95,10 +95,25 @@ mod tests {
     #[test]
     fn capability_copy_follows_the_locale() {
         // Wired in Task 3; asserted here so the strip's full copy is covered end to end.
+        //
+        // Asserts the whole `label: value` segment, NOT the bare value. `"aus"` alone is a
+        // substring of ordinary German words — `Pausieren` is `Msg::Pause` — so the moment
+        // `StatusLine` or anything nested in it gains such a word, a bare `contains("aus")` goes
+        // vacuous while still passing. The segment text is rendered as `"{label}: {value}"`, which
+        // no unrelated copy can satisfy by accident.
+        let de = render(Locale::De);
         assert!(
-            render(Locale::De).contains("aus"),
-            "sandbox value not localized"
+            de.contains("Sandbox: aus"),
+            "sandbox value not localized: {de}"
         );
+        assert!(
+            de.contains("Engine: lokal"),
+            "engine value not localized: {de}"
+        );
+        // …and the English copy is displaced, not merely accompanied.
+        let en = render(Locale::En);
+        assert!(en.contains("sandbox: off"), "{en}");
+        assert!(!de.contains("sandbox: off"), "{de}");
     }
 
     #[test]

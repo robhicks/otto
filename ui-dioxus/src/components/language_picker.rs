@@ -134,6 +134,18 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
+    /// The `<option>` fragment carrying `value="{tag}"`, for asserting on its attributes.
+    ///
+    /// Splitting on `<option` rather than searching the whole document is what makes `selected`
+    /// attributable to ONE option: the rendered markup carries `selected=true` only on the active
+    /// one and omits the attribute entirely on the rest, so a whole-document `contains("selected")`
+    /// would be true no matter which locale were active.
+    fn option_for<'a>(html: &'a str, tag: &str) -> &'a str {
+        html.split("<option")
+            .find(|s| s.starts_with(&format!(" value=\"{tag}\"")))
+            .unwrap_or_else(|| panic!("no {tag} option in: {html}"))
+    }
+
     #[test]
     fn lists_every_language_endonymically() {
         let html = render_with(Locale::En);
@@ -149,12 +161,10 @@ mod tests {
     #[test]
     fn marks_the_active_locale_selected() {
         let html = render_with(Locale::De);
-        // The `de` option carries `selected`; find its tag and check.
-        let de_opt = html
-            .split("<option")
-            .find(|s| s.contains("value=\"de\""))
-            .unwrap_or_else(|| panic!("no de option in: {html}"));
-        assert!(de_opt.contains("selected"), "de not selected: {de_opt}");
+        assert!(
+            option_for(&html, "de").contains("selected"),
+            "de not selected: {html}"
+        );
     }
 
     #[test]
@@ -185,17 +195,42 @@ mod tests {
         assert!(dioxus_ssr::render(&dom).contains("ok"));
     }
 
-    /// Mounts the picker with NO provider. Must render (falling back to `en`) rather than panic —
-    /// the same guarantee that keeps `editor/dirty.rs`'s provider-less render tests working.
+    /// Mounts the picker with NO provider. Must render, and render AT `en` — the same guarantee
+    /// that keeps `editor/dirty.rs`'s provider-less render tests working.
+    ///
+    /// Deliberately does NOT assert on an option LABEL. The labels are endonyms, which are
+    /// locale-invariant by design, so `contains("English")` holds of every render at every locale —
+    /// it would establish only "did not panic" while its message claimed to check the fallback.
+    /// The two things that actually discriminate are which option is `selected` and which language
+    /// the accessible name is in; both are asserted here.
     #[test]
-    fn renders_without_a_provider_instead_of_panicking() {
+    fn renders_at_the_en_fallback_without_a_provider() {
         #[component]
         fn Bare() -> Element {
             rsx! { LanguagePicker {} }
         }
         let mut dom = VirtualDom::new(Bare);
         dom.rebuild_in_place();
+        // Rendering at all is half the guarantee: a provider-less mount must be inert, not fatal.
         let html = dioxus_ssr::render(&dom);
-        assert!(html.contains("English"), "expected en fallback in: {html}");
+        assert!(
+            option_for(&html, "en").contains("selected"),
+            "en is not the selected option: {html}"
+        );
+        // …and it is the ONLY selected one, so this cannot pass by accident on another locale.
+        for loc in Locale::ALL.iter().filter(|l| **l != Locale::En) {
+            assert!(
+                !option_for(&html, loc.tag()).contains("selected"),
+                "{loc:?} is selected without a provider: {html}"
+            );
+        }
+        // The translated part of the picker is its accessible name, so it must be the English one.
+        assert!(
+            html.contains(&format!(
+                "aria-label=\"{}\"",
+                t(Locale::En, Msg::LanguageLabel)
+            )),
+            "the accessible name is not the en one: {html}"
+        );
     }
 }

@@ -351,6 +351,59 @@ mod tests {
     }
 
     #[test]
+    fn tf_substitutes_into_multi_byte_templates() {
+        // `tf` slices its template by BYTE offset (`&rest[..open]`, `&after[..close]`). That is
+        // correct because `str::find` returns byte offsets that are always char boundaries — but
+        // only the `en` cases above demonstrate it, and every `en` template is pure ASCII. So a
+        // future "optimization" swapping in char-index arithmetic (or any hand-rolled offset math)
+        // would panic or mis-slice for Hindi and Chinese users ONLY, with the suite still green.
+        //
+        // These are the sharpest templates in the catalog: `zh`'s `RowFileEdit` puts a 3-byte
+        // full-width `（` immediately against `{bytes}` with no ASCII separator, and `zh`'s
+        // `RowApprovalNeeded` puts a 3-byte `：` immediately against `{path}`.
+        assert_eq!(
+            tf(
+                Locale::ZhHans,
+                Msg::RowFileEdit,
+                &[("path", "src/lib.rs"), ("bytes", "42")]
+            ),
+            "✎ FileEdit src/lib.rs （+42 字节）"
+        );
+        assert_eq!(
+            tf(
+                Locale::ZhHans,
+                Msg::RowApprovalNeeded,
+                &[("path", "src/主.rs")]
+            ),
+            "⏸ 需要批准：src/主.rs"
+        );
+        assert_eq!(
+            tf(
+                Locale::Hi,
+                Msg::RowFileEdit,
+                &[("path", "src/lib.rs"), ("bytes", "42")]
+            ),
+            "✎ FileEdit src/lib.rs (+42 बाइट)"
+        );
+        assert_eq!(
+            tf(Locale::Hi, Msg::ApprovalNeeded, &[("path", "src/main.rs")]),
+            "अनुमोदन आवश्यक: src/main.rs"
+        );
+        // A multi-byte VALUE substituted into a multi-byte template — the substituted bytes are
+        // pushed, never re-scanned, so the offsets that follow stay on the template's boundaries.
+        assert_eq!(
+            tf(Locale::Hi, Msg::ApprovalNeeded, &[("path", "स्रोत/मुख्य.rs")]),
+            "अनुमोदन आवश्यक: स्रोत/मुख्य.rs"
+        );
+        // …and an unsupplied placeholder still comes back verbatim out of a multi-byte template,
+        // which is the path that re-emits the name it just sliced.
+        assert_eq!(
+            tf(Locale::ZhHans, Msg::RowFileEdit, &[("path", "src/lib.rs")]),
+            "✎ FileEdit src/lib.rs （+{bytes} 字节）"
+        );
+    }
+
+    #[test]
     fn tf_leaves_an_unsupplied_placeholder_verbatim() {
         // Visibly wrong beats silently blank: a missing arg must be reportable, not invisible.
         assert_eq!(
