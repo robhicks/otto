@@ -28,7 +28,8 @@ macro_rules! messages {
         }
 
         /// Look up a message. Exhaustive over `(Locale, Msg)` with NO wildcard arm — that is what
-        /// makes an unhandled locale a compile error.
+        /// makes an unhandled locale a compile error. **Never add one**; see the warning above the
+        /// `messages!` invocation below, which is where rustc's E0004 diagnostic points.
         pub fn t(locale: Locale, m: Msg) -> &'static str {
             match (locale, m) {
                 $(
@@ -82,6 +83,24 @@ pub fn tf(locale: Locale, m: Msg, args: &[(&str, &str)]) -> String {
     out
 }
 
+// ============================================================================================
+// IF YOU LANDED HERE FROM `error[E0004]: non-exhaustive patterns` — READ THIS FIRST.
+//
+// You added a `Locale` variant (say `Fr`) in `mod.rs`, and rustc is pointing at this invocation
+// and proposing:
+//
+//     (Locale::Fr, _) => todo!()
+//
+// **Do not take that suggestion.** The exhaustive `(Locale, Msg)` match with no wildcard arm is
+// the entire mechanism that makes a missing translation a compile error rather than a runtime
+// gap. A single wildcard arm — anywhere, `todo!()` or not — silently disarms it for EVERY key at
+// once, and the next contributor adds a message with four translations and ships it.
+//
+// The error is not a defect to be patched; it is the design working. It is telling you the
+// catalog is incomplete. The fix is to add `fr: "…"` to every entry in the block below (and an
+// `fr` arm to the `messages!` pattern + `t`'s match at the top of this file), which is exactly
+// as much work as the language actually costs.
+// ============================================================================================
 messages! {
     // ---- Buttons and actions -------------------------------------------------------------
     Connect { en: "Connect", de: "Verbinden", es: "Conectar", hi: "कनेक्ट करें", zh: "连接" }

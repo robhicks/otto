@@ -29,49 +29,50 @@ pub fn initial_locale() -> Locale {
     resolve_locale(load_persisted_locale().as_deref(), &env_locale_tags())
 }
 
-/// A shipped UI language. Adding a variant is a compile error until every catalog entry supplies
-/// it — see the `messages!` macro in `catalog.rs`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Locale {
-    En,
-    De,
-    Es,
-    Hi,
-    ZhHans,
+/// Emit `Locale`, its `ALL` roster, `tag()`, and `endonym()` from ONE variant list.
+///
+/// Hand-maintaining these four in parallel does not work, and the failure is silent in the worst
+/// direction. `ALL` is a value, not a match, so the compiler has nothing to check it against:
+/// adding a variant to the enum produced three errors (`t`, `tag`, `endonym`) and **none** from
+/// `ALL`. A locale forgotten there compiles clean, disappears from the picker, and — because every
+/// catalog-integrity test iterates `Locale::ALL` — is silently skipped by the very tests that
+/// exist to catch a missing translation, `lists_every_language_endonymically` included. Same
+/// technique `messages!` in `catalog.rs` already establishes for the same reason.
+macro_rules! locales {
+    ($($variant:ident { tag: $tag:expr, endonym: $endonym:expr $(,)? })+) => {
+        /// A shipped UI language. Adding a variant is a compile error until every catalog entry
+        /// supplies it — see the `messages!` macro in `catalog.rs`.
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        pub enum Locale { $($variant),+ }
+
+        impl Locale {
+            /// Every shipped language, in picker order. Derived from the same list as the enum, so
+            /// it cannot fall out of step with it.
+            pub const ALL: [Locale; [$(Locale::$variant),+].len()] = [$(Locale::$variant),+];
+
+            /// The BCP-47 tag persisted to storage and written to `document.documentElement.lang`.
+            pub fn tag(self) -> &'static str {
+                match self { $(Locale::$variant => $tag),+ }
+            }
+
+            /// The language's own name for itself. Deliberately NOT a catalog entry: the picker
+            /// must be usable by a reader currently stuck in a language they cannot read.
+            pub fn endonym(self) -> &'static str {
+                match self { $(Locale::$variant => $endonym),+ }
+            }
+        }
+    };
+}
+
+locales! {
+    En { tag: "en", endonym: "English" }
+    De { tag: "de", endonym: "Deutsch" }
+    Es { tag: "es", endonym: "Español" }
+    Hi { tag: "hi", endonym: "हिन्दी" }
+    ZhHans { tag: "zh-Hans", endonym: "中文（简体）" }
 }
 
 impl Locale {
-    pub const ALL: [Locale; 5] = [
-        Locale::En,
-        Locale::De,
-        Locale::Es,
-        Locale::Hi,
-        Locale::ZhHans,
-    ];
-
-    /// The BCP-47 tag persisted to storage and written to `document.documentElement.lang`.
-    pub fn tag(self) -> &'static str {
-        match self {
-            Locale::En => "en",
-            Locale::De => "de",
-            Locale::Es => "es",
-            Locale::Hi => "hi",
-            Locale::ZhHans => "zh-Hans",
-        }
-    }
-
-    /// The language's own name for itself. Deliberately NOT a catalog entry: the picker must be
-    /// usable by a reader currently stuck in a language they cannot read.
-    pub fn endonym(self) -> &'static str {
-        match self {
-            Locale::En => "English",
-            Locale::De => "Deutsch",
-            Locale::Es => "Español",
-            Locale::Hi => "हिन्दी",
-            Locale::ZhHans => "中文（简体）",
-        }
-    }
-
     /// Parse a BCP-47-ish tag. `None` for anything with no shipped catalog — the caller falls back
     /// to `En` rather than guessing a near-match.
     pub fn from_tag(tag: &str) -> Option<Locale> {
