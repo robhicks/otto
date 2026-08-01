@@ -15,7 +15,7 @@ use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
     can_demote, can_promote, client_error_row, describe_event, error_row, ClientText, ConnState,
-    LogRow,
+    RowMsg,
 };
 use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 
@@ -48,7 +48,7 @@ pub fn App() -> Element {
     // be mutable even though the web target never writes it — only reads it via `token.read()`).
     let mut token = use_signal(String::new);
     let mut conn = use_signal(|| ConnState::Disconnected);
-    let mut rows = use_signal(Vec::<LogRow>::new);
+    let mut rows = use_signal(Vec::<RowMsg>::new);
     let mut last_seq = use_signal(|| None::<u64>);
     let mut session = use_signal(|| None::<String>);
     // The capabilities manifest from the last `Ready` frame; None when disconnected (cleared on

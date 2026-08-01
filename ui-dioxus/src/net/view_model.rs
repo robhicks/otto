@@ -27,6 +27,8 @@ pub enum ClientText {
 /// locale that was active when it arrived, so a language switch would leave the event log — the
 /// largest text surface in the UI — permanently mixed-language. Formatting happens in
 /// `render_row`, at render time, so every row follows the active locale.
+/// The row's CSS class is not stored — `RowMsg::class()` derives it, so a class cannot disagree
+/// with its content.
 ///
 /// Fields carrying server-originated text (`detail`, `message`), workspace paths (`path`), and
 /// protocol identifiers (`role`) are rendered verbatim; only the framing around them is localized.
@@ -54,16 +56,28 @@ pub enum RowMsg {
     ClientError(ClientText),
 }
 
-/// A single rendered row in the event log. `class` is a CSS class; `msg` is formatted by
-/// `render_row` against the active locale.
-#[derive(Clone, PartialEq)]
-pub struct LogRow {
-    pub class: &'static str,
-    pub msg: RowMsg,
-}
-
-fn row(class: &'static str, msg: RowMsg) -> LogRow {
-    LogRow { class, msg }
+impl RowMsg {
+    /// The row's CSS class.
+    ///
+    /// A TOTAL function of the variant — which is precisely why there is no struct pairing the
+    /// two. `LogRow { class, msg }` made a class that contradicts its content representable
+    /// (`class: "row-agent"` beside `RowMsg::ServerError`); deriving it makes that unrepresentable.
+    ///
+    /// Exhaustive with no wildcard arm, for the same reason `t`'s `(Locale, Msg)` match has none:
+    /// a new `RowMsg` variant must be a compile error here, not a row that silently renders
+    /// unclassed.
+    pub fn class(&self) -> &'static str {
+        match self {
+            RowMsg::AgentStarted { .. } | RowMsg::AgentFinished { .. } => "row-agent",
+            RowMsg::FileEdit { .. } => "row-edit",
+            RowMsg::Verify { .. } => "row-verify",
+            RowMsg::Log { .. } => "row-log",
+            RowMsg::TurnComplete { .. } => "row-turn",
+            RowMsg::ApprovalRequest { .. } => "row-approval",
+            RowMsg::Meter { .. } => "row-meter",
+            RowMsg::ServerError { .. } | RowMsg::ClientError(_) => "row-error",
+        }
+    }
 }
 
 /// Format a row for display in `locale`.
@@ -325,77 +339,54 @@ pub fn short_session(id: &str) -> String {
     }
 }
 
-/// Classify one engine event into a structured log row. Formatting happens later, in `render_row`.
-pub fn describe_event(kind: &EventKind) -> LogRow {
+/// Classify one engine event into a structured log row. Formatting happens later, in `render_row`;
+/// the CSS class is derived on demand by `RowMsg::class()`.
+pub fn describe_event(kind: &EventKind) -> RowMsg {
     match kind {
-        EventKind::AgentStarted { role } => row(
-            "row-agent",
-            RowMsg::AgentStarted {
-                role: format!("{role:?}"),
-            },
-        ),
-        EventKind::AgentFinished { role } => row(
-            "row-agent",
-            RowMsg::AgentFinished {
-                role: format!("{role:?}"),
-            },
-        ),
+        EventKind::AgentStarted { role } => RowMsg::AgentStarted {
+            role: format!("{role:?}"),
+        },
+        EventKind::AgentFinished { role } => RowMsg::AgentFinished {
+            role: format!("{role:?}"),
+        },
         EventKind::FileEdit {
             path,
             bytes_written,
-        } => row(
-            "row-edit",
-            RowMsg::FileEdit {
-                path: path.display().to_string(),
-                bytes: *bytes_written,
-            },
-        ),
-        EventKind::VerifyResult { ok, detail } => row(
-            "row-verify",
-            RowMsg::Verify {
-                ok: *ok,
-                detail: detail.clone(),
-            },
-        ),
-        EventKind::Log { message } => row(
-            "row-log",
-            RowMsg::Log {
-                message: message.clone(),
-            },
-        ),
-        EventKind::TurnComplete { ok } => row("row-turn", RowMsg::TurnComplete { ok: *ok }),
-        EventKind::ApprovalRequest { path, .. } => row(
-            "row-approval",
-            RowMsg::ApprovalRequest {
-                path: path.display().to_string(),
-            },
-        ),
+        } => RowMsg::FileEdit {
+            path: path.display().to_string(),
+            bytes: *bytes_written,
+        },
+        EventKind::VerifyResult { ok, detail } => RowMsg::Verify {
+            ok: *ok,
+            detail: detail.clone(),
+        },
+        EventKind::Log { message } => RowMsg::Log {
+            message: message.clone(),
+        },
+        EventKind::TurnComplete { ok } => RowMsg::TurnComplete { ok: *ok },
+        EventKind::ApprovalRequest { path, .. } => RowMsg::ApprovalRequest {
+            path: path.display().to_string(),
+        },
         EventKind::TokenCostMeter {
             input_tokens,
             output_tokens,
-        } => row(
-            "row-meter",
-            RowMsg::Meter {
-                input: *input_tokens,
-                output: *output_tokens,
-            },
-        ),
+        } => RowMsg::Meter {
+            input: *input_tokens,
+            output: *output_tokens,
+        },
     }
 }
 
 /// A server-sent `Error` frame as a row. The message is engine-originated and passes through.
-pub fn error_row(message: &str) -> LogRow {
-    row(
-        "row-error",
-        RowMsg::ServerError {
-            message: message.to_string(),
-        },
-    )
+pub fn error_row(message: &str) -> RowMsg {
+    RowMsg::ServerError {
+        message: message.to_string(),
+    }
 }
 
-/// A client-side problem as a row — authored copy or a passthrough diagnostic (spec §2).
-pub fn client_error_row(text: ClientText) -> LogRow {
-    row("row-error", RowMsg::ClientError(text))
+/// A client-side problem as a row — authored copy or a passthrough diagnostic (i18n spec §2).
+pub fn client_error_row(text: ClientText) -> RowMsg {
+    RowMsg::ClientError(text)
 }
 
 #[cfg(test)]
@@ -442,9 +433,9 @@ mod tests {
             path: PathBuf::from("src/main.rs"),
             bytes_written: 42,
         });
-        assert_eq!(r.class, "row-edit");
+        assert_eq!(r.class(), "row-edit");
         assert_eq!(
-            render_row(Locale::En, &r.msg),
+            render_row(Locale::En, &r),
             "✎ FileEdit src/main.rs (+42 bytes)"
         );
     }
@@ -454,7 +445,7 @@ mod tests {
         assert_eq!(
             render_row(
                 Locale::En,
-                &describe_event(&EventKind::TurnComplete { ok: true }).msg
+                &describe_event(&EventKind::TurnComplete { ok: true })
             ),
             "● TurnComplete ok"
         );
@@ -465,7 +456,6 @@ mod tests {
                     ok: false,
                     detail: "boom".into()
                 })
-                .msg
             ),
             "✗ Verify boom"
         );
@@ -482,7 +472,6 @@ mod tests {
                     ok: true,
                     detail: String::new()
                 })
-                .msg
             ),
             "✓ Verify ok"
         );
@@ -493,7 +482,6 @@ mod tests {
                     ok: false,
                     detail: String::new()
                 })
-                .msg
             ),
             "✗ Verify ok"
         );
@@ -504,7 +492,7 @@ mod tests {
         let r = describe_event(&EventKind::AgentStarted {
             role: Role::Planner,
         });
-        assert_eq!(render_row(Locale::En, &r.msg), "▸ Planner started");
+        assert_eq!(render_row(Locale::En, &r), "▸ Planner started");
     }
 
     #[test]
@@ -513,21 +501,21 @@ mod tests {
         // differently per locale, so a picker switch retranslates already-received rows.
         let plain = describe_event(&EventKind::TurnComplete { ok: false });
         assert_ne!(
-            render_row(Locale::En, &plain.msg),
-            render_row(Locale::Es, &plain.msg)
+            render_row(Locale::En, &plain),
+            render_row(Locale::Es, &plain)
         );
         let parameterized = describe_event(&EventKind::AgentStarted { role: Role::Coder });
         assert_ne!(
-            render_row(Locale::En, &parameterized.msg),
-            render_row(Locale::De, &parameterized.msg)
+            render_row(Locale::En, &parameterized),
+            render_row(Locale::De, &parameterized)
         );
         let boolean = describe_event(&EventKind::FileEdit {
             path: PathBuf::from("a.rs"),
             bytes_written: 1,
         });
         assert_ne!(
-            render_row(Locale::En, &boolean.msg),
-            render_row(Locale::ZhHans, &boolean.msg)
+            render_row(Locale::En, &boolean),
+            render_row(Locale::ZhHans, &boolean)
         );
     }
 
@@ -540,11 +528,11 @@ mod tests {
             message: "engine says hi".into(),
         });
         for loc in Locale::ALL {
-            let rendered = render_row(loc, &log.msg);
+            let rendered = render_row(loc, &log);
             assert!(rendered.starts_with('·'), "{loc:?}: {rendered}");
             assert!(rendered.contains("engine says hi"), "{loc:?}: {rendered}");
         }
-        assert_eq!(render_row(Locale::En, &log.msg), "· engine says hi");
+        assert_eq!(render_row(Locale::En, &log), "· engine says hi");
     }
 
     #[test]
@@ -554,20 +542,20 @@ mod tests {
         let log = describe_event(&EventKind::Log {
             message: "engine says hi".into(),
         });
-        assert!(render_row(Locale::En, &log.msg).contains("engine says hi"));
-        assert!(render_row(Locale::ZhHans, &log.msg).contains("engine says hi"));
+        assert!(render_row(Locale::En, &log).contains("engine says hi"));
+        assert!(render_row(Locale::ZhHans, &log).contains("engine says hi"));
 
         let verify = describe_event(&EventKind::VerifyResult {
             ok: false,
             detail: "cargo test failed".into(),
         });
-        assert!(render_row(Locale::ZhHans, &verify.msg).contains("cargo test failed"));
+        assert!(render_row(Locale::ZhHans, &verify).contains("cargo test failed"));
 
         // A protocol identifier survives too.
         let agent = describe_event(&EventKind::AgentStarted {
             role: Role::Verifier,
         });
-        assert!(render_row(Locale::ZhHans, &agent.msg).contains("Verifier"));
+        assert!(render_row(Locale::ZhHans, &agent).contains("Verifier"));
     }
 
     #[test]
@@ -575,12 +563,12 @@ mod tests {
         // Authored copy retranslates…
         let authored = client_error_row(ClientText::Authored(Msg::UrlAndTokenRequired));
         assert_ne!(
-            render_row(Locale::En, &authored.msg),
-            render_row(Locale::De, &authored.msg)
+            render_row(Locale::En, &authored),
+            render_row(Locale::De, &authored)
         );
         // …a transport diagnostic does not (spec §2's boundary rule).
         let passthrough = client_error_row(ClientText::Passthrough("socket closed".into()));
-        assert!(render_row(Locale::De, &passthrough.msg).contains("socket closed"));
+        assert!(render_row(Locale::De, &passthrough).contains("socket closed"));
     }
 
     #[test]
@@ -733,8 +721,8 @@ mod tests {
             old: None,
             new: "x".into(),
         });
-        assert_eq!(r.class, "row-approval");
-        assert!(render_row(Locale::En, &r.msg).contains("src/main.rs"));
+        assert_eq!(r.class(), "row-approval");
+        assert!(render_row(Locale::En, &r).contains("src/main.rs"));
     }
 
     #[test]
@@ -759,8 +747,8 @@ mod tests {
             input_tokens: 7,
             output_tokens: 9,
         });
-        assert_eq!(r.class, "row-meter");
-        assert!(render_row(Locale::En, &r.msg).contains("↑7"));
+        assert_eq!(r.class(), "row-meter");
+        assert!(render_row(Locale::En, &r).contains("↑7"));
     }
 
     fn caps(engine_remote: bool) -> CapabilitiesManifest {
@@ -805,5 +793,79 @@ mod tests {
             false
         ));
         assert!(!can_demote(&connected, &None, false));
+    }
+
+    #[test]
+    fn row_classes_are_pinned_per_variant() {
+        // `class` used to be a second FIELD alongside `msg`, which made
+        // `LogRow { class: "row-agent", msg: RowMsg::ServerError { .. } }` representable. It is a
+        // total 1:1 function of the variant, so it is now derived and that state is unrepresentable.
+        //
+        // Deliberately pinned against hardcoded expectations rather than checked against
+        // `style.css`: `style.css:41-46` defines only `.row-agent`/`.row-edit`/`.row-verify`/
+        // `.row-log`/`.row-turn`/`.row-error`, so `row-approval` and `row-meter` have no rule and
+        // inherit `.row`. That gap is pre-existing and out of scope; a stylesheet-derived test
+        // would fail for a reason this change did not cause.
+        let cases: [(RowMsg, &str); 10] = [
+            (
+                RowMsg::AgentStarted {
+                    role: "Planner".into(),
+                },
+                "row-agent",
+            ),
+            (
+                RowMsg::AgentFinished {
+                    role: "Planner".into(),
+                },
+                "row-agent",
+            ),
+            (
+                RowMsg::FileEdit {
+                    path: "a.rs".into(),
+                    bytes: 1,
+                },
+                "row-edit",
+            ),
+            (
+                RowMsg::Verify {
+                    ok: true,
+                    detail: String::new(),
+                },
+                "row-verify",
+            ),
+            (
+                RowMsg::Log {
+                    message: "hi".into(),
+                },
+                "row-log",
+            ),
+            (RowMsg::TurnComplete { ok: true }, "row-turn"),
+            (
+                RowMsg::ApprovalRequest {
+                    path: "a.rs".into(),
+                },
+                "row-approval",
+            ),
+            (
+                RowMsg::Meter {
+                    input: 1,
+                    output: 2,
+                },
+                "row-meter",
+            ),
+            (
+                RowMsg::ServerError {
+                    message: "boom".into(),
+                },
+                "row-error",
+            ),
+            (
+                RowMsg::ClientError(ClientText::Authored(Msg::UrlAndTokenRequired)),
+                "row-error",
+            ),
+        ];
+        for (msg, expected) in &cases {
+            assert_eq!(msg.class(), *expected, "{msg:?}");
+        }
     }
 }
