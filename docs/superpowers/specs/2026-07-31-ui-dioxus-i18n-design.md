@@ -256,8 +256,11 @@ Normalize (`_` → `-`, ASCII-lowercase, trim), then:
      to `en` is honest, whereas serving Simplified to a Traditional reader is not).
 3. Anything else → `None`.
 
-Bare `zh` → Simplified is a judgment call: Simplified is the majority default for an unqualified
-`zh` tag, and the picker (§5) gives a reader who wants otherwise an immediate override.
+Bare `zh` → Simplified is a judgment call **at the level of a single tag**: Simplified is the
+majority default for an unqualified `zh`, and the picker (§5) gives a reader who wants otherwise an
+immediate override. But `from_tag` never sees a tag alone in production — it is called from
+`resolve_locale`'s scan over an ordered list, and the composition is what decides the outcome. See
+the variant-aware scan below; reasoning about `from_tag` in isolation is not sufficient.
 
 ### `resolve_locale`
 
@@ -269,9 +272,30 @@ Pure, browser-free, host-tested. Precedence, in order:
 
 1. `persisted`, if it parses via `from_tag`. (An unparseable persisted value is treated as absent —
    a stale tag from a future build must not wedge the UI.)
-2. The **first** `env_tags` entry that parses. The list is ordered by user preference, so a user
-   whose preferences are `["fr", "de"]` gets German, not English.
+2. The **first** `env_tags` entry that parses, subject to the Chinese-variant rule below. The list
+   is ordered by user preference, so a user whose preferences are `["fr", "de"]` gets German, not
+   English.
 3. `Locale::En`.
+
+**The Chinese-variant rule (the composed behavior).** Environments append the base tag after the
+regional one: a browser reports `navigator.languages == ["zh-TW", "zh", "en-US", "en"]`, and POSIX
+`LANGUAGE` yields `zh_TW:zh:en`. A naive "first parseable tag" scan therefore rejects `zh-TW`
+(correct) and then immediately matches the bare `zh` as Simplified (wrong) — serving Simplified to
+exactly the Traditional reader that `from_tag`'s rejection exists to protect, and defeating the
+guarantee §3 states. Because it takes both rules to produce the bug, testing them separately
+cannot find it.
+
+The scan therefore tracks whether any `zh-*` tag has already been rejected, and if so treats a
+later bare `zh` as that variant's base tag rather than an independent Simplified preference —
+skipping it and continuing to the next language. `from_tag` itself is unchanged (a lone `zh` with
+no other signal is still Simplified), and the suppression is narrow in both directions:
+
+- `["zh-TW", "zh", "en-US", "en"]` → `En`; `["zh-Hant-HK", "zh", "en"]` → `En`;
+  `["zh_TW", "zh", "en"]` → `En`.
+- `["zh-CN", "zh", "en"]` → `ZhHans` — a genuine Simplified user matches before any rejection is
+  recorded. A bare `["zh"]` alone is still `ZhHans`.
+- `["zh-TW", "zh", "de"]` → `De` — only Simplified is suppressed, never an unrelated language.
+- A persisted `zh-Hans` still wins over the whole scan (precedence 1 is untouched).
 
 Environment sources, per target:
 
@@ -653,7 +677,10 @@ The test suite cannot cover the two runtime detection/persistence paths. After m
    rewritten row tests, but it is where a mistake would land.
 5. **Number/currency formatting stays `en`-shaped** (§8). A German reader sees `$0.0042`, not
    `0,0042 $`. Known and accepted.
-6. **`zh` bare → Simplified** (§3) is a judgment call, mitigated by the picker.
+6. **`zh` bare → Simplified** (§3) is a judgment call for a tag considered alone, mitigated by the
+   picker. It is *not* what a Traditional environment resolves to: `resolve_locale`'s scan is
+   variant-aware and suppresses a bare `zh` that follows an already-rejected `zh-*`, so
+   `["zh-TW", "zh", "en"]` → `En`. See §3 — the rule only holds composed, not per-tag.
 7. **Open:** whether the desktop config file should be JSON rather than a bare tag, in anticipation
    of a second preference. Deliberately deferred — §4 argues the second preference is the right
    moment to decide the file's shape, and a one-line tag file is trivially migratable.
@@ -718,7 +745,10 @@ keeping the wasm bundle under its existing guard and leaving every workspace cra
 - All five catalogs are complete by construction (compile error otherwise), non-empty and
   placeholder-consistent by test.
 - `resolve_locale` precedence (persisted > environment > `en`) and `zh`/`zh-Hant` handling are
-  unit-tested on the host.
+  unit-tested on the host — including the **composed** browser/POSIX list shapes
+  (`["zh-TW", "zh", "en-US", "en"]`, `["zh-Hant-HK", "zh", "en"]`, `zh_TW:zh:en`), not only
+  `from_tag` in isolation, which is where a Traditional environment would otherwise slip through
+  to Simplified.
 - Switching locale retranslates the whole UI *including already-received log rows*, with no reload,
   no reconnect, and no change to session, `seq`, editor buffer, or pending approval.
 - The choice survives a restart on both targets, and beats detection on the next startup.
