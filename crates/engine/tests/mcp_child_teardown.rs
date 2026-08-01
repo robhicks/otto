@@ -534,8 +534,18 @@ fn mcp_server_dies_when_parent_is_hard_killed() {
 #[test]
 fn language_server_grandchild_dies_when_parent_is_hard_killed() {
     let ra = std::env::var("OTTO_RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".into());
-    if which(&ra).is_none() {
-        eprintln!("skipping: `{ra}` not on PATH, so mcp-lsp cannot start a language server");
+    // Probe by *running* it, not by `which`: rustup installs a `rust-analyzer` proxy shim into
+    // ~/.cargo/bin whether or not the component itself is present, so a path lookup is a false
+    // positive on any rustup-provisioned machine (every CI runner). The shim exits non-zero when
+    // the component is missing, so `--version` is the only honest availability check — this
+    // mirrors `rust_analyzer_available()` in crates/mcp-lsp.
+    let usable = std::process::Command::new(&ra)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        eprintln!("skipping: `{ra}` not usable, so mcp-lsp cannot start a language server");
         return;
     }
 
