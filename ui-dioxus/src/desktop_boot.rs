@@ -117,7 +117,10 @@ fn resolve_otto_bin() -> String {
 /// this reproduction is functionally equivalent to Tauri's, not a weaker fixed-delay shortcut.
 pub async fn boot() -> BootOutcome {
     let Some(handle) = rfd::AsyncFileDialog::new()
-        .set_title("Choose a workspace folder")
+        .set_title(crate::i18n::t(
+            crate::i18n::initial_locale(),
+            crate::i18n::Msg::ChooseWorkspaceFolder,
+        ))
         .pick_folder()
         .await
     else {

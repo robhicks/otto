@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-use crate::i18n::use_locale;
+use crate::i18n::{t, tf, use_locale, Msg};
 use crate::net::view_model::{diff_lines, DiffKind};
 
 /// A pending edit approval surfaced to the user: the correlation id, the path, and the diff
@@ -26,7 +26,9 @@ pub fn ApprovalPanel(
     let lines = diff_lines(locale, old.as_deref(), &new);
     rsx! {
         div { class: "approval-panel",
-            div { class: "approval-head", "approval needed: {path.display()}" }
+            div { class: "approval-head",
+                {tf(locale, Msg::ApprovalNeeded, &[("path", &path.display().to_string())])}
+            }
             pre { class: "approval-diff",
                 for l in lines {
                     div {
@@ -40,8 +42,8 @@ pub fn ApprovalPanel(
                 }
             }
             div { class: "approval-actions",
-                button { onclick: move |_| on_decide.call((id, true)), "Approve" }
-                button { onclick: move |_| on_decide.call((id, false)), "Reject" }
+                button { onclick: move |_| on_decide.call((id, true)), {t(locale, Msg::Approve)} }
+                button { onclick: move |_| on_decide.call((id, false)), {t(locale, Msg::Reject)} }
             }
         }
     }

@@ -123,6 +123,28 @@ mod render_tests {
         dioxus_ssr::render(&dom)
     }
 
+    #[component]
+    fn LocalizedHarness(start: crate::i18n::Locale) -> Element {
+        use_context_provider(|| Signal::new(start));
+        let open = use_signal(|| None::<(PathBuf, FileBody)>);
+        let seed = use_signal(String::new);
+        let dirty = use_signal(DirtyState::clean);
+        rsx! { Editor { open, seed, dirty } }
+    }
+
+    #[test]
+    fn the_empty_editor_notice_follows_the_locale() {
+        let mut dom = VirtualDom::new_with_props(
+            LocalizedHarness,
+            LocalizedHarnessProps {
+                start: crate::i18n::Locale::De,
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Keine Datei geöffnet"), "{html}");
+    }
+
     #[test]
     fn clean_buffer_renders_the_path_with_no_marker() {
         let html = render(DirtyState::clean());

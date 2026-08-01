@@ -10,7 +10,7 @@ use crate::components::{
     ApprovalPanel, ConnectionForm, EventLog, FileTree, PendingApproval, PromptBar, StatusLine,
 };
 use crate::editor::{DirtyState, Editor};
-use crate::i18n::Msg;
+use crate::i18n::{t, use_locale, Msg};
 use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
@@ -38,6 +38,9 @@ pub fn App() -> Element {
     // cache `None` and pin `App`'s own copy to English permanently, silently, with every other
     // component still switching correctly. Provider first, always.
     use_context_provider(|| Signal::new(crate::i18n::initial_locale()));
+    // Immediately after the provider, for the reason spelled out just above: consumer-after-
+    // provider is the only ordering that lets `App`'s own copy track the picker.
+    let locale = use_locale();
 
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
     // `mut`: the desktop-only auto-connect mount block below calls `token.set(..)` with the
@@ -512,7 +515,7 @@ pub fn App() -> Element {
                         class: "refresh-btn",
                         disabled: !matches!(conn(), ConnState::Connected { .. }),
                         onclick: move |_| load_files(),
-                        "Refresh files"
+                        {t(locale, Msg::RefreshFiles)}
                     }
                     FileTree {
                         nodes: tree.read().clone(),
@@ -538,12 +541,12 @@ pub fn App() -> Element {
                 button {
                     disabled: !can_promote(&conn.read(), &capabilities.read(), *turn_running.read()),
                     onclick: move |_| promote_remote(()),
-                    "Promote to remote"
+                    {t(locale, Msg::PromoteToRemote)}
                 }
                 button {
                     disabled: !can_demote(&conn.read(), &capabilities.read(), *turn_running.read()),
                     onclick: move |_| demote_local(()),
-                    "Demote to local"
+                    {t(locale, Msg::DemoteToLocal)}
                 }
             }
             ConnectionForm {

@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use dioxus::prelude::*;
 
-// Both highlight backends need this; neither is compiled when the crate is built with no target
-// feature (`cargo build --no-default-features`, the pure `editor::tokens`/`net::` seam check), so
-// the import is gated to match or it warns as unused there.
+use crate::i18n::{t, use_locale, Msg};
+// Both highlight backends need `language_for_path`; neither is compiled when the crate is built
+// with no target feature (`cargo build --no-default-features`, the pure `editor::tokens`/`net::`
+// seam check), so the import is gated to match or it warns as unused there.
 #[cfg(any(feature = "desktop", feature = "web"))]
 use crate::net::tree::language_for_path;
 use crate::net::tree::FileBody;
@@ -44,6 +45,10 @@ pub fn Editor(
     // (Nesting them inside the `FileBody::Text` arm would make hook count vary 0-vs-2 across
     // renders, an immediate downcast panic the moment any hook is added around the match — which
     // Task 10's styled-span editor will do.)
+    //
+    // `use_locale()` is a hook too, and the notices it feeds sit on BOTH sides of the `open` early
+    // return below — so it is hoisted here for exactly the same reason.
+    let locale = use_locale();
     let mut buf = use_signal(|| seed.read().clone());
     // Re-seed when a different file opens. `seed.read()` is a tracked read, so this fires whenever
     // app.rs writes a new seed on open_path — keeping the textarea in sync with the newly-opened
@@ -63,11 +68,15 @@ pub fn Editor(
     let dirty_marker = dirty().marker();
 
     let Some((path, body)) = open.read().clone() else {
-        return rsx! { div { class: "editor-empty", "No file open" } };
+        return rsx! { div { class: "editor-empty", {t(locale, Msg::EditorNoFileOpen)} } };
     };
     match body {
-        FileBody::Binary => rsx! { div { class: "editor-notice", "binary file — not editable" } },
-        FileBody::TooLarge => rsx! { div { class: "editor-notice", "file too large to edit" } },
+        FileBody::Binary => {
+            rsx! { div { class: "editor-notice", {t(locale, Msg::EditorBinary)} } }
+        }
+        FileBody::TooLarge => {
+            rsx! { div { class: "editor-notice", {t(locale, Msg::EditorTooLarge)} } }
+        }
         FileBody::Text(_) => {
             // Span source is a plain function call, not a hook — safe to call here inside the
             // `Text` arm (unlike `buf`/the re-seed effect above, which must stay hoisted and
