@@ -1,6 +1,10 @@
 # ui-dioxus i18n type-design follow-ups
 
-> **Status:** DRAFT — three type-design changes deferred from the #118 review: make the
+> **Status:** IMPLEMENTED — shipped in [#121](https://github.com/robhicks/otto/pull/121), together
+> with the two review rounds that followed it (redaction moved into `SeamError::new`, the type
+> moved to its own module so the constructor is the only door, the arity gap closed, and three
+> tests replaced after review showed them vacuous or evadable — see "As shipped" below).
+> Three type-design changes deferred from the #118 review: make the
 > translate-vs-passthrough boundary a type the compiler enforces, delete a struct whose second
 > field is a total function of its first, and settle the one boundary judgment the i18n spec's
 > rule did not cleanly decide.
@@ -219,10 +223,12 @@ would be a public constructor by another name.
 
   **Stated plainly: the wasm test is browser-harness-only and is NOT part of the default gate.**
   It needs `wasm-bindgen-test-runner` version-matched to `Cargo.lock`'s `wasm-bindgen` plus a
-  webdriver (`.cargo/config.toml`), and this repo has no CI. Both are present in the current
-  development environment and the wasm suite runs green (4 tests), so this change verifies it in
-  Phase 5 — but the host source-scan is what keeps the invariant enforced for the next developer,
-  who may have neither tool installed.
+  webdriver (`.cargo/config.toml`). **Correction, discovered at merge time:** the repo *does* have
+  CI as of [#117](https://github.com/robhicks/otto/pull/117) (`.github/workflows/ci.yml`, added to
+  `main` after this branch was cut) — but it runs `fmt`/`clippy`/`test` over the **workspace**, and
+  `ui-dioxus/` is workspace-excluded, so no `ui-dioxus` test runs in CI at all. The conclusion is
+  unchanged and in fact stronger: neither the wasm suite nor the host `--features desktop` suite is
+  gated automatically, so a host-runnable guard is what protects the next developer.
 - `passthrough_can_only_carry_a_transport_value` — a doc-level compile-fail is not worth a
   `trybuild` dependency for one case; instead the invariant is asserted structurally: `SeamError`'s
   only non-`cfg(test)` constructor is `pub(in crate::transport)`, verified by a source-scan test in
@@ -483,3 +489,42 @@ Every choice made without asking, with its rationale:
 - **§3 is a judgment, not a proof.** A future contributor may disagree that the sidecar failure is
   interface copy. The amendment in the i18n spec records the reasoning so the disagreement is with
   a stated argument rather than with an unexplained precedent.
+
+
+---
+
+## As shipped
+
+Recorded at merge so the spec matches the code rather than the plan. Four things changed during
+implementation and review; each is a correction to this document, not a deviation from it.
+
+1. **Redaction moved into `SeamError::new`.** §1 specified redaction at the two `web.rs` call
+   sites, guarded by a source scan. Review showed that scan was evadable (it keyed on the literal
+   `{e:?}`, so a differently-named binding slipped past), blind to `desktop.rs`, and brittle enough
+   to fail the correct chokepoint refactor. Redaction is now applied by the single constructor, so
+   the property is structural. The source scan was deleted rather than patched.
+
+2. **`SeamError` lives in `transport/seam_error.rs`, not `transport/mod.rs`.** §1's Premise
+   correction 1 got the visibility argument right for `pub(in crate::transport)` but missed a
+   second instance of the same rule: a private *field* is visible to the declaring module **and its
+   descendants**, and `transport::{web,desktop}` were descendants — so they could construct
+   `SeamError(..)` directly, bypassing the constructor and its redaction. Declared in its own
+   module they are siblings, the field is unnameable, and direct construction is `error[E0423]`.
+   This is what makes the section's claim literally true.
+
+3. **`ClientText::authored`/`authored_with` gained arity guards.** The spec's §3 shape allowed
+   `authored(Msg::SidecarSpawnFailed)`, which renders the literal `{bin}` to a user because `tf`
+   emits unsupplied placeholders verbatim. `Msg::has_placeholders()` is derived from the catalog at
+   macro-expansion time and both constructors `debug_assert` on it. Keys are `&'static str`. The
+   doc comment's original justification — an analogy to `RowMsg::class()` — was unsound and is
+   corrected in the code: `class` was derivable from its variant, `args` is not derivable from
+   `msg`.
+
+4. **The rule lived in five places, not four.** Scope named the i18n spec's §2/§6/§9 and
+   `CLAUDE.md`. The fifth is `ui-dioxus/src/i18n/mod.rs`'s module doc — the one a contributor reads
+   while adding a catalog key. The miss was structural: the plan's verification grep was scoped to
+   `docs/`, which cannot see the source tree. Both are fixed.
+
+Deferred, with reasoning, to [#122](https://github.com/robhicks/otto/issues/122): a failed
+connection currently produces no event-log row at all; a sidecar that dies after spawning is
+silent while its stderr diagnosis is read and discarded; plus four smaller hardening items.

@@ -1,5 +1,11 @@
 # ui-dioxus i18n Type-Design Follow-ups Implementation Plan
 
+> **Status:** SHIPPED — all four tasks landed in [#121](https://github.com/robhicks/otto/pull/121),
+> plus two review rounds. See the design spec's "As shipped" section for the four places the
+> implementation corrected this plan; the most significant is that Task 3's `SeamError` ended up in
+> its own module (`transport/seam_error.rs`) rather than in `transport/mod.rs`, because a private
+> field is visible to descendant modules and the per-target impls were descendants.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Convert two `ui-dioxus` i18n conventions into compiler-enforced invariants — the event log's CSS class becomes a derived function instead of a second field that can contradict the first, and the translate-vs-passthrough boundary becomes a type only `transport/` can mint — and settle the one boundary judgment the i18n spec left open by localizing the sidecar-spawn failure's framing while passing its payload through verbatim.
@@ -632,7 +638,7 @@ mod tests {
     ///
     /// A source scan rather than a behavioral test because `web.rs` is `cfg(feature = "web")`:
     /// its call sites can only be EXERCISED on wasm (which needs a webdriver and a version-matched
-    /// `wasm-bindgen-test-runner`, and this repo has no CI), while `include_str!` sees the source
+    /// `wasm-bindgen-test-runner`, and CI does not cover this crate), while `include_str!` sees the source
     /// under every feature combination — including the default `--features desktop` gate. The
     /// wasm test in `web_mount_test.rs` is the real guarantee; this is the one that runs by
     /// default.
