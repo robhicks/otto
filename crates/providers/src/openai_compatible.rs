@@ -77,7 +77,7 @@ impl OpenAiCompatibleProvider {
             .choices
             .into_iter()
             .filter_map(|c| c.message)
-            .map(|m| m.content)
+            .map(|m| m.content.unwrap_or_default())
             .collect::<Vec<_>>()
             .join("");
         Ok(CompleteResponse { text, usage })
@@ -102,8 +102,10 @@ struct ChatRequest<'a> {
 
 #[derive(Deserialize)]
 struct RespMessage {
+    /// Reasoning-tier responses (e.g. DeepSeek reasoner) may carry `content: null` when only
+    /// reasoning tokens were produced; treated as empty text.
     #[serde(default)]
-    content: String,
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -126,4 +128,16 @@ struct ChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn always_max_tokens_never_sends_max_completion_tokens() {
+        for model in ["deepseek-v4-flash", "deepseek-reasoner"] {
+            assert_eq!(always_max_tokens(model, 4096), (Some(4096), None));
+        }
+    }
 }

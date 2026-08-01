@@ -65,6 +65,16 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn o_series_token_fields_switch_field_for_reasoning_models_only() {
+        for model in ["o1", "o1-mini", "o3-mini", "o4-mini"] {
+            assert_eq!(o_series_token_fields(model, 4096), (None, Some(4096)));
+        }
+        for model in ["gpt-4o-mini", "deepseek-v4-flash", "gemini-2.5-flash"] {
+            assert_eq!(o_series_token_fields(model, 4096), (Some(4096), None));
+        }
+    }
+
     #[tokio::test]
     async fn openai_posts_chat_with_bearer_and_parses_text() {
         let server = MockServer::start().await;
