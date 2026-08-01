@@ -4,10 +4,11 @@
 #
 # This builds a stripped `otto` release binary for six targets (Linux/macOS × x86_64/aarch64, with
 # Linux also in a static musl flavor for Alpine and older glibc distros), tars each as
-# `otto-<target>.tar.gz` (the cargo-binstall quick-install convention, so `cargo binstall otto`
-# works with no extra config), attaches a per-archive `.sha256` checksum (a sidecar named
-# `otto-<target>.sha256` — the target stem WITHOUT the `.tar.gz` suffix, and NOT a combined
-# SHA256SUMS file), and drafts a GitHub Release.
+# `otto-<target>.tar.gz` (the cargo-binstall quick-install convention — note this alone is NOT
+# enough for `cargo binstall`, which also needs the crate published to crates.io under a name
+# matching the archive prefix; see the README), attaches a per-archive `.sha256` checksum (a
+# sidecar named `otto-<target>.sha256` — the target stem WITHOUT the `.tar.gz` suffix, and NOT a
+# combined SHA256SUMS file), and drafts a GitHub Release.
 # Linux also gets native `.rpm` packages (Fedora/RHEL-family) built from
 # `[package.metadata.generate-rpm]` in crates/engine/Cargo.toml. Publish the draft once the
 # checksums look right. The same archive layout is what `deploy/install.sh` and

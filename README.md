@@ -26,19 +26,13 @@ Prebuilt binaries for Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `arm64`) 
 each [GitHub release](https://github.com/robhicks/otto/releases). Linux ships both a glibc build
 (`...-unknown-linux-gnu`) and a static musl build (`...-unknown-linux-musl`, for Alpine and older
 glibc distros). Release archives are named `otto-<target>.tar.gz` with a per-archive `.sha256`
-checksum (a sidecar named `otto-<target>.tar.gz.sha256`), and Linux releases also ship native
+checksum (a sidecar named `otto-<target>.sha256`), and Linux releases also ship native
 `.rpm` packages (Fedora / RHEL-family). Any of these work:
 
 **curl installer** — detects the platform, verifies the checksum, installs to `~/.local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/robhicks/otto/main/deploy/install.sh | sh
-```
-
-**cargo-binstall** (needs [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) once):
-
-```bash
-cargo binstall otto
 ```
 
 **Homebrew** — the formula in [`deploy/homebrew/otto.rb`](deploy/homebrew/otto.rb) tracks the
