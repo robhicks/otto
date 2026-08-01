@@ -12,6 +12,10 @@ anyhow.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# Only `time`, for the bounded connect-retry backoff in `SqliteStore::open`. sqlx's
+# `runtime-tokio` feature already puts tokio in the graph, so this declares a dependency that
+# was already being built rather than adding one.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

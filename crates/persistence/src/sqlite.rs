@@ -12,6 +12,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+/// How long to keep retrying a `SQLITE_BUSY` before giving up, in aggregate across one `open`.
+const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// True if `e` is sqlite's SQLITE_BUSY ("database is locked").
+///
+/// Matched on the primary result code, so extended codes (`SQLITE_BUSY_SNAPSHOT` = 517 etc.)
+/// count too — they all mean "another connection holds a lock; try again".
+fn is_busy(e: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = e else {
+        return false;
+    };
+    db.code()
+        .and_then(|c| c.parse::<i32>().ok())
+        .is_some_and(|c| c & 0xff == 5)
+}
+
+/// True if any error in `e`'s source chain is a SQLITE_BUSY.
+///
+/// `open` returns `anyhow::Error`, which erases the `sqlx::Error`, so the chain is walked rather
+/// than downcast at the top level.
+fn busy_somewhere(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<sqlx::Error>().is_some_and(is_busy))
+}
+
 /// Bumped whenever the on-disk schema changes shape. Stamped into `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 1;
 
@@ -26,15 +51,40 @@ impl SqliteStore {
     /// exists.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
+
+        // Several otto processes can open the same database at once — `otto serve &` then
+        // `otto run` both resolve `otto-sessions.db` in the cwd — and on a *fresh* file they race
+        // to create it. Two distinct steps can then report SQLITE_BUSY:
+        //
+        //   1. `connect_with`, because applying `journal_mode = WAL` takes a brief exclusive
+        //      lock and sqlite's own `busy_timeout` is not yet installed on that connection.
+        //   2. `init_schema`, whose `BEGIN IMMEDIATE` takes the write lock to create the schema.
+        //
+        // `busy_timeout` alone covers neither reliably (it does not apply to step 1 at all), so
+        // the whole open is retried under one budget. Measured before this: 8 concurrent opens of
+        // one fresh path failed 6 times at connect, and adding a connect-only retry still left
+        // ~30% failing in `init_schema` under CPU contention.
+        let deadline = std::time::Instant::now() + BUSY_BUDGET;
+        loop {
+            match Self::try_open(path).await {
+                Ok(store) => return Ok(store),
+                Err(e) if std::time::Instant::now() < deadline && busy_somewhere(&e) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One attempt at [`Self::open`]. Any step may fail with SQLITE_BUSY; the caller retries.
+    async fn try_open(path: &Path) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             // WAL lets one writer proceed concurrently with readers.
             .journal_mode(SqliteJournalMode::Wal)
-            // Two otto processes can open the same default database at once (`otto serve &`
-            // then `otto run` both resolve `otto-sessions.db` in the cwd). Wait for the other
-            // one's schema transaction instead of failing with SQLITE_BUSY.
-            .busy_timeout(std::time::Duration::from_secs(10));
+            // Covers statements on an established connection. Not the connect itself.
+            .busy_timeout(BUSY_BUDGET);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let store = Self { pool };
         store.init_schema(path).await?;
