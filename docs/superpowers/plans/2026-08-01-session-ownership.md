@@ -48,8 +48,10 @@ Forced by the inward dependency rule: `protocol` (Task 1) → `persistence` (Tas
 
 **An intermediate-state warning the implementer must expect, stated precisely because the distinction matters:**
 
-- `cargo build --workspace` stays green after **every** task. Every out-of-crate `SessionState` literal is inside `#[cfg(test)]` or an integration test, and `cargo build` does not compile those.
-- `cargo test --workspace` does **not**. After Task 3, `cargo test -p otto-persistence` and `-p otto-remote` pass while `cargo test -p otto-engine` fails to compile. That is expected, is stated per task, and is resolved at the end of Task 5.
+- `cargo build --workspace` stays green through Task 2. Every out-of-crate `SessionState` literal is inside `#[cfg(test)]` or an integration test, and `cargo build` does not compile those.
+- **After Task 3 it does not.** `otto-engine`'s *library* — not merely its tests — has exactly four call sites that break on the new signatures: `crates/engine/src/service.rs:143` (`create_session`), `:595` and `:742` (`snapshot`), and `crates/engine/src/serve.rs:576` (`replay_since`). `cargo build --workspace --exclude otto-engine` is green; `cargo build -p otto-engine` reports 4 errors. **This correction was found during implementation — an earlier draft of this plan claimed the breakage was test-only, and it is not.**
+- Those four sites are precisely the authorization choke point Task 4 owns. Do **not** patch them at the end of Task 3 by threading `UserId::local()` through: that is the compatibility shim this plan forbids, and Task 4 would have to undo it.
+- `cargo test --workspace` is green again only at the end of Task 5.
 
 Do not "fix" the intermediate breakage by shimming old signatures — there is no installed base to preserve them for.
 
@@ -853,10 +855,11 @@ Expected: PASS.
 
 - [ ] **Step 8: Confirm the expected intermediate breakage is confined to `otto-engine`**
 
-Run: `cargo build --workspace` → expected SUCCESS (the remaining broken literals are all
-test-only).
-Run: `cargo test -p otto-engine` → expected **FAILS** to compile, with argument-count errors at the
-`SessionStore` call sites. This is the intermediate state described in Task Order & Rationale, and
+Run: `cargo build --workspace --exclude otto-engine` → expected SUCCESS.
+Run: `cargo build -p otto-engine` → expected **FAILS** with exactly 4 argument-count errors, in
+`otto-engine`'s **library**: `src/service.rs:143` (`create_session`), `:595` and `:742`
+(`snapshot`), and `src/serve.rs:576` (`replay_since`). These are the four sites Task 4's
+authorization choke point owns — leave them broken rather than shimming them. This is the intermediate state described in Task Order & Rationale, and
 it is now confined to one crate. Tasks 4–5 fix it. Do not add compatibility shims.
 
 - [ ] **Step 9: Format and commit**
