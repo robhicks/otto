@@ -42,6 +42,12 @@ pub fn build_ws_url(
 /// The scan is value-scoped — it stops at the first `&`/`#`, quote, or whitespace — so trailing
 /// query parameters and any surrounding prose survive. Over-matching (a key that merely *ends* in
 /// `token=`) redacts something harmless; under-matching would leak, so the bias is deliberate.
+///
+/// Its only production caller is `transport/web.rs` (the desktop transport discards its connect
+/// error entirely, so nothing there can leak), hence the dead-code allow off-web. It lives in this
+/// browser-free module rather than beside its caller so it stays host-testable — the tests below
+/// are the ones that actually pin the redaction.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub fn redact_token(diagnostic: &str) -> String {
     const KEY: &str = "token=";
     const MASK: &str = "<redacted>";
