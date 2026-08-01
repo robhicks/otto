@@ -26,6 +26,10 @@ pub fn store_persisted_locale(tag: &str) {
     }
 }
 
+// `not(feature = "web")` is load-bearing here and on `store_persisted_locale`: these two names have
+// one definition per cfg arm, so a `--features web,desktop` build would otherwise define each twice.
+// The private `load_locale_from`/`store_locale_in` below need no such guard — they have no web
+// counterpart to collide with, which is why their cfg is the plain one.
 #[cfg(all(feature = "desktop", not(feature = "web")))]
 pub fn load_persisted_locale() -> Option<String> {
     load_locale_from(&dirs::config_dir()?)
