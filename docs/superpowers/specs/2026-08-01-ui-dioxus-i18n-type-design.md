@@ -99,7 +99,9 @@ around an unchanged payload.
   keeps them untranslated. The checkable property is *provenance*, which is exactly what §1's
   private constructor enforces, not authorship.)
 - `transport/web.rs`'s bearer-token redaction survives the seam's type change: a `SeamError` from
-  `connect_impl` contains `token=<redacted>`, never the token. Regression-tested (§1).
+  `connect_impl` contains `token=<redacted>`, never the token. Guarded by a host source-scan that
+  runs in the default `--features desktop` gate **and** by a wasm behavioral test that does not
+  (§1 Testing explains why both).
 
 ---
 
@@ -192,7 +194,7 @@ a `SyntaxError` that quotes the URL in full:
 `SeamError::new(e.to_string())`.** They are the only two of the twelve `map_err` sites that are not
 a plain `e.to_string()`, and rewriting them uniformly with the other ten would delete the redaction
 and ship the bearer token into the event log — the surface most likely to be pasted into a bug
-report. Nothing in the suite would catch it today: `redact_token`'s tests (`net/url.rs:168-212`)
+report. Nothing in the suite would catch it today: `redact_token`'s tests (`net/url.rs:168-213`)
 exercise the pure function only, never a call site.
 
 Given that, the redaction now happens *inside* the module that owns the constructor, so no other
@@ -202,10 +204,25 @@ would be a public constructor by another name.
 
 ### Testing
 
-- `connect_error_redacts_the_bearer_token` — the missing call-site regression test. Asserts a
-  `SeamError` produced by `connect_impl` for a URL carrying `token=<secret>` renders
-  `token=<redacted>` and does not contain the secret. Wasm-target test (`web.rs` is
-  `cfg(feature = "web")`), alongside the existing wasm-only tests.
+- **Two tests, deliberately, because neither alone covers the regression.**
+  - `web_socket_error_paths_still_redact_the_bearer_token` — a **host** source-scan in
+    `transport/mod.rs` over `include_str!("web.rs")`, asserting every `{e:?}` format in that file
+    is on a line that also names `redact_token`, and that there are exactly two such sites. This is
+    the one that matters operationally: `transport/mod.rs` compiles under every feature
+    combination, so this runs in `cd ui-dioxus && cargo test --features desktop` — the command the
+    success criteria name, and the only one a developer runs by default. The regression it guards
+    is a *source-level* edit, which is exactly what a source scan can see.
+  - `connect_error_redacts_the_bearer_token` — a **wasm** behavioral test in `web_mount_test.rs`
+    (`#[cfg(all(test, feature = "web", target_arch = "wasm32"))]`), asserting a `SeamError` from
+    `connect_impl` for a scheme-invalid URL carrying `token=<secret>` renders `token=<redacted>`
+    and does not contain the secret. This is the real guarantee rather than a proxy for it.
+
+  **Stated plainly: the wasm test is browser-harness-only and is NOT part of the default gate.**
+  It needs `wasm-bindgen-test-runner` version-matched to `Cargo.lock`'s `wasm-bindgen` plus a
+  webdriver (`.cargo/config.toml`), and this repo has no CI. Both are present in the current
+  development environment and the wasm suite runs green (4 tests), so this change verifies it in
+  Phase 5 — but the host source-scan is what keeps the invariant enforced for the next developer,
+  who may have neither tool installed.
 - `passthrough_can_only_carry_a_transport_value` — a doc-level compile-fail is not worth a
   `trybuild` dependency for one case; instead the invariant is asserted structurally: `SeamError`'s
   only non-`cfg(test)` constructor is `pub(in crate::transport)`, verified by a source-scan test in
@@ -307,9 +324,13 @@ byte-identical in every locale. The five translations keep the backtick-quoted `
 literal intact — `serve` is a CLI subcommand, a protocol-identifier-class token under §2, and the
 existing `protocol_identifiers_survive_translation` test's rationale applies to it.
 
-This also removes the **only** `ClientText::Passthrough` in the tree carrying authored prose, which
-is what makes §1's boundary airtight rather than merely narrower: after this change, every
-remaining `Passthrough` value is literally a `SeamError` the transport produced.
+This is also what makes §1's boundary airtight rather than merely narrower: after this change,
+every remaining `Passthrough` value is literally a `SeamError` the transport produced. Note the
+property is **provenance, not authorship** — several surviving `SeamError` payloads are still
+crate-authored English (`"socket closed"`, `"workspace rpc failed: HTTP {status}"`,
+`"unexpected response to List/Read"`, `"no transport feature enabled …"`), and Scope keeps them
+untranslated deliberately. What §3 removes is the only `Passthrough` authored **outside**
+`transport/`, which is the case the private constructor could not otherwise reach.
 
 ### Shape
 
