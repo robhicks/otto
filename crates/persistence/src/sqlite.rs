@@ -12,6 +12,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+/// Wall-clock bound on one `SqliteStore::open`, enforced with a `timeout` around the whole retry
+/// loop rather than a deadline checked between attempts — a single attempt can block this long by
+/// itself, so a between-attempts check bounds nothing.
+const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// True if `e` is sqlite's SQLITE_BUSY ("database is locked").
+///
+/// Matched on the primary result code, so extended codes (`SQLITE_BUSY_SNAPSHOT` = 517 etc.)
+/// count too — they all mean "another connection holds a lock; try again".
+fn is_busy(e: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = e else {
+        return false;
+    };
+    db.code()
+        .and_then(|c| c.parse::<i32>().ok())
+        .is_some_and(|c| c & 0xff == 5)
+}
+
+/// True if `e` is, or was caused by, a SQLITE_BUSY.
+///
+/// `anyhow::Error::downcast_ref` already searches the source chain, so `.context()` layers added
+/// on the way up do not hide the `sqlx::Error`. Verified by test: a busy error behind two
+/// `.context()` calls is still found.
+fn busy_somewhere(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<sqlx::Error>().is_some_and(is_busy)
+}
+
 /// Bumped whenever the on-disk schema changes shape. Stamped into `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 1;
 
@@ -26,18 +53,80 @@ impl SqliteStore {
     /// exists.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
+
+        // Several otto processes can open the same database at once — `otto serve &` then
+        // `otto run` both resolve `otto-sessions.db` in the cwd — and on a *fresh* file they race
+        // to create it. Two distinct steps can then report SQLITE_BUSY:
+        //
+        //   1. `connect_with`, because applying `journal_mode = WAL` takes an exclusive lock that
+        //      `busy_timeout` cannot wait on. Note the mechanism: sqlx *does* install
+        //      `sqlite3_busy_timeout` before the WAL pragma — the timeout is set, it simply does
+        //      not apply to this transition. sqlx says so itself in `options/mod.rs`: "changing
+        //      into or out of it requires an exclusive lock that can't be waited on with
+        //      sqlite3_busy_timeout()" (launchbadge/sqlx#1930). Do not try to "fix" this by
+        //      reordering connection setup.
+        //   2. `init_schema`, whose `BEGIN IMMEDIATE` takes the write lock to create the schema.
+        //
+        // `busy_timeout` alone covers neither reliably (it does not apply to step 1 at all), so
+        // the whole open is retried under one budget. Measured before this: 8 concurrent opens of
+        // one fresh path failed 6 times at connect, and adding a connect-only retry still left
+        // ~30% failing in `init_schema` under CPU contention.
+        // The budget bounds the whole loop, not just the gaps between attempts. Checking a
+        // deadline only *after* an attempt returns does not bound anything: a single attempt can
+        // itself block for `busy_timeout` inside `init_schema`'s `BEGIN IMMEDIATE`, and
+        // `connect_with` is bounded by the pool's `acquire_timeout` (sqlx defaults it to 30s).
+        // Measured with a lock released at t=9.6s: 19.65s elapsed against a nominal 10s. Wrapping
+        // the loop makes the stated bound the real one.
+        tokio::time::timeout(BUSY_BUDGET, async {
+            loop {
+                match Self::try_open(path).await {
+                    Ok(store) => return Ok(store),
+                    Err(e) if busy_somewhere(&e) => {
+                        // Jitter, so N racing processes do not retry in lockstep.
+                        let jitter = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| u64::from(d.subsec_nanos() % 15_000_000))
+                            .unwrap_or(0);
+                        tokio::time::sleep(
+                            std::time::Duration::from_millis(15)
+                                + std::time::Duration::from_nanos(jitter),
+                        )
+                        .await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "timed out after {}s waiting for another process to release the session database \
+                 at {}; if no other otto is running, the file may be locked by a stale process",
+                BUSY_BUDGET.as_secs(),
+                path.display()
+            ))
+        })
+    }
+
+    /// One attempt at [`Self::open`]. Any step may fail with SQLITE_BUSY; the caller retries.
+    async fn try_open(path: &Path) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             // WAL lets one writer proceed concurrently with readers.
             .journal_mode(SqliteJournalMode::Wal)
-            // Two otto processes can open the same default database at once (`otto serve &`
-            // then `otto run` both resolve `otto-sessions.db` in the cwd). Wait for the other
-            // one's schema transaction instead of failing with SQLITE_BUSY.
-            .busy_timeout(std::time::Duration::from_secs(10));
+            // Covers statements on an established connection. Not the connect itself.
+            .busy_timeout(BUSY_BUDGET);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let store = Self { pool };
-        store.init_schema(path).await?;
+        if let Err(e) = store.init_schema(path).await {
+            // Close rather than drop. `PoolInner::drop` only marks the pool closed; the actual
+            // `sqlite3_close` happens later on the connection's worker thread. On the retry path
+            // that would leave handles and WAL shm mappings open against the very file we are
+            // waiting for a lock on — amplifying the contention we are retrying.
+            store.pool.close().await;
+            return Err(e);
+        }
         Ok(store)
     }
 
@@ -51,8 +140,10 @@ impl SqliteStore {
     ///
     /// Takes `path` solely so the error can name the file an operator has to delete.
     ///
-    /// Creation runs inside one `BEGIN IMMEDIATE` transaction. That is load-bearing rather than
-    /// tidiness: each `execute` auto-commits on its own, so without the transaction a second
+    /// **Both** paths below are transactional, and both must be. Creation runs inside one
+    /// `BEGIN IMMEDIATE`; the read-only probe runs inside a deferred `BEGIN` so its two
+    /// statements share one WAL snapshot. That is load-bearing rather than
+    /// tidiness: each `execute` auto-commits on its own, so without a transaction a second
     /// process opening the same fresh file could probe in the window after `CREATE TABLE
     /// sessions` committed but before the version was stamped — seeing `user_version == 0`
     /// *and* an existing `sessions` table, which is the pre-ownership signature. It would then
@@ -66,8 +157,17 @@ impl SqliteStore {
         // `otto-sessions.db` in the cwd), and taking a write lock on every open serializes
         // unrelated processes against each other for no benefit.
         {
-            let mut conn = self.pool.acquire().await?;
-            if Self::schema_is_current(&mut conn, path).await? {
+            // `begin()`, not `acquire()`. The probe is TWO statements, and in WAL each implicit
+            // transaction takes its own snapshot — so a concurrent creator committing between
+            // them is read as `user_version == 0` (pre-commit) *with* `sessions` present
+            // (post-commit): the pre-ownership signature, and the operator is told to delete a
+            // brand-new database. This is the same window `BEGIN IMMEDIATE` closes for the slow
+            // path, which the read-only fast path reintroduced when it was added.
+            //
+            // A deferred `BEGIN` takes no write lock, so the reason the fast path exists — not
+            // serializing unrelated processes on every open — is fully preserved.
+            let mut tx = self.pool.begin().await?;
+            if Self::schema_is_current(&mut tx, path).await? {
                 return Ok(());
             }
         }
@@ -90,8 +190,12 @@ impl SqliteStore {
     /// `Ok(true)` when the database is already at `SCHEMA_VERSION`, `Ok(false)` when it is empty
     /// and must be created. Errors on a database this build cannot use.
     ///
-    /// Safe to call outside a transaction: every arm either errors or is re-checked under the
-    /// write lock before anything is created.
+    /// **Must be called inside a transaction.** It issues two statements, and in WAL each
+    /// implicit transaction takes its own snapshot — a concurrent creator committing between them
+    /// produces `(0, true)`, the pre-ownership signature, on a perfectly good new database. An
+    /// earlier version called this on a bare pooled connection and failed ~30% of concurrent
+    /// fresh opens that way. A deferred `BEGIN` suffices for the read-only path; the create path
+    /// already holds `BEGIN IMMEDIATE`.
     async fn schema_is_current(
         conn: &mut sqlx::SqliteConnection,
         path: &Path,
@@ -1258,5 +1362,99 @@ mod tests {
         let (dst, _d2) = temp_store().await;
         dst.restore(&state).await.unwrap();
         assert_eq!(dst.owner_of(id).await.unwrap(), alice());
+    }
+    /// The budget must bound the whole open, including time spent blocked *inside* a single
+    /// attempt — a deadline checked only between attempts bounds nothing, since one attempt can
+    /// block for the full `busy_timeout` in `init_schema`'s `BEGIN IMMEDIATE`.
+    ///
+    /// Contends on a *fresh* database deliberately. An already-stamped one is not contended at
+    /// all: `init_schema`'s read-only fast path sails past a held write lock in microseconds,
+    /// which is the fast path working as intended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn open_gives_up_within_the_busy_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.db");
+
+        // Lock the file before any schema exists, so the racer must take the write lock to
+        // create one and cannot fast-path past it.
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let holder = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+        let mut conn = holder.acquire().await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE hold_the_lock (x INTEGER)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = SqliteStore::open(&path).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a permanently held write lock on a fresh database must not open"
+        );
+        assert!(
+            elapsed <= BUSY_BUDGET + std::time::Duration::from_secs(2),
+            "open overran its stated budget: {elapsed:?} > {BUSY_BUDGET:?}"
+        );
+        eprintln!("gave up after {elapsed:?} (budget {BUSY_BUDGET:?})");
+    }
+
+    /// The retry's classification is load-bearing and an innocuous refactor breaks it silently:
+    /// replace a `?` with `anyhow!("{e}")` anywhere in `try_open`'s call graph and the concrete
+    /// `sqlx::Error` is gone, the retry degrades to a no-op, and nothing but a probabilistic
+    /// timing test would notice. This pins it deterministically — including that `.context()`
+    /// layers do not hide it, since `anyhow`'s downcast searches the source chain.
+    #[tokio::test]
+    async fn busy_is_detected_through_context_layers() {
+        // A real SQLITE_BUSY, produced rather than hand-built: hold an exclusive lock, then make
+        // a second connection attempt a write with no busy timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.db");
+        let opts = || {
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .busy_timeout(std::time::Duration::from_millis(0))
+        };
+        let holder = SqlitePoolOptions::new().connect_with(opts()).await.unwrap();
+        let mut hc = holder.acquire().await.unwrap();
+        sqlx::query("BEGIN EXCLUSIVE")
+            .execute(&mut *hc)
+            .await
+            .unwrap();
+
+        let other = SqlitePoolOptions::new().connect_with(opts()).await.unwrap();
+        let err = sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(&other)
+            .await
+            .expect_err("a held exclusive lock must block this write");
+
+        assert!(is_busy(&err), "should classify as busy: {err:?}");
+
+        // ...and it is still found after anyhow erases the concrete type behind two contexts,
+        // which is how it actually reaches `open`'s retry decision.
+        let wrapped = anyhow::Error::new(err)
+            .context("init_schema")
+            .context("opening the session database");
+        assert!(busy_somewhere(&wrapped), "must survive context layers");
+    }
+
+    #[test]
+    fn non_busy_errors_are_not_retried() {
+        // A plain string error carries no sqlx::Error at all.
+        let plain = anyhow::anyhow!("session database predates session ownership");
+        assert!(!busy_somewhere(&plain), "a bail! must not be retried");
+
+        // Neither does a non-database sqlx error.
+        let not_db = anyhow::Error::new(sqlx::Error::RowNotFound).context("ctx");
+        assert!(!busy_somewhere(&not_db), "RowNotFound is not busy");
     }
 }
