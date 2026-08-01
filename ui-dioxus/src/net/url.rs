@@ -2,6 +2,10 @@
 //! (no wasm, no DOM) — this is the determinism seam for the UI's logic.
 
 /// Build the `/ws` connection URL. `session`/`last_seq` are appended only when reconnecting.
+///
+/// **The bearer token rides in the query string.** Anything that derives a user-visible diagnostic
+/// from this URL — or from a browser API that echoes it back in an error — must route the text
+/// through [`redact_token`] first. See its doc for the concrete leak that motivated it.
 pub fn build_ws_url(
     base: &str,
     token: &str,
@@ -20,6 +24,41 @@ pub fn build_ws_url(
         url.push_str(&format!("&last_seq={seq}"));
     }
     url
+}
+
+/// Replace the value of every `token=` query parameter in a diagnostic string with `<redacted>`.
+///
+/// The leak this closes: `build_ws_url` puts the bearer token in the query string, and the
+/// browser's `WebSocket::new` rejects a malformed URL with a `SyntaxError` whose text **quotes the
+/// offending URL in full**. That string is a `Result<_, String>` transport diagnostic, so it flows
+/// straight into `client_error_row(ClientText::Passthrough(..))` and renders in the event log — a
+/// surface this crate's own docs describe as "their audience is a bug report", i.e. exactly the
+/// text a user is most likely to copy into an issue.
+///
+/// Redaction rather than a fixed authored message, deliberately: the host, port, path, `session`,
+/// and `last_seq` are what make "the URL was rejected" actionable, and replacing the whole
+/// diagnostic would trade a real leak for a useless error. Only the secret goes.
+///
+/// The scan is value-scoped — it stops at the first `&`/`#`, quote, or whitespace — so trailing
+/// query parameters and any surrounding prose survive. Over-matching (a key that merely *ends* in
+/// `token=`) redacts something harmless; under-matching would leak, so the bias is deliberate.
+pub fn redact_token(diagnostic: &str) -> String {
+    const KEY: &str = "token=";
+    const MASK: &str = "<redacted>";
+    let mut out = String::with_capacity(diagnostic.len());
+    let mut rest = diagnostic;
+    while let Some(at) = rest.find(KEY) {
+        out.push_str(&rest[..at + KEY.len()]);
+        let value = &rest[at + KEY.len()..];
+        // Every delimiter is ASCII, so this byte index is always a char boundary.
+        let end = value
+            .find(|c: char| matches!(c, '&' | '#' | '"' | '\'' | ')') || c.is_whitespace())
+            .unwrap_or(value.len());
+        out.push_str(MASK);
+        rest = &value[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// True if an incoming event seq is newer than what we've applied
@@ -117,6 +156,54 @@ mod tests {
     fn url_with_reconnect_appends_session_and_seq() {
         let u = build_ws_url("ws://h", "t", Some("sess-1"), Some(12));
         assert_eq!(u, "ws://h/ws?token=t&session=sess-1&last_seq=12");
+    }
+
+    #[test]
+    fn redact_token_removes_the_secret_and_keeps_the_diagnostic_useful() {
+        // The exact shape a browser `SyntaxError` carries: the whole URL, quoted, inside prose.
+        let raw = build_ws_url("ws://h", "s3cr3t-bearer", Some("sess-1"), Some(12));
+        let err = format!(
+            "JsValue(SyntaxError: Failed to construct 'WebSocket': The URL '{raw}' is invalid.)"
+        );
+        let safe = redact_token(&err);
+        assert!(!safe.contains("s3cr3t-bearer"), "token survived: {safe}");
+        // Everything that makes the error actionable is still there.
+        assert!(safe.contains("token=<redacted>"), "no mask in: {safe}");
+        assert!(safe.contains("ws://h/ws"), "host/path lost: {safe}");
+        assert!(safe.contains("session=sess-1"), "session lost: {safe}");
+        assert!(safe.contains("last_seq=12"), "last_seq lost: {safe}");
+        assert!(safe.contains("SyntaxError"), "prose lost: {safe}");
+    }
+
+    #[test]
+    fn redact_token_stops_at_the_value_boundary() {
+        assert_eq!(redact_token("token=abc&x=1"), "token=<redacted>&x=1");
+        assert_eq!(redact_token("token=abc#frag"), "token=<redacted>#frag");
+        assert_eq!(
+            redact_token("url is token=abc here"),
+            "url is token=<redacted> here"
+        );
+        assert_eq!(redact_token("'token=abc'"), "'token=<redacted>'");
+        // Last parameter, nothing after it.
+        assert_eq!(
+            redact_token("ws://h/ws?token=abc"),
+            "ws://h/ws?token=<redacted>"
+        );
+        // An empty value is still masked rather than left as a bare `token=`.
+        assert_eq!(redact_token("token=&x=1"), "token=<redacted>&x=1");
+        // More than one occurrence (a retry log, say) — every one goes.
+        assert_eq!(
+            redact_token("token=a then token=b"),
+            "token=<redacted> then token=<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_token_leaves_token_free_text_untouched() {
+        assert_eq!(redact_token("socket closed"), "socket closed");
+        assert_eq!(redact_token(""), "");
+        // The word "token" without a `=` is not a parameter.
+        assert_eq!(redact_token("bad token supplied"), "bad token supplied");
     }
 
     #[test]

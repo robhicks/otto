@@ -13,12 +13,18 @@ use wasm_bindgen::JsCast;
 use web_sys::{CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 
 use super::{Sink, SocketEvent};
+use crate::net::url::redact_token;
 
 struct WebSink(WebSocket);
 impl Sink for WebSink {
     fn send(&self, cmd: &Command) -> Result<(), String> {
         let json = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
-        self.0.send_with_str(&json).map_err(|e| format!("{e:?}"))
+        // Redacted for the same reason as `connect_impl` below. This particular JsValue is not
+        // known to quote the connection URL, but every string leaving this seam reaches the visible
+        // event log, so the whole seam is redacted rather than the one site we happened to audit.
+        self.0
+            .send_with_str(&json)
+            .map_err(|e| redact_token(&format!("{e:?}")))
     }
 
     fn close(&self) {
@@ -36,7 +42,12 @@ pub fn connect_impl(
     ws_url: &str,
 ) -> Result<(Box<dyn Sink>, UnboundedReceiver<SocketEvent>), String> {
     let (tx, rx) = unbounded::<SocketEvent>();
-    let ws = WebSocket::new(ws_url).map_err(|e| format!("{e:?}"))?;
+    // `ws_url` carries the bearer token as a query parameter (`build_ws_url`), and a rejected URL
+    // comes back as a `SyntaxError` that QUOTES THE URL IN FULL. This `String` is a transport
+    // diagnostic, so `app.rs` routes it to `client_error_row(ClientText::Passthrough(..))` and it
+    // renders in the event log — the surface most likely to be copied into a bug report. Redact
+    // the secret while keeping host/path/session/last_seq, which are what make the error useful.
+    let ws = WebSocket::new(ws_url).map_err(|e| redact_token(&format!("{e:?}")))?;
 
     let tx_msg: UnboundedSender<SocketEvent> = tx.clone();
     let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
