@@ -1,10 +1,81 @@
 # Multitenant identity — the `Authenticator` seam, TOTP + JWT, and session ownership
 
-> **Status:** DRAFT — slice 1 of GitHub issue #115 (multitenancy): identity and session ownership,
-> no UI.
-> **Implements:** the "Suggested first slice" of [#115](https://github.com/robhicks/otto/issues/115).
-> **Blocks:** slice 2 (UI slash commands + `otto login`/`logout` CLI) and slice 3 (handover
-> credentials — `Promoted.token` always `Some`, per-session secrets on every target).
+> **Status:** DRAFT — **NOT IMPLEMENTED. Deferred, and deliberately so.**
+> **Implements:** the identity half of the "Suggested first slice" of
+> [#115](https://github.com/robhicks/otto/issues/115).
+> **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a —
+> session ownership), which lands first and carries this spec's §3.1, §4 and §7.1 unchanged.
+> **Blocks:** slice 2 (UI slash commands + `otto login`/`logout` CLI).
+> **Entangled with:** slice 3 (handover credentials). See "Why this is deferred" immediately below —
+> the two cannot be designed independently, which is the finding that split this work.
+
+## Why this is deferred
+
+Three rounds of design review converged on one structural problem, recorded here so the follow-up
+does not rediscover it:
+
+**`AuthMode::Machine` (§6.5) cannot be made safe within this slice, and removing it takes the
+promote-receiver story with it.** The mode exists because §7.4's zero-principal startup guard would
+otherwise brick `deploy/fly/Dockerfile:57`'s `--accept-promotions` guest, and because a client
+reconnecting after a promote needs a credential the remote is permitted to verify (Decision 4
+forbids a remote verifying user JWTs). But as specified it fails on both counts:
+
+1. **It re-creates cross-tenant authority.** Decision 4 states that a long-lived
+   `--accept-promotions` receiver "hosts many sessions from potentially many users". A single
+   machine-wide promotion secret, plus a client-supplied `?session=` uuid, plus "the connection
+   adopts the attached session's owner", means the secret-holder can attach to *every* session on
+   that receiver regardless of owner — precisely the root-credential shape Decision 3 removes,
+   rebuilt under a new name.
+2. **It does not actually restore the reconnect.** `emit_promoted` (`crates/engine/src/serve.rs:1040-1048`)
+   sends `token: None` for loopback/vps/microvm, and making `Promoted.token` always `Some` is
+   explicitly slice 3. So nothing in this slice delivers the secret to a client — and since §6.4
+   deletes `?token=` and a `Machine` server rejects `Attach`, a browser has no channel to present it
+   even if it had it. That matters concretely because the Fly image serves the UI *from* the
+   promoted machine (`--ui-dir`).
+
+The correct scope for the machine-to-machine credential is **slice 3's per-session secret map**, not
+a machine-wide secret bolted onto this one. So the identity work waits for slice 3's credential
+design rather than shipping a coarse version that would have to be un-shipped.
+
+**What lands instead:** slice 1a, session ownership — the schema, the choke points, and the
+`UserId` type this spec's §3.1/§4/§7.1 describe, with no behavior change and no new credential.
+It is a pure mechanical foundation, which is also why separating it helps: reviewed together, ~35
+mechanical call-site edits would drown every security decision in this document.
+
+## Open issues to resolve before implementing this spec
+
+Carried from the third review round; each would otherwise be rediscovered:
+
+1. **§6.5 / §2 — `Machine` mode**, per the two points above. Make it an explicit opt-in rather than
+   implied by `--accept-promotions`, condition it on zero enrolled principals, or replace it with
+   slice 3's per-session secrets. Whatever the answer, §2's "Not secured" paragraph must name it —
+   §2 currently names only the workspace, so a reader takes "attach/replay/abort are
+   ownership-checked" at face value.
+2. **§7.3 — `/workspace` has no defined credential under `SingleUser`.** The mode mints and verifies
+   no token, but §7.3 says the route "requires a valid access token", and the UI calls it
+   unconditionally with `Authorization: Bearer` (`ui-dioxus/src/transport/web.rs:84`,
+   `transport/desktop.rs:95`). State the per-mode rule.
+3. **§7.2 never sends `Hello`, and covers only `Users`.** §3.5 says it is sent immediately on
+   upgrade; §7.2's five steps never emit it, say nothing about the `SingleUser`/`Machine` sequence
+   (no deadline, no frame, straight to `Ready`), and do not say whether it is still sent when an
+   `Authorization: Bearer` header already pre-resolved the principal. This is the ordering slice 2's
+   UI will depend on.
+4. **§6.6's `ui-dioxus` table is incomplete in two ways that break the desktop app**, neither
+   catchable by success criterion 7 as worded: `ui-dioxus/src/app.rs:129-214` matches
+   `ServerMessage` **exhaustively with no wildcard**, so the new frames are a hard compile error
+   there; and removing the minted secret leaves the `token` signal empty (`app.rs:449`), which makes
+   `load_files`/`open_path` (`app.rs:342-372`) early-return on `tok.is_empty()` — the file tree and
+   editor go silently dead while the app still reaches `Ready`. Widen the criterion to exercise
+   `/workspace`.
+5. **§6.4's Fly citation is wrong** in the same way premise correction 5 fixes: `deploy/fly/Dockerfile`
+   has no `OTTO_TOKEN` `ENV` line (it is a comment at `:51-52`; the `ENV` at `:53` sets
+   port/root/host/ui-dir). The injection site is `create_machine_body`'s `env` map at
+   `crates/remote/src/fly.rs:192-197`.
+
+Two smaller corrections: §6.5's loopback predicate must note that an unset `OTTO_HOST` defaults to
+`"127.0.0.1"` (`main.rs:812`) and so must pass the guard; and "the provisioned engine inherits
+`SingleUser`" requires threading an `AuthMode` through `LoopbackTarget::new` (`loopback.rs:31`) and
+`serve::app` (`loopback.rs:84`), both of which take the shared token positionally today.
 
 otto is single-tenant today: one shared `OTTO_TOKEN` is a root credential for the whole machine,
 nothing in the protocol carries an identity, and `sessions` has no owner. This slice introduces a
