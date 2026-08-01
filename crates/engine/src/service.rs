@@ -829,14 +829,18 @@ impl EngineService {
         // The ownership check for handover lives on the source, in `serve.rs`'s WS command loop
         // where a principal exists: the `PromoteToRemote`/`DemoteToLocal` arm calls
         // `EngineService::authorize_session` before `handle_handover`. It is there rather than
-        // here because this function is also reached machine-to-machine from `POST /export`,
-        // which has no connected principal.
+        // here because this function's only non-test caller is `POST /export`, which is
+        // machine-to-machine and has no connected principal.
         //
-        // Still unchecked, and deliberately so until the identity slice: `POST /export` and
-        // `POST /promote` are bearer-only, so any token holder can export any session id or
-        // restore a bundle naming any owner; and `resolve_session`'s explicit `?session=` arm
-        // attaches without an ownership check. All three are inert while `local` is the only
-        // principal.
+        // Still unchecked, and deliberately so until the identity slice:
+        //   - `POST /export` is bearer-only, so any token holder can export any session id.
+        //   - `POST /promote` is bearer-only and takes the owner from the pushed bundle, so a
+        //     token holder can plant a session row owned by an arbitrary principal. Unlike the
+        //     other two this is not merely inert — it is a live authorization concern the moment
+        //     real principals exist, since nothing today enumerates sessions by owner.
+        //   - `resolve_session`'s explicit `?session=` arm attaches without an ownership check.
+        //     Inert: every command then routes through `authorize`, and connect-time replay is
+        //     owner-scoped, so an attach to a foreign session yields `Ready` and nothing else.
         let owner = self.store.owner_of(session).await?;
         Ok(otto_remote::PromoteBundle {
             session: self.store.snapshot(&owner, session).await?,
