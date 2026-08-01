@@ -35,7 +35,16 @@ pub struct Edit {
 }
 
 /// A transferable capture of a workspace's current files (relative path -> contents).
-/// Excludes the same paths `list("**")` excludes (`target`/`.git`/`node_modules`/dotfiles).
+///
+/// **Scope of the exclusion guarantee.** A snapshot *produced by a `Workspace` impl* excludes the
+/// same paths `list("**")` excludes (`target`/`.git`/`node_modules`/dotfiles) **and** every path
+/// the sensitive-path floor marks — the dotfile skip does not imply the floor (see
+/// `Workspace::snapshot`). A snapshot *deserialized from a peer* carries no such guarantee: this
+/// type is `Deserialize` with a public field, and `otto_remote::PromoteBundle` is parsed straight
+/// off the wire by `POST /promote`. Ingress is validated separately by
+/// `EngineService::validate_workspace_edits`, which is why that check must not be removed on the
+/// theory that snapshots are already clean.
+///
 /// Serde-serializable so it can later cross the wire to a remote engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {

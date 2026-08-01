@@ -27,6 +27,15 @@ impl LocalWorkspace {
     /// written and are not rolled back.
     pub async fn restore(&self, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
         for (path, bytes) in &snapshot.files {
+            // The ingress mirror of `snapshot`'s floor. `apply_edit` enforces containment only,
+            // and `LoopbackTarget::provision` calls this directly on a caller-supplied bundle
+            // without the `validate_workspace_edits` pass the network paths get. Unreachable
+            // today (the only loopback bundle comes from `promote`, which now filters on the way
+            // out) — but relying on that is delegation to another control, which is the exact
+            // pattern this seam's last leak came from.
+            if path.to_str().is_none_or(otto_protocol::is_sensitive) {
+                continue;
+            }
             let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
                 anyhow::anyhow!("restore: non-UTF-8 contents for {}", path.display())
             })?;
@@ -82,9 +91,12 @@ impl WorkspaceRead for LocalWorkspace {
         }
 
         // Recursive mode (`**`): walk the subtree, returning files only. Skips a fixed set of
-        // ignored directories (build/VCS/dependency dirs and any dotfile/dotdir, which also
-        // covers the gate's sensitive-path floor), does not follow symlinks, and caps the
-        // number of files to bound cost. Output is sorted for determinism.
+        // ignored directories (build/VCS/dependency dirs and any dotfile/dotdir). NOTE: the
+        // dotfile skip is NOT the sensitive-path floor and must not be mistaken for it — the
+        // floor's markers match as substrings, so `id_rsa` and `production.env` have no leading
+        // dot and are returned by this walk. `snapshot` applies the floor itself for exactly
+        // that reason. Does not follow symlinks, and caps the number of files to bound cost.
+        // Output is sorted for determinism.
         const MAX_ENTRIES: usize = 5000;
         fn ignored(name: &str) -> bool {
             name == ".git" || name == "target" || name == "node_modules" || name.starts_with('.')
@@ -149,11 +161,42 @@ impl Workspace for LocalWorkspace {
         let paths = self.list("**").await?;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
+            // The floor, applied at the seam every caller shares. `list`'s dotfile skip is NOT
+            // equivalent: the markers match as substrings, so `id_rsa` and `production.env`
+            // pass it. A snapshot is the one `Workspace` operation that reads whole file
+            // *contents* for shipment off-machine — `otto_remote::promote` puts one straight
+            // into a `PromoteBundle` — so the floor is re-asserted here rather than in any one
+            // caller, which would leave the next caller to reintroduce the gap.
+            //
+            // `to_str()`, never `to_string_lossy()`: `validate_workspace_edits` warns in as many
+            // words that U+FFFD substitution could let a non-UTF-8 path slip a marker past the
+            // check. A non-UTF-8 path is skipped rather than shipped — which also stops one such
+            // filename from making a whole bundle unusable, since the receiver refuses them.
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            if otto_protocol::is_sensitive(path_str) {
+                continue;
+            }
             let bytes = self.read(&path).await?;
             files.push((path, bytes));
         }
         Ok(WorkspaceSnapshot { files })
     }
+}
+
+/// Drop floor-sensitive entries from a snapshot's file list.
+///
+/// `LocalWorkspace::snapshot` skips these *before* reading, so the bytes are never loaded at all;
+/// this is for the case where the list arrives already-populated from elsewhere
+/// (`RemoteWorkspace::snapshot`, which receives it over the wire).
+pub(crate) fn strip_sensitive_files(mut files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
+    // `retain` in place rather than filter-and-collect: the element type is unchanged, so there
+    // is no reason to allocate a second backing buffer for what is usually a no-op.
+    // Fail closed on a non-UTF-8 path: drop it rather than lossy-convert. See the note in
+    // `LocalWorkspace::snapshot`.
+    files.retain(|(p, _)| p.to_str().is_some_and(|s| !otto_protocol::is_sensitive(s)));
+    files
 }
 
 #[cfg(test)]
@@ -297,6 +340,48 @@ mod tests {
         assert_eq!(lib.1, b"L");
     }
 
+    /// The walk skips dotfiles, which is NOT the same as the sensitive-path floor: the markers
+    /// match as substrings, so `id_rsa` and `production.env` have no leading dot and sail
+    /// through. A snapshot reads whole file *contents* for shipment off-machine (it is what
+    /// `otto_remote::promote` puts in a `PromoteBundle`), so the floor has to be re-asserted
+    /// here. Measured before the fix: the snapshot contained `id_rsa`, `production.env`, and
+    /// `config/local.env`.
+    #[tokio::test]
+    async fn snapshot_excludes_floor_sensitive_files_that_are_not_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("id_rsa"), b"PRIVATE KEY").unwrap();
+        std::fs::write(dir.path().join("production.env"), b"DB_PASSWORD=hunter2").unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/local.env"), b"SECRET=xyz").unwrap();
+        std::fs::write(dir.path().join(".env"), b"HIDDEN=1").unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"fine").unwrap();
+
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = ws.snapshot().await.unwrap();
+        let names: Vec<String> = snap
+            .files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+
+        // Asserted against `is_sensitive` rather than a hardcoded list, so the test tracks the
+        // floor automatically if a marker is ever added.
+        let leaked: Vec<&String> = names
+            .iter()
+            .filter(|n| otto_protocol::is_sensitive(n))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "floor-sensitive files in a snapshot: {leaked:?}"
+        );
+
+        // ...and the snapshot is not vacuously empty.
+        assert!(
+            names.iter().any(|n| n == "ok.txt"),
+            "ordinary files must still be captured: {names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_restore_round_trips_into_fresh_workspace() {
         let src_dir = tempfile::tempdir().unwrap();
@@ -396,5 +481,58 @@ mod tests {
         }
         // snapshot reads each listed file; an unreadable one must fail loudly, not be skipped.
         assert!(ws.snapshot().await.is_err());
+    }
+
+    /// `RemoteWorkspace::snapshot` receives its file list from a peer. An otto peer already
+    /// filters, so this is normally a no-op — but satisfying the seam's contract by *delegation*
+    /// means trusting the peer to be an up-to-date otto, and trusting one control to cover
+    /// another is exactly what caused this seam's last leak.
+    #[test]
+    fn strip_sensitive_files_drops_floor_paths_and_keeps_the_rest() {
+        let files = vec![
+            (PathBuf::from("ok.txt"), b"fine".to_vec()),
+            (PathBuf::from("id_rsa"), b"KEY".to_vec()),
+            (PathBuf::from("production.env"), b"PW".to_vec()),
+            (PathBuf::from("config/local.env"), b"S".to_vec()),
+            (PathBuf::from(".env"), b"H".to_vec()),
+        ];
+        let kept: Vec<String> = strip_sensitive_files(files)
+            .into_iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(kept, vec!["ok.txt".to_string()]);
+    }
+
+    /// `restore` is the ingress mirror of `snapshot`, and `apply_edit` enforces containment only.
+    /// `LoopbackTarget::provision` calls this directly on a caller-supplied bundle, without the
+    /// `validate_workspace_edits` pass the network ingress paths get — so the floor is applied
+    /// here too rather than delegated to whoever built the bundle.
+    #[tokio::test]
+    async fn restore_refuses_to_write_floor_sensitive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+
+        ws.restore(&WorkspaceSnapshot {
+            files: vec![
+                (PathBuf::from("ok.txt"), b"fine".to_vec()),
+                (PathBuf::from("id_rsa"), b"PRIVATE KEY".to_vec()),
+                (PathBuf::from("config/local.env"), b"SECRET=xyz".to_vec()),
+            ],
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            dir.path().join("ok.txt").exists(),
+            "ordinary files must land"
+        );
+        assert!(
+            !dir.path().join("id_rsa").exists(),
+            "a floor-sensitive entry must not be written"
+        );
+        assert!(
+            !dir.path().join("config/local.env").exists(),
+            "a nested floor-sensitive entry must not be written"
+        );
     }
 }

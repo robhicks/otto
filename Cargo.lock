@@ -2849,6 +2849,7 @@ dependencies = [
  "otto-engine-core",
  "otto-persistence",
  "otto-protocol",
+ "otto-workspace",
  "reqwest",
  "serde",
  "serde_json",

@@ -411,6 +411,76 @@ mod tests {
         );
     }
 
+    /// The floor pinned where the bytes actually leave the machine. `promote()` deliberately does
+    /// not filter — it inherits `Workspace::snapshot`'s floor — so this test guards the seam from
+    /// the outside: if a future refactor rebuilds the bundle from an unfiltered source, this fails
+    /// even though the workspace crate's own test still passes. Before the fix, `id_rsa` was
+    /// serialized into the `PromoteBundle` and crossed the wire ahead of the receiver's
+    /// fail-closed refusal.
+    #[tokio::test]
+    async fn promote_bundle_excludes_floor_sensitive_workspace_files() {
+        // A target that provisions nothing and records the bundle it was handed.
+        struct CapturingTarget {
+            seen: std::sync::Mutex<Option<WorkspaceSnapshot>>,
+        }
+
+        #[async_trait]
+        impl RemoteTarget for CapturingTarget {
+            async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
+                *self.seen.lock().unwrap() = Some(bundle.workspace.clone());
+                Ok(RemoteHandle::new("ws://127.0.0.1:1", "t"))
+            }
+
+            async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = otto_persistence::SqliteStore::open(db_dir.path().join("s.db"))
+            .await
+            .unwrap();
+        let session = store
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let ws_dir = tempfile::tempdir().unwrap();
+        std::fs::write(ws_dir.path().join("id_rsa"), b"PRIVATE KEY").unwrap();
+        std::fs::write(ws_dir.path().join("ok.txt"), b"fine").unwrap();
+        let workspace = otto_workspace::LocalWorkspace::new(ws_dir.path());
+
+        let target = CapturingTarget {
+            seen: std::sync::Mutex::new(None),
+        };
+        promote(&store, &workspace, session, &target).await.unwrap();
+
+        let captured = target
+            .seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("target received a bundle");
+        let names: Vec<String> = captured
+            .files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+
+        let leaked: Vec<&String> = names
+            .iter()
+            .filter(|n| otto_protocol::is_sensitive(n))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "floor-sensitive files in a PromoteBundle: {leaked:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ok.txt"),
+            "ordinary files must still be promoted: {names:?}"
+        );
+    }
+
     #[tokio::test]
     async fn microvm_target_over_unsupported_provisioner_errs() {
         let bundle = PromoteBundle {
