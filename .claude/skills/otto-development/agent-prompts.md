@@ -262,6 +262,69 @@ Agent tool:
 
 ---
 
+## Mandatory Review Pair — Phase 4 Step 8 — `subagent_type: rust-pro` / `architect-reviewer`
+
+Every PR gets both reviews, no exceptions (Non-Negotiable Rule 4). Capture the diff range first:
+`git log --oneline <merge-base>..HEAD` from inside the worktree, or use `gh pr diff <PR>`. Dispatch
+both in the same parallel batch, each reading the actual diff, not the summary.
+
+```
+Agent tool (Rust expert):
+  subagent_type: rust-pro
+  description: "Rust review: <scope>: <subject>"
+  prompt: |
+    You are the mandatory Rust-expert reviewer for PR #<N> on robhicks/otto (<ref>).
+
+    Review the actual diff:
+      gh pr diff <N>
+      gh pr view <N> --json commits,files,title,body
+
+    Check against otto's Rust conventions (from CLAUDE.md):
+    - Idiomatic Rust: ownership/lifetimes, error handling, no panics on untrusted input
+    - Trait seams are Send + Sync + async; the orchestrator holds trait objects, never concrete impls
+    - Tests live next to code (#[cfg(test)] mod tests); wiremock for HTTP, tempfile for fs,
+      ScriptedProvider for agent tests
+    - Determinism is a test invariant: the offline default path must stay reproducible; anything
+      reading OTTO_* / a provider API key belongs behind build_router, never in core logic
+    - The permission gate / sensitive-path floor is never weakened; Coder edits stay gated fail-closed;
+      bash is registered only with a sandbox backend
+    - cargo fmt --all is clean; clippy-clean
+    - No AI attribution in commits, comments, or docs
+
+    Report: Strengths, Issues (Critical / Important / Minor), Assessment (Approve / Request changes).
+
+Agent tool (architect):
+  subagent_type: architect-reviewer
+  description: "Architect review: <scope>: <subject>"
+  prompt: |
+    You are the mandatory architectural reviewer for PR #<N> on robhicks/otto (<ref>).
+
+    Review the actual diff and the spec/plan for this change:
+      gh pr diff <N>
+      gh pr view <N> --json commits,files,title,body
+      # Spec/plan (committed repo files): docs/superpowers/specs/<slug>-design.md,
+      # docs/superpowers/plans/<slug>.md
+
+    Check against otto's architecture (docs/ARCHITECTURE.md — the intended destination — and the
+    latest plan for what is actually shipped):
+    - Inward dependency flow preserved: protocol → engine-core → impl crates → engine;
+      engine-core must never depend on a concrete impl crate
+    - Crate boundaries respected; new capabilities added via AgentCtx accessors or new seams,
+      never by widening public surface
+    - The change matches the spec/plan it claims to implement; wire types stay semver-minor
+    - Trait seams stay remote-ready (Send + Sync + async); extensible payloads stay JSON Value
+    - ui-dioxus stays workspace-excluded; workspace build/test never requires dx
+    - The change follows the documented design rather than eroding it; deviations are justified
+
+    Report: Strengths, Issues (Critical / Important / Minor), Assessment (Approve / Request changes).
+```
+
+Aggregate both reports — plus the pr-review-toolkit and Copilot findings — into the single PR
+comment grouped by **Critical / Important / Suggestions / Strengths**. Critical/Important findings
+from either reviewer must be fixed or explicitly dismissed (with reasoning) before merge.
+
+---
+
 ## Review-Response Subagent — Phase 4 Step 9 — `subagent_type: general-purpose`
 
 ```
@@ -273,7 +336,8 @@ Agent tool:
     Follow otto-development requirements (Phase 4 step 9).
 
     Your job:
-    - Read all unresolved review threads on the PR
+    - Read all unresolved review threads on the PR (including the aggregated rust-pro and
+      architect-reviewer findings if they were posted as comments)
     - For each comment: either fix-and-reply ("Fixed in <sha>") or explicitly dismiss
       with reasoning. NEVER silent dismissal.
     - After each reply, resolve the conversation thread via GraphQL:
