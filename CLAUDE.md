@@ -46,6 +46,16 @@ the fixed port). The Dioxus migration replaced the original `ui/` (Leptos CSR) +
 stack, retiring two toolchains (`trunk` + `tauri-cli`) in favor of `dx`. The decision record and
 migration plan live in `docs/superpowers/specs/2026-07-21-ui-dioxus-runtime-spike-report.md` and
 `docs/superpowers/plans/2026-07-22-ui-dioxus-migration.md`.
+The UI is **localized** (`en`/`de`/`es`/`hi`/`zh-Hans`): interface copy goes through the
+compile-time catalog in `ui-dioxus/src/i18n/` (`t`/`tf`, read via the `use_locale()` hook) and must
+never appear as a literal in the RSX — a missing key or locale is a compile error, not a runtime
+gap. The boundary is *interface copy — the app's own state, controls, and instructions — is
+translated; failure diagnostics carried on the transport's `Result<_, String>` seam are not*. So
+server-originated text (`EventKind::Log`, `VerifyResult.detail`, `ServerMessage::Error`), protocol
+identifiers (`Role` names, `FileEdit`/`Verify`/`TurnComplete`), **and the crate's own
+transport/boot diagnostics** all pass through untranslated. Locale follows the browser/OS by
+default; a picker in the status strip overrides it and persists the choice (`localStorage` on web,
+the OS config dir on desktop). See `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`cli`, etc. — `retrieval`, `extensions`, and `mcp-lsp` are now shipped, see the

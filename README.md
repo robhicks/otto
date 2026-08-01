@@ -135,8 +135,13 @@ OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787   # prints ws:
 
 The UI is a single Dioxus CSR crate in [`ui-dioxus/`](ui-dioxus/). It compiles to WASM for the
 browser and natively (via Dioxus Desktop) for a native window — a **standalone crate, intentionally
-excluded from the cargo workspace**, depending only on `protocol`. Build and run it from inside
-`ui-dioxus/`:
+excluded from the cargo workspace**, depending only on `protocol`.
+
+The UI ships in English, German, Spanish, Hindi, and Simplified Chinese. It follows the browser's
+(or, on desktop, the OS's) language by default; the picker in the status strip overrides that and
+remembers the choice across restarts.
+
+Build and run it from inside `ui-dioxus/`:
 
 ```bash
 cd ui-dioxus
