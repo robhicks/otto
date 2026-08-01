@@ -45,6 +45,7 @@ both router slots use the in-process `LocalProvider`. To use real models:
 |---|---|
 | `OTTO_OLLAMA=1` | Local slot uses Ollama (`OTTO_OLLAMA_MODEL`, default `llama3.2`). |
 | `ANTHROPIC_API_KEY=…` | Remote slot uses Anthropic (`OTTO_ANTHROPIC_MODEL`, default `claude-haiku-4-5`); enables the Brain-Blend router. |
+| `DEEPSEEK_API_KEY=…` | Remote slot uses DeepSeek (`OTTO_DEEPSEEK_MODEL`, default `deepseek-v4-flash`); enables the Brain-Blend router. |
 
 ## How it works
 

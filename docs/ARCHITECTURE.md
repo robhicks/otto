@@ -23,7 +23,7 @@ otto-next/
 │   ├── protocol         # Wire types: Command/Event enums, SessionState, capabilities manifest. No I/O.
 │   ├── engine-core      # Orchestrator state machine, Agent/Workspace/Provider/RemoteTarget traits, registry.
 │   ├── agents           # Built-in atomic agents: planner, context-finder, coder, verifier.
-│   ├── providers        # LLM provider libs (in-process): anthropic, gemini, openai, local(ollama).
+│   ├── providers        # LLM provider libs (in-process): anthropic, gemini, openai, deepseek, local(ollama).
 │   ├── router           # SingleProviderRouter + BrainBlendRouter (privacy/complexity routing) over the Provider pool.
 │   ├── tools            # In-process Tool impls (fs.read/write/list) + DefaultPermissionGate (sensitive-path floor).
 │   ├── mcp-fs           # MCP stdio server: file read/write/search, path-contained.
@@ -152,7 +152,7 @@ on a checkout living on the remote engine. The orchestrator only ever holds
 ```rust
 #[async_trait]
 trait Provider {
-    fn id(&self) -> ProviderId;                   // anthropic | gemini | openai | local
+    fn id(&self) -> ProviderId;                   // anthropic | gemini | openai | deepseek | local
     async fn complete(&self, req: CompleteRequest) -> Result<CompleteStream>;
 }
 ```
