@@ -272,7 +272,7 @@ tautology if used as a check. It is used only to satisfy the scoped read.
 `serve.rs` gains **no** authentication change: `authorized`/`authorized_ws` (`:73-85`) and
 `ConnectParams` (`:39-50`) are untouched. Only the replay call at `:576` passes a principal.
 
-**`resolve_session` (`:1055-1068`) deliberately does not gain an ownership check in this slice.**
+**`resolve_session` (in `crates/engine/src/serve.rs`) deliberately does not gain an ownership check in this slice.**
 It is tempting — it is the hole issue #115 opens with — but adding it here would break success
 criterion 2. Today an unknown `?session=` uuid is accepted blind and receives a `Ready` frame;
 routing attach through `owner_of` turns that into an error and a closed socket, and

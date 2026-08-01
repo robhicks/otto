@@ -30,7 +30,7 @@ forbids a remote verifying user JWTs). But as specified it fails on both counts:
    adopts the attached session's owner", means the secret-holder can attach to *every* session on
    that receiver regardless of owner — precisely the root-credential shape Decision 3 removes,
    rebuilt under a new name.
-2. **It does not actually restore the reconnect.** `emit_promoted` (`crates/engine/src/serve.rs:1040-1048`)
+2. **It does not actually restore the reconnect.** the `ServerMessage::Promoted` construction in `crates/engine/src/serve.rs`'s `handle_handover`
    sends `token: None` for loopback/vps/microvm, and making `Promoted.token` always `Some` is
    explicitly slice 3. So nothing in this slice delivers the secret to a client — and since §6.4
    deletes `?token=` and a `Machine` server rejects `Attach`, a browser has no channel to present it
@@ -107,7 +107,7 @@ each one changes the design.
    engine has one process-global root.** The issue asks that `POST /workspace` be "scoped to the
    session's owner and its root". But `WorkspaceRequest` carries no session id
    (`crates/protocol/src/lib.rs:180-185`), `EngineService::workspace_rpc`
-   (`crates/engine/src/service.rs:647-707`) operates on the single `Arc<dyn Workspace>` the service
+   (`EngineService::workspace_rpc`, `crates/engine/src/service.rs`) operates on the single `Arc<dyn Workspace>` the service
    was constructed with, and `otto serve` resolves exactly one `--root` for the process
    (`crates/engine/src/main.rs:638`). Every session on a served engine therefore shares one
    directory. Adding a session field to the RPC would scope the *call* without isolating the
@@ -140,7 +140,7 @@ each one changes the design.
 
 Two smaller findings, folded into the design rather than listed as corrections: `authorized()`
 compares credentials with `==` on `Option<&str>` (`crates/engine/src/serve.rs:73-79`), which is not
-constant-time (§6.1); and `resolve_session` (`serve.rs:1055-1068`) parses a client-supplied
+constant-time (§6.1); and `resolve_session` (in `serve.rs`) parses a client-supplied
 `?session=` uuid and attaches with **no ownership check whatsoever** (§6.2), which is the specific
 hole issue #115 opens with.
 
@@ -228,6 +228,15 @@ Every choice made without asking, with its rationale.
 | A7 | Access TTL 15 minutes; refresh TTL 30 days, single-use with rotation; TOTP lockout after 5 failures within 15 minutes. | Ordinary, defensible defaults. All are constants in one module so they are trivially tuned. |
 | A8 | The WS handshake accepts credentials **after** upgrade (a `Login`/`Attach` frame) and additionally honours an `Authorization: Bearer` header at upgrade time for non-browser clients. `?token=` is deleted. | The issue requires the credential out of the query string. A browser `WebSocket` cannot set headers, so a post-upgrade frame is the only option that serves both clients from one path. |
 | A9 | `EngineService`'s session-bearing methods take an explicit `&UserId` rather than a type-level `AuthorizedSession` token. | Simplest change that is still fail-closed at one choke point. The typed alternative (a `SessionRef` constructible only by `authorize()`) is stronger but a much larger refactor across ~45 existing test call sites; recorded here as the natural follow-up if ownership checks ever get missed. |
+
+> **A9's trigger condition has now fired — re-weigh it before implementing.** A9 defers the typed
+> `SessionRef` alternative as "the natural follow-up **if ownership checks ever get missed**". One
+> was: `serve.rs`'s handover arm reaches `otto_remote::promote` through the `store()` accessor, so it
+> bypassed `EngineService` by construction and shipped unchecked until review caught it (see the
+> ownership spec's §3.4). The fix was a `pub authorize_session` wrapper — i.e. the invariant is held
+> by convention plus a doc comment, not by the type system. This slice adds three more hand-placed
+> call sites with the same bypass-by-construction shape (attach, `POST /promote`, `POST /export`).
+> Decide A9 on that evidence rather than re-deriving the original cost estimate.
 | A10 | ~~`CapabilitiesManifest` gains `auth_required: bool`.~~ **Withdrawn** — replaced by a pre-auth `ServerMessage::Hello { auth_mode }` frame (§3.5). | The manifest rides only on `Ready`, which §7.2 sends *after* authentication, so the flag would have been unreadable at the one moment a client needs it. A dedicated pre-auth frame also gives `SingleUser`/`Machine` clients a defined greeting, which the field could not. |
 | A11 | Failed authentication returns one opaque message (`"authentication failed"`) to the client regardless of cause; the specific reason is logged server-side only. | An error distinguishing "unknown user" from "bad code" from "locked out" is an enumeration oracle. |
 | A12 | A **`--single-user` mode** is added, and the desktop sidecar uses it, rather than accepting a dead UI between slices. | Without it slice 1 ships a broken application: `ui-dioxus/src/desktop_boot.rs:130` mints a secret and `:219` passes it as `OTTO_TOKEN`, `ui-dioxus/src/net/url.rs:19` appends `?token=`, and both stop working here while the login UI is slice 2 — so the client *cannot* be rebuilt in lockstep, which is the precondition Decision 3's "clean break" relies on. Forcing TOTP on a locally-spawned loopback sidecar is also absurd UX. See §6.5 for why this is not the admin bypass Decision 3 rejects. |

@@ -1060,6 +1060,28 @@ async fn handover_refuses_a_session_the_connection_does_not_own() {
             "{cmd}: unexpected {frame}"
         );
     }
+
+    // Vacuity guard. The seeding above reconstructs the server's DB path by hardcoding `s.db`,
+    // an unexported detail of `start_server`. If that ever changes, the seeded row would not be
+    // in the server's store, the refusal above would become an ordinary not-found, and this test
+    // would stay green while testing nothing about ownership. So assert the opposite direction
+    // too: a session the connection *does* own gets past `authorize` and fails later, on the
+    // absent promote configuration, with a different message.
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .expect("connect");
+    let ready: Value = next_json(&mut ws).await;
+    let owned = ready["session"].as_str().unwrap().to_string();
+    let msg = serde_json::json!({ "PromoteToRemote": { "session": owned } });
+    ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+        .await
+        .unwrap();
+    let frame: Value = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert!(
+        !frame["message"].as_str().unwrap().contains("no session"),
+        "the owner must clear authorization, not be rejected by it: {frame}"
+    );
 }
 
 #[tokio::test]
