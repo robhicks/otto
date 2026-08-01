@@ -3872,6 +3872,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "dioxus-ssr",
+ "dirs",
  "futures-channel",
  "futures-util",
  "getrandom 0.4.3",
@@ -3882,6 +3883,7 @@ dependencies = [
  "reqwest",
  "rfd 0.15.4",
  "serde_json",
+ "sys-locale",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
@@ -5445,6 +5447,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

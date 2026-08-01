@@ -49,6 +49,14 @@ body {
 .cap-degraded { color: var(--warn); font-weight: bold; }
 .cap-sep { color: var(--dim); }
 
+.lang-picker {
+  background: #1c2128;
+  color: var(--fg);
+  border: 1px solid #2a313c;
+  font: inherit;
+  margin-left: 8px;
+}
+
 .prompt, .conn-form {
   display: flex;
   gap: 6px;

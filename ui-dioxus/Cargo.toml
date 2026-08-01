@@ -15,6 +15,8 @@ desktop = [
     "dep:reqwest",
     "dep:rfd",
     "dep:libc",
+    "dep:sys-locale",
+    "dep:dirs",
     "dep:tree-sitter",
     "dep:tree-sitter-highlight",
     "dep:tree-sitter-rust",
@@ -51,6 +53,12 @@ web-sys = { version = "0.3", features = [
     "MessageEvent",
     "CloseEvent",
     "ErrorEvent",
+    # i18n: `Navigator` reads navigator.language(s); `Storage` persists the picked locale to
+    # localStorage; `Document` + `Element` set document.documentElement.lang.
+    "Navigator",
+    "Storage",
+    "Document",
+    "Element",
 ], optional = true }
 
 # desktop transport (only compiled with --features desktop)
@@ -68,6 +76,19 @@ tokio = { version = "1", features = [
 tokio-tungstenite = { version = "0.24", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 rfd = { version = "0.15", optional = true }
+# OS-locale detection for the desktop target. Deliberately NOT env-var parsing (`LANG`/`LC_ALL`):
+# a macOS app launched from Finder inherits none of the shell's locale vars and Windows never sets
+# them, so an env-only detector would silently report `en` on two of three desktop platforms.
+# Optional/desktop-only, so the wasm build never resolves it.
+sys-locale = { version = "0.3", optional = true }
+# Resolves the OS config dir for the persisted locale (`<config_dir>/otto/ui-locale`). The UI must
+# not write settings into the user's workspace — the engine indexes and edits that tree.
+#
+# Version 6, NOT 5: `ui-dioxus/` is its own workspace root, and its lockfile already resolves
+# `dirs 6.0.0` transitively (via `wry`/`tray-icon`). Pinning 5 here would add a SECOND `dirs` tree
+# (5.0.1 + dirs-sys 0.4 + option-ext) rather than reuse the one already present. The workspace's
+# own `dirs = "5"` at crates/engine/Cargo.toml is a different lockfile and does not constrain this.
+dirs = { version = "6", optional = true }
 # Sidecar teardown guard (`PR_SET_PDEATHSIG`): used in `desktop_boot::install_pdeathsig`'s
 # `pre_exec` so the kernel kills the `otto serve` sidecar when this process dies for ANY reason —
 # including the non-unwinding teardowns (SIGKILL/`exit`) that `kill_on_drop` cannot catch. See the

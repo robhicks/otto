@@ -1,5 +1,12 @@
 <!DOCTYPE html>
-<html>
+<!--
+  `lang="en"` is the PRE-MOUNT value only, and does not contradict `set_document_lang`. The app
+  cannot label the document before it exists, so without a static value the document would be
+  entirely *un*-labeled until mount — worse for assistive tech than being briefly mislabeled. The
+  startup effect in `src/app.rs` overwrites this attribute with the resolved locale as soon as the
+  app is up, and the language picker rewrites it on every change thereafter.
+-->
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

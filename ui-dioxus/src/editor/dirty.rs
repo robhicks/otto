@@ -123,6 +123,55 @@ mod render_tests {
         dioxus_ssr::render(&dom)
     }
 
+    /// Mounts the real `Editor` at a chosen locale with a chosen body. `body: None` is the
+    /// no-file-open case; `Some(FileBody::Binary)` / `Some(FileBody::TooLarge)` reach the two
+    /// notice arms, which are separate `rsx!` branches in `editor/mod.rs` and so cannot be covered
+    /// by rendering the empty editor alone.
+    #[component]
+    fn LocalizedHarness(start: crate::i18n::Locale, body: Option<FileBody>) -> Element {
+        use_context_provider(|| Signal::new(start));
+        let open = use_signal(|| body.map(|b| (PathBuf::from(PATH), b)));
+        let seed = use_signal(String::new);
+        let dirty = use_signal(DirtyState::clean);
+        rsx! { Editor { open, seed, dirty } }
+    }
+
+    fn render_localized(start: crate::i18n::Locale, body: Option<FileBody>) -> String {
+        let mut dom =
+            VirtualDom::new_with_props(LocalizedHarness, LocalizedHarnessProps { start, body });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_empty_editor_notice_follows_the_locale() {
+        let html = render_localized(crate::i18n::Locale::De, None);
+        assert!(html.contains("Keine Datei geöffnet"), "{html}");
+    }
+
+    /// The three notices live in three separate arms, so a copy-paste error putting the wrong
+    /// `Msg` in one of them changes nothing the other arms' tests can see. Each assertion below
+    /// therefore pairs its own expected string with the other two being ABSENT — the exact strings
+    /// come from `Msg::EditorBinary`/`EditorTooLarge`/`EditorNoFileOpen` in `i18n/catalog.rs`.
+    #[test]
+    fn the_binary_notice_follows_the_locale() {
+        let html = render_localized(crate::i18n::Locale::De, Some(FileBody::Binary));
+        assert!(html.contains("Binärdatei — nicht bearbeitbar"), "{html}");
+        assert!(!html.contains("Datei zu groß zum Bearbeiten"), "{html}");
+        assert!(!html.contains("Keine Datei geöffnet"), "{html}");
+        // The English copy is displaced, not merely accompanied.
+        assert!(!html.contains("binary file"), "{html}");
+    }
+
+    #[test]
+    fn the_too_large_notice_follows_the_locale() {
+        let html = render_localized(crate::i18n::Locale::De, Some(FileBody::TooLarge));
+        assert!(html.contains("Datei zu groß zum Bearbeiten"), "{html}");
+        assert!(!html.contains("Binärdatei — nicht bearbeitbar"), "{html}");
+        assert!(!html.contains("Keine Datei geöffnet"), "{html}");
+        assert!(!html.contains("file too large"), "{html}");
+    }
+
     #[test]
     fn clean_buffer_renders_the_path_with_no_marker() {
         let html = render(DirtyState::clean());

@@ -10,10 +10,12 @@ use crate::components::{
     ApprovalPanel, ConnectionForm, EventLog, FileTree, PendingApproval, PromptBar, StatusLine,
 };
 use crate::editor::{DirtyState, Editor};
+use crate::i18n::{t, use_locale, Msg};
 use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
-    can_demote, can_promote, client_error_row, describe_event, error_row, ConnState, LogRow,
+    can_demote, can_promote, client_error_row, describe_event, error_row, ClientText, ConnState,
+    LogRow,
 };
 use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 
@@ -25,6 +27,21 @@ static STYLE_CSS: Asset = asset!("/style.css");
 
 #[component]
 pub fn App() -> Element {
+    // The active UI language. Published as context so every component reads it through
+    // `use_locale()`; the LanguagePicker in the status strip is its only writer. Nothing in the
+    // connection path reads it, so switching language cannot disturb the socket, the session,
+    // `last_seq`, the editor buffer, or the log.
+    //
+    // ORDER IS LOAD-BEARING: within a single scope, this MUST run before any `use_locale()` in the
+    // same scope (Task 5 adds one to this very component). `use_locale` is `use_hook(|| ...)` over
+    // `try_consume_context`, so it CACHES its lookup on the first render — consumer-first would
+    // cache `None` and pin `App`'s own copy to English permanently, silently, with every other
+    // component still switching correctly. Provider first, always.
+    use_context_provider(|| Signal::new(crate::i18n::initial_locale()));
+    // Immediately after the provider, for the reason spelled out just above: consumer-after-
+    // provider is the only ordering that lets `App`'s own copy track the picker.
+    let locale = use_locale();
+
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
     // `mut`: the desktop-only auto-connect mount block below calls `token.set(..)` with the
     // sidecar-generated bearer token (`Signal::set` requires `&mut self`, so this binding must
@@ -74,8 +91,9 @@ pub fn App() -> Element {
         let base = url.read().clone();
         let tok = token.read().clone();
         if base.trim().is_empty() || tok.trim().is_empty() {
-            rows.write()
-                .push(client_error_row("URL and token are required"));
+            rows.write().push(client_error_row(ClientText::Authored(
+                Msg::UrlAndTokenRequired,
+            )));
             return;
         }
         let target = build_ws_url(&base, &tok, session.read().as_deref(), *last_seq.read());
@@ -179,7 +197,9 @@ pub fn App() -> Element {
                                 reconnect_to.set(Some(endpoint));
                             }
                             SocketEvent::Message(Err(detail)) => {
-                                rows.write().push(client_error_row(&detail));
+                                rows.write().push(client_error_row(ClientText::Passthrough(
+                                    detail.clone(),
+                                )));
                             }
                             SocketEvent::Closed | SocketEvent::Errored => {
                                 // Guarded above, so this is the CURRENT connection's close — safe
@@ -198,7 +218,8 @@ pub fn App() -> Element {
                 });
             }
             Err(e) => {
-                rows.write().push(client_error_row(&e));
+                rows.write()
+                    .push(client_error_row(ClientText::Passthrough(e)));
                 conn.set(ConnState::Disconnected);
             }
         }
@@ -221,7 +242,8 @@ pub fn App() -> Element {
     let mut send = move |cmd: Command| {
         if let Some(s) = sink.read().as_ref() {
             if let Err(e) = s.send(&cmd) {
-                rows.write().push(client_error_row(&e));
+                rows.write()
+                    .push(client_error_row(ClientText::Passthrough(e)));
             }
         }
     };
@@ -307,7 +329,9 @@ pub fn App() -> Element {
         };
         match s.send(&cmd) {
             Ok(()) => pending_approval.set(None),
-            Err(e) => rows.write().push(client_error_row(&e)),
+            Err(e) => rows
+                .write()
+                .push(client_error_row(ClientText::Passthrough(e))),
         }
     };
 
@@ -325,7 +349,9 @@ pub fn App() -> Element {
         spawn(async move {
             match list_files(&http_base, &tok).await {
                 Ok(paths) => tree.set(build_tree(&paths)),
-                Err(e) => rows.write().push(client_error_row(&e)),
+                Err(e) => rows
+                    .write()
+                    .push(client_error_row(ClientText::Passthrough(e))),
             }
         });
     };
@@ -358,7 +384,9 @@ pub fn App() -> Element {
                     editor_dirty.set(DirtyState::clean());
                     open_file.set(Some((path, body)));
                 }
-                Err(e) => rows.write().push(client_error_row(&e)),
+                Err(e) => rows
+                    .write()
+                    .push(client_error_row(ClientText::Passthrough(e))),
             }
         });
     };
@@ -424,7 +452,8 @@ pub fn App() -> Element {
                 // Spawn failure (missing/misconfigured `otto` binary): surface it so the user knows
                 // why auto-connect didn't happen, then fall back to the manual form.
                 BootOutcome::SpawnFailed(msg) => {
-                    rows.write().push(client_error_row(&msg));
+                    rows.write()
+                        .push(client_error_row(ClientText::Passthrough(msg)));
                 }
                 // User cancelled the picker: silent fallback to the manual ConnectionForm.
                 BootOutcome::Cancelled => {}
@@ -467,6 +496,22 @@ pub fn App() -> Element {
         });
     }
 
+    // Label the document with the resolved locale at startup; the picker applies it again on every
+    // change. `index.html` ships a static `lang="en"` so the document is never unlabeled pre-mount;
+    // this corrects it once the app is up.
+    //
+    // NOT web-gated: the desktop target is a webview with a real `documentElement`, so its screen
+    // reader reads this attribute too — `set_document_lang` implements both targets and no-ops only
+    // in the seam-check build. Unconditional here, so each target still sees one fixed hook
+    // sequence.
+    //
+    // Reads the `locale` binding already resolved above rather than re-running `initial_locale()` —
+    // the provider is unconditionally earlier in this same body, so the value is in hand and a
+    // second storage/environment read would buy nothing.
+    use_future(move || async move {
+        crate::components::set_document_lang(locale);
+    });
+
     rsx! {
         document::Stylesheet { href: STYLE_CSS }
         div { class: "app",
@@ -477,7 +522,7 @@ pub fn App() -> Element {
                         class: "refresh-btn",
                         disabled: !matches!(conn(), ConnState::Connected { .. }),
                         onclick: move |_| load_files(),
-                        "Refresh files"
+                        {t(locale, Msg::RefreshFiles)}
                     }
                     FileTree {
                         nodes: tree.read().clone(),
@@ -503,12 +548,12 @@ pub fn App() -> Element {
                 button {
                     disabled: !can_promote(&conn.read(), &capabilities.read(), *turn_running.read()),
                     onclick: move |_| promote_remote(()),
-                    "Promote to remote"
+                    {t(locale, Msg::PromoteToRemote)}
                 }
                 button {
                     disabled: !can_demote(&conn.read(), &capabilities.read(), *turn_running.read()),
                     onclick: move |_| demote_local(()),
-                    "Demote to local"
+                    {t(locale, Msg::DemoteToLocal)}
                 }
             }
             ConnectionForm {
@@ -517,5 +562,122 @@ pub fn App() -> Element {
                 on_disconnect: move |_| disconnect(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod locale_switch_tests {
+    use super::*;
+    use crate::i18n::Locale;
+
+    // The harness's provided signal, handed out to the test so it can write it from outside the
+    // tree. A `thread_local` rather than a prop because `Signal` is not `PartialEq`, so it cannot
+    // ride in a `Props` struct; tests each run on their own thread, so there is no cross-test
+    // sharing. Set during the harness's render, read inside `in_runtime`.
+    thread_local! {
+        static PROVIDED_LOCALE: std::cell::RefCell<Option<Signal<Locale>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A harness that reproduces `App`'s locale wiring exactly: `use_context_provider` first, then
+    /// `use_locale()` in the SAME scope, then child components that consume the context from their
+    /// own scopes.
+    ///
+    /// `App` itself is not mounted deliberately — under `--features desktop` its body spawns the
+    /// `desktop_boot::boot()` future (a native folder picker plus an `otto serve` sidecar process),
+    /// which no unit test can drive. The hook ordering below is byte-for-byte the ordering `App`
+    /// uses, and the strings asserted are the ones `App` itself owns (`Msg::RefreshFiles` /
+    /// `Msg::PromoteToRemote`, rendered from `App`'s own `locale` binding rather than a child's) —
+    /// so the provider-before-consumer bug `App`'s comment warns about would fail this test.
+    #[component]
+    fn LocaleHarness() -> Element {
+        let sig = use_context_provider(|| Signal::new(Locale::En));
+        PROVIDED_LOCALE.with(|c| *c.borrow_mut() = Some(sig));
+        let locale = use_locale();
+        rsx! {
+            button { {t(locale, Msg::RefreshFiles)} }
+            button { {t(locale, Msg::PromoteToRemote)} }
+            LocaleChild {}
+        }
+    }
+
+    /// A consumer in its OWN scope, standing in for `StatusLine`/`PromptBar`/`Editor`. A locale
+    /// switch has to reach these too, not only the providing scope.
+    #[component]
+    fn LocaleChild() -> Element {
+        let locale = use_locale();
+        rsx! { span { {t(locale, Msg::DemoteToLocal)} } }
+    }
+
+    /// Write the provided locale signal from outside the tree, the way `LanguagePicker`'s
+    /// `onchange` does. The write must happen inside the VirtualDom's runtime, which is what
+    /// `in_runtime` establishes — that is also what marks the subscribed scopes dirty.
+    fn pick_locale(dom: &VirtualDom, next: Locale) {
+        dom.in_runtime(|| {
+            let mut sig = PROVIDED_LOCALE
+                .with(|c| *c.borrow())
+                .expect("the harness published its locale signal during render");
+            sig.set(next);
+        });
+    }
+
+    #[test]
+    fn writing_the_locale_signal_retranslates_the_mounted_tree_in_place() {
+        // The PR's headline claim, and the only one every other harness leaves unverified: they
+        // all render once at a fixed locale, which cannot distinguish "retranslates on switch"
+        // from "happened to be built in that language".
+        let mut dom = VirtualDom::new(LocaleHarness);
+        dom.rebuild_in_place();
+        let before = dioxus_ssr::render(&dom);
+        assert!(before.contains("Refresh files"), "en missing in: {before}");
+        assert!(
+            before.contains("Promote to remote"),
+            "en missing in: {before}"
+        );
+        assert!(
+            before.contains("Demote to local"),
+            "en missing in child: {before}"
+        );
+
+        // No remount, no new VirtualDom — the same mounted tree.
+        pick_locale(&dom, Locale::De);
+        dom.render_immediate_to_vec();
+        let after = dioxus_ssr::render(&dom);
+
+        assert_ne!(before, after, "the locale write did not re-render anything");
+        // `App`'s own copy followed the switch — the provider-then-consumer ordering holds. If
+        // `use_locale()` ran before `use_context_provider`, it would have cached `None`, pinned
+        // these two to English, and left only the child switching.
+        assert!(
+            after.contains("Dateien aktualisieren"),
+            "App-owned copy did not retranslate: {after}"
+        );
+        assert!(
+            after.contains("Auf Remote hochstufen"),
+            "App-owned copy did not retranslate: {after}"
+        );
+        // …and so did the child scope.
+        assert!(
+            after.contains("Auf Lokal herabstufen"),
+            "child scope did not retranslate: {after}"
+        );
+        assert!(
+            !after.contains("Refresh files"),
+            "stale English survived the switch: {after}"
+        );
+    }
+
+    #[test]
+    fn switching_back_restores_the_original_render() {
+        // Retranslation is not one-way, and nothing accumulates across switches.
+        let mut dom = VirtualDom::new(LocaleHarness);
+        dom.rebuild_in_place();
+        let first = dioxus_ssr::render(&dom);
+
+        for next in [Locale::ZhHans, Locale::Hi, Locale::En] {
+            pick_locale(&dom, next);
+            dom.render_immediate_to_vec();
+        }
+        assert_eq!(dioxus_ssr::render(&dom), first);
     }
 }

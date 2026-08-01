@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+use crate::i18n::{t, tf, use_locale, Msg};
 use crate::net::view_model::{diff_lines, DiffKind};
 
 /// A pending edit approval surfaced to the user: the correlation id, the path, and the diff
@@ -16,13 +17,18 @@ pub fn ApprovalPanel(
     pending: Signal<Option<PendingApproval>>,
     on_decide: EventHandler<(Uuid, bool)>,
 ) -> Element {
+    // Hooks are positional, so this must run before the early return below — a component that
+    // sometimes skips a hook call desynchronizes every hook after it.
+    let locale = use_locale();
     let Some((id, path, old, new)) = pending.read().clone() else {
         return rsx! {};
     };
-    let lines = diff_lines(old.as_deref(), &new);
+    let lines = diff_lines(locale, old.as_deref(), &new);
     rsx! {
         div { class: "approval-panel",
-            div { class: "approval-head", "approval needed: {path.display()}" }
+            div { class: "approval-head",
+                {tf(locale, Msg::ApprovalNeeded, &[("path", &path.display().to_string())])}
+            }
             pre { class: "approval-diff",
                 for l in lines {
                     div {
@@ -36,9 +42,66 @@ pub fn ApprovalPanel(
                 }
             }
             div { class: "approval-actions",
-                button { onclick: move |_| on_decide.call((id, true)), "Approve" }
-                button { onclick: move |_| on_decide.call((id, false)), "Reject" }
+                button { onclick: move |_| on_decide.call((id, true)), {t(locale, Msg::Approve)} }
+                button { onclick: move |_| on_decide.call((id, false)), {t(locale, Msg::Reject)} }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Locale;
+
+    #[component]
+    fn Harness(start: Locale) -> Element {
+        use_context_provider(|| Signal::new(start));
+        let pending = use_signal(|| {
+            Some((
+                Uuid::nil(),
+                PathBuf::from("src/main.rs"),
+                None,
+                "fn main() {}\n".to_string(),
+            ))
+        });
+        rsx! {
+            ApprovalPanel {
+                pending,
+                on_decide: move |_: (Uuid, bool)| {},
+            }
+        }
+    }
+
+    fn render(start: Locale) -> String {
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { start });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_header_and_both_verdict_buttons_follow_the_locale() {
+        let en = render(Locale::En);
+        assert!(
+            en.contains("approval needed") && en.contains("Approve") && en.contains("Reject"),
+            "{en}"
+        );
+        let de = render(Locale::De);
+        assert!(
+            de.contains("Genehmigung erforderlich")
+                && de.contains("Genehmigen")
+                && de.contains("Ablehnen"),
+            "{de}"
+        );
+        // The English copy must be fully displaced, not merely accompanied.
+        assert!(!de.contains("approval needed"), "{de}");
+    }
+
+    #[test]
+    fn the_path_is_never_translated() {
+        // A path is data, not copy (spec §2) — byte-identical in every language.
+        for loc in Locale::ALL {
+            assert!(render(loc).contains("src/main.rs"), "{loc:?}");
         }
     }
 }

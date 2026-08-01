@@ -3,6 +3,7 @@ mod components;
 #[cfg(feature = "desktop")]
 mod desktop_boot;
 mod editor;
+mod i18n;
 mod net;
 mod transport;
 /// Wasm integration test for the web mount→parse→connect path. Runs only under
