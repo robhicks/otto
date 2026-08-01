@@ -226,6 +226,28 @@ seam's `String` error with a `ClientErr { Authored(Msg, Vec<(String,String)>), P
 — the same two-shape enum §6 already introduces for `RowMsg::ClientError`. Recorded so the path is
 known rather than rediscovered.
 
+> **Amended 2026-08-01 (issue #120).** Two changes to the above, both shipped:
+>
+> 1. The "Named future upgrade" landed. The transport seam's `String` error is now
+>    `transport::SeamError`, a newtype whose constructor is `pub(in crate::transport)`, and
+>    `ClientText` is `{ Authored { msg, args }, Passthrough(SeamError) }`. The boundary is no
+>    longer a convention re-decided at each call site: no module outside `transport/` can
+>    construct a `Passthrough`.
+> 2. **The sidecar-spawn failure is now translated framing over a verbatim payload**, moving it
+>    out of the "Crate-authored technical diagnostics" row above. The rule did not cleanly settle
+>    it and both readings were defensible; the deciding fact is that it is not on the transport
+>    seam at all — it is produced by the desktop shell's boot path before any socket exists, and
+>    its job is to tell the user auto-connect did not happen and to use the manual form. Neither
+>    of this section's two justifications applies: it does not sit in a stream of
+>    engine-originated text (it is the reason there is no stream), and the parts worth carrying
+>    into a bug report — the binary path and the OS error — pass through untranslated regardless.
+>    It renders via `Msg::SidecarSpawnFailed` with `{bin}` and `{detail}` byte-identical in every
+>    locale. The other crate-authored diagnostics in that row (`"socket closed"`,
+>    `"workspace rpc failed: HTTP {status}"`, `"unexpected response to List/Read"`) are unchanged
+>    and stay untranslated — they ARE on the seam.
+>
+> Full reasoning: `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md`.
+
 Consequently §13's success criterion is scoped to **UI copy**, not to every literal: the excluded
 categories above are enumerated exhaustively so "did the implementer miss one?" stays a checkable
 question.
@@ -518,6 +540,12 @@ and the desktop `SpawnFailed` arm at `:427`) are transport/boot diagnostics and 
 `RowMsg` and `ClientText` derive `Clone` and `PartialEq` so `LogRow` keeps the derives it has today
 (`Signal<Vec<LogRow>>` requires them).
 
+> **Superseded 2026-08-01 (issue #120).** `LogRow` no longer exists — `RowMsg::class()` derives the
+> CSS class and the signal is `Signal<Vec<RowMsg>>`. The desktop `SpawnFailed` arm is no longer a
+> `Passthrough`: it is `Authored { msg: Msg::SidecarSpawnFailed, args }`, leaving six `Passthrough`
+> call sites, all carrying a `transport::SeamError`. See
+> `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md` §§1-3.
+
 **`Verify`'s empty-detail case is authored copy and gets a catalog key.** Today
 `view_model.rs:220-231` renders the literal `"ok"` when `detail.is_empty()`, and the server's
 `detail` otherwise. `render_row` preserves exactly that branch: empty detail → `t(locale,
@@ -630,11 +658,14 @@ Two files, so a new component does not silently reintroduce a literal:
 - **`CLAUDE.md`** — the `ui-dioxus` paragraph in "What this is" gains a sentence: the UI is
   localized (`en`/`de`/`es`/`hi`/`zh-Hans`); interface copy goes through `src/i18n/` (`t`/`tf`, via
   the `use_locale()` hook) and never appears as an RSX literal; **server-originated text, protocol
-  identifiers, *and the crate's own transport/boot diagnostics*** pass through untranslated.
+  identifiers, *and the crate's own transport diagnostics*** pass through untranslated.
   It must state §2's **actual** rule — interface copy vs. transport-seam failure diagnostics — not
   the authored-vs-received rule §2 rejects, and must name the diagnostics carve-out explicitly.
   §9's whole purpose is stopping a future component from regressing the boundary, so a doc line
   that restates the wrong rule is worse than none.
+  As amended 2026-08-01, the carve-out is **transport** diagnostics only — the desktop boot
+  diagnostic (the sidecar-spawn failure) is interface copy and IS translated, with its `{bin}` and
+  `{detail}` payloads passing through verbatim.
 - **`README.md`** — the "Serving the engine + the browser UI" section notes the supported languages,
   that the UI follows the browser/OS locale, and that the picker in the status strip overrides and
   persists it.
