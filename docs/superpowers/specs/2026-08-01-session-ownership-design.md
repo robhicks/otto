@@ -1,6 +1,9 @@
 # Session ownership — `UserId`, the owner column, and the authorization choke points
 
-> **Status:** DRAFT — slice 1a of GitHub issue #115 (multitenancy).
+> **Status:** IMPLEMENTED — shipped in [#123](https://github.com/robhicks/otto/pull/123) as slice 1a
+> of GitHub issue #115 (multitenancy). Review closed two gaps this spec had deferred: the handover
+> ownership check (`PromoteToRemote`/`DemoteToLocal`) landed here rather than in slice 1b, and
+> `accept_demotion` now binds the returned bundle to the requested session id.
 > **Implements:** the session-ownership half of the "Suggested first slice" of
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Blocks:** `docs/superpowers/specs/2026-08-01-multitenant-identity-design.md` (slice 1b —

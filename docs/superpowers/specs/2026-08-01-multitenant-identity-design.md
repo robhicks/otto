@@ -4,7 +4,9 @@
 > **Implements:** the identity half of the "Suggested first slice" of
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a —
-> session ownership), which lands first and carries this spec's §3.1, §4 and §7.1 unchanged.
+> session ownership), **now shipped** in [#123](https://github.com/robhicks/otto/pull/123). It carried
+> this spec's §3.1, §4 and §7.1, and additionally closed the handover ownership check that this
+> spec's open-issue list had assigned to slice 1b — so that item is done.
 > **Blocks:** slice 2 (UI slash commands + `otto login`/`logout` CLI).
 > **Entangled with:** slice 3 (handover credentials). See "Why this is deferred" immediately below —
 > the two cannot be designed independently, which is the finding that split this work.
