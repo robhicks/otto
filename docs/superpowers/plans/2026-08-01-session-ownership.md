@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (edition 2024, toolchain pinned stable, `rust-version = "1.85"`), `sqlx` 0.8 (sqlite, `runtime-tokio`), `serde`, `anyhow`, `tokio` + `tempfile` for tests. **No new dependency is added by this plan.**
 
-> **Status:** SHIPPED — all 5 tasks landed in [#123](https://github.com/robhicks/otto/pull/123),
+> **Status:** SHIPPED 2026-08-01 — all 5 tasks landed in [#123](https://github.com/robhicks/otto/pull/123),
 > together with the review round that followed: the handover authorization gap (closed here rather
 > than deferred), the `accept_demotion` session-id binding, two test gaps found by mutation testing
 > (a reordered `abort` and a deleted `authorize` in `run_prompt_with_controls` had both survived),

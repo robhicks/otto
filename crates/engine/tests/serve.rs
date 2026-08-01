@@ -1012,6 +1012,56 @@ fn authed_endpoint_request(
     req
 }
 
+/// The handover arm authorizes before `handle_handover`, and this is its regression test.
+/// Promote ships a session's whole event log off-machine and demote overwrites the local row
+/// including its owner, so the check must not be quietly droppable.
+///
+/// With one principal a connection cannot normally reach another owner's session, so the test
+/// seeds one directly in the store under a different owner and then attaches to it by id —
+/// which `resolve_session` still permits, deliberately (attach-time checking is the identity
+/// slice's, because it would change behavior a reconnecting client depends on).
+#[tokio::test]
+async fn handover_refuses_a_session_the_connection_does_not_own() {
+    let (port, dir) = start_server().await;
+
+    let store = otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+        .await
+        .unwrap();
+    let alice = otto_protocol::UserId::parse("alice").unwrap();
+    let victim = otto_persistence::SessionStore::create_session(
+        &store,
+        &alice,
+        "alice's session",
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    for cmd in ["PromoteToRemote", "DemoteToLocal"] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(
+            port,
+            &format!("?session={}", victim.0),
+        ))
+        .await
+        .expect("connect");
+        let ready: Value = next_json(&mut ws).await;
+        assert_eq!(ready["type"], "ready");
+
+        let msg = serde_json::json!({ cmd: { "session": victim.0.to_string() } });
+        ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+            .await
+            .unwrap();
+
+        let frame: Value = next_json(&mut ws).await;
+        assert_eq!(frame["type"], "error", "{cmd} should be refused");
+        // The shared not-found message — never "not yours", which would be an existence oracle.
+        assert!(
+            frame["message"].as_str().unwrap().contains("no session"),
+            "{cmd}: unexpected {frame}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn promote_without_flag_replies_error() {
     let (port, _dir) = start_server().await; // no promote config

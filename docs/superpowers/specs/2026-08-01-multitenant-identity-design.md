@@ -5,8 +5,10 @@
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a —
 > session ownership), **now shipped** in [#123](https://github.com/robhicks/otto/pull/123). It carried
-> this spec's §3.1, §4 and §7.1, and additionally closed the handover ownership check that this
-> spec's open-issue list had assigned to slice 1b — so that item is done.
+> this spec's §3.1, §4 and §7.1. It also shipped the ownership check on the WS
+> `PromoteToRemote`/`DemoteToLocal` arm — which the *ownership* spec's §3.4 had assigned here, not
+> the open-issue list below, none of whose five items concerned handover. `POST /promote`,
+> `POST /export`, and attach-time `?session=` ownership all remain open for this slice.
 > **Blocks:** slice 2 (UI slash commands + `otto login`/`logout` CLI).
 > **Entangled with:** slice 3 (handover credentials). See "Why this is deferred" immediately below —
 > the two cannot be designed independently, which is the finding that split this work.
@@ -157,7 +159,9 @@ hole issue #115 opens with.
 - Principal resolution on every `serve.rs` route, including a post-upgrade WS authentication
   handshake that replaces the `?token=` query parameter.
 - `Command::Login`/`Attach`/`Refresh`/`Logout` and `ServerMessage::LoggedIn`/`LoggedOut`.
-- Ownership checks on session attach, replay, abort, and both handover commands.
+- Ownership checks on session **attach** (`resolve_session`'s explicit `?session=` arm), and on
+  `POST /promote` / `POST /export`. Replay, abort, and the WS handover commands already shipped in
+  slice 1a — do not re-implement them.
 - `otto auth enroll <user>` — the out-of-band bootstrap that provisions the first principal.
 - `otto serve --single-user` — the loopback-only, unauthenticated single-principal mode the desktop
   sidecar runs in (§6.5), plus the two `ui-dioxus/` line changes that keep the shipped desktop app
@@ -720,7 +724,9 @@ The three protocol routes:
   behind the existing `--accept-promotions` gate. Ownership travels in the bundle. The user-facing
   ownership check for handover is on the **source**, in the WS command loop, where a real principal
   exists: `PromoteToRemote`/`DemoteToLocal` verify the connection's principal owns the session
-  before any bundle is built.
+  before any bundle is built. **That check shipped in slice 1a**
+  (`EngineService::authorize_session`) — described here for completeness, not as outstanding work.
+  What remains for this slice is the two endpoints themselves, which are bearer-only today.
 
 **Which credential `/workspace` accepts, and from whom** (A13 — this is the direction the plan will
 encode, so it is stated rather than implied):
