@@ -41,8 +41,8 @@ curl -fsSL https://raw.githubusercontent.com/robhicks/otto/main/deploy/install.s
 cargo binstall otto
 ```
 
-**Homebrew** (once the current release's checksums are in
-[`deploy/homebrew/otto.rb`](deploy/homebrew/otto.rb)):
+**Homebrew** — the formula in [`deploy/homebrew/otto.rb`](deploy/homebrew/otto.rb) tracks the
+current release:
 
 ```bash
 brew install --formula https://raw.githubusercontent.com/robhicks/otto/main/deploy/homebrew/otto.rb
