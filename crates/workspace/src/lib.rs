@@ -173,11 +173,11 @@ impl Workspace for LocalWorkspace {
 /// `LocalWorkspace::snapshot` skips these *before* reading, so the bytes are never loaded at all;
 /// this is for the case where the list arrives already-populated from elsewhere
 /// (`RemoteWorkspace::snapshot`, which receives it over the wire).
-pub(crate) fn strip_sensitive_files(files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
+pub(crate) fn strip_sensitive_files(mut files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
+    // `retain` in place rather than filter-and-collect: the element type is unchanged, so there
+    // is no reason to allocate a second backing buffer for what is usually a no-op.
+    files.retain(|(p, _)| !otto_protocol::is_sensitive(&p.to_string_lossy()));
     files
-        .into_iter()
-        .filter(|(p, _)| !otto_protocol::is_sensitive(&p.to_string_lossy()))
-        .collect()
 }
 
 #[cfg(test)]
