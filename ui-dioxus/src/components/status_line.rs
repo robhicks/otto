@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use otto_protocol::CapabilitiesManifest;
 
+use crate::components::LanguagePicker;
 use crate::i18n::use_locale;
 use crate::net::view_model::{
     capability_segments, cost_estimate, format_meter, short_session, status_label, ConnState,
@@ -48,6 +49,9 @@ pub fn StatusLine(
                     }
                 }
             }
+            // Outside the `Connected` block on purpose: switching language must be reachable
+            // before connecting, which is its most likely first use.
+            LanguagePicker {}
         }
     }
 }

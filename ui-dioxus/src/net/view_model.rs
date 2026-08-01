@@ -28,8 +28,8 @@ pub enum ClientText {
 /// largest text surface in the UI — permanently mixed-language. Formatting happens in
 /// `render_row`, at render time, so every row follows the active locale.
 ///
-/// Fields carrying server-originated text (`detail`, `message`) and protocol identifiers (`role`)
-/// are rendered verbatim; only the framing around them is localized.
+/// Fields carrying server-originated text (`detail`, `message`), workspace paths (`path`), and
+/// protocol identifiers (`role`) are rendered verbatim; only the framing around them is localized.
 #[derive(Clone, PartialEq, Debug)]
 pub enum RowMsg {
     AgentStarted { role: String },

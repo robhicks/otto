@@ -27,6 +27,18 @@ static STYLE_CSS: Asset = asset!("/style.css");
 
 #[component]
 pub fn App() -> Element {
+    // The active UI language. Published as context so every component reads it through
+    // `use_locale()`; the LanguagePicker in the status strip is its only writer. Nothing in the
+    // connection path reads it, so switching language cannot disturb the socket, the session,
+    // `last_seq`, the editor buffer, or the log.
+    //
+    // ORDER IS LOAD-BEARING: within a single scope, this MUST run before any `use_locale()` in the
+    // same scope (Task 5 adds one to this very component). `use_locale` is `use_hook(|| ...)` over
+    // `try_consume_context`, so it CACHES its lookup on the first render — consumer-first would
+    // cache `None` and pin `App`'s own copy to English permanently, silently, with every other
+    // component still switching correctly. Provider first, always.
+    use_context_provider(|| Signal::new(crate::i18n::initial_locale()));
+
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
     // `mut`: the desktop-only auto-connect mount block below calls `token.set(..)` with the
     // sidecar-generated bearer token (`Signal::set` requires `&mut self`, so this binding must
@@ -478,6 +490,15 @@ pub fn App() -> Element {
                     }
                 }
             }
+        });
+
+        // Startup only; the picker applies it again on every change. This re-runs
+        // `initial_locale()` rather than reading the signal just provided above — one extra
+        // localStorage read at mount, deliberately, because it keeps this effect independent of
+        // hook ordering. It cannot diverge: both calls resolve from the same persisted value and
+        // environment within the same render.
+        use_future(move || async move {
+            crate::components::set_document_lang(crate::i18n::initial_locale());
         });
     }
 
