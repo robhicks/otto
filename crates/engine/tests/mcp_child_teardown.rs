@@ -609,18 +609,3 @@ fn control_child_ignoring_stdin_eof_survives_hard_kill() {
          above would pass even if the EOF cascade were broken."
     );
 }
-
-/// Minimal PATH lookup, so the LSP scenario can skip cleanly rather than fail on a machine with no
-/// `rust-analyzer`.
-fn which(bin: &str) -> Option<PathBuf> {
-    if bin.contains('/') {
-        let p = PathBuf::from(bin);
-        return p.is_file().then_some(p);
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let candidate = dir.join(bin);
-            candidate.is_file().then_some(candidate)
-        })
-    })
-}
