@@ -492,6 +492,7 @@ mod tests {
         crate::PromoteBundle {
             session: SessionState {
                 id: SessionId::new(),
+                owner: otto_protocol::UserId::local(),
                 goal: "g".into(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),

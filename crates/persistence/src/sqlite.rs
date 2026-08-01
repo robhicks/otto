@@ -160,6 +160,7 @@ impl SqliteStore {
 impl crate::SessionStore for SqliteStore {
     async fn create_session(
         &self,
+        owner: &otto_protocol::UserId,
         goal: &str,
         config: &serde_json::Value,
     ) -> anyhow::Result<otto_protocol::SessionId> {
@@ -170,7 +171,7 @@ impl crate::SessionStore for SqliteStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(id.0.to_string())
-        .bind(otto_protocol::UserId::local().as_str())
+        .bind(owner.as_str())
         .bind(goal)
         .bind(crate::SessionStatus::Active.as_db_str())
         .bind(now)
@@ -179,6 +180,20 @@ impl crate::SessionStore for SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    async fn owner_of(
+        &self,
+        session: otto_protocol::SessionId,
+    ) -> anyhow::Result<otto_protocol::UserId> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT owner FROM sessions WHERE id = ?1")
+            .bind(session.0.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        let (owner,) = row.ok_or_else(|| no_such_session("owner_of", session))?;
+        // No `Ok(...?)` here — clippy's needless_question_mark fires on it.
+        otto_protocol::UserId::parse(&owner)
+            .map_err(|e| anyhow::anyhow!("owner_of: stored owner is invalid: {e}"))
     }
 
     async fn append_event(
@@ -234,6 +249,7 @@ impl crate::SessionStore for SqliteStore {
 
     async fn replay_since(
         &self,
+        owner: &otto_protocol::UserId,
         session: otto_protocol::SessionId,
         after_seq: Option<u64>,
     ) -> anyhow::Result<Vec<otto_protocol::Event>> {
@@ -242,11 +258,13 @@ impl crate::SessionStore for SqliteStore {
             Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
         };
         let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT seq, kind FROM events
-             WHERE session_id = ?1 AND seq > ?2
-             ORDER BY seq ASC",
+            "SELECT e.seq, e.kind FROM events e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE e.session_id = ?1 AND s.owner = ?2 AND e.seq > ?3
+             ORDER BY e.seq ASC",
         )
         .bind(session.0.to_string())
+        .bind(owner.as_str())
         .bind(bound)
         .fetch_all(&self.pool)
         .await?;
@@ -263,34 +281,37 @@ impl crate::SessionStore for SqliteStore {
 
     async fn session_status(
         &self,
+        owner: &otto_protocol::UserId,
         session: otto_protocol::SessionId,
     ) -> anyhow::Result<crate::SessionStatus> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM sessions WHERE id = ?1")
-            .bind(session.0.to_string())
-            .fetch_optional(&self.pool)
-            .await?;
-        let (status,) =
-            row.ok_or_else(|| anyhow::anyhow!("session_status: no session {}", session.0))?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM sessions WHERE id = ?1 AND owner = ?2")
+                .bind(session.0.to_string())
+                .bind(owner.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        let (status,) = row.ok_or_else(|| no_such_session("session_status", session))?;
         crate::SessionStatus::from_db_str(&status)
     }
 
     async fn snapshot(
         &self,
+        owner: &otto_protocol::UserId,
         session: otto_protocol::SessionId,
     ) -> anyhow::Result<crate::SessionState> {
-        let row: Option<(String, String, String, String)> =
-            sqlx::query_as("SELECT owner, goal, status, config FROM sessions WHERE id = ?1")
-                .bind(session.0.to_string())
-                .fetch_optional(&self.pool)
-                .await?;
-        let (owner, goal, status, config) =
-            row.ok_or_else(|| anyhow::anyhow!("snapshot: no session {}", session.0))?;
-        let owner = otto_protocol::UserId::parse(&owner)
-            .map_err(|e| anyhow::anyhow!("snapshot: stored owner is invalid: {e}"))?;
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT owner, goal, status, config FROM sessions WHERE id = ?1 AND owner = ?2",
+        )
+        .bind(session.0.to_string())
+        .bind(owner.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (_owner_str, goal, status, config) =
+            row.ok_or_else(|| no_such_session("snapshot", session))?;
         let status = crate::SessionStatus::from_db_str(&status)?;
         let config: serde_json::Value = serde_json::from_str(&config)?;
 
-        let events = self.replay_since(session, None).await?;
+        let events = self.replay_since(owner, session, None).await?;
 
         let turn_rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT turn_index, goal, outcome FROM turns
@@ -310,7 +331,9 @@ impl crate::SessionStore for SqliteStore {
 
         Ok(crate::SessionState {
             id: session,
-            owner,
+            // The row's `owner` column is redundant with the `owner` predicate that just matched
+            // it, so the argument is the authority — one fewer parse that can fail.
+            owner: owner.clone(),
             goal,
             status,
             config,
@@ -453,6 +476,14 @@ impl crate::SessionStore for SqliteStore {
     }
 }
 
+/// The error returned for BOTH "no such session" and "session owned by someone else".
+///
+/// One constructor, deliberately: if these two ever produced different strings the API would
+/// become an existence oracle for other tenants' session ids.
+fn no_such_session(op: &str, session: otto_protocol::SessionId) -> anyhow::Error {
+    anyhow::anyhow!("{op}: no session {}", session.0)
+}
+
 /// Milliseconds since the Unix epoch, for `created_at`/`updated_at`/`started_at`.
 fn now_millis() -> i64 {
     SystemTime::now()
@@ -494,11 +525,18 @@ mod tests {
     async fn create_session_starts_active() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("add a greeting", &serde_json::json!({}))
+            .create_session(
+                &otto_protocol::UserId::local(),
+                "add a greeting",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap();
         assert_eq!(
-            store.session_status(id).await.unwrap(),
+            store
+                .session_status(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
             SessionStatus::Active
         );
     }
@@ -517,7 +555,7 @@ mod tests {
     async fn append_then_replay_returns_events_in_order() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
@@ -526,7 +564,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let replayed = store.replay_since(id, None).await.unwrap();
+        let replayed = store
+            .replay_since(&otto_protocol::UserId::local(), id, None)
+            .await
+            .unwrap();
         assert_eq!(
             replayed,
             vec![
@@ -541,7 +582,7 @@ mod tests {
     async fn replay_since_returns_only_the_gap() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         for (seq, msg) in [(0u64, "a"), (1, "b"), (2, "c")] {
@@ -550,7 +591,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let gap = store.replay_since(id, Some(1)).await.unwrap();
+        let gap = store
+            .replay_since(&otto_protocol::UserId::local(), id, Some(1))
+            .await
+            .unwrap();
         assert_eq!(gap, vec![log_event(id, 2, "c")]);
     }
 
@@ -558,7 +602,7 @@ mod tests {
     async fn append_duplicate_seq_is_error() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         store
@@ -577,11 +621,17 @@ mod tests {
     async fn set_status_updates_existing_session() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         store.set_status(id, SessionStatus::Done).await.unwrap();
-        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
+        assert_eq!(
+            store
+                .session_status(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
+            SessionStatus::Done
+        );
     }
 
     #[tokio::test]
@@ -608,7 +658,7 @@ mod tests {
     async fn record_turn_succeeds() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
@@ -618,7 +668,7 @@ mod tests {
     async fn record_turn_rejects_duplicate_index() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
@@ -629,14 +679,20 @@ mod tests {
     async fn replay_since_unknown_session_is_empty() {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
-        assert!(store.replay_since(missing, None).await.unwrap().is_empty());
+        assert!(
+            store
+                .replay_since(&otto_protocol::UserId::local(), missing, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn replay_since_huge_after_seq_returns_nothing() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         store
@@ -648,7 +704,10 @@ mod tests {
             .await
             .unwrap();
         // A u64 larger than i64::MAX must not wrap to -1 and dump the whole log.
-        let gap = store.replay_since(id, Some(u64::MAX)).await.unwrap();
+        let gap = store
+            .replay_since(&otto_protocol::UserId::local(), id, Some(u64::MAX))
+            .await
+            .unwrap();
         assert!(gap.is_empty());
     }
 
@@ -656,7 +715,11 @@ mod tests {
     async fn snapshot_captures_metadata_events_and_turns() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("the goal", &serde_json::json!({ "k": 1 }))
+            .create_session(
+                &otto_protocol::UserId::local(),
+                "the goal",
+                &serde_json::json!({ "k": 1 }),
+            )
             .await
             .unwrap();
         store
@@ -670,7 +733,10 @@ mod tests {
         store.record_turn(id, &turn(0, true)).await.unwrap();
         store.set_status(id, SessionStatus::Done).await.unwrap();
 
-        let snap = store.snapshot(id).await.unwrap();
+        let snap = store
+            .snapshot(&otto_protocol::UserId::local(), id)
+            .await
+            .unwrap();
         assert_eq!(snap.id, id);
         assert_eq!(snap.goal, "the goal");
         assert_eq!(snap.status, SessionStatus::Done);
@@ -686,14 +752,23 @@ mod tests {
     async fn snapshot_unknown_session_is_error() {
         let (store, _dir) = temp_store().await;
         let missing = otto_protocol::SessionId::new();
-        assert!(store.snapshot(missing).await.is_err());
+        assert!(
+            store
+                .snapshot(&otto_protocol::UserId::local(), missing)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn snapshot_restore_round_trips_into_a_fresh_store() {
         let (source, _d1) = temp_store().await;
         let id = source
-            .create_session("g", &serde_json::json!({ "m": "x" }))
+            .create_session(
+                &otto_protocol::UserId::local(),
+                "g",
+                &serde_json::json!({ "m": "x" }),
+            )
             .await
             .unwrap();
         source
@@ -706,17 +781,35 @@ mod tests {
             .unwrap();
         source.record_turn(id, &turn(0, true)).await.unwrap();
         source.set_status(id, SessionStatus::Done).await.unwrap();
-        let snap = source.snapshot(id).await.unwrap();
+        let snap = source
+            .snapshot(&otto_protocol::UserId::local(), id)
+            .await
+            .unwrap();
 
         let (target, _d2) = temp_store().await;
         let restored_id = target.restore(&snap).await.unwrap();
         assert_eq!(restored_id, id);
 
         // Re-snapshotting the target yields an identical SessionState (preserved id/seqs).
-        assert_eq!(target.snapshot(id).await.unwrap(), snap);
-        assert_eq!(target.replay_since(id, None).await.unwrap(), snap.events);
         assert_eq!(
-            target.session_status(id).await.unwrap(),
+            target
+                .snapshot(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
+            snap
+        );
+        assert_eq!(
+            target
+                .replay_since(&otto_protocol::UserId::local(), id, None)
+                .await
+                .unwrap(),
+            snap.events
+        );
+        assert_eq!(
+            target
+                .session_status(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
             SessionStatus::Done
         );
     }
@@ -737,17 +830,25 @@ mod tests {
         };
         assert!(store.restore(&state).await.is_err());
         // The transaction rolled back: no stranded session row.
-        assert!(store.session_status(id).await.is_err());
+        assert!(
+            store
+                .session_status(&otto_protocol::UserId::local(), id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn restore_into_existing_session_is_error() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
-        let snap = store.snapshot(id).await.unwrap();
+        let snap = store
+            .snapshot(&otto_protocol::UserId::local(), id)
+            .await
+            .unwrap();
         // Restoring into the same store collides on the sessions primary key.
         assert!(store.restore(&snap).await.is_err());
     }
@@ -756,7 +857,11 @@ mod tests {
     async fn restore_over_overwrites_an_existing_session() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("old goal", &serde_json::json!({}))
+            .create_session(
+                &otto_protocol::UserId::local(),
+                "old goal",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap();
         // A different snapshot for the SAME id: new goal, fresh event, Done status.
@@ -772,34 +877,55 @@ mod tests {
         let returned = store.restore_over(&advanced).await.unwrap();
         assert_eq!(returned, id);
         // The stale row was replaced, not duplicated or rejected.
-        assert_eq!(store.snapshot(id).await.unwrap(), advanced);
-        assert_eq!(store.session_status(id).await.unwrap(), SessionStatus::Done);
+        assert_eq!(
+            store
+                .snapshot(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
+            advanced
+        );
+        assert_eq!(
+            store
+                .session_status(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
+            SessionStatus::Done
+        );
     }
 
     #[tokio::test]
     async fn restore_over_into_a_fresh_store_inserts() {
         let (source, _d1) = temp_store().await;
         let id = source
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         source
             .append_event(id, &log_event(id, 0, "a"))
             .await
             .unwrap();
-        let snap = source.snapshot(id).await.unwrap();
+        let snap = source
+            .snapshot(&otto_protocol::UserId::local(), id)
+            .await
+            .unwrap();
 
         let (target, _d2) = temp_store().await;
         // No existing row: restore_over behaves like restore (insert).
         assert_eq!(target.restore_over(&snap).await.unwrap(), id);
-        assert_eq!(target.snapshot(id).await.unwrap(), snap);
+        assert_eq!(
+            target
+                .snapshot(&otto_protocol::UserId::local(), id)
+                .await
+                .unwrap(),
+            snap
+        );
     }
 
     #[tokio::test]
     async fn cursors_advance_with_events_and_turns() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(store.next_seq(id).await.unwrap(), 0);
@@ -829,11 +955,11 @@ mod tests {
     async fn replay_is_isolated_per_session() {
         let (store, _dir) = temp_store().await;
         let a = store
-            .create_session("a", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "a", &serde_json::json!({}))
             .await
             .unwrap();
         let b = store
-            .create_session("b", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "b", &serde_json::json!({}))
             .await
             .unwrap();
         store
@@ -845,20 +971,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.replay_since(a, None).await.unwrap(),
+            store
+                .replay_since(&otto_protocol::UserId::local(), a, None)
+                .await
+                .unwrap(),
             vec![log_event(a, 0, "for-a")]
         );
         assert_eq!(
-            store.replay_since(b, None).await.unwrap(),
+            store
+                .replay_since(&otto_protocol::UserId::local(), b, None)
+                .await
+                .unwrap(),
             vec![log_event(b, 0, "for-b")]
         );
     }
 
     #[tokio::test]
-    async fn create_session_defaults_the_owner_to_local() {
+    async fn create_session_writes_the_owner_column() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         let owner: (String,) = sqlx::query_as("SELECT owner FROM sessions WHERE id = ?1")
@@ -873,10 +1005,13 @@ mod tests {
     async fn snapshot_carries_the_owner() {
         let (store, _dir) = temp_store().await;
         let id = store
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
-        let state = store.snapshot(id).await.unwrap();
+        let state = store
+            .snapshot(&otto_protocol::UserId::local(), id)
+            .await
+            .unwrap();
         assert_eq!(state.owner, otto_protocol::UserId::local());
     }
 
@@ -977,5 +1112,129 @@ mod tests {
                 .unwrap();
             assert_eq!(v, SCHEMA_VERSION, "open {i} saw an unstamped schema");
         }
+    }
+
+    fn alice() -> otto_protocol::UserId {
+        otto_protocol::UserId::parse("alice").unwrap()
+    }
+    fn bob() -> otto_protocol::UserId {
+        otto_protocol::UserId::parse("bob").unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_session_records_the_given_owner() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session(&alice(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(store.owner_of(id).await.unwrap(), alice());
+    }
+
+    #[tokio::test]
+    async fn scoped_reads_succeed_for_the_owner() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session(&alice(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "hi"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.replay_since(&alice(), id, None).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.session_status(&alice(), id).await.unwrap(),
+            SessionStatus::Active
+        );
+        assert_eq!(store.snapshot(&alice(), id).await.unwrap().owner, alice());
+    }
+
+    /// The API must not be an existence oracle: "someone else's session" and "no such session"
+    /// must be indistinguishable. Asserting string equality, not just `is_err`.
+    #[tokio::test]
+    async fn wrong_owner_is_byte_identical_to_nonexistent() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session(&alice(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let missing = otto_protocol::SessionId::new();
+
+        let wrong = store
+            .session_status(&bob(), id)
+            .await
+            .unwrap_err()
+            .to_string();
+        let absent = store
+            .session_status(&bob(), missing)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            wrong.replace(&id.0.to_string(), "ID"),
+            absent.replace(&missing.0.to_string(), "ID"),
+            "session_status must not distinguish wrong-owner from nonexistent"
+        );
+
+        let wrong = store.snapshot(&bob(), id).await.unwrap_err().to_string();
+        let absent = store
+            .snapshot(&bob(), missing)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            wrong.replace(&id.0.to_string(), "ID"),
+            absent.replace(&missing.0.to_string(), "ID"),
+            "snapshot must not distinguish wrong-owner from nonexistent"
+        );
+    }
+
+    /// replay_since returns an empty vec for a nonexistent session today; a wrong owner must
+    /// look exactly the same, and must not leak the events.
+    #[tokio::test]
+    async fn replay_for_the_wrong_owner_is_empty() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session(&alice(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .append_event(id, &log_event(id, 0, "secret"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .replay_since(&bob(), id, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .replay_since(&bob(), otto_protocol::SessionId::new(), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_preserves_the_owner() {
+        let (src, _d1) = temp_store().await;
+        let id = src
+            .create_session(&alice(), "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let state = src.snapshot(&alice(), id).await.unwrap();
+
+        let (dst, _d2) = temp_store().await;
+        dst.restore(&state).await.unwrap();
+        assert_eq!(dst.owner_of(id).await.unwrap(), alice());
     }
 }
