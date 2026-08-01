@@ -847,7 +847,7 @@ git commit -m "ui-dioxus: make the transport seam carry a typed SeamError"
 The i18n design spec states the boundary rule in three places and `CLAUDE.md` in one. Task 2 changed the rule, so all four need amending — §9 in particular *prescribes* the `CLAUDE.md` wording, so leaving it would make the spec instruct a future contributor to restore the superseded sentence.
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md` — §2 (`~:280`, after the "Named future upgrade" paragraph), §6 (`:513-518`), §9 (`:630-635`)
+- Modify: `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md` — §2 (the "Named future upgrade" paragraph at `:224-229`), §6 (`:511-518`), §9 (`:626-635`)
 - Modify: `CLAUDE.md:53-58`
 
 **Interfaces:**
@@ -884,7 +884,7 @@ In `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`, immediately aft
 
 - [ ] **Step 2: Amend §6 — the superseded implementation description**
 
-`:513-518` describes `client_error_row`'s call sites and `LogRow`'s derives as of #118. It is a historical record, so do not rewrite it — append one blockquote directly beneath that paragraph:
+`:511-518` describes `client_error_row`'s call sites and `LogRow`'s derives as of #118. It is a historical record, so do not rewrite it — append one blockquote directly beneath that paragraph:
 
 ```markdown
 > **Superseded 2026-08-01 (issue #120).** `LogRow` no longer exists — `RowMsg::class()` derives the
@@ -896,7 +896,7 @@ In `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`, immediately aft
 
 - [ ] **Step 3: Amend §9 — the prescribed `CLAUDE.md` wording**
 
-§9's first bullet (`~:630-635`) tells a future contributor what `CLAUDE.md` must say, including "***and the crate's own transport/boot diagnostics*** pass through untranslated", and warns that "a doc line that restates the wrong rule is worse than none". Replace `transport/boot diagnostics` with `transport diagnostics` in that bullet and append one sentence to it:
+§9's first bullet (`:629-635`) tells a future contributor what `CLAUDE.md` must say, including "***and the crate's own transport/boot diagnostics*** pass through untranslated", and warns that "a doc line that restates the wrong rule is worse than none". Replace `transport/boot diagnostics` with `transport diagnostics` in that bullet and append one sentence to it:
 
 ```markdown
   As amended 2026-08-01, the carve-out is **transport** diagnostics only — the desktop boot
