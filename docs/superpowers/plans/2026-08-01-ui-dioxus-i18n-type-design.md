@@ -962,7 +962,16 @@ Paste the output into the task report. The only failure conditions are a survivi
 
 Run: `grep -rn "LogRow" --include='*.rs' ui-dioxus/`
 Note the quoting — zsh expands a bare `--include=*.rs` and aborts with `no matches found`.
-Expected: **no matches.** (`.md` files under `docs/` still mention `LogRow` in historical plan and spec prose; that is a record of what #118 built, not a live rule, and is left alone.)
+
+Expected: **exactly two matches, both comments, both in `ui-dioxus/src/net/view_model.rs`** — the `class()` doc block and the `row_classes_are_pinned_per_variant` comment. Task 1 *prescribes* both: each explains what `LogRow` was and why deriving the class replaced it, which is the rationale a future reader needs. Zero matches would mean someone stripped that rationale.
+
+**No `LogRow` may remain as a type reference** — no `struct LogRow`, no `Vec<LogRow>`, no `-> LogRow`. Confirm with:
+
+```bash
+grep -rn "LogRow" --include='*.rs' ui-dioxus/ | grep -v '^\s*[^:]*:[0-9]*:\s*//'
+```
+
+Expected: no output. (`.md` files under `docs/` still mention `LogRow` in historical plan and spec prose; that is a record of what #118 built, not a live rule, and is left alone.)
 
 - [ ] **Step 6: Commit**
 
