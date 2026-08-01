@@ -1,8 +1,13 @@
 //! Localization for the Dioxus UI: a dependency-free, compile-time-verified message catalog
 //! plus locale resolution and persistence.
 //!
-//! The boundary this module enforces (design spec §2): **actionable copy addressed to the user is
-//! translated; technical failure detail is not.** Server-originated payloads (`EventKind::Log`,
+//! The boundary this module enforces (design spec §2): **interface copy — the words that describe
+//! the app's own state, its controls, and what the user should do — is translated. Failure
+//! diagnostics carried on the transport's `Result<_, String>` seam are not.** The line is *where
+//! the text comes from*, not whether it is actionable: `No file open`, `binary file — not
+//! editable`, `disconnected`, `off`, and `seq {n}` are purely informational yet all correctly
+//! translated, because each describes the app's own state.
+//! Server-originated payloads (`EventKind::Log`,
 //! `VerifyResult.detail`, `ServerMessage::Error.message`), protocol identifiers (`Role` names,
 //! `FileEdit`/`Verify`/`TurnComplete`), and this crate's transport/boot diagnostics render verbatim
 //! in every locale — they share a surface with permanently-English engine output, and their

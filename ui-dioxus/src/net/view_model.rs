@@ -30,6 +30,16 @@ pub enum ClientText {
 ///
 /// Fields carrying server-originated text (`detail`, `message`), workspace paths (`path`), and
 /// protocol identifiers (`role`) are rendered verbatim; only the framing around them is localized.
+/// Three qualifications, all visible in `render_row`:
+///
+/// - `Verify.detail` is verbatim only when NON-EMPTY. An empty `detail` has always rendered the
+///   authored word "ok" (including when `ok` is false), so `render_row` substitutes the translated
+///   `Msg::VerifyOk` there — client-authored copy, not a passed-through server payload.
+/// - `ClientError(ClientText)` carries both kinds: the `Authored(Msg)` arm IS translated (it is
+///   this crate's own copy, e.g. `Msg::UrlAndTokenRequired`); only `Passthrough(String)` is
+///   verbatim.
+/// - The numeric fields (`bytes`, `input`, `output`) render as Western digits in every locale —
+///   `u64::to_string()`, with no locale-aware numeral system or digit grouping (spec §8).
 #[derive(Clone, PartialEq, Debug)]
 pub enum RowMsg {
     AgentStarted { role: String },
