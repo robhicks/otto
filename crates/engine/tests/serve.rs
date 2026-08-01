@@ -1155,3 +1155,28 @@ async fn next_json_opt(
         }
     }
 }
+
+/// Ownership is wired end to end: a served session is owned by the reserved local principal,
+/// and the store's scoped reads accept it. This is the seam slice 1b flips on — until then
+/// there is exactly one principal, so this asserts the plumbing, not isolation.
+#[tokio::test]
+async fn served_sessions_are_owned_by_the_local_principal() {
+    let (port, dir) = start_server().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
+        .await
+        .unwrap();
+    let ready: Value = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = ready["session"].as_str().unwrap().to_string();
+
+    let store = otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+        .await
+        .unwrap();
+    let id = otto_protocol::SessionId(session.parse().unwrap());
+    assert_eq!(
+        otto_persistence::SessionStore::owner_of(&store, id)
+            .await
+            .unwrap(),
+        otto_protocol::UserId::local()
+    );
+}

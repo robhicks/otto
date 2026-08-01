@@ -69,15 +69,23 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     );
 
     let session = service
-        .create_session("g", &serde_json::json!({}))
+        .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
         .await
         .unwrap();
     let mut sink = CollectingSink::default();
     service
-        .run_prompt(session, "add a greeting", &mut sink)
+        .run_prompt(
+            &otto_protocol::UserId::local(),
+            session,
+            "add a greeting",
+            &mut sink,
+        )
         .await
         .unwrap();
-    let src_events = store.replay_since(session, None).await.unwrap();
+    let src_events = store
+        .replay_since(&otto_protocol::UserId::local(), session, None)
+        .await
+        .unwrap();
     assert!(
         src_events.len() >= 2,
         "the source turn should emit several events"

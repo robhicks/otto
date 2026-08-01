@@ -34,6 +34,7 @@ fn sample_bundle(id: SessionId, files: Vec<(&str, &[u8])>) -> PromoteBundle {
     PromoteBundle {
         session: SessionState {
             id,
+            owner: otto_protocol::UserId::local(),
             goal: "g".to_string(),
             status: SessionStatus::Active,
             config: serde_json::json!({}),

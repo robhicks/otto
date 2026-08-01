@@ -1070,13 +1070,20 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
             Ok(SessionId(uuid))
         }
         None => {
+            // One principal exists until slice 1b adds identity, so every served session is owned
+            // by `local` — the same principal every command handler in this file passes.
+            // Enforcement lives in `EngineService::authorize`, which every command routes through;
+            // the store's reads are owner-scoped too, so a replay for the wrong owner is empty.
+            //
+            // Deliberately *not* checked in the `Some(s)` arm above: attaching to an explicit
+            // `?session=` stays blind, because rejecting an unowned id would close a socket that
+            // today receives `Ready`, and `ui-dioxus` appends `&session=` on reconnect. Nothing
+            // leaks — the first command on such a connection hits `authorize` and fails. The
+            // attach-time check lands in slice 1b alongside real principals.
+            let owner = otto_protocol::UserId::local();
             state
                 .service
-                .create_session(
-                    &otto_protocol::UserId::local(),
-                    "(serve/ws)",
-                    &serde_json::json!({}),
-                )
+                .create_session(&owner, "(serve/ws)", &serde_json::json!({}))
                 .await
         }
     }

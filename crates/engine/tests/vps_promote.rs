@@ -28,6 +28,7 @@ fn sample_bundle(id: SessionId, files: Vec<(&str, &[u8])>) -> PromoteBundle {
     PromoteBundle {
         session: SessionState {
             id,
+            owner: otto_protocol::UserId::local(),
             goal: "g".to_string(),
             status: SessionStatus::Active,
             config: serde_json::json!({}),
@@ -597,15 +598,23 @@ async fn vps_promote_resumes_session_and_workspace_on_receiver() {
     );
 
     let session = service
-        .create_session("g", &serde_json::json!({}))
+        .create_session(&otto_protocol::UserId::local(), "g", &serde_json::json!({}))
         .await
         .unwrap();
     let mut sink = CollectingSink::default();
     service
-        .run_prompt(session, "add a greeting", &mut sink)
+        .run_prompt(
+            &otto_protocol::UserId::local(),
+            session,
+            "add a greeting",
+            &mut sink,
+        )
         .await
         .unwrap();
-    let src_events = store.replay_since(session, None).await.unwrap();
+    let src_events = store
+        .replay_since(&otto_protocol::UserId::local(), session, None)
+        .await
+        .unwrap();
     let last_seq = src_events.last().unwrap().seq;
 
     // --- Promote to the receiver via VpsTarget. ---
