@@ -1,10 +1,10 @@
 # SQLite Open Busy-Retry Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **This is a retrospective record, not executable work.** It was written after the fix, against
+> the measured before/after, because the merge gate was red. Do not pick it up as a plan; the steps
+> are checked because they are done.
 
-> **Status:** SHIPPED 2026-08-01 — one task, landed as a single commit. Written after the fact
-> against the measured before/after, since the fix was diagnosed and verified in one pass while
-> the merge gate was red.
+> **Status:** SHIPPED 2026-08-01.
 
 **Goal:** Make `SqliteStore::open` survive a concurrent first-open of the same fresh database, fixing both the flaky merge-gate test and the real robustness bug it was reporting.
 
@@ -32,7 +32,7 @@
 
 ## Task Order & Rationale
 
-One task. The diagnosis, the fix, and the measurement are inseparable here — the first two attempts (connect-only retry; then a whole-open retry with a top-level downcast) both *looked* right and were disproved only by re-measuring, so the verification step is the substance of the task rather than a formality.
+One task. The diagnosis, the fix, and the measurement are inseparable here: three attempts looked right and were disproved only by measuring — see Self-Review for the full list, including the two claims that were wrong in this document before review corrected them.
 
 ---
 
@@ -70,16 +70,16 @@ fn is_busy(e: &sqlx::Error) -> bool {
     db.code().and_then(|c| c.parse::<i32>().ok()).is_some_and(|c| c & 0xff == 5)
 }
 
-/// `open` returns `anyhow::Error`, which erases the `sqlx::Error` — a top-level downcast finds
-/// nothing, so walk the chain.
+/// `anyhow::Error::downcast_ref` already searches the source chain, so `.context()` layers do
+/// not hide the `sqlx::Error`.
 fn busy_somewhere(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<sqlx::Error>().is_some_and(is_busy))
+    e.downcast_ref::<sqlx::Error>().is_some_and(is_busy)
 }
 ```
 
 - [x] **Step 4: Split `open` into a retry loop plus `try_open`**
 
-`try_open` is the previous body verbatim. `open` loops on it under `BUSY_BUDGET`, sleeping 20 ms between attempts, returning any non-busy error immediately.
+`try_open` is the previous body plus an explicit `pool.close()` on the failure path. `open` wraps the loop in `tokio::time::timeout(BUSY_BUDGET, …)` — not a deadline checked between attempts, which bounds nothing since one attempt can block that long by itself.
 
 - [x] **Step 5: Declare the `tokio` dependency**
 
@@ -112,4 +112,16 @@ git commit -m "persistence: retry SqliteStore::open while sqlite reports the dat
 
 **Spec coverage.** §"The bug, measured" → Steps 1–2. §Fix and both load-bearing details → Steps 3–4. §"On the new dependency" → Steps 5, 7. Success criteria 1 → Step 6; 2 → Step 8; 3 → Step 7; 4 → the bounded `BUSY_BUDGET` in Step 3.
 
-**The one thing worth carrying forward:** two plausible fixes were disproved by measurement, not by review — a connect-only retry, and a whole-open retry whose predicate downcast at the top level and so never matched through `anyhow`. Both compiled, both looked correct, and both left the test failing. Re-measure after every attempt.
+**The one thing worth carrying forward:** *three* plausible fixes were disproved, and only the first
+two by my own measurement.
+
+1. A connect-only retry — `init_schema` is a second busy source (~30% still failing).
+2. A whole-open retry that I claimed also fixed an `anyhow` downcast problem. **The downcast was
+   never the problem** — `anyhow::Error::downcast_ref` searches the source chain — and I only found
+   that out by mutation-testing the guard I had written for it, which passed when it should have
+   failed. The claim was in the spec, the plan, the code comment, and the PR body before it was
+   caught.
+3. The whole-open retry *did* fix the busy class entirely — and unmasked a second race behind it,
+   caught by the architect review measuring what I had claimed was 0/20 and finding 6/20.
+
+Re-measure after every attempt, and mutation-test the guard, not just the fix.
