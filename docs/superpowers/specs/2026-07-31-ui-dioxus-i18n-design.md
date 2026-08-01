@@ -572,6 +572,7 @@ All host-side unless noted: `cd ui-dioxus && cargo test --features desktop`.
 | Locale switched mid-turn | Purely a view re-render. The socket, session, `last_seq`, editor buffer, dirty flag, and pending approval are untouched (§5). |
 | Locale switched with a pending approval open | The panel's copy retranslates; the pending `(id, path, old, new)` tuple is untouched, so the verdict still correlates. |
 | RTL | None of the five locales is RTL. Out of scope, and the layout is not prepared for it. |
+| Desktop folder-picker title shows a stale locale | **Known, accepted.** `desktop_boot::boot()` is a free async function outside the component tree, so it has no hook access and resolves its title through `initial_locale()` rather than the live signal. If a user changed language and then triggered a new pick within the same session, the dialog title would lag. In practice `boot()` runs once at launch, before the UI mounts, so the window is effectively nil — but it is a real asymmetry with every other string in the app, and it is recorded rather than left for someone to rediscover. |
 | Very long translated button text (e.g. German) | A pre-existing CSS concern, not an i18n one. `style.css` is checked for fixed-width button rules during implementation; if any exist, they are relaxed — otherwise no CSS change. |
 
 **Pluralization** is not needed: no message counts a noun. `seq {n}`, `↑{in} ↓{out} tok`, and
@@ -628,8 +629,21 @@ The test suite cannot cover the two runtime detection/persistence paths. After m
    touches one file and no logic. **This is the largest known risk in the change and is accepted
    deliberately**, because five imperfect catalogs plus a correct mechanism is strictly better than
    no localization, and the mechanism is the part that is expensive to change later.
-2. **Bundle growth.** Expected single-digit KB against a 1.2 MB ceiling with ~405 KB of headroom. If
-   `build-web.sh` guard 4 ever fires, revisit §1 rather than raise the ceiling.
+2. **Bundle growth — MEASURED, and the original estimate was wrong.** This spec predicted
+   "single-digit KB." The real figure, measured by `./scripts/build-web.sh` on the finished
+   branch, is **834,754 B against the 795,188 B baseline — ~39.5 KB of growth**, roughly 4–5× the
+   estimate. All four guards pass with ~365 KB of headroom, so the ceiling was never at risk and
+   §1's mechanism choice stands.
+
+   The estimate was wrong because it counted only the catalog's *string data*. The other
+   contributors, none of them accounted for: the macro-generated match arms (5 arms × 47 keys),
+   the `RowMsg`/`render_row` dispatch added by the §6 log refactor, the `LanguagePicker`
+   component, and the wasm-bindgen glue pulled in by four new `web-sys` features
+   (`Navigator`/`Storage`/`Document`/`Element`).
+
+   Recorded as a correction rather than quietly left, because the next person to reason about
+   this crate's budget should start from 834,754 B and a real decomposition — not from a
+   prediction that turned out to be off by 4×.
 3. **`sys-locale` and `dirs` are new desktop-only dependencies.** Both are small and neither can
    reach the wasm build (optional, under `desktop`). `dirs` is already a workspace dependency at
    `crates/engine/Cargo.toml:37`; `ui-dioxus/` is its own workspace root, so the version is pinned
