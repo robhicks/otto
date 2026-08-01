@@ -65,6 +65,10 @@ pub fn env_locale_tags() -> Vec<String> {
     out
 }
 
+// `not(feature = "web")` is load-bearing: `env_locale_tags` has one definition per cfg arm, so a
+// `--features web,desktop` build would otherwise define it twice. Same crate-wide convention (and
+// same reason) as `store.rs`'s `load_persisted_locale`/`store_persisted_locale`, where it is
+// spelled out at length.
 #[cfg(all(feature = "desktop", not(feature = "web")))]
 pub fn env_locale_tags() -> Vec<String> {
     sys_locale::get_locales().collect()

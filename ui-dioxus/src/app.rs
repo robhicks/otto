@@ -494,18 +494,23 @@ pub fn App() -> Element {
                 }
             }
         });
-
-        // Startup only; the picker applies it again on every change. `index.html` ships a static
-        // `lang="en"` so the document is never unlabeled pre-mount; this corrects it to the
-        // resolved locale once the app is up.
-        //
-        // Reads the `locale` binding already resolved above rather than re-running
-        // `initial_locale()` — the provider is unconditionally earlier in this same body, so the
-        // value is in hand and a second storage/environment read would buy nothing.
-        use_future(move || async move {
-            crate::components::set_document_lang(locale);
-        });
     }
+
+    // Label the document with the resolved locale at startup; the picker applies it again on every
+    // change. `index.html` ships a static `lang="en"` so the document is never unlabeled pre-mount;
+    // this corrects it once the app is up.
+    //
+    // NOT web-gated: the desktop target is a webview with a real `documentElement`, so its screen
+    // reader reads this attribute too — `set_document_lang` implements both targets and no-ops only
+    // in the seam-check build. Unconditional here, so each target still sees one fixed hook
+    // sequence.
+    //
+    // Reads the `locale` binding already resolved above rather than re-running `initial_locale()` —
+    // the provider is unconditionally earlier in this same body, so the value is in hand and a
+    // second storage/environment read would buy nothing.
+    use_future(move || async move {
+        crate::components::set_document_lang(locale);
+    });
 
     rsx! {
         document::Stylesheet { href: STYLE_CSS }

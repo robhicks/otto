@@ -1,3 +1,4 @@
+use dioxus::logger::tracing::warn;
 use dioxus::prelude::*;
 
 use crate::i18n::{store_persisted_locale, t, use_locale, Locale, Msg};
@@ -26,14 +27,38 @@ pub fn LanguagePicker() -> Element {
             class: "lang-picker",
             "aria-label": "{t(active, Msg::LanguageLabel)}",
             onchange: move |e| {
-                let Some(next) = Locale::from_tag(&e.value()) else { return };
+                let raw = e.value();
+                let Some(next) = Locale::from_tag(&raw) else {
+                    // Unreachable through the UI — every `<option>` carries a `Locale::tag()` — so
+                    // reaching it means the option values and `from_tag` have diverged. The
+                    // rejected value is a locale tag, not user content, so it is safe to log.
+                    warn!("language picker ignoring an unparseable locale tag: {raw:?}");
+                    return;
+                };
                 // A provider-less mount is fully inert: with nowhere to publish the choice, the
                 // pick cannot take effect, so it must not persist or relabel the document either.
-                let Some(mut sig) = sink else { return };
+                let Some(mut sig) = sink else {
+                    warn!(
+                        "language picker has no Signal<Locale> provider; the pick of {:?} is inert",
+                        next.tag()
+                    );
+                    return;
+                };
                 sig.set(next);
                 // Persisted ONLY on an explicit pick, never at startup, so environment detection
                 // never becomes accidentally sticky for a user who has not chosen.
-                store_persisted_locale(next.tag());
+                //
+                // A failed store is logged, NOT surfaced: the language still switches for this
+                // session, and interrupting a user who just picked a language with an error about
+                // their browser's storage policy is worse than the lost preference. But it is no
+                // longer invisible — see `store.rs` on why store-side silence, unlike load-side
+                // silence, was the wrong default.
+                if !store_persisted_locale(next.tag()) {
+                    warn!(
+                        "could not persist the locale choice {:?}; it will not survive a restart",
+                        next.tag()
+                    );
+                }
                 set_document_lang(next);
             },
             for loc in Locale::ALL {
@@ -49,7 +74,17 @@ pub fn LanguagePicker() -> Element {
 }
 
 /// Keep `document.documentElement.lang` in step with the active locale so assistive tech announces
-/// content in the right language. Web-only; a no-op on desktop and in the seam-check build.
+/// content in the right language.
+///
+/// Implemented on **both** real targets. The desktop target is a wry webview with a genuine
+/// `documentElement`, so a screen reader there reads the same `lang` attribute a browser does —
+/// treating it as a no-op would have shipped a desktop user who picks 中文 a document still
+/// declaring `lang="en"`, which is a `web-sys` feature-gate dressed up as a platform property.
+/// Only the mechanism differs: web writes the DOM directly through `web-sys` (already linked, and
+/// synchronous), desktop goes through `dioxus::document::eval`, which needs no `web-sys` at all.
+///
+/// `locale.tag()` is one of a fixed set of `&'static str` literals, so the interpolated script has
+/// no injection surface.
 #[cfg(feature = "web")]
 pub fn set_document_lang(locale: Locale) {
     if let Some(el) = web_sys::window()
@@ -60,7 +95,25 @@ pub fn set_document_lang(locale: Locale) {
     }
 }
 
-#[cfg(not(feature = "web"))]
+#[cfg(all(feature = "desktop", not(feature = "web")))]
+pub fn set_document_lang(locale: Locale) {
+    // SAFE INTERPOLATION: the only substituted value is `locale.tag()`, which the `locales!` macro
+    // fixes to one of five `&'static str` literals ("en"/"de"/"es"/"hi"/"zh-Hans"). No user,
+    // server, or workspace input can reach this script, so there is no injection surface. (It is
+    // reached only via a `<select>` whose values are those same literals, and `from_tag` has
+    // already rejected anything else.)
+    //
+    // Fire-and-forget: `Eval` is a handle for reading a result back, and the script is dispatched
+    // to the webview on creation — the same pattern `dioxus-desktop`'s own `create_meta`/
+    // `create_style` use when they drop the handle.
+    let _ = dioxus::document::eval(&format!(
+        "document.documentElement.setAttribute('lang', '{}');",
+        locale.tag()
+    ));
+}
+
+/// The `--no-default-features` seam check has no document to label.
+#[cfg(not(any(feature = "web", feature = "desktop")))]
 pub fn set_document_lang(_locale: Locale) {}
 
 #[cfg(test)]
@@ -114,6 +167,22 @@ mod tests {
     #[test]
     fn the_accessible_label_follows_the_active_locale() {
         assert!(render_with(Locale::De).contains("Sprache"));
+    }
+
+    #[test]
+    fn set_document_lang_is_safe_to_call_from_a_mounted_component() {
+        // The desktop arm dispatches through `dioxus::document::eval`, which needs a live runtime
+        // and resolves to a no-op Document when none provides one (as in this SSR harness). This
+        // pins that it neither panics nor wedges the render on the desktop test build — the arm
+        // that used to be a bare no-op and so could not fail.
+        #[component]
+        fn Labels() -> Element {
+            use_effect(|| set_document_lang(Locale::ZhHans));
+            rsx! { div { "ok" } }
+        }
+        let mut dom = VirtualDom::new(Labels);
+        dom.rebuild_in_place();
+        assert!(dioxus_ssr::render(&dom).contains("ok"));
     }
 
     /// Mounts the picker with NO provider. Must render (falling back to `en`) rather than panic —

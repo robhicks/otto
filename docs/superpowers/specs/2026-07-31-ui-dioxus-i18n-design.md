@@ -440,8 +440,17 @@ signal write re-renders view code and nothing else. This is a structural propert
 test for regressions, but §7 asserts it anyway at the level a host test can.
 
 On change the picker performs exactly three things: `locale.set(next)`, `store_persisted_locale`,
-and — on web only — set `document.documentElement.lang` to the new tag so assistive tech announces
-content correctly. The `lang` attribute is also set once at startup from the resolved locale.
+and set `document.documentElement.lang` to the new tag so assistive tech announces content
+correctly. The `lang` attribute is also set once at startup from the resolved locale.
+
+The `lang` write applies on **both** real targets, not web only. The desktop target is a wry
+webview with a genuine `documentElement`, so its screen reader reads the same attribute a browser
+does; treating desktop as a no-op would be a `web-sys` feature-gate presented as a platform
+property, and would ship a desktop user who picks 中文 a document still declaring `lang="en"`. Only
+the mechanism differs — web writes the DOM directly through `web-sys` (already linked, synchronous),
+desktop dispatches through `dioxus::document::eval`, which needs no `web-sys` at all. The
+interpolated tag is one of five `&'static str` literals, so the script has no injection surface.
+The `--no-default-features` seam-check build has no document and keeps the no-op.
 
 `index.html`'s `<html>` element carries no `lang` today, so the pre-mount document has none until
 that startup effect runs. A static `lang="en"` is added there — it costs nothing, and it means the
