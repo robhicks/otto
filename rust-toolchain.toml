@@ -1,3 +1,9 @@
+# Pinned to an exact version, not the floating `stable`. With `channel = "stable"`, every Rust
+# release re-resolves under CI and can introduce new clippy lints that turn `main` red with no
+# code change — `-D warnings` in .github/workflows/ci.yml makes that a merge blocker. Pinning
+# keeps CI and every developer on the same compiler and makes a toolchain upgrade a deliberate
+# one-line PR that clears any new lints on purpose. rustup auto-installs this per-project, so a
+# developer's global default toolchain is untouched.
 [toolchain]
-channel = "stable"
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]

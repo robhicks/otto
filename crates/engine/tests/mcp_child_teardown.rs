@@ -529,12 +529,23 @@ fn mcp_server_dies_when_parent_is_hard_killed() {
 /// even though the intermediate process is itself killed only by EOF (never signalled directly).
 ///
 /// Skipped when `rust-analyzer` is absent — `mcp-lsp` refuses to start with no supported server on
-/// PATH, and the repo has no CI, so a developer without it should not see a hard failure.
+/// PATH, so a developer without it should not see a hard failure. The CI runner image does not ship
+/// `rust-analyzer` either, so this self-skips there too and the merge gate never exercises it.
 #[test]
 fn language_server_grandchild_dies_when_parent_is_hard_killed() {
     let ra = std::env::var("OTTO_RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".into());
-    if which(&ra).is_none() {
-        eprintln!("skipping: `{ra}` not on PATH, so mcp-lsp cannot start a language server");
+    // Probe by *running* it, not by `which`: rustup installs a `rust-analyzer` proxy shim into
+    // ~/.cargo/bin whether or not the component itself is present, so a path lookup is a false
+    // positive on any rustup-provisioned machine (every CI runner). The shim exits non-zero when
+    // the component is missing, so `--version` is the only honest availability check — this
+    // mirrors `rust_analyzer_available()` in crates/mcp-lsp.
+    let usable = std::process::Command::new(&ra)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !usable {
+        eprintln!("skipping: `{ra}` not usable, so mcp-lsp cannot start a language server");
         return;
     }
 
@@ -597,19 +608,4 @@ fn control_child_ignoring_stdin_eof_survives_hard_kill() {
          process-group kill, a subreaper, a cgroup) is killing subprocesses, and the scenarios \
          above would pass even if the EOF cascade were broken."
     );
-}
-
-/// Minimal PATH lookup, so the LSP scenario can skip cleanly rather than fail on a machine with no
-/// `rust-analyzer`.
-fn which(bin: &str) -> Option<PathBuf> {
-    if bin.contains('/') {
-        let p = PathBuf::from(bin);
-        return p.is_file().then_some(p);
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths).find_map(|dir| {
-            let candidate = dir.join(bin);
-            candidate.is_file().then_some(candidate)
-        })
-    })
 }

@@ -110,7 +110,9 @@ cd ui-dioxus && CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-un
 cd ui-dioxus && ./scripts/build-web.sh
 ```
 
-Toolchain is pinned to stable in `rust-toolchain.toml` (edition 2024, rust-version 1.85).
+Toolchain is pinned to an exact version (`1.97.0`) in `rust-toolchain.toml`, not the floating
+`stable` — CI runs `-D warnings`, so a floating channel would let a new Rust release block merges
+with no code change. Upgrading is a deliberate one-line PR. Edition 2024, rust-version 1.85.
 
 ### Runtime configuration (env vars)
 

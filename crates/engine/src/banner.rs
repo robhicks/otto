@@ -256,7 +256,7 @@ mod tests {
         assert!(out.contains("38;2;122;162;247"), "missing --accent shell");
         assert!(out.contains("38;2;125;207;255"), "missing cyan eyes");
         // The four spine stages each carry their own colour.
-        for c in [b'C', b'V', b'G', b'A'] {
+        for c in *b"CVGA" {
             let Rgb(r, g, b) = color(c).unwrap();
             assert!(out.contains(&format!("{r};{g};{b}")), "spine {c} missing");
         }
