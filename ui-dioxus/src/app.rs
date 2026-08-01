@@ -495,13 +495,15 @@ pub fn App() -> Element {
             }
         });
 
-        // Startup only; the picker applies it again on every change. This re-runs
-        // `initial_locale()` rather than reading the signal just provided above — one extra
-        // localStorage read at mount, deliberately, because it keeps this effect independent of
-        // hook ordering. It cannot diverge: both calls resolve from the same persisted value and
-        // environment within the same render.
+        // Startup only; the picker applies it again on every change. `index.html` ships a static
+        // `lang="en"` so the document is never unlabeled pre-mount; this corrects it to the
+        // resolved locale once the app is up.
+        //
+        // Reads the `locale` binding already resolved above rather than re-running
+        // `initial_locale()` — the provider is unconditionally earlier in this same body, so the
+        // value is in hand and a second storage/environment read would buy nothing.
         use_future(move || async move {
-            crate::components::set_document_lang(crate::i18n::initial_locale());
+            crate::components::set_document_lang(locale);
         });
     }
 
@@ -555,5 +557,122 @@ pub fn App() -> Element {
                 on_disconnect: move |_| disconnect(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod locale_switch_tests {
+    use super::*;
+    use crate::i18n::Locale;
+
+    // The harness's provided signal, handed out to the test so it can write it from outside the
+    // tree. A `thread_local` rather than a prop because `Signal` is not `PartialEq`, so it cannot
+    // ride in a `Props` struct; tests each run on their own thread, so there is no cross-test
+    // sharing. Set during the harness's render, read inside `in_runtime`.
+    thread_local! {
+        static PROVIDED_LOCALE: std::cell::RefCell<Option<Signal<Locale>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A harness that reproduces `App`'s locale wiring exactly: `use_context_provider` first, then
+    /// `use_locale()` in the SAME scope, then child components that consume the context from their
+    /// own scopes.
+    ///
+    /// `App` itself is not mounted deliberately — under `--features desktop` its body spawns the
+    /// `desktop_boot::boot()` future (a native folder picker plus an `otto serve` sidecar process),
+    /// which no unit test can drive. The hook ordering below is byte-for-byte the ordering `App`
+    /// uses, and the strings asserted are the ones `App` itself owns (`Msg::RefreshFiles` /
+    /// `Msg::PromoteToRemote`, rendered from `App`'s own `locale` binding rather than a child's) —
+    /// so the provider-before-consumer bug `App`'s comment warns about would fail this test.
+    #[component]
+    fn LocaleHarness() -> Element {
+        let sig = use_context_provider(|| Signal::new(Locale::En));
+        PROVIDED_LOCALE.with(|c| *c.borrow_mut() = Some(sig));
+        let locale = use_locale();
+        rsx! {
+            button { {t(locale, Msg::RefreshFiles)} }
+            button { {t(locale, Msg::PromoteToRemote)} }
+            LocaleChild {}
+        }
+    }
+
+    /// A consumer in its OWN scope, standing in for `StatusLine`/`PromptBar`/`Editor`. A locale
+    /// switch has to reach these too, not only the providing scope.
+    #[component]
+    fn LocaleChild() -> Element {
+        let locale = use_locale();
+        rsx! { span { {t(locale, Msg::DemoteToLocal)} } }
+    }
+
+    /// Write the provided locale signal from outside the tree, the way `LanguagePicker`'s
+    /// `onchange` does. The write must happen inside the VirtualDom's runtime, which is what
+    /// `in_runtime` establishes — that is also what marks the subscribed scopes dirty.
+    fn pick_locale(dom: &VirtualDom, next: Locale) {
+        dom.in_runtime(|| {
+            let mut sig = PROVIDED_LOCALE
+                .with(|c| *c.borrow())
+                .expect("the harness published its locale signal during render");
+            sig.set(next);
+        });
+    }
+
+    #[test]
+    fn writing_the_locale_signal_retranslates_the_mounted_tree_in_place() {
+        // The PR's headline claim, and the only one every other harness leaves unverified: they
+        // all render once at a fixed locale, which cannot distinguish "retranslates on switch"
+        // from "happened to be built in that language".
+        let mut dom = VirtualDom::new(LocaleHarness);
+        dom.rebuild_in_place();
+        let before = dioxus_ssr::render(&dom);
+        assert!(before.contains("Refresh files"), "en missing in: {before}");
+        assert!(
+            before.contains("Promote to remote"),
+            "en missing in: {before}"
+        );
+        assert!(
+            before.contains("Demote to local"),
+            "en missing in child: {before}"
+        );
+
+        // No remount, no new VirtualDom — the same mounted tree.
+        pick_locale(&dom, Locale::De);
+        dom.render_immediate_to_vec();
+        let after = dioxus_ssr::render(&dom);
+
+        assert_ne!(before, after, "the locale write did not re-render anything");
+        // `App`'s own copy followed the switch — the provider-then-consumer ordering holds. If
+        // `use_locale()` ran before `use_context_provider`, it would have cached `None`, pinned
+        // these two to English, and left only the child switching.
+        assert!(
+            after.contains("Dateien aktualisieren"),
+            "App-owned copy did not retranslate: {after}"
+        );
+        assert!(
+            after.contains("Auf Remote hochstufen"),
+            "App-owned copy did not retranslate: {after}"
+        );
+        // …and so did the child scope.
+        assert!(
+            after.contains("Auf Lokal herabstufen"),
+            "child scope did not retranslate: {after}"
+        );
+        assert!(
+            !after.contains("Refresh files"),
+            "stale English survived the switch: {after}"
+        );
+    }
+
+    #[test]
+    fn switching_back_restores_the_original_render() {
+        // Retranslation is not one-way, and nothing accumulates across switches.
+        let mut dom = VirtualDom::new(LocaleHarness);
+        dom.rebuild_in_place();
+        let first = dioxus_ssr::render(&dom);
+
+        for next in [Locale::ZhHans, Locale::Hi, Locale::En] {
+            pick_locale(&dom, next);
+            dom.render_immediate_to_vec();
+        }
+        assert_eq!(dioxus_ssr::render(&dom), first);
     }
 }
