@@ -49,7 +49,7 @@ One task: the two files are a required mirror pair (the SKILL.md references `age
   Under the fast-path criteria, add: no breaking change to wire types or a crate's public API (renamed/removed/reordered fields or variants, changed signatures) — breaking changes are semver-major and never fast-path.
 
 - [ ] **Step 4: Add Load-Bearing Invariant 8**
-  Wire types and public APIs are semver-constrained: additions stay additive so old receivers parse; renaming/removing/reordering a field or variant breaks the protocol and is semver-major (version bump in the PR + explicit review, never an incidental refactor side-effect).
+  Wire types and public APIs are semver-constrained: additions are semver-minor by this repo's convention (not wire forward-compatibility — the protocol enums are externally tagged with no `#[serde(other)]`, so an old receiver cannot decode a new variant; `CapabilitiesManifest` is the negotiation mechanism); renaming/removing/reordering a field or variant breaks the protocol and is semver-major (version bump in the PR + explicit review, never an incidental refactor side-effect).
 
 - [ ] **Step 5: Add the plan-task semver step to Phase 2**
   In "Every task MUST include", add: a `- [ ]` step bumping the affected crate(s)' `version` in `Cargo.toml` (semver-major — the 0.x minor-position bump at this repo's pre-1.0 state) before the final commit, when the task makes a breaking change to a public interface or wire type. Additive changes need no bump.

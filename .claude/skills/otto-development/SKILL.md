@@ -187,10 +187,16 @@ step below checks them:
 7. **Trait seams are remote-ready.** Keep seams `Send + Sync` and async; the orchestrator holds
    trait objects, never concrete impls.
 8. **Wire types and public APIs are semver-constrained.** `protocol` wire types are typed serde
-   records; extensible payloads are JSON `Value`. Additions stay additive — new optional fields,
-   new enum variants, new event kinds — so old receivers parse (semver-minor). Renaming, removing,
-   or reordering a field or variant breaks the protocol and is semver-major: version bump in the
-   PR + explicit review, never an incidental refactor side-effect (Non-Negotiable Rule 6).
+   records; extensible payloads are JSON `Value`. Additions — new optional fields, new enum
+   variants, new event kinds — are **semver-minor by this repo's convention** (CLAUDE.md:
+   "Adding a tool/agent/event should stay a semver-minor change to the wire types"). Know the
+   limit: `Command`/`EventKind`/`ServerMessage` are externally tagged with no `#[serde(other)]`,
+   so an old receiver still fails to decode a *new variant* — additive is a versioning and
+   source-compatibility guarantee, not wire forward-compatibility. `CapabilitiesManifest`
+   (`#[serde(default)]` → absent means `false`) is how a peer learns what it may be sent.
+   Renaming, removing, or reordering a field or variant breaks the protocol and is semver-major:
+   version bump in the PR + explicit review, never an incidental refactor side-effect
+   (Non-Negotiable Rule 6).
 
 ## Tracker abstraction (GitHub Issues or ticketless)
 
