@@ -680,6 +680,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "has placeholders")]
+    fn authored_rejects_a_parameterized_key() {
+        let _ = ClientText::authored(Msg::SidecarSpawnFailed);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no placeholders")]
+    fn authored_with_rejects_a_placeholder_free_key() {
+        let _ = ClientText::authored_with(Msg::UrlAndTokenRequired, vec![("x", "y".to_string())]);
+    }
+
+    #[test]
     fn arity_matches_the_catalog_for_every_authored_construction() {
         // `tf` renders an unsupplied placeholder verbatim, so `authored(Msg::SidecarSpawnFailed)`
         // would ship the literal `{bin}` to a user. `Msg::has_placeholders` is derived from the
@@ -687,12 +699,15 @@ mod tests {
         assert!(Msg::SidecarSpawnFailed.has_placeholders());
         assert!(!Msg::UrlAndTokenRequired.has_placeholders());
 
-        // Every no-arg construction must name a placeholder-free key…
-        for m in [Msg::UrlAndTokenRequired] {
-            assert!(!m.has_placeholders(), "{m:?} needs authored_with");
-            let rendered = render_row(Locale::En, &client_error_row(ClientText::authored(m)));
-            assert!(!rendered.contains('{'), "{m:?}: {rendered}");
-        }
+        // The one no-arg construction in the crate must name a placeholder-free key, and must
+        // render without leaving a brace behind.
+        let no_args = Msg::UrlAndTokenRequired;
+        assert!(
+            !no_args.has_placeholders(),
+            "{no_args:?} needs authored_with"
+        );
+        let rendered = render_row(Locale::En, &client_error_row(ClientText::authored(no_args)));
+        assert!(!rendered.contains('{'), "{no_args:?}: {rendered}");
         // …and the catalog's own placeholder-free keys must stay that way, or `authored` starts
         // silently rendering braces. Spot-check the ones this module constructs.
         assert!(!Msg::RowTurnCompleteOk.has_placeholders());

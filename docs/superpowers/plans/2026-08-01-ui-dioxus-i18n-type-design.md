@@ -960,7 +960,9 @@ and `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md`.
 
 - [ ] **Step 5: Verify no live rule still states the superseded wording**
 
-Run: `grep -rn "transport/boot diagnostics" CLAUDE.md README.md docs/`
+Run: `grep -rn "transport/boot diagnostics" CLAUDE.md README.md docs/ ui-dioxus/src/`
+
+**The `ui-dioxus/src/` scope is load-bearing and was missing from the first version of this step.** The rule is stated in **five** places, not four: the fifth is `ui-dioxus/src/i18n/mod.rs`'s module doc — the one a contributor actually reads while adding a catalog key — and a grep scoped to `docs/` structurally cannot see it. `net/url.rs` carries a stale `Result<_, String>` reference for the same reason. Both are in Scope.
 
 Before Task 4 this returns **9 matches in 5 files**. After Steps 1–4 it must return **7 matches in 4 files**, all of them legitimate:
 
