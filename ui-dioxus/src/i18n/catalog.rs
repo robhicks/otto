@@ -25,6 +25,28 @@ macro_rules! messages {
             /// names the variants it needs. Without the gate it is dead code in every real build.
             #[cfg(test)]
             pub const ALL: &'static [Msg] = &[$(Msg::$key),+];
+
+            /// Whether this message's template takes `{name}` placeholders.
+            ///
+            /// Derived from the `en` template at macro-expansion time, so it cannot drift from the
+            /// catalog. `placeholder_sets_match_across_locales` already proves every locale of a
+            /// key agrees on its placeholder set, so `en` is representative.
+            ///
+            /// Exists so `ClientText::authored`/`authored_with` can assert they were handed the
+            /// right kind of key: passing a parameterized `Msg` to `authored` renders the literal
+            /// `{bin}` to a user, because `tf` emits an unsupplied placeholder verbatim by design.
+            pub const fn has_placeholders(self) -> bool {
+                let template = match self { $(Msg::$key => $en),+ };
+                let bytes = template.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'{' {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            }
         }
 
         /// Look up a message. Exhaustive over `(Locale, Msg)` with NO wildcard arm — that is what

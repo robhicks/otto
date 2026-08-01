@@ -4,6 +4,13 @@ use otto_protocol::CapabilitiesManifest;
 use otto_protocol::EventKind;
 
 use crate::i18n::{t, tf, Locale, Msg};
+// `net/` is "browser-free, host-tested" and this is the one import from `transport/`, which is
+// where `cfg(feature)` splits web vs desktop — so it looks like a layering inversion and is not.
+// `SeamError` is declared ABOVE that cfg split and is target-agnostic plain data; the property
+// this module actually promises is checked by `cargo test --no-default-features`, which compiles
+// neither target. The direction is forced: `SeamError`'s constructor is `pub(in crate::transport)`,
+// and Rust only allows a visibility scoped to an *ancestor* module, so the type cannot live here.
+// Do not "fix" this import, and do not read it as licence for a target-dependent one.
 use crate::transport::SeamError;
 
 /// The single connection-state signal that drives the whole UI.
@@ -20,12 +27,22 @@ pub enum ConnState {
 pub enum ClientText {
     /// Authored copy, retranslated on every locale switch. `args` fill the template's `{name}`
     /// placeholders and are rendered VERBATIM — they carry filesystem paths and OS errors, not
-    /// copy. One variant rather than a separate parameterized sibling: two variants differing only
-    /// in whether a `Vec` is empty is the same representable-illegal-state shape `RowMsg::class()`
-    /// exists to avoid.
+    /// copy.
+    ///
+    /// One variant rather than a parameterized sibling, but NOT for the reason
+    /// `RowMsg::class()` exists: `class` was *derivable* from its variant, which is why deleting
+    /// it was lossless. `args` is not derivable from `msg` — only the required key set is — so
+    /// this is a genuine coupling the type does not express, not a redundant field. The reason to
+    /// keep one variant is narrower: an empty `args` against a placeholder-free `Msg` is a
+    /// perfectly legal state, so splitting would buy no invariant while adding a variant.
+    ///
+    /// The coupling it leaves open: `authored(Msg::SidecarSpawnFailed)` compiles and renders the
+    /// literal text `{bin}` to the user, because `tf` emits an unsupplied placeholder verbatim by
+    /// design. `arity_matches_the_catalog_for_every_authored_construction` is what stops that
+    /// reaching a release; keys are `&'static str` so at least they cannot be computed at runtime.
     Authored {
         msg: Msg,
-        args: Vec<(String, String)>,
+        args: Vec<(&'static str, String)>,
     },
     /// A diagnostic the transport seam produced. Verbatim in every locale, and — since
     /// `SeamError`'s constructor is private to `transport/` — unfabricatable anywhere else.
@@ -33,8 +50,16 @@ pub enum ClientText {
 }
 
 impl ClientText {
-    /// Authored copy with no placeholders — the common case.
+    /// Authored copy whose template has no placeholders.
+    ///
+    /// `debug_assert`s that, so the mismatch fails a test run rather than shipping `{bin}` to a
+    /// user. It is a `debug_assert` and not a hard panic because rendering a visibly-wrong string
+    /// is strictly better than killing the UI over a copy bug in a release build.
     pub fn authored(msg: Msg) -> Self {
+        debug_assert!(
+            !msg.has_placeholders(),
+            "{msg:?} has placeholders; use authored_with"
+        );
         Self::Authored {
             msg,
             args: Vec::new(),
@@ -42,7 +67,11 @@ impl ClientText {
     }
 
     /// Authored copy framing a payload that cannot be translated (a path, an OS error).
-    pub fn authored_with(msg: Msg, args: Vec<(String, String)>) -> Self {
+    pub fn authored_with(msg: Msg, args: Vec<(&'static str, String)>) -> Self {
+        debug_assert!(
+            msg.has_placeholders(),
+            "{msg:?} has no placeholders; use authored"
+        );
         Self::Authored { msg, args }
     }
 }
@@ -155,7 +184,7 @@ pub fn render_row(locale: Locale, msg: &RowMsg) -> String {
             let message = match text {
                 ClientText::Authored { msg, args } => {
                     let pairs: Vec<(&str, &str)> =
-                        args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                        args.iter().map(|(k, v)| (*k, v.as_str())).collect();
                     tf(locale, *msg, &pairs)
                 }
                 ClientText::Passthrough(e) => e.as_str().to_string(),
@@ -609,31 +638,65 @@ mod tests {
         // is interface copy (it tells the user auto-connect did not happen and to use the manual
         // form), so the SENTENCE localizes — but `{bin}` and `{detail}` are a filesystem path and
         // an OS error, so they pass through byte-identically in every locale.
+        //
+        // The localization half asserts on the UNWRAPPED templates, not the rendered rows. An
+        // earlier version compared whole rows and was vacuous: `render_row` wraps them in
+        // `Msg::RowClientError`, whose en/de differ only as `client:`/`Client:`, so `assert_ne!`
+        // was satisfied by the wrapper's capital C even with the German entry replaced by the
+        // English one — precisely the regression the test names.
+        assert_ne!(
+            t(Locale::En, Msg::SidecarSpawnFailed),
+            t(Locale::De, Msg::SidecarSpawnFailed),
+            "SidecarSpawnFailed is untranslated in de"
+        );
+        assert!(
+            t(Locale::De, Msg::SidecarSpawnFailed).contains("konnte nicht gestartet werden"),
+            "de lost its distinctive wording"
+        );
+
         let row = client_error_row(ClientText::authored_with(
             Msg::SidecarSpawnFailed,
             vec![
-                ("bin".to_string(), "/usr/bin/otto-sidecar".to_string()),
-                (
-                    "detail".to_string(),
-                    "No such file or directory".to_string(),
-                ),
+                ("bin", "/usr/bin/otto-sidecar".to_string()),
+                ("detail", "No such file or directory".to_string()),
             ],
         ));
-        let en = render_row(Locale::En, &row);
-        let de = render_row(Locale::De, &row);
-        assert_ne!(en, de, "the framing sentence must differ per locale");
-        for rendered in [&en, &de] {
-            assert!(rendered.contains("/usr/bin/otto-sidecar"), "{rendered}");
-            assert!(rendered.contains("No such file or directory"), "{rendered}");
+        // The payloads survive verbatim in every locale, and no placeholder is left unsubstituted.
+        for loc in Locale::ALL {
+            let rendered = render_row(loc, &row);
+            assert!(
+                rendered.contains("/usr/bin/otto-sidecar"),
+                "{loc:?}: {rendered}"
+            );
+            assert!(
+                rendered.contains("No such file or directory"),
+                "{loc:?}: {rendered}"
+            );
+            assert!(
+                !rendered.contains('{'),
+                "{loc:?} left a placeholder: {rendered}"
+            );
         }
     }
 
     #[test]
-    fn authored_client_text_with_no_args_still_retranslates() {
-        // The no-parameter case keeps working through the same single `Authored` variant — an
-        // empty `args` is the normal shape, not an error state.
-        let row = client_error_row(ClientText::authored(Msg::UrlAndTokenRequired));
-        assert_ne!(render_row(Locale::En, &row), render_row(Locale::De, &row));
+    fn arity_matches_the_catalog_for_every_authored_construction() {
+        // `tf` renders an unsupplied placeholder verbatim, so `authored(Msg::SidecarSpawnFailed)`
+        // would ship the literal `{bin}` to a user. `Msg::has_placeholders` is derived from the
+        // catalog at macro-expansion time, so this cannot drift from the templates.
+        assert!(Msg::SidecarSpawnFailed.has_placeholders());
+        assert!(!Msg::UrlAndTokenRequired.has_placeholders());
+
+        // Every no-arg construction must name a placeholder-free key…
+        for m in [Msg::UrlAndTokenRequired] {
+            assert!(!m.has_placeholders(), "{m:?} needs authored_with");
+            let rendered = render_row(Locale::En, &client_error_row(ClientText::authored(m)));
+            assert!(!rendered.contains('{'), "{m:?}: {rendered}");
+        }
+        // …and the catalog's own placeholder-free keys must stay that way, or `authored` starts
+        // silently rendering braces. Spot-check the ones this module constructs.
+        assert!(!Msg::RowTurnCompleteOk.has_placeholders());
+        assert!(Msg::RowClientError.has_placeholders());
     }
 
     #[test]

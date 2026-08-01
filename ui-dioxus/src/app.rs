@@ -455,9 +455,8 @@ pub fn App() -> Element {
                 // the OS error are not.
                 BootOutcome::SpawnFailed { bin, detail } => {
                     rows.write()
-                        .push(client_error_row(ClientText::authored_with(
-                            Msg::SidecarSpawnFailed,
-                            vec![("bin".to_string(), bin), ("detail".to_string(), detail)],
+                        .push(client_error_row(crate::desktop_boot::spawn_failure_text(
+                            bin, detail,
                         )));
                 }
                 // User cancelled the picker: silent fallback to the manual ConnectionForm.

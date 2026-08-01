@@ -10,7 +10,9 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 
+use crate::i18n::Msg;
 use crate::net::url::LaunchParams;
+use crate::net::view_model::ClientText;
 
 /// Fixed local port the sidecar binds and the webview then connects to. Single source of truth for
 /// both, so the spawn argv and the `LaunchParams` URL cannot drift apart.
@@ -46,6 +48,21 @@ pub enum BootOutcome {
     /// so storing it in a component signal keeps it alive for the app's lifetime and kills it when
     /// that signal's value is dropped.
     Ready(Child, LaunchParams),
+}
+
+/// The event-log text for a spawn failure: localized framing, verbatim payloads.
+///
+/// Extracted from `app.rs`'s match arm so the ARGUMENT WIRING is testable. `boot()` opens an
+/// `rfd` folder picker and cannot be driven unattended, and a test that builds the `ClientText`
+/// by hand validates the destination while leaving the wiring uncovered — swapping the two
+/// bindings renders ``failed to launch `No such file or directory serve` sidecar: /usr/bin/otto``
+/// to the user, in every locale, with the whole suite green. `spawn_failure_row_puts_each_payload
+/// _in_its_own_slot` is what catches that.
+pub fn spawn_failure_text(bin: String, detail: String) -> ClientText {
+    ClientText::authored_with(
+        Msg::SidecarSpawnFailed,
+        vec![("bin", bin), ("detail", detail)],
+    )
 }
 
 /// Resolve the `otto` binary the sidecar is spawned from.
@@ -332,6 +349,34 @@ fn is_ready_line(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The spawn-failure row puts each payload in its own slot.
+    ///
+    /// The regression this exists for: `app.rs` builds the args positionally, and swapping the two
+    /// bindings is a one-token edit that renders
+    /// ``failed to launch `No such file or directory serve` sidecar: /usr/bin/otto`` — nonsense,
+    /// in every locale — while every other test in the suite stays green, because they construct
+    /// the `ClientText` by hand and so never exercise this wiring.
+    #[test]
+    fn spawn_failure_row_puts_each_payload_in_its_own_slot() {
+        use crate::i18n::Locale;
+        use crate::net::view_model::{client_error_row, render_row};
+
+        let row = client_error_row(super::spawn_failure_text(
+            "/usr/bin/otto-sidecar".to_string(),
+            "No such file or directory".to_string(),
+        ));
+        let en = render_row(Locale::En, &row);
+        // The binary belongs inside the backticked command, the OS error after the colon.
+        assert!(
+            en.contains("`/usr/bin/otto-sidecar serve`"),
+            "bin is not in the command slot: {en}"
+        );
+        assert!(
+            en.ends_with("No such file or directory"),
+            "detail is not in the trailing slot: {en}"
+        );
+    }
+
     use super::*;
     use std::ffi::OsStr;
 
