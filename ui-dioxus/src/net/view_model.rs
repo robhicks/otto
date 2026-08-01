@@ -91,7 +91,7 @@ pub fn render_row(locale: Locale, msg: &RowMsg) -> String {
             )
         }
         // Server-originated: the glyph is framing, the message passes through untranslated.
-        RowMsg::Log { message } => format!("· {message}"),
+        RowMsg::Log { message } => tf(locale, Msg::RowLog, &[("message", message)]),
         RowMsg::TurnComplete { ok } => t(
             locale,
             if *ok {
@@ -207,16 +207,20 @@ pub fn diff_lines(locale: Locale, old: Option<&str>, new: &str) -> Vec<DiffLine>
 /// represents a degraded/lost capability (rendered in the warning style).
 #[derive(Clone, PartialEq, Debug)]
 pub struct CapSegment {
-    pub label: String,
-    pub value: String,
+    pub label: &'static str,
+    pub value: &'static str,
     pub degraded: bool,
 }
 
 /// Derive the engine/LLM/sandbox segments from the manifest. The two degradations the strip
 /// exists to surface: a fully-offline (deterministic) LLM, and an absent sandbox (bash off).
+///
+/// The fields stay `&'static str`: `t` returns `&'static str` in every locale (the catalog is
+/// compile-time), so localization is what `locale` selects, not a reason to own the strings —
+/// `status_label` in this file returns `&'static str` for exactly the same reason.
 pub fn capability_segments(locale: Locale, m: &CapabilitiesManifest) -> Vec<CapSegment> {
     let engine = CapSegment {
-        label: t(locale, Msg::CapEngine).to_string(),
+        label: t(locale, Msg::CapEngine),
         value: t(
             locale,
             if m.engine_remote {
@@ -224,8 +228,7 @@ pub fn capability_segments(locale: Locale, m: &CapabilitiesManifest) -> Vec<CapS
             } else {
                 Msg::CapLocal
             },
-        )
-        .to_string(),
+        ),
         degraded: false,
     };
     let (llm_value, llm_degraded) = match (m.local_llm, m.remote_llm) {
@@ -235,13 +238,13 @@ pub fn capability_segments(locale: Locale, m: &CapabilitiesManifest) -> Vec<CapS
         (false, false) => (Msg::CapOffline, true),
     };
     let llm = CapSegment {
-        label: t(locale, Msg::CapLlm).to_string(),
-        value: t(locale, llm_value).to_string(),
+        label: t(locale, Msg::CapLlm),
+        value: t(locale, llm_value),
         degraded: llm_degraded,
     };
     let sandbox = CapSegment {
-        label: t(locale, Msg::CapSandbox).to_string(),
-        value: t(locale, if m.sandbox { Msg::CapOn } else { Msg::CapOff }).to_string(),
+        label: t(locale, Msg::CapSandbox),
+        value: t(locale, if m.sandbox { Msg::CapOn } else { Msg::CapOff }),
         degraded: !m.sandbox,
     };
     vec![engine, llm, sandbox]
@@ -526,6 +529,22 @@ mod tests {
             render_row(Locale::En, &boolean.msg),
             render_row(Locale::ZhHans, &boolean.msg)
         );
+    }
+
+    #[test]
+    fn the_log_rows_framing_glyph_comes_from_the_catalog() {
+        // Every other row's glyph lives inside its catalog template; `RowMsg::Log`'s `·` used to be
+        // hardcoded in `render_row`, so the framing rule was uniform everywhere except here — and
+        // `zh` could not adapt the framing punctuation the way it does for the error rows.
+        let log = describe_event(&EventKind::Log {
+            message: "engine says hi".into(),
+        });
+        for loc in Locale::ALL {
+            let rendered = render_row(loc, &log.msg);
+            assert!(rendered.starts_with('·'), "{loc:?}: {rendered}");
+            assert!(rendered.contains("engine says hi"), "{loc:?}: {rendered}");
+        }
+        assert_eq!(render_row(Locale::En, &log.msg), "· engine says hi");
     }
 
     #[test]

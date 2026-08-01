@@ -178,6 +178,11 @@ messages! {
     RowTurnCompleteFailed { en: "● TurnComplete failed", de: "● TurnComplete fehlgeschlagen", es: "● TurnComplete fallido", hi: "● TurnComplete विफल", zh: "● TurnComplete 失败" }
     RowApprovalNeeded { en: "⏸ approval needed: {path}", de: "⏸ Genehmigung erforderlich: {path}", es: "⏸ se necesita aprobación: {path}", hi: "⏸ अनुमोदन आवश्यक: {path}", zh: "⏸ 需要批准：{path}" }
     RowMeter { en: "◷ tokens ↑{input} ↓{output}", de: "◷ Tokens ↑{input} ↓{output}", es: "◷ tokens ↑{input} ↓{output}", hi: "◷ टोकन ↑{input} ↓{output}", zh: "◷ 词元 ↑{input} ↓{output}" }
+    // `{message}` is the engine's own text, passed through untranslated; only the `·` framing
+    // glyph is the catalog's. It lives here rather than being hardcoded in `render_row` so the
+    // framing rule is uniform across every row — and so `zh` can adapt the framing punctuation,
+    // as `RowServerError`/`RowClientError`/`RowApprovalNeeded` already do with `：`.
+    RowLog { en: "· {message}", de: "· {message}", es: "· {message}", hi: "· {message}", zh: "· {message}" }
     RowServerError { en: "error: {message}", de: "Fehler: {message}", es: "error: {message}", hi: "त्रुटि: {message}", zh: "错误：{message}" }
     RowClientError { en: "client: {message}", de: "Client: {message}", es: "cliente: {message}", hi: "क्लाइंट: {message}", zh: "客户端：{message}" }
 }
