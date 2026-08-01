@@ -26,12 +26,14 @@ the issue is otherwise accurate.
    (`view_model.rs:94-96`). All six are in scope; the AC's "no user-facing string literal remains"
    cannot be met without them.
 
-   It further omits a **seventh cluster that is deliberately left untranslated**: the
-   crate-authored *diagnostics* in `transport/web.rs`, `transport/desktop.rs`, and
-   `desktop_boot.rs` — `"socket closed"` (`transport/desktop.rs:23`), `"workspace rpc failed:
-   HTTP {status}"` and `"unexpected response to List: …"` (`transport/web.rs:82,102,113`,
-   `transport/desktop.rs:104,124,135`), and `"failed to launch \`{bin} serve\` sidecar: {e}"`
-   (`desktop_boot.rs:147`). §2 draws the line that excludes them and says why.
+   It further omits a **cluster that is deliberately left untranslated**: the crate-authored
+   *diagnostics* in `transport/web.rs`, `transport/desktop.rs`, and `desktop_boot.rs` — four
+   distinct messages across seven sites. `"socket closed"` (`transport/desktop.rs:23`);
+   `"workspace rpc failed: HTTP {status}"` (`transport/web.rs:82,102`,
+   `transport/desktop.rs:104,124`); `"unexpected response to List"` (`transport/web.rs:82`) and
+   `"unexpected response to Read"` (`transport/web.rs:113`, `transport/desktop.rs:135`); and
+   `"failed to launch \`{bin} serve\` sidecar: {e}"` (`desktop_boot.rs:147`). §2 draws the line
+   that excludes them and says why.
 
 2. **"A test that fails when a key is missing from any locale" understates what is achievable.**
    The issue's AC asks for a runtime completeness test. With the mechanism chosen in §1, a missing
@@ -173,11 +175,11 @@ cannot see that the sandbox is off. They are UI copy and they are translated.
 
 | Category | Examples | Reason |
 |---|---|---|
-| **Server-originated text** | `EventKind::Log { message }`, `VerifyResult { detail }`, `ServerMessage::Error { message }` bodies | Produced by the engine and delivered over the `protocol` wire. The client has no key for them and inventing one would mistranslate. The **surrounding** copy (`error:`, `client:`, the `·` prefix) is translated; the payload passes through verbatim. |
+| **Server-originated text** | `EventKind::Log { message }`, `VerifyResult { detail }`, `ServerMessage::Error { message }` bodies | Produced by the engine and delivered over the `protocol` wire. The client has no key for them and inventing one would mistranslate. The **surrounding** copy (`error:`, `client:`) is translated; the payload passes through verbatim. |
 | **Protocol identifiers** | `Role` names (`Planner`, `ContextFinder`, `Coder`, `Verifier`), event-kind names (`FileEdit`, `Verify`, `TurnComplete`) | Stable wire vocabulary shared with the engine, the logs, and the docs. Translating them would make a user's report untranslatable back to a maintainer. They render as-is in every locale. |
 | **Crate-authored technical diagnostics** | `"socket closed"`, `"workspace rpc failed: HTTP {status}"`, `"unexpected response to List: …"`, `"failed to launch \`{bin} serve\` sidecar: {e}"` | See the boundary rule below. |
 | **The URL placeholder** | `ws://127.0.0.1:8787` | An example value, byte-identical in every language. Translating a URL is meaningless. (The issue lists it; this is a deliberate divergence.) |
-| **Glyphs and markers** | `▸ ✎ ✓ ✗ ● ⏸ ◷ ▾ — ↑ ↓ ●`(dirty) | Not language. |
+| **Glyphs and markers** | `▸ ✎ ✓ ✗ ● ⏸ ◷ ▾ — ↑ ↓ ·` and the dirty-buffer `●` | Not language. |
 | **Structural strings** | CSS classes, file paths, numbers, session ids | Not copy. |
 | **Engine/CLI output** | `otto run`, `otto serve` | Out of scope per the issue's own proposal. |
 
@@ -185,13 +187,23 @@ cannot see that the sandbox is off. They are UI copy and they are translated.
 
 The obvious rule — *"a string the engine sent is never translated; a string this crate authored
 always is"* — is **wrong**, and stating it would create a contradiction the implementer has to
-resolve by guessing. `transport/{web,desktop}.rs` and `desktop_boot.rs` author six strings that are
-plainly this crate's, yet translating them is the wrong call. The rule that actually holds is:
+resolve by guessing. `transport/{web,desktop}.rs` and `desktop_boot.rs` author four distinct
+messages (across seven call sites) that are plainly this crate's, yet translating them is the wrong
+call. The rule that actually holds is:
 
-> **Actionable copy addressed to the user is translated. Technical failure detail is not.**
+> **Interface copy — the words that describe the app's own state, its controls, and what the user
+> should do — is translated. Failure diagnostics carried on the transport's `Result<_, String>`
+> seam are not.**
 
-- `"URL and token are required"` (`app.rs:78`) tells the user what to *do*. Translated.
-- `"workspace rpc failed: HTTP 500"` tells the user what *broke*. Not translated.
+A narrower phrasing ("actionable copy is translated") is tempting but mis-describes the table:
+`No file open`, `binary file — not editable`, `disconnected`, `off`, and `seq {n}` are all purely
+informational, and all correctly translated. The rule has to cover interface *state*, not only
+instruction. Worked examples:
+
+- `"URL and token are required"` (`app.rs:78`) — instruction copy. Translated.
+- `"disconnected"`, `"sandbox: off"`, `"No file open"` — interface state. Translated.
+- `"workspace rpc failed: HTTP 500"`, `"socket closed"` — a failure diagnostic produced on the
+  transport seam. Not translated.
 
 Three reasons this is the right line, not merely a convenient one:
 
@@ -268,6 +280,14 @@ Environment sources, per target:
   (`Window`/`Location`/`History`/`WebSocket`/`MessageEvent`/`CloseEvent`/`ErrorEvent`):
   `Navigator` and `Storage` (§4), plus `Document` and `Element` for the
   `document.documentElement.lang` write (§5). All four are additive and wasm-only.
+
+  It also requires **one new direct dependency**: `Navigator::languages()` returns a
+  `js_sys::Array`, and `js-sys` is currently only a transitive lock entry — nothing under `src/`
+  uses it. It is added `optional = true` under the `web` feature. This costs no bundle bytes
+  (`wasm-bindgen` already pulls it in); it is a manifest edit, not new code weight. The
+  alternative — using only `navigator.language()`, which returns `Option<String>` and needs
+  nothing new — is rejected because it discards the ordered preference list, which is exactly what
+  makes the "first *parseable* tag" rule below worth having.
 - **desktop:** `sys_locale::get_locales()`.
 - **neither feature:** an empty slice, so `resolve_locale` yields `En`. (`cargo build
   --no-default-features` is an existing supported configuration — `editor/mod.rs:94` accommodates
@@ -367,12 +387,16 @@ read it through a single helper:
 ```rust
 /// The active locale for the calling component. Falls back to `En` when no provider is in scope.
 pub fn use_locale() -> Locale {
-    match try_consume_context::<Signal<Locale>>() {
+    match try_use_context::<Signal<Locale>>() {
         Some(sig) => sig(),   // TRACKED read — this is what subscribes the component
         None => Locale::En,
     }
 }
 ```
+
+`try_use_context` (the `dioxus-hooks` **hook**), not the bare `try_consume_context` — the hook form
+caches the lookup on first render and obeys the positional-hook rules the rest of this crate already
+follows. Both exist; the hook is the correct one inside a component body.
 
 `sig()` is a **tracked read**, which is what subscribes a component to the signal, so Dioxus
 re-renders exactly the subscribers when the picker writes. (This is the same tracked-read discipline
@@ -397,6 +421,11 @@ test for regressions, but §7 asserts it anyway at the level a host test can.
 On change the picker performs exactly three things: `locale.set(next)`, `store_persisted_locale`,
 and — on web only — set `document.documentElement.lang` to the new tag so assistive tech announces
 content correctly. The `lang` attribute is also set once at startup from the resolved locale.
+
+`index.html`'s `<html>` element carries no `lang` today, so the pre-mount document has none until
+that startup effect runs. A static `lang="en"` is added there — it costs nothing, and it means the
+document is never *un*-labeled, only briefly mislabeled in the rare non-`en` case, which is
+strictly better for assistive tech than an absent attribute.
 
 ### Hook-order safety
 
@@ -449,9 +478,13 @@ pub fn render_row(locale: Locale, msg: &RowMsg) -> String;
 
 `describe_event` keeps its signature and call sites but builds a `RowMsg` instead of a `String`.
 `error_row` keeps its `&str` parameter (its payload is always server-originated). `client_error_row`
-takes a `ClientText` — the two authored call sites (`app.rs:78`'s validation message) pass
-`Authored(Msg::…)`, and the transport/boot diagnostic call sites pass `Passthrough(e)`.
-`EventLog` reads the locale via `use_locale()` and calls `render_row` per row.
+takes a `ClientText`: there is **exactly one** authored call site — `app.rs:78`'s validation message
+— which passes `Authored(Msg::UrlAndTokenRequired)`; the other seven (`app.rs:182,201,224,310,328,361`
+and the desktop `SpawnFailed` arm at `:427`) are transport/boot diagnostics and pass
+`Passthrough(…)`. `EventLog` reads the locale via `use_locale()` and calls `render_row` per row.
+
+`RowMsg` and `ClientText` derive `Clone` and `PartialEq` so `LogRow` keeps the derives it has today
+(`Signal<Vec<LogRow>>` requires them).
 
 **`Verify`'s empty-detail case is authored copy and gets a catalog key.** Today
 `view_model.rs:220-231` renders the literal `"ok"` when `detail.is_empty()`, and the server's
@@ -562,9 +595,13 @@ skipped.
 Two files, so a new component does not silently reintroduce a literal:
 
 - **`CLAUDE.md`** — the `ui-dioxus` paragraph in "What this is" gains a sentence: the UI is
-  localized (`en`/`de`/`es`/`hi`/`zh-Hans`); all authored user-facing copy goes through
-  `src/i18n/` (`t`/`tf`) and never appears as an RSX literal; server-originated text and protocol
-  identifiers are passed through untranslated (the §2 rule, stated in one line).
+  localized (`en`/`de`/`es`/`hi`/`zh-Hans`); interface copy goes through `src/i18n/` (`t`/`tf`, via
+  the `use_locale()` hook) and never appears as an RSX literal; **server-originated text, protocol
+  identifiers, *and the crate's own transport/boot diagnostics*** pass through untranslated.
+  It must state §2's **actual** rule — interface copy vs. transport-seam failure diagnostics — not
+  the authored-vs-received rule §2 rejects, and must name the diagnostics carve-out explicitly.
+  §9's whole purpose is stopping a future component from regressing the boundary, so a doc line
+  that restates the wrong rule is worse than none.
 - **`README.md`** — the "Serving the engine + the browser UI" section notes the supported languages,
   that the UI follows the browser/OS locale, and that the picker in the status strip overrides and
   persists it.
