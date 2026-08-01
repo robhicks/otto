@@ -43,6 +43,9 @@ calls during a turn; this is an operator running a command, exactly like `git cl
 - An interactive `/plugin` TUI/REPL.
 - Any serve-path exposure. This is a CLI-only action.
 
+*(All three install-side deferrals shipped since: remote-source materialization 2026-07-10; the
+interactive `/plugin` TUI and project-level installs 2026-07-30.)*
+
 ## Code layout
 
 Following the existing split — pure discovery/parsing in `extensions`, OS/process-touching code at

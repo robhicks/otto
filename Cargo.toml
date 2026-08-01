@@ -26,6 +26,14 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
+# Released-binary profile: single codegen unit + LTO + stripped symbols keep the shipped
+# `otto` binary lean. Only the release-build path (CI release workflow / users building from
+# source) is affected; dev and test builds are untouched.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 async-trait = "0.1"

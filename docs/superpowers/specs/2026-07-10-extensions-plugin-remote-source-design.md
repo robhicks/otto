@@ -26,7 +26,8 @@ local-path minority. This slice makes remote-sourced install work end to end.
 This is **slice 1 of 3** in the plugin-install follow-up decomposition. The other two —
 project-level marketplace installs (writing under a project `.claude/` instead of `~/.claude/`)
 and an interactive `/plugin` UX — are independent subsystems and get their own spec → plan →
-implementation cycles later.
+implementation cycles later. *(Both shipped 2026-07-30: `--project`/`--root` scoping and the
+interactive TUI, per the install slice's deferral.)*
 
 ## Goal
 

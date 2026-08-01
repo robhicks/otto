@@ -1,6 +1,6 @@
 [package]
 name = "otto-engine"
-version = "0.1.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,6 +21,25 @@ firecracker = ["otto-remote/firecracker"]
 candle = ["otto-providers/candle"]
 candle-cuda = ["candle", "otto-providers/candle-cuda"]
 candle-metal = ["candle", "otto-providers/candle-metal"]
+
+# RPM packaging for Fedora/RHEL-family — `cargo generate-rpm -p crates/engine`, run from the
+# workspace root (assets are relative to the CWD, which is also where cargo builds). Consumed by
+# the release workflow's build-rpm job; keep the two in sync. The job passes `--target <triple>`,
+# which redirects `target/release/` to `target/<triple>/release/` — where `cargo build --target`
+# puts the binary. bubblewrap is a weak (recommends) dependency: dnf pulls it by default so
+# `otto run`'s sandbox works out of the box, but a serve-only install can opt out with
+# --no-recommends.
+[package.metadata.generate-rpm]
+name = "otto"
+summary = "Agentic coding engine: a deterministic orchestrator drives a spine of atomic agents"
+license = "MIT OR Apache-2.0"
+url = "https://github.com/robhicks/otto"
+assets = [
+    { source = "target/release/otto", dest = "/usr/bin/otto", mode = "0755" },
+]
+
+[package.metadata.generate-rpm.recommends]
+bubblewrap = "*"
 
 [dependencies]
 otto-protocol = { path = "../protocol" }
