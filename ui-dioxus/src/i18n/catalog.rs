@@ -25,6 +25,28 @@ macro_rules! messages {
             /// names the variants it needs. Without the gate it is dead code in every real build.
             #[cfg(test)]
             pub const ALL: &'static [Msg] = &[$(Msg::$key),+];
+
+            /// Whether this message's template takes `{name}` placeholders.
+            ///
+            /// Derived from the `en` template at macro-expansion time, so it cannot drift from the
+            /// catalog. `placeholder_sets_match_across_locales` already proves every locale of a
+            /// key agrees on its placeholder set, so `en` is representative.
+            ///
+            /// Exists so `ClientText::authored`/`authored_with` can assert they were handed the
+            /// right kind of key: passing a parameterized `Msg` to `authored` renders the literal
+            /// `{bin}` to a user, because `tf` emits an unsupplied placeholder verbatim by design.
+            pub const fn has_placeholders(self) -> bool {
+                let template = match self { $(Msg::$key => $en),+ };
+                let bytes = template.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'{' {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            }
         }
 
         /// Look up a message. Exhaustive over `(Locale, Msg)` with NO wildcard arm — that is what
@@ -160,6 +182,12 @@ messages! {
 
     // ---- Desktop shell -------------------------------------------------------------------
     ChooseWorkspaceFolder { en: "Choose a workspace folder", de: "Arbeitsbereichsordner auswählen", es: "Elegir una carpeta de espacio de trabajo", hi: "कार्यस्थान फ़ोल्डर चुनें", zh: "选择工作区文件夹" }
+    // Localized framing, verbatim payload — the shape `RowServerError` establishes. `{bin}` is a
+    // filesystem path and `{detail}` an OS error; both pass through byte-identically. The
+    // backtick-quoted `serve` is a CLI sub-command and stays untranslated in every locale (see
+    // `protocol_identifiers_survive_translation`). Decision recorded in
+    // `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md` §3.
+    SidecarSpawnFailed { en: "failed to launch `{bin} serve` sidecar: {detail}", de: "Sidecar `{bin} serve` konnte nicht gestartet werden: {detail}", es: "no se pudo iniciar el sidecar `{bin} serve`: {detail}", hi: "साइडकार `{bin} serve` लॉन्च नहीं हो सका: {detail}", zh: "无法启动 `{bin} serve` 边车进程：{detail}" }
 
     // ---- Language picker -----------------------------------------------------------------
     // The picker's accessible name. The OPTION labels are endonyms (`Locale::endonym`) and are
@@ -339,6 +367,12 @@ mod tests {
                     "{m:?} lost the TurnComplete identifier in {loc:?}"
                 );
             }
+            // `serve` is a CLI sub-command — shared vocabulary with the engine and the docs, and
+            // the token a user would grep for. It survives translation like the event-kind names.
+            assert!(
+                t(loc, Msg::SidecarSpawnFailed).contains("serve"),
+                "SidecarSpawnFailed lost the `serve` sub-command in {loc:?}"
+            );
         }
     }
 

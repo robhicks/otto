@@ -4,9 +4,12 @@ use std::path::PathBuf;
 
 use otto_protocol::{Command, ServerMessage};
 
+mod seam_error;
+pub use seam_error::SeamError;
+
 /// An inbound socket event, delivered over the receiver `connect` returns.
 pub enum SocketEvent {
-    Message(Result<ServerMessage, String>),
+    Message(Result<ServerMessage, SeamError>),
     Closed,
     Errored,
 }
@@ -14,7 +17,7 @@ pub enum SocketEvent {
 /// The outbound half of a live socket: serialize + send a `Command`. Boxed so the spine holds a
 /// trait object, never a concrete socket type.
 pub trait Sink {
-    fn send(&self, cmd: &Command) -> Result<(), String>;
+    fn send(&self, cmd: &Command) -> Result<(), SeamError>;
 
     /// Tear the socket down explicitly. Dropping the sink is NOT enough on web — the inbound
     /// `web_sys` closures are `.forget()`'d, so the real `WebSocket` outlives the `Rc` and keeps
@@ -73,7 +76,7 @@ pub fn connect(
         Box<dyn Sink>,
         futures_channel::mpsc::UnboundedReceiver<SocketEvent>,
     ),
-    String,
+    SeamError,
 > {
     #[cfg(all(test, target_arch = "wasm32"))]
     connect_probe::record(ws_url);
@@ -92,15 +95,14 @@ pub fn connect(
     #[cfg(not(any(feature = "web", feature = "desktop")))]
     {
         let _ = ws_url;
-        Err(
-            "no transport feature enabled (build with --features web or --features desktop)"
-                .to_string(),
-        )
+        Err(SeamError::new(
+            "no transport feature enabled (build with --features web or --features desktop)",
+        ))
     }
 }
 
 /// List every file in the served workspace (`POST /workspace` `List`).
-pub async fn list_files(http_base: &str, token: &str) -> Result<Vec<PathBuf>, String> {
+pub async fn list_files(http_base: &str, token: &str) -> Result<Vec<PathBuf>, SeamError> {
     #[cfg(feature = "web")]
     {
         web::list_files_impl(http_base, token).await
@@ -112,15 +114,14 @@ pub async fn list_files(http_base: &str, token: &str) -> Result<Vec<PathBuf>, St
     #[cfg(not(any(feature = "web", feature = "desktop")))]
     {
         let _ = (http_base, token);
-        Err(
-            "no transport feature enabled (build with --features web or --features desktop)"
-                .to_string(),
-        )
+        Err(SeamError::new(
+            "no transport feature enabled (build with --features web or --features desktop)",
+        ))
     }
 }
 
 /// Read one file's bytes (`POST /workspace` `Read`).
-pub async fn read_file(http_base: &str, token: &str, path: PathBuf) -> Result<Vec<u8>, String> {
+pub async fn read_file(http_base: &str, token: &str, path: PathBuf) -> Result<Vec<u8>, SeamError> {
     #[cfg(feature = "web")]
     {
         web::read_file_impl(http_base, token, path).await
@@ -132,9 +133,8 @@ pub async fn read_file(http_base: &str, token: &str, path: PathBuf) -> Result<Ve
     #[cfg(not(any(feature = "web", feature = "desktop")))]
     {
         let _ = (http_base, token, path);
-        Err(
-            "no transport feature enabled (build with --features web or --features desktop)"
-                .to_string(),
-        )
+        Err(SeamError::new(
+            "no transport feature enabled (build with --features web or --features desktop)",
+        ))
     }
 }

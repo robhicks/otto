@@ -9,18 +9,18 @@ use futures_util::{SinkExt, StreamExt};
 use otto_protocol::{Command, ServerMessage, WorkspaceRequest, WorkspaceResponse};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{Sink, SocketEvent};
+use super::{SeamError, Sink, SocketEvent};
 
 // The outbound sender lives behind a `RefCell<Option<..>>` so `close()` can take it out and drop
 // it explicitly (an `UnboundedSender` closes its channel only when the last sender drops; the sink
 // holds the only one). Single-threaded use, matching the `!Send` `Rc<dyn Sink>` the spine stores.
 struct DesktopSink(std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>>);
 impl Sink for DesktopSink {
-    fn send(&self, cmd: &Command) -> Result<(), String> {
-        let json = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+    fn send(&self, cmd: &Command) -> Result<(), SeamError> {
+        let json = serde_json::to_string(cmd).map_err(|e| SeamError::new(e.to_string()))?;
         match self.0.borrow().as_ref() {
-            Some(tx) => tx.send(json).map_err(|e| e.to_string()),
-            None => Err("socket closed".to_string()),
+            Some(tx) => tx.send(json).map_err(|e| SeamError::new(e.to_string())),
+            None => Err(SeamError::new("socket closed")),
         }
     }
 
@@ -33,7 +33,7 @@ impl Sink for DesktopSink {
 
 pub fn connect_impl(
     ws_url: &str,
-) -> Result<(Box<dyn Sink>, UnboundedReceiver<SocketEvent>), String> {
+) -> Result<(Box<dyn Sink>, UnboundedReceiver<SocketEvent>), SeamError> {
     let (inbound_tx, inbound_rx) = unbounded::<SocketEvent>();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let url = ws_url.to_string();
@@ -59,8 +59,8 @@ pub fn connect_impl(
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
-                        let parsed =
-                            serde_json::from_str::<ServerMessage>(&txt).map_err(|e| e.to_string());
+                        let parsed = serde_json::from_str::<ServerMessage>(&txt)
+                            .map_err(|e| SeamError::new(e.to_string()));
                         let _ = inbound_reader.unbounded_send(SocketEvent::Message(parsed));
                     }
                     Ok(Message::Close(_)) | Err(_) => {
@@ -91,7 +91,7 @@ async fn rpc(
     http_base: &str,
     token: &str,
     req: &WorkspaceRequest,
-) -> Result<WorkspaceResponse, String> {
+) -> Result<WorkspaceResponse, SeamError> {
     let url = format!("{}/workspace", http_base.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .post(&url)
@@ -99,18 +99,24 @@ async fn rpc(
         .json(req)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| SeamError::new(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(format!("workspace rpc failed: HTTP {}", resp.status()));
+        return Err(SeamError::new(format!(
+            "workspace rpc failed: HTTP {}",
+            resp.status()
+        )));
     }
-    let parsed: WorkspaceResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let parsed: WorkspaceResponse = resp
+        .json()
+        .await
+        .map_err(|e| SeamError::new(e.to_string()))?;
     if let WorkspaceResponse::Error { message } = &parsed {
-        return Err(message.clone());
+        return Err(SeamError::new(message.clone()));
     }
     Ok(parsed)
 }
 
-pub async fn list_files_impl(http_base: &str, token: &str) -> Result<Vec<PathBuf>, String> {
+pub async fn list_files_impl(http_base: &str, token: &str) -> Result<Vec<PathBuf>, SeamError> {
     match rpc(
         http_base,
         token,
@@ -121,7 +127,9 @@ pub async fn list_files_impl(http_base: &str, token: &str) -> Result<Vec<PathBuf
     .await?
     {
         WorkspaceResponse::List { paths } => Ok(paths),
-        other => Err(format!("unexpected response to List: {other:?}")),
+        other => Err(SeamError::new(format!(
+            "unexpected response to List: {other:?}"
+        ))),
     }
 }
 
@@ -129,9 +137,11 @@ pub async fn read_file_impl(
     http_base: &str,
     token: &str,
     path: PathBuf,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, SeamError> {
     match rpc(http_base, token, &WorkspaceRequest::Read { path }).await? {
         WorkspaceResponse::Read { bytes } => Ok(bytes),
-        other => Err(format!("unexpected response to Read: {other:?}")),
+        other => Err(SeamError::new(format!(
+            "unexpected response to Read: {other:?}"
+        ))),
     }
 }

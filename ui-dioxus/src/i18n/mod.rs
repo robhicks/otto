@@ -3,15 +3,28 @@
 //!
 //! The boundary this module enforces (design spec §2): **interface copy — the words that describe
 //! the app's own state, its controls, and what the user should do — is translated. Failure
-//! diagnostics carried on the transport's `Result<_, String>` seam are not.** The line is *where
-//! the text comes from*, not whether it is actionable: `No file open`, `binary file — not
+//! diagnostics carried on the transport's `Result<_, SeamError>` seam are not.** The line is
+//! *where the text comes from*, not whether it is actionable: `No file open`, `binary file — not
 //! editable`, `disconnected`, `off`, and `seq {n}` are purely informational yet all correctly
 //! translated, because each describes the app's own state.
 //! Server-originated payloads (`EventKind::Log`,
 //! `VerifyResult.detail`, `ServerMessage::Error.message`), protocol identifiers (`Role` names,
-//! `FileEdit`/`Verify`/`TurnComplete`), and this crate's transport/boot diagnostics render verbatim
+//! `FileEdit`/`Verify`/`TurnComplete`), and this crate's transport diagnostics render verbatim
 //! in every locale — they share a surface with permanently-English engine output, and their
 //! audience is a bug report.
+//!
+//! That last carve-out is enforced by type rather than by convention: `transport::SeamError`'s
+//! constructor is `pub(in crate::transport)`, so `ClientText::Passthrough` cannot be handed prose
+//! authored anywhere else. What the type does NOT decide is whether text written *inside*
+//! `transport/` is a diagnostic or interface copy — that stays a review question, so do not put
+//! user-facing instructions there.
+//!
+//! **The desktop boot diagnostic is the one deliberate exception.** The sidecar-spawn failure is
+//! not on the transport seam — it is produced before any socket exists, and it tells the user
+//! auto-connect did not happen and to use the manual form — so it is interface copy: the sentence
+//! is localized (`Msg::SidecarSpawnFailed`) while its `{bin}` and `{detail}` payloads pass through
+//! byte-identically. Amended 2026-08-01; full reasoning in
+//! `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md` §3.
 
 use dioxus::prelude::*;
 

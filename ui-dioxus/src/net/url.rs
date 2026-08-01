@@ -30,10 +30,10 @@ pub fn build_ws_url(
 ///
 /// The leak this closes: `build_ws_url` puts the bearer token in the query string, and the
 /// browser's `WebSocket::new` rejects a malformed URL with a `SyntaxError` whose text **quotes the
-/// offending URL in full**. That string is a `Result<_, String>` transport diagnostic, so it flows
-/// straight into `client_error_row(ClientText::Passthrough(..))` and renders in the event log — a
-/// surface this crate's own docs describe as "their audience is a bug report", i.e. exactly the
-/// text a user is most likely to copy into an issue.
+/// offending URL in full**. That string becomes a `transport::SeamError`, so it flows straight
+/// into `client_error_row(ClientText::Passthrough(..))` and renders in the event log — a surface
+/// this crate's own docs describe as "their audience is a bug report", i.e. exactly the text a
+/// user is most likely to copy into an issue.
 ///
 /// Redaction rather than a fixed authored message, deliberately: the host, port, path, `session`,
 /// and `last_seq` are what make "the URL was rejected" actionable, and replacing the whole
@@ -43,11 +43,15 @@ pub fn build_ws_url(
 /// query parameters and any surrounding prose survive. Over-matching (a key that merely *ends* in
 /// `token=`) redacts something harmless; under-matching would leak, so the bias is deliberate.
 ///
-/// Its only production caller is `transport/web.rs` (the desktop transport discards its connect
-/// error entirely, so nothing there can leak), hence the dead-code allow off-web. It lives in this
-/// browser-free module rather than beside its caller so it stays host-testable — the tests below
-/// are the ones that actually pin the redaction.
-#[cfg_attr(not(feature = "web"), allow(dead_code))]
+/// Its production caller is `transport::SeamError::new` — the seam's single constructor — so
+/// every transport diagnostic is redacted by construction on **both** targets, rather than at
+/// hand-audited call sites. That is why there is no longer a dead-code allow here: the seam type
+/// is compiled under every feature combination, including `--no-default-features`.
+///
+/// It lives in this browser-free module rather than beside a caller so it stays host-testable —
+/// the tests below are the ones that actually pin the redaction, and
+/// `transport::tests::new_redacts_a_bearer_token_whatever_the_call_site_formats` pins that the
+/// constructor applies it.
 pub fn redact_token(diagnostic: &str) -> String {
     const KEY: &str = "token=";
     const MASK: &str = "<redacted>";

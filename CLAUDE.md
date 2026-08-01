@@ -50,12 +50,17 @@ The UI is **localized** (`en`/`de`/`es`/`hi`/`zh-Hans`): interface copy goes thr
 compile-time catalog in `ui-dioxus/src/i18n/` (`t`/`tf`, read via the `use_locale()` hook) and must
 never appear as a literal in the RSX — a missing key or locale is a compile error, not a runtime
 gap. The boundary is *interface copy — the app's own state, controls, and instructions — is
-translated; failure diagnostics carried on the transport's `Result<_, String>` seam are not*. So
+translated; failure diagnostics carried on the transport's `Result<_, SeamError>` seam are not*. So
 server-originated text (`EventKind::Log`, `VerifyResult.detail`, `ServerMessage::Error`), protocol
-identifiers (`Role` names, `FileEdit`/`Verify`/`TurnComplete`), **and the crate's own
-transport/boot diagnostics** all pass through untranslated. Locale follows the browser/OS by
+identifiers (`Role` names, `FileEdit`/`Verify`/`TurnComplete`), **and the crate's own transport
+diagnostics** all pass through untranslated — the last enforced by type rather than convention:
+`transport::SeamError`'s constructor is private to `transport/`, so `ClientText::Passthrough`
+cannot be handed prose authored anywhere else. The desktop **boot** diagnostic is the one
+deliberate exception: the sidecar-spawn failure is interface copy and renders localized framing
+around a verbatim `{bin}`/`{detail}` payload. Locale follows the browser/OS by
 default; a picker in the status strip overrides it and persists the choice (`localStorage` on web,
-the OS config dir on desktop). See `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`.
+the OS config dir on desktop). See `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`
+and `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md`.
 
 `docs/ARCHITECTURE.md` describes the **full intended design**, including crates that do
 not exist yet (`cli`, etc. — `retrieval`, `extensions`, and `mcp-lsp` are now shipped, see the
