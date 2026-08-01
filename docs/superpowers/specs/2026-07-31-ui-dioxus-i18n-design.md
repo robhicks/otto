@@ -1,6 +1,7 @@
 # Dioxus UI localization design
 
-> **Status:** DRAFT — an i18n layer for `ui-dioxus/` with `en`/`de`/`es`/`hi`/`zh-Hans` catalogs,
+> **Status:** IMPLEMENTED — shipped in [#118](https://github.com/robhicks/otto/pull/118).
+> An i18n layer for `ui-dioxus/` with `en`/`de`/`es`/`hi`/`zh-Hans` catalogs,
 > environment detection, a persisted in-UI language picker, and a live locale switch.
 > **Implements:** [#114](https://github.com/robhicks/otto/issues/114).
 > **Depends on:** the Dioxus migration (COMPLETE) — `docs/superpowers/plans/2026-07-22-ui-dioxus-migration.md`.
@@ -354,7 +355,8 @@ Properties:
 - **Desktop writes go to the OS config dir, never the workspace root.** The UI must not create files
   inside the user's workspace: the engine indexes and edits that tree, and a settings file appearing
   there would be surprising at best. `dirs` (already a workspace dependency at `crates/engine`,
-  version `5`) resolves the config dir; it is added optional under `desktop` only. The write is a
+  where it is pinned `5`) resolves the config dir; it is added optional under `desktop` only, at
+  version **`6`** — see risk 3 for why the two pins differ. The write is a
   single `create_dir_all` + `write` of a short ASCII tag to a fixed filename — no user-controlled
   path component, so there is no traversal surface.
 
@@ -679,8 +681,12 @@ The test suite cannot cover the two runtime detection/persistence paths. After m
    prediction that turned out to be off by 4×.
 3. **`sys-locale` and `dirs` are new desktop-only dependencies.** Both are small and neither can
    reach the wasm build (optional, under `desktop`). `dirs` is already a workspace dependency at
-   `crates/engine/Cargo.toml:37`; `ui-dioxus/` is its own workspace root, so the version is pinned
-   independently and is matched to `5` for consistency.
+   `crates/engine/Cargo.toml:37`, pinned `5` — but `ui-dioxus/` is its own workspace root with its
+   own lockfile, which that pin does not constrain. It ships **`6`**, deliberately: this crate's
+   lockfile already resolves `dirs 6.0.0` transitively via `wry`/`tray-icon`, so pinning `5` "for
+   consistency" would add a SECOND `dirs` tree (5.0.1 + dirs-sys 0.4 + option-ext) rather than
+   reuse the one already linked. Matching the workspace number would have cost dependencies, not
+   saved them.
 4. **The `LogRow` refactor is the widest blast radius in this change** — it touches `view_model.rs`,
    `event_log.rs`, and every push site in `app.rs`. It is mechanical and fully covered by the
    rewritten row tests, but it is where a mistake would land.
