@@ -1,8 +1,10 @@
 //! The message catalog: one entry per key, all five locales side by side.
 //!
 //! Adding a key requires all five translations at the call site or the macro does not parse;
-//! adding a `Locale` variant without extending the macro fails `t`'s exhaustive match. Missing
-//! translations are therefore a COMPILE error, not a runtime gap.
+//! adding a `Locale` variant without extending the macro fails `t`'s exhaustive match. An ABSENT
+//! translation — a missing key or a missing locale — is therefore a COMPILE error, not a runtime
+//! gap. A *stub* is not: `de: ""` compiles fine, so it is caught by test instead
+//! (`no_message_is_empty_in_any_locale`).
 //!
 //! Keys whose template embeds a protocol identifier (`FileEdit`, `Verify`, `TurnComplete`) keep
 //! that identifier byte-identical in every locale — spec §2, enforced by
@@ -167,6 +169,12 @@ mod tests {
     use crate::i18n::Locale;
 
     /// Collect the `{name}` placeholders in a template, in order of appearance.
+    ///
+    /// An unterminated `{` PANICS rather than returning what was collected so far. Truncating
+    /// silently would let two different malformed templates compare equal in
+    /// `placeholder_sets_match_across_locales` — `"a {x} b {y"` and `"a {x} b {z"` both truncate to
+    /// `["x"]` — which is the same blindness `every_brace_is_a_closed_placeholder` had. Any caller
+    /// reaching this already ran that test's structural scan, so a panic here means a genuine bug.
     fn placeholders(s: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut rest = s;
@@ -177,7 +185,7 @@ mod tests {
                     out.push(after[..close].to_string());
                     rest = &after[close + 1..];
                 }
-                None => break,
+                None => panic!("unterminated '{{' in template: {s}"),
             }
         }
         out.sort();
@@ -216,19 +224,76 @@ mod tests {
         }
     }
 
+    /// Walk a template exactly the way `tf` does, reporting the first structural fault.
+    ///
+    /// Deliberately NOT a `{`/`}` count comparison. Counting is blind to ORDER, so `"done} at {seq"`
+    /// balances (one of each) and passes while `tf` substitutes nothing in it — the `}` is consumed
+    /// as literal text and the `{seq}` is left unterminated. The two faults `tf` can hit are:
+    ///
+    /// (a) a `{` with no following `}` — `tf` emits the rest verbatim, so `{seq` renders raw;
+    /// (b) a `}` reached before any `{` opened it — `tf` treats it as literal text, so a template
+    ///     whose placeholder braces are transposed silently loses its substitution.
+    fn brace_fault(s: &str) -> Option<String> {
+        let mut rest = s;
+        while let Some(open) = rest.find('{') {
+            // Everything before the `{` is literal text as far as `tf` is concerned; a `}` in
+            // there was never opened.
+            if let Some(stray) = rest[..open].find('}') {
+                return Some(format!("'}}' at byte {stray} is not closing any '{{'"));
+            }
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('}') else {
+                return Some("'{' is never closed".to_string());
+            };
+            rest = &after[close + 1..];
+        }
+        // The tail after the last placeholder is literal too.
+        rest.find('}')
+            .map(|_| "'}' is not closing any '{'".to_string())
+    }
+
     #[test]
     fn every_brace_is_a_closed_placeholder() {
-        // `tf` cannot escape a literal brace, so an unbalanced one is always a catalog bug.
+        // `tf` cannot escape a literal brace, so any brace that isn't part of a well-formed
+        // `{name}` is always a catalog bug.
         for &m in Msg::ALL {
             for loc in Locale::ALL {
                 let s = t(loc, m);
-                assert_eq!(
-                    s.matches('{').count(),
-                    s.matches('}').count(),
-                    "unbalanced braces for {m:?} in {loc:?}: {s}"
+                assert!(
+                    brace_fault(s).is_none(),
+                    "brace fault for {m:?} in {loc:?}: {} in {s}",
+                    brace_fault(s).unwrap()
                 );
             }
         }
+    }
+
+    #[test]
+    fn brace_fault_rejects_what_balanced_counts_accept() {
+        // The regression this guardrail exists for: `"done} at {seq"` has one `{` and one `}`, so
+        // the old count comparison passed it, while `tf` substitutes nothing in it at all.
+        assert_eq!(
+            tf(Locale::En, Msg::SeqLabel, &[("seq", "7")]),
+            "seq 7",
+            "sanity: a well-formed template does substitute"
+        );
+        assert!(brace_fault("done} at {seq").is_some());
+        // Both faults independently.
+        assert!(brace_fault("a {x} b {y").is_some()); // unterminated `{`
+        assert!(brace_fault("a} b").is_some()); // stray `}` with no `{` at all
+        assert!(brace_fault("{x} y}").is_some()); // stray `}` in the tail
+                                                  // …and well-formed templates still pass.
+        assert!(brace_fault("no placeholders").is_none());
+        assert!(brace_fault("{a} and {b}").is_none());
+        assert!(brace_fault("").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "unterminated")]
+    fn placeholders_panics_rather_than_truncating() {
+        // Truncating on an unterminated `{` would make `"a {x} b {y"` and `"a {x} b {z"` both
+        // yield `["x"]`, so `placeholder_sets_match_across_locales` could not tell them apart.
+        placeholders("a {x} b {y");
     }
 
     #[test]
