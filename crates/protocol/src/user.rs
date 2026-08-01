@@ -15,8 +15,11 @@ const MAX_LEN: usize = 64;
 /// A principal's stable identifier.
 ///
 /// Validated on construction **and on deserialization**: 1–64 characters of `[a-z0-9._-]`. That
-/// charset keeps it safe as a sqlite key, as an `otpauth://` URI label (slice 1b), and in a log
-/// line without escaping.
+/// charset keeps it safe as a sqlite key, as an `otpauth://` URI label (slice 1b), as a path
+/// segment, and in a log line without escaping.
+///
+/// The length bound is on **bytes**, which equals characters here because the charset admits only
+/// ASCII — loosen the charset and the two stop coinciding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct UserId(String);
@@ -30,6 +33,16 @@ impl UserId {
         if !s.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
         }) {
+            return Err(InvalidUserId);
+        }
+        // Must START with a letter or digit. The charset above alone would accept `.`, `..`,
+        // `.hidden`, and `-flag`: `..` is a path traversal the moment a `UserId` is used as a
+        // directory name (per-owner workspace roots are a planned slice), a leading `.` makes a
+        // hidden file, and a leading `-` reads as a flag to any program handed the value as argv
+        // — the same class of hazard `mcp-git` already guards against. Cheap to require now,
+        // expensive to retrofit once this type is a persisted key.
+        let first = s.as_bytes()[0];
+        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
             return Err(InvalidUserId);
         }
         Ok(Self(s.to_string()))
@@ -103,6 +116,19 @@ mod tests {
         ] {
             assert!(UserId::parse(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    /// The charset alone would accept every one of these. An id must start with a letter or
+    /// digit, because `..` is a path traversal once a UserId names a directory, a leading `.`
+    /// makes a hidden file, and a leading `-` reads as a flag in argv.
+    #[test]
+    fn parse_rejects_ids_that_do_not_start_with_a_letter_or_digit() {
+        for bad in [".", "..", "...", ".hidden", "-flag", "--flag", "_leading"] {
+            assert!(UserId::parse(bad).is_err(), "should reject {bad:?}");
+        }
+        // ...while the same characters remain legal anywhere after the first byte.
+        assert!(UserId::parse("a.b_c-d").is_ok());
+        assert!(UserId::parse("a..b").is_ok());
     }
 
     #[test]
