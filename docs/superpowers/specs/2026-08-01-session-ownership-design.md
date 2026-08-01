@@ -101,6 +101,11 @@ than by restructuring the store.
    unaffected; only a *nonexistent* id behaves differently, and it now fails fast instead of
    creating orphaned rows. That prior behavior was a latent bug, not a contract, and no test
    asserted it.
+
+   A second, much smaller textual divergence, recorded for exhaustiveness: `abort` on an unknown
+   session now fails at `authorize` with `no session <id>` where it previously fell through to
+   `set_status`'s `set_status: no session <id>`. Error in both cases, so no pass/fail behavior
+   changed — only the string, which nothing pattern-matches on.
 3. A scoped read for the wrong owner returns a message **byte-for-byte identical** to the one for a
    nonexistent session (asserted by a test comparing the two strings), so the API is not an
    existence oracle.
@@ -278,6 +283,20 @@ learns nothing in the meantime — `replay_since` at `:576` is already owner-sco
 With exactly one principal the attach-time check is unobservable anyway. Slice 1b adds it together
 with real principals, and can fix the pre-existing "unknown session attaches blind" oddity at the
 same time, where the behavior change is in scope and reviewable.
+
+**`PromoteToRemote` / `DemoteToLocal` are also not ownership-checked, and this one is a real gap.**
+`serve.rs:672-676` dispatches both straight into `handle_handover`, which calls `promote()` /
+`accept_demotion` on the session id without consulting a principal. Unlike the `SendPrompt` path
+there is no `EngineService::authorize` behind it to catch the case, because handover does not go
+through a client-facing `EngineService` method — `export_promotion` is machine-to-machine and
+derives the owner from the session itself. So a connection attached via an explicit `?session=`
+could move a session it does not own.
+
+This is **not a regression** — before this slice there was no ownership concept to check against,
+and it is unobservable while `local` is the only principal — but it is the one place where slice 1a
+leaves a hole rather than merely deferring a check to a layer that already covers it. Slice 1b must
+add an explicit `authorize` call in the WS command loop for both commands. It is called out here and
+in a `NOT YET CHECKED ANYWHERE` comment at `crates/engine/src/service.rs:797` so it cannot be missed.
 
 ---
 

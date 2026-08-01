@@ -796,8 +796,15 @@ impl EngineService {
     ) -> anyhow::Result<otto_remote::PromoteBundle> {
         // Machine-to-machine: there is no connected principal. The owner is derived from the
         // session purely to satisfy the owner-scoped `snapshot`; passing it back in as an
-        // authorization check would be a tautology. The real ownership check for handover
-        // happens on the source, in the WS command loop.
+        // authorization check would be a tautology.
+        //
+        // NOT YET CHECKED ANYWHERE: the ownership check for handover belongs on the source, in
+        // `serve.rs`'s WS command loop where a principal exists — but `handle_handover` does not
+        // perform one today, so `PromoteToRemote`/`DemoteToLocal` reach this path without the
+        // caller having proved ownership. That is not a regression (before session ownership
+        // existed there was nothing to check) and it is unobservable while `local` is the only
+        // principal, but it is a real gap that the identity slice must close. Do not read this
+        // comment as saying the check already exists.
         let owner = self.store.owner_of(session).await?;
         Ok(otto_remote::PromoteBundle {
             session: self.store.snapshot(&owner, session).await?,
