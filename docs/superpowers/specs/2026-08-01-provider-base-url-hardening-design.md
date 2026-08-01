@@ -227,6 +227,71 @@ Keeping them separate means the pure string function stays trivially testable ac
 
 ---
 
+## §4 — Validating the destination is not enough; the route must be pinned too
+
+**Added after the independent security review**, which found that §1–§2 alone do not deliver the
+property this change claims. Both gaps were verified against the vendored reqwest 0.12.28 source
+rather than taken on argument.
+
+**Redirects.** `reqwest::Client::new()` keeps the default `Policy::limited(10)`, and
+`redirect.rs:239-251` strips `Authorization` only when `next.host_str() != previous.host_str() ||
+next.port_or_known_default() != previous.port_or_known_default()`. **Scheme is not part of that
+test.** So a validated `https://gw:8443` answering `302 Location: http://gw:8443/…` is same-host,
+same-port — and the `Bearer` token is re-sent *in cleartext*, which is exactly the outcome §1
+exists to prevent. Worse, a 307/308 preserves the request body, re-POSTing the goal and whatever
+workspace file contents the ContextFinder gathered to a host the operator never named.
+
+Fix: the provider's client is built with `redirect(Policy::none())`. A chat-completions endpoint
+has no legitimate reason to redirect. Proven by a wiremock test in which the first server answers
+`302` toward a second: the call must fail and the second server must receive **zero** requests.
+Confirmed to fail against the pre-fix client (the redirect target received the request).
+
+**Proxies.** The loopback carve-out is justified in §1 by "traffic to loopback never leaves the
+machine". That is a property of the *destination*, not of the client. `Client::new()` sets
+`auto_sys_proxy: true`, and neither reqwest nor hyper-util exempts loopback from `HTTP_PROXY` /
+`ALL_PROXY` — only `NO_PROXY` excludes anything. A developer with a corporate proxy exported who
+sets `OPENAI_BASE_URL=http://127.0.0.1:8080` would send the plaintext request, key included, to
+`proxy.corp:3128` across the LAN.
+
+Fix: `.no_proxy()` when the base is `http://`. `https` bases keep proxy support, since the proxy
+sees only a CONNECT tunnel and the credential stays inside it.
+
+**Base-URL shape.** Rejecting userinfo and query/fragment (§1) is also part of this: reqwest
+converts URL userinfo into an `Authorization: Basic` header that collides with the provider's own
+`Bearer`, and a query on the base makes `join_url`'s concatenation mis-target the request
+(`https://gw/?t=x` + `/v1/chat/completions` → `…?t=x/v1/chat/completions`). Refusing both is what
+makes the plain string concat safe *by construction* rather than by argument.
+
+**Error redaction.** A base URL can itself be a credential (`https://gw/?api-key=…`,
+`https://user:pw@gw/`). Since rejections are printed to stderr — reaching CI logs and journald —
+every `BaseUrlError` carries only `scheme://host:port`, and the unparseable case echoes nothing at
+all, since an unparseable string cannot be safely redacted.
+
+## §5 — Failing fast at the binary edge
+
+**Added after the architectural review.** Degrading to the offline router is the right contract for
+a *library*, but it understates what the operator experiences: the local slot is `LocalProvider`, a
+deterministic canned provider, and the engine then runs a complete turn — Planner, ContextFinder,
+Coder, Verifier all emit their normal events. It does not look degraded; it looks like it worked.
+On `otto serve` the only signal is one line on the server's stderr, and connected clients receive
+nothing at all.
+
+So `preflight_base_urls()` validates every present `*_BASE_URL` and is called at the top of
+`cmd_run` and `cmd_serve`, both of which already return `anyhow::Result`. The library keeps its
+degrade-to-offline contract for embedders; the CLI — where a human set the variable — refuses to
+start with a clear message.
+
+## §6 — Making the guarantee structural rather than conventional
+
+**Added after the architectural review.** `build_remote` is a four-arm match where two arms happened
+to validate and two did not. Nothing stopped a future contributor adding `ANTHROPIC_BASE_URL` with
+an inline `env::var` read: it would compile, pass every test, and silently reintroduce this bug.
+
+The per-provider difference is therefore **data, not control flow** — `base_url_var(choice) ->
+Option<&'static str>`, matching the file's existing `has_key` / `default_model_for` / `infer_remote`
+table style. Adding an override becomes a one-line table edit that cannot skip validation, and a
+test pins the table's contents.
+
 ## Goal & Success Criteria
 
 Make the OpenAI-compatible providers robust to operator-supplied base URLs: never transmit an API
@@ -239,8 +304,9 @@ key over cleartext to a non-loopback host, and never emit a malformed endpoint.
   offline router with a stderr warning.
 - `join_url` produces exactly one separator for bases with zero, one, or many trailing slashes, and
   preserves a path prefix, across both `/v1/chat/completions` and `/chat/completions`.
-- `cargo test -p otto-providers` and `cargo test -p otto-engine --lib` stay green (the pre-existing
-  counts were 25 and 74; new tests add to them).
+- `cargo test -p otto-providers` and `cargo test -p otto-engine --lib` stay green. Pre-existing
+  counts on this branch's merge base are **25 and 79** — issue #111 cites 79 as "74", which was
+  accurate when it was filed but is stale; new tests add to the real figures.
 - The offline-deterministic default path is unchanged.
 - **No test added by this change sets or removes a process environment variable**, so the SAFETY
   contract at `crates/engine/src/lib.rs:596-601` remains true verbatim.
@@ -265,10 +331,15 @@ key over cleartext to a non-loopback host, and never emit a malformed endpoint.
 | `https://` / `http://` | reject — `url` fails these with `EmptyHost`, so they land in `Unparseable` |
 | `https:///foo` | **accept** — this is NOT hostless; it parses as host `Domain("foo")` |
 
-An empty-string env var (`OPENAI_BASE_URL=`) is *present but unparseable*, so it is rejected rather
-than treated as unset. **Assumption:** this is the desired behavior — an explicitly-empty override
-is operator error worth surfacing, not a silent request for the default. Documented here because it
-is a small behavior change for anyone exporting an empty var.
+**Revised after review:** an empty-string env var (`OPENAI_BASE_URL=`) is treated as **unset**, not
+as an invalid override. The first draft rejected it, which contradicted the convention twenty lines
+away in the same file — `has_key` already treats an empty API key as absent — and would have made
+the provider silently vanish for anyone using the `environment: [OPENAI_BASE_URL=${OPENAI_BASE_URL}]`
+compose idiom or a `.env` template, both of which export an empty string when unset.
+
+A **non-UTF-8** value is treated as *invalid* rather than absent: falling back to the production
+default there would send the key to `api.openai.com` when the operator plainly intended their own
+proxy. `env::var(..).ok()` conflates the two, so the read uses `env::var_os`.
 
 ## Risks & Open Questions
 

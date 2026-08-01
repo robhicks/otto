@@ -18,6 +18,34 @@ pub(crate) fn always_max_tokens(_model: &str, budget: u32) -> (Option<u32>, Opti
     (Some(budget), None)
 }
 
+/// Build the HTTP client for a chat-completions endpoint.
+///
+/// Validating the base URL (`base_url::validate_base_url`) only constrains the *first* hop, so two
+/// client settings are needed for that guarantee to survive contact with the network:
+///
+/// - **Redirects are disabled.** reqwest strips `Authorization` only when a redirect changes host
+///   or port — *not* when it changes scheme. A validated `https://gw:8443` answering `302` with
+///   `http://gw:8443` is same-host, same-port, so the `Bearer` token would be re-sent in cleartext.
+///   A 307/308 would additionally re-POST the request body — which carries the goal and whatever
+///   workspace file contents the ContextFinder gathered — to a host the operator never named.
+///   A chat-completions endpoint has no legitimate reason to redirect.
+/// - **The system proxy is disabled for `http` bases.** `Client::new()` honors `HTTP_PROXY`/
+///   `ALL_PROXY`, and neither reqwest nor hyper exempts loopback. Without this, an operator with a
+///   corporate proxy exported who points at `http://127.0.0.1:8080` would send the plaintext
+///   request — key included — to that proxy across the network, defeating the whole justification
+///   for allowing loopback `http` at all. `https` bases keep proxy support: the proxy sees only a
+///   CONNECT tunnel, so the credential stays protected.
+fn build_client(base_url: &str) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if base_url.starts_with("http://") {
+        builder = builder.no_proxy();
+    }
+    // Mirrors `reqwest::Client::new()`, which panics on the same TLS-backend init failure.
+    builder
+        .build()
+        .expect("provider HTTP client failed to initialize")
+}
+
 pub(crate) struct OpenAiCompatibleProvider {
     client: reqwest::Client,
     base_url: String,
@@ -37,7 +65,7 @@ impl OpenAiCompatibleProvider {
         token_fields: TokenFields,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_client(&base_url),
             base_url,
             path_suffix,
             api_key,

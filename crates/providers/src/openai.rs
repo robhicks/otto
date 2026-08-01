@@ -222,6 +222,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_does_not_follow_redirects() {
+        // reqwest's default policy follows up to 10 redirects and strips `Authorization` only on a
+        // host/port change — NOT on an https->http scheme downgrade. Following would therefore
+        // re-send the Bearer token, and on 307/308 the request body, to a host the operator never
+        // validated. `upstream` here stands in for that host: it must receive nothing.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "leaked" } }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/v1/chat/completions", upstream.uri()).as_str(),
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "test-key", "gpt-4o-mini");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(result.is_err(), "the redirect must not be followed");
+        let hits = upstream.received_requests().await.unwrap_or_default();
+        assert!(
+            hits.is_empty(),
+            "the redirect target received {} request(s); the Bearer token and prompt body must \
+             never reach an unvalidated host",
+            hits.len()
+        );
+    }
+
+    #[tokio::test]
     async fn openai_returns_empty_text_for_empty_choices() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

@@ -288,13 +288,16 @@ fn resolve_base_url(
     default: &str,
     var_name: &str,
 ) -> Option<String> {
-    let Some(value) = override_value else {
+    // An exported-but-empty var means "unset" here, matching `has_key`'s treatment of an empty
+    // API key. Compose files and `.env` templates routinely export `FOO=` for an unset value.
+    let Some(value) = override_value.filter(|v| !v.is_empty()) else {
         return Some(default.to_string());
     };
     match otto_providers::validate_base_url(&value) {
         Ok(()) => Some(value),
         Err(e) => {
-            // `e` carries only the offending URL, never the API key.
+            // `e` is redacted to scheme://host:port — it carries neither the API key nor any
+            // secret embedded in the rejected URL's userinfo or query.
             eprintln!(
                 "warning: {var_name} was rejected: {e}; falling back to the offline/local router \
                  rather than sending the API key"
@@ -302,6 +305,77 @@ fn resolve_base_url(
             None
         }
     }
+}
+
+/// The `*_BASE_URL` override for a provider, or `None` for providers that have no override.
+///
+/// This is a table rather than a branch inside [`build_remote`] on purpose: adding an override for
+/// a new provider is a one-line edit here, and it is then **impossible** to wire that provider up
+/// without the validation in [`resolve_base_url`] running. Writing the `env::var` read inline in a
+/// `build_remote` arm instead would compile, pass every test, and silently reintroduce the
+/// cleartext-key bug this module exists to prevent.
+fn base_url_var(choice: RemoteChoice) -> Option<&'static str> {
+    match choice {
+        RemoteChoice::OpenAi => Some("OPENAI_BASE_URL"),
+        RemoteChoice::DeepSeek => Some("DEEPSEEK_BASE_URL"),
+        // Fixed endpoints — `api_base_default()` only, no operator input reaches them.
+        RemoteChoice::Anthropic | RemoteChoice::Gemini => None,
+    }
+}
+
+/// Read a provider's `*_BASE_URL` override from the environment and validate it.
+///
+/// A non-UTF-8 value is treated as *invalid*, not as absent: silently falling back to the
+/// production default would send the key to a host the operator did not intend.
+fn env_base_url(choice: RemoteChoice, default: &str) -> Option<String> {
+    let Some(var_name) = base_url_var(choice) else {
+        return Some(default.to_string());
+    };
+    match std::env::var_os(var_name) {
+        None => Some(default.to_string()),
+        Some(raw) => match raw.into_string() {
+            Ok(value) => resolve_base_url(Some(value), default, var_name),
+            Err(_) => {
+                eprintln!(
+                    "warning: {var_name} is not valid UTF-8; falling back to the offline/local \
+                     router rather than sending the API key to the default endpoint"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Validate every `*_BASE_URL` override present in the environment, without building anything.
+///
+/// [`build_remote`] degrades to the offline router on a bad override, which is the right contract
+/// for a library — but on `otto serve` that degrade is nearly invisible: the local slot is a
+/// deterministic canned provider, so turns keep completing and *look* successful while a single
+/// warning sits in the server's stderr. The binary, where a human set the variable, should refuse
+/// to start instead. Call this from the CLI entrypoints before any router is built.
+pub fn preflight_base_urls() -> anyhow::Result<()> {
+    for choice in [
+        RemoteChoice::Anthropic,
+        RemoteChoice::OpenAi,
+        RemoteChoice::Gemini,
+        RemoteChoice::DeepSeek,
+    ] {
+        let Some(var_name) = base_url_var(choice) else {
+            continue;
+        };
+        let Some(raw) = std::env::var_os(var_name) else {
+            continue;
+        };
+        let value = raw.into_string().map_err(|_| {
+            anyhow::anyhow!("{var_name} is set but is not valid UTF-8; unset it or fix the value")
+        })?;
+        if value.is_empty() {
+            continue; // Explicitly empty means "unset"; the default endpoint is used.
+        }
+        otto_providers::validate_base_url(&value)
+            .map_err(|e| anyhow::anyhow!("{var_name} is invalid: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Construct the remote provider for `choice`, pinned to `model`. Callers must have confirmed
@@ -317,11 +391,7 @@ fn build_remote(choice: RemoteChoice, model: String) -> Option<Arc<dyn Provider>
             model,
         ))),
         RemoteChoice::OpenAi => {
-            let base = resolve_base_url(
-                std::env::var("OPENAI_BASE_URL").ok(),
-                OpenAiProvider::api_base_default(),
-                "OPENAI_BASE_URL",
-            )?;
+            let base = env_base_url(choice, OpenAiProvider::api_base_default())?;
             Some(Arc::new(OpenAiProvider::new(
                 base,
                 std::env::var("OPENAI_API_KEY").unwrap_or_default(),
@@ -334,11 +404,7 @@ fn build_remote(choice: RemoteChoice, model: String) -> Option<Arc<dyn Provider>
             model,
         ))),
         RemoteChoice::DeepSeek => {
-            let base = resolve_base_url(
-                std::env::var("DEEPSEEK_BASE_URL").ok(),
-                DeepSeekProvider::api_base_default(),
-                "DEEPSEEK_BASE_URL",
-            )?;
+            let base = env_base_url(choice, DeepSeekProvider::api_base_default())?;
             Some(Arc::new(DeepSeekProvider::new(
                 base,
                 std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
@@ -376,7 +442,8 @@ pub fn build_router_with_model(model_override: Option<&str>) -> Box<dyn otto_eng
             // active remote. Either way the chosen provider's key must be present.
             let choice = infer_remote(model).or_else(select_remote);
             // `build_remote` returning None means the provider's *_BASE_URL override was
-            // refused; it has already explained why on stderr, so no second warning here.
+            // refused; it has already explained the specific reason on stderr. The generic
+            // pinned-model warning below still fires, which is what we want here.
             match choice
                 .filter(|c| has_key(*c))
                 .and_then(|c| build_remote(c, model.to_string()))
@@ -643,6 +710,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_base_url_override_is_treated_as_unset() {
+        // `FOO=` is how compose files and .env templates spell "not set". Treating it as an
+        // invalid override would make the provider silently vanish; `has_key` already treats an
+        // empty API key as absent, so this matches the file's own convention.
+        assert_eq!(
+            resolve_base_url(
+                Some(String::new()),
+                "https://api.openai.com",
+                "OPENAI_BASE_URL"
+            ),
+            Some("https://api.openai.com".to_string())
+        );
+    }
+
+    #[test]
+    fn only_providers_with_an_override_consult_the_environment() {
+        // The table is what makes validation impossible to skip: a provider with no entry can
+        // never read an operator-supplied base, and one with an entry always goes through
+        // `resolve_base_url`. If a future provider gains an override, it belongs here.
+        assert_eq!(base_url_var(RemoteChoice::OpenAi), Some("OPENAI_BASE_URL"));
+        assert_eq!(
+            base_url_var(RemoteChoice::DeepSeek),
+            Some("DEEPSEEK_BASE_URL")
+        );
+        assert_eq!(base_url_var(RemoteChoice::Anthropic), None);
+        assert_eq!(base_url_var(RemoteChoice::Gemini), None);
+    }
+
+    #[test]
     fn valid_base_url_override_is_used_verbatim() {
         // https anywhere, and plain http to loopback (the wiremock shape), are both honored.
         for candidate in [
@@ -673,7 +769,8 @@ mod tests {
             "http://169.254.169.254",
             "ftp://host",
             "not a url",
-            "",
+            // Note: "" is deliberately NOT here — an empty override means "unset"; see
+            // `empty_base_url_override_is_treated_as_unset`.
         ] {
             assert_eq!(
                 resolve_base_url(
