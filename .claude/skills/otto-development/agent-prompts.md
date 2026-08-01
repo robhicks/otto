@@ -317,6 +317,8 @@ Agent tool:
     - Crate boundaries respected; new capabilities added via AgentCtx accessors or new seams,
       never by widening public surface
     - The change matches the spec/plan it claims to implement; wire types stay semver-minor
+      (additive only — a breaking change bumps the affected crate version(s) in Cargo.toml within
+      this same PR, per Non-Negotiable Rule 6)
     - Trait seams stay remote-ready (Send + Sync + async); extensible payloads stay JSON Value
     - ui-dioxus stays workspace-excluded; workspace build/test never requires dx
     - The change follows the documented design rather than eroding it; deviations are justified
