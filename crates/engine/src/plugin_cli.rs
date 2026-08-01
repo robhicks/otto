@@ -653,7 +653,8 @@ fn parse_base_flags(args: Vec<String>) -> anyhow::Result<(bool, Option<PathBuf>,
 /// (CWD by default, overridable via `--root`) when project-scoped.
 fn resolve_base(project_mode: bool, root_override: Option<PathBuf>, home: &Path) -> PathBuf {
     if project_mode {
-        root_override.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home.to_path_buf()))
+        root_override
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| home.to_path_buf()))
     } else {
         home.to_path_buf()
     }
@@ -675,9 +676,7 @@ pub async fn cmd_plugin(args: Vec<String>, home: PathBuf) -> anyhow::Result<()> 
     let sub_rest: Vec<String> = it.collect();
 
     match sub.as_str() {
-        "" | "interactive" => {
-            super::plugin_tui::interactive_plugin_ui(base).await
-        }
+        "" | "interactive" => super::plugin_tui::interactive_plugin_ui(base).await,
         "marketplace" => {
             let filtered: Vec<String> = sub_rest.into_iter().filter(|a| a != "--all").collect();
             cmd_plugin_marketplace(filtered, &base, &home, all_mode).await
@@ -802,15 +801,25 @@ async fn cmd_plugin_marketplace(
         "list" => {
             if all_mode {
                 let user_lock = read_lockfile(home);
-                let project_lock = if base != home { read_lockfile(base) } else { otto_extensions::MarketplaceLockfile::default() };
+                let project_lock = if base != home {
+                    read_lockfile(base)
+                } else {
+                    otto_extensions::MarketplaceLockfile::default()
+                };
                 for (name, entry) in &user_lock.entries {
                     let short_commit = &entry.commit[..entry.commit.len().min(12)];
-                    println!("[user]    {name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+                    println!(
+                        "[user]    {name}\t{}\t{}\t{short_commit}",
+                        entry.url, entry.git_ref
+                    );
                 }
                 for (name, entry) in &project_lock.entries {
                     if !user_lock.entries.contains_key(name) {
                         let short_commit = &entry.commit[..entry.commit.len().min(12)];
-                        println!("[project] {name}\t{}\t{}\t{short_commit}", entry.url, entry.git_ref);
+                        println!(
+                            "[project] {name}\t{}\t{}\t{short_commit}",
+                            entry.url, entry.git_ref
+                        );
                     }
                 }
             } else {
@@ -1725,7 +1734,11 @@ mod tests {
 
     #[test]
     fn parse_base_flags_root_implies_project() {
-        let args = vec!["--root".to_string(), "/tmp/proj".to_string(), "list".to_string()];
+        let args = vec![
+            "--root".to_string(),
+            "/tmp/proj".to_string(),
+            "list".to_string(),
+        ];
         let (project, root, rest) = parse_base_flags(args).unwrap();
         assert!(project);
         assert_eq!(root, Some(PathBuf::from("/tmp/proj")));
@@ -1745,7 +1758,14 @@ mod tests {
         let (project, root, rest) = parse_base_flags(args).unwrap();
         assert!(project);
         assert_eq!(root, Some(PathBuf::from("/tmp/p")));
-        assert_eq!(rest, vec!["marketplace".to_string(), "add".to_string(), "http://example.com/mp.git".to_string()]);
+        assert_eq!(
+            rest,
+            vec![
+                "marketplace".to_string(),
+                "add".to_string(),
+                "http://example.com/mp.git".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1809,13 +1829,13 @@ mod tests {
         let user_mp = marketplaces_dir(home.path()).join("acme");
         let proj_mp = marketplaces_dir(proj.path()).join("acme");
         assert!(
-            proj_mp.join(".claude-plugin").join("marketplace.json").exists(),
+            proj_mp
+                .join(".claude-plugin")
+                .join("marketplace.json")
+                .exists(),
             "marketplace should be at project level"
         );
-        assert!(
-            !user_mp.exists(),
-            "marketplace should NOT be at user level"
-        );
+        assert!(!user_mp.exists(), "marketplace should NOT be at user level");
 
         // The project lockfile must exist and contain the entry.
         let proj_lock = read_lockfile(proj.path());
@@ -1924,7 +1944,10 @@ mod tests {
         let combined = plugin_list_combined(home.path(), proj.path()).unwrap();
         let keys: Vec<&str> = combined.iter().map(|(k, _, _)| k.as_str()).collect();
         assert!(keys.contains(&"foo@acme"), "user-scope plugin must appear");
-        assert!(keys.contains(&"bar@acme2"), "project-scope plugin must appear");
+        assert!(
+            keys.contains(&"bar@acme2"),
+            "project-scope plugin must appear"
+        );
     }
 
     #[tokio::test]

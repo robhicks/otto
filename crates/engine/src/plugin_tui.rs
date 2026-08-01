@@ -62,9 +62,7 @@ fn main_menu(base: &Path) -> anyhow::Result<MainChoice> {
         "Manage marketplaces",
         "Exit",
     ];
-    let selected = Select::new(title, choices)
-        .with_vim_mode(true)
-        .prompt()?;
+    let selected = Select::new(title, choices).with_vim_mode(true).prompt()?;
     Ok(match selected {
         "List plugins" => MainChoice::ListPlugins,
         "Install a plugin" => MainChoice::InstallPlugin,
@@ -77,7 +75,9 @@ fn main_menu(base: &Path) -> anyhow::Result<MainChoice> {
 }
 
 fn confirm_return_to_menu() -> anyhow::Result<bool> {
-    Ok(Confirm::new("Return to menu?").with_default(true).prompt()?)
+    Ok(Confirm::new("Return to menu?")
+        .with_default(true)
+        .prompt()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +91,9 @@ fn list_plugins(home: &Path) -> anyhow::Result<()> {
         if have_marketplaces {
             println!("All plugins are installed. Use 'Enable/Disable' to toggle them.");
         } else {
-            println!("No marketplaces in this scope. Add one with 'Manage marketplaces > Add a marketplace'.");
+            println!(
+                "No marketplaces in this scope. Add one with 'Manage marketplaces > Add a marketplace'."
+            );
         }
         return Ok(());
     }
@@ -104,7 +106,11 @@ fn list_plugins(home: &Path) -> anyhow::Result<()> {
             enabled_count += 1;
         }
     }
-    println!("\n{} plugin(s) total, {} enabled", plugins.len(), enabled_count);
+    println!(
+        "\n{} plugin(s) total, {} enabled",
+        plugins.len(),
+        enabled_count
+    );
     Ok(())
 }
 
