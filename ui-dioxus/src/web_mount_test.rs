@@ -227,3 +227,33 @@ async fn params_without_autoconnect_flag_do_not_connect() {
         "autoconnect=0 must not connect, got {attempts:?}"
     );
 }
+
+/// The behavioral half of `transport::tests::web_socket_error_paths_still_redact_the_bearer_token`.
+///
+/// A structurally invalid URL (unclosed IPv6 literal) makes `WebSocket::new` reject with a
+/// `SyntaxError` that quotes the URL IN FULL — including the `token=` query parameter — so this
+/// asserts the actual string a user would see in the event log.
+///
+/// The URL must be malformed, not merely wrong-scheme: WHATWG normalizes `http`/`https` to
+/// `ws`/`wss`, so `connect("http://…")` succeeds and yields no diagnostic at all.
+///
+/// Unlike the launch-param tests above, this one needs no unreachable port: `WebSocket::new`
+/// rejects the URL during construction, so no socket is ever opened and there is nothing to keep
+/// away from a developer's live `otto serve`. Do NOT "fix" the missing port by adding one — that
+/// would turn a construction-time rejection into a real connection attempt.
+#[wasm_bindgen_test]
+fn connect_error_redacts_the_bearer_token() {
+    let err = crate::transport::connect("ws://[::1/ws?token=supersecret")
+        .err()
+        .expect("a malformed URL must be rejected by WebSocket::new");
+    assert!(
+        !err.as_str().contains("supersecret"),
+        "the bearer token leaked into a transport diagnostic: {}",
+        err.as_str()
+    );
+    assert!(
+        err.as_str().contains("token=<redacted>"),
+        "expected the redaction marker, got: {}",
+        err.as_str()
+    );
+}

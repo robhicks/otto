@@ -4,6 +4,7 @@ use otto_protocol::CapabilitiesManifest;
 use otto_protocol::EventKind;
 
 use crate::i18n::{t, tf, Locale, Msg};
+use crate::transport::SeamError;
 
 /// The single connection-state signal that drives the whole UI.
 #[derive(Clone, PartialEq)]
@@ -26,8 +27,9 @@ pub enum ClientText {
         msg: Msg,
         args: Vec<(String, String)>,
     },
-    /// A diagnostic produced on the transport seam. Verbatim in every locale.
-    Passthrough(String),
+    /// A diagnostic the transport seam produced. Verbatim in every locale, and — since
+    /// `SeamError`'s constructor is private to `transport/` — unfabricatable anywhere else.
+    Passthrough(SeamError),
 }
 
 impl ClientText {
@@ -156,7 +158,7 @@ pub fn render_row(locale: Locale, msg: &RowMsg) -> String {
                         args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                     tf(locale, *msg, &pairs)
                 }
-                ClientText::Passthrough(s) => s.clone(),
+                ClientText::Passthrough(e) => e.as_str().to_string(),
             };
             tf(locale, Msg::RowClientError, &[("message", &message)])
         }
@@ -595,7 +597,9 @@ mod tests {
             render_row(Locale::De, &authored)
         );
         // …a transport diagnostic does not (spec §2's boundary rule).
-        let passthrough = client_error_row(ClientText::Passthrough("socket closed".into()));
+        let passthrough = client_error_row(ClientText::Passthrough(SeamError::for_test(
+            "socket closed",
+        )));
         assert!(render_row(Locale::De, &passthrough).contains("socket closed"));
     }
 
