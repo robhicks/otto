@@ -89,8 +89,18 @@ than by restructuring the store.
    `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean. The only
    pre-existing failure, `otto-mcp-lsp`'s `full_round_trip_against_a_real_rust_analyzer`, is
    unaffected.
-2. **Observable behavior is unchanged.** `otto run` produces the same event sequence, `otto serve`
-   authenticates exactly as before, and no wire type gains or loses a variant.
+2. **Observable behavior is unchanged, with one narrow documented exception.** `otto run` produces
+   the same event sequence, `otto serve` authenticates exactly as before, and no wire type gains or
+   loses a variant.
+
+   The exception, found during implementation and recorded rather than glossed: a client that
+   attaches with an explicit `?session=<uuid>` naming a session that **does not exist** now gets
+   `no session <id>` from its first `SendPrompt`, where previously the turn ran and wrote events
+   for a session with no `sessions` row. Attach itself is unchanged — `resolve_session` still
+   accepts the id blind and still sends `Ready` (§3.4) — so the reconnect path `ui-dioxus` uses is
+   unaffected; only a *nonexistent* id behaves differently, and it now fails fast instead of
+   creating orphaned rows. That prior behavior was a latent bug, not a contract, and no test
+   asserted it.
 3. A scoped read for the wrong owner returns a message **byte-for-byte identical** to the one for a
    nonexistent session (asserted by a test comparing the two strings), so the API is not an
    existence oracle.
