@@ -42,8 +42,9 @@
 | `crates/remote/src/lib.rs` (tests) | **Modify.** Assert `promote()`'s bundle inherits the filtering. |
 | `CLAUDE.md` | **Modify.** The `workspace` crate row states that `snapshot()` applies the floor; the `remote` row notes the dev-only `otto-workspace` edge. |
 | `crates/workspace/src/remote.rs` | **Modify** *(added during review).* `RemoteWorkspace::snapshot` re-applies the floor instead of trusting the peer. |
-| `crates/workspace/src/lib.rs` (`restore`) | **Modify** *(added during review).* The ingress mirror applies the floor too, and the check fails closed on non-UTF-8 paths. |
-| `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only: the same false dotfile-covers-the-floor claim lived at the seam contract, one level up. |
+| `crates/workspace/src/lib.rs` (`restore`) | **Modify** *(added during review).* The ingress mirror applies the floor too, and every floor check fails closed on a non-UTF-8 path (`to_str()`, never `to_string_lossy()`). |
+| `crates/workspace/src/lib.rs` (`strip_sensitive_files`) | **Create** *(added during review).* A `pub(crate)` helper shared with `RemoteWorkspace::snapshot`. Its crate-privacy is the drift vector #129 item 2 tracks. |
+| `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only, two corrections: the same false dotfile-covers-the-floor claim lived at the seam contract one level up; and the `WorkspaceSnapshot` guarantee is now scoped to snapshots *produced by a `Workspace` impl*, since the type is `Deserialize` with a public field and a peer's bundle can violate it. |
 | `crates/remote/Cargo.toml` | **Modify** *(added during review).* The dev-dependency above. |
 
 ## Task Order & Rationale

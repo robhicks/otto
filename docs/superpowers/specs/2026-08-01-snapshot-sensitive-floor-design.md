@@ -66,7 +66,12 @@ real secret-egress path, not an exploit chain.
 `Workspace::snapshot` inherits it; correct the false comment on the walk; regression tests.
 
 **Out:** changing `SENSITIVE_MARKERS` (the floor is not widened — it is *applied* in one more
-place); changing `list()`'s behavior; the gate; the sandbox; anything in `remote`.
+place); changing `list()`'s behavior; the gate; the sandbox; ~~anything in `remote`~~.
+
+**Amended during implementation:** `crates/remote` did change, in two ways that leave `promote()`
+itself byte-for-byte intact — a `[dev-dependencies]` edge on `otto-workspace` and a test, so that
+`promote()`'s inheritance of the floor is pinned from the caller's side by something that actually
+fails when the guard is removed.
 
 ---
 
@@ -109,6 +114,11 @@ async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
     Ok(WorkspaceSnapshot { files })
 }
 ```
+
+> **What shipped differs in one detail — do not copy the block above verbatim.** Review replaced
+> `to_string_lossy()` with `to_str()`, skipping on `None`, because `validate_workspace_edits` warns
+> in as many words that U+FFFD substitution could let a non-UTF-8 path slip a marker past the
+> check. See `crates/workspace/src/lib.rs`.
 
 Rejected alternatives:
 
@@ -162,7 +172,7 @@ has no floor check — true of the design, false of what shipped.)
 | `id_rsa` / `production.env` / `config/local.env` in the workspace | Silently omitted from the snapshot. Not an error: a snapshot is a best-effort capture, and failing the whole promote because a workspace contains a key would be worse than omitting it. |
 | `.env`, `.ssh/`, `.git/` | Already excluded by the walk; now excluded twice. |
 | A promoted session whose workspace *needed* an omitted file | The remote gets a workspace without it, exactly as `/export` already behaves. Consistency between the two directions is the point. |
-| A `PromoteBundle` from an un-upgraded peer carrying a sensitive entry | Unchanged — `accept_promotion`'s existing fail-closed refusal still catches it. |
+| A `PromoteBundle` from an un-upgraded peer carrying a sensitive entry | `accept_promotion`'s fail-closed refusal still catches it on the network path, and (added during review) `restore`'s own floor covers the loopback path, which `LoopbackTarget::provision` reaches *without* the `validate_workspace_edits` pass. |
 
 ---
 
