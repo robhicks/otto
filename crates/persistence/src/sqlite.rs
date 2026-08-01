@@ -1,6 +1,10 @@
-//! Sqlite-backed `SessionStore`. Schema is created idempotently at open time with
-//! `CREATE TABLE IF NOT EXISTS`, so no migrations dir or compile-time DB is needed and
-//! the build/test path stays fully offline.
+//! Sqlite-backed `SessionStore`. The schema is created at open time with
+//! `CREATE TABLE IF NOT EXISTS`, so no migrations dir or compile-time DB is needed and the
+//! build/test path stays fully offline.
+//!
+//! Open is idempotent *within* a schema generation but not *across* one: since there is no
+//! migration mechanism, a database written by a different `SCHEMA_VERSION` is refused rather
+//! than silently used with the wrong table shape. See [`SqliteStore::init_schema`].
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +30,11 @@ impl SqliteStore {
             .filename(path)
             .create_if_missing(true)
             // WAL lets one writer proceed concurrently with readers.
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            // Two otto processes can open the same default database at once (`otto serve &`
+            // then `otto run` both resolve `otto-sessions.db` in the cwd). Wait for the other
+            // one's schema transaction instead of failing with SQLITE_BUSY.
+            .busy_timeout(std::time::Duration::from_secs(10));
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let store = Self { pool };
         store.init_schema(path).await?;
@@ -42,13 +50,39 @@ impl SqliteStore {
     /// the two are told apart by whether `sessions` already exists.
     ///
     /// Takes `path` solely so the error can name the file an operator has to delete.
+    ///
+    /// The probe, the DDL, and the version stamp all run inside one `BEGIN IMMEDIATE`
+    /// transaction. That is load-bearing rather than tidiness: each `execute` auto-commits on
+    /// its own, so without the transaction a second process opening the same fresh file could
+    /// probe in the window after `CREATE TABLE sessions` committed but before the version was
+    /// stamped — seeing `user_version == 0` *and* an existing `sessions` table, which is the
+    /// pre-ownership signature. It would then refuse a perfectly good brand-new database and
+    /// tell the operator to delete it. `BEGIN IMMEDIATE` takes the write lock up front, so the
+    /// second process blocks until the first commits and then observes the stamped version.
     async fn init_schema(&self, path: &Path) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        match Self::init_schema_txn(&mut conn, path).await {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort: the transaction is aborted either way once the connection drops.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::init_schema`], run inside the caller's transaction.
+    async fn init_schema_txn(conn: &mut sqlx::SqliteConnection, path: &Path) -> anyhow::Result<()> {
         let (user_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
         let sessions_exists: Option<(String,)> =
             sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *conn)
                 .await?;
 
         match (user_version, sessions_exists.is_some()) {
@@ -60,9 +94,18 @@ impl SqliteStore {
                 path.display()
             ),
             (v, _) if v == SCHEMA_VERSION => return Ok(()),
-            (v, _) => anyhow::bail!(
+            // Split by direction: once SCHEMA_VERSION is next bumped, a genuinely older
+            // database would otherwise be told it is "newer", which is backwards. Neither
+            // direction has a migration story, but the message has to be true.
+            (v, _) if v > SCHEMA_VERSION => anyhow::bail!(
                 "session database at {} has schema version {v}, newer than this otto build \
                  understands ({SCHEMA_VERSION}); upgrade otto",
+                path.display()
+            ),
+            (v, _) => anyhow::bail!(
+                "session database at {} has schema version {v}, older than this otto build \
+                 requires ({SCHEMA_VERSION}), and otto has no migration path: delete the file \
+                 and let otto re-create it.",
                 path.display()
             ),
         }
@@ -78,10 +121,10 @@ impl SqliteStore {
                 config TEXT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS sessions_owner_idx ON sessions (owner)")
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS events (
@@ -91,7 +134,7 @@ impl SqliteStore {
                 PRIMARY KEY (session_id, seq)
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS turns (
@@ -103,11 +146,11 @@ impl SqliteStore {
                 PRIMARY KEY (session_id, turn_index)
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         Ok(())
     }
@@ -901,5 +944,38 @@ mod tests {
             err.contains("newer than this otto build"),
             "unexpected: {err}"
         );
+    }
+
+    /// Two otto processes can open the same default database at once — `otto serve &` followed
+    /// by `otto run` both resolve `otto-sessions.db` in the cwd. Before the schema probe, the
+    /// DDL, and the version stamp were wrapped in one `BEGIN IMMEDIATE` transaction, the second
+    /// opener could observe the window after `CREATE TABLE sessions` committed but before the
+    /// version was stamped — `user_version == 0` with a `sessions` table present, which is
+    /// exactly the pre-ownership signature — and refuse a brand-new database, telling the
+    /// operator to delete it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_opens_of_a_fresh_database_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racy.db");
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                tokio::spawn(async move { SqliteStore::open(&path).await })
+            })
+            .collect();
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let store = handle
+                .await
+                .expect("task panicked")
+                .unwrap_or_else(|e| panic!("concurrent open {i} failed: {e}"));
+            // ...and every one of them sees a usable, correctly stamped schema.
+            let (v,): (i64,) = sqlx::query_as("PRAGMA user_version")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION, "open {i} saw an unstamped schema");
+        }
     }
 }
