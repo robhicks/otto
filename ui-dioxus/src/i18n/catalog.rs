@@ -319,6 +319,7 @@ mod tests {
         assert_eq!(Locale::from_tag("zh-Hant"), None);
         assert_eq!(Locale::from_tag("zh-TW"), None);
         assert_eq!(Locale::from_tag("zh-HK"), None);
+        assert_eq!(Locale::from_tag("zh-MO"), None);
     }
 
     #[test]
