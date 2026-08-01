@@ -998,7 +998,11 @@ git commit -m "docs: record the sidecar-spawn boundary decision where the rule l
 
 ## Out-of-band verification (Phase 5)
 
-- **UI bundle** — `ui-dioxus/` changed, so run `cd ui-dioxus && ./scripts/build-web.sh` and confirm its four bundle-trust guards pass (wasm-opt success, no DWARF, under `MAX_WASM_BYTES` = 1,200,000). No dependency was added, so the size should be within noise of the 795,188 B baseline.
+- **UI bundle** — `ui-dioxus/` changed, so run `cd ui-dioxus && ./scripts/build-web.sh` and confirm its four bundle-trust guards pass (wasm-opt success, no DWARF, under `MAX_WASM_BYTES` = 1,200,000).
+
+  **Measured:** branch point (`f715522`) = **836,345 B**; this branch = **836,512 B**; delta **+167 B**. No dependency was added, and a catalog key plus a newtype is all this change costs.
+
+  Note the `795,188 B` figure in `scripts/build-web.sh`'s comment is a **2026-07-24 measurement that predates #118** — the i18n layer's five locale catalogs account for the ~41 KB between it and today's baseline. Compare against a freshly-measured branch point, not against that comment, or you will attribute #118's growth to whatever change you are verifying.
 - **Wasm test harness** — `cd ui-dioxus && CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --features web`. Baseline 4 tests; expect 5.
 - **Workspace** — `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --all --check` from the repo root. `ui-dioxus/` is workspace-excluded, so these must be **unchanged** from `main`; a difference means something leaked out of the crate.
 - **Fly image / distribution / CI / feature-gated crates** — vacuously satisfied: no `deploy/`, no `.github/`, no `candle`/`firecracker` code is touched. State that explicitly rather than skipping it.
