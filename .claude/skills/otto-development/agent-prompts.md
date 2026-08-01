@@ -76,9 +76,8 @@ Agent tool:
     Repo requirements to check against (from otto-development):
     <PASTE THE LOAD-BEARING INVARIANTS + Repository Conventions — test/lint commands
      (cargo test --workspace, cargo clippy --workspace --all-targets, cargo fmt --all),
-     out-of-band surfaces (deploy/fly, deploy/install.sh, deploy/homebrew, .github/ CI,
-     ui-dioxus bundle guards, feature-gated candle/firecracker builds), plan-by-plan doc
-     conventions, "no AI attribution" rule>
+     out-of-band surfaces (deploy/fly image, ui-dioxus bundle guards, feature-gated
+     candle/firecracker builds), plan-by-plan doc conventions, "no AI attribution" rule>
 
     Check: completeness, spec alignment, task decomposition, buildability, and whether each
     task:
@@ -118,7 +117,7 @@ Agent tool:
     cargo test -p otto-<crate> <filter>, cargo clippy --workspace --all-targets, cargo fmt --all),
     the Load-Bearing Invariants that apply (gated edits, sensitive-path floor, sandbox-only bash,
     inward dependency flow, offline determinism, unauthenticated-by-design --ui-dir static route),
-    any out-of-band surface this task touches (deploy/fly, install.sh, homebrew, CI, bundle guards,
+    any out-of-band surface this task touches (deploy/fly, bundle guards,
     feature-gated builds), and the "no AI attribution in commits" rule>
 
     ## AUTONOMOUS MODE — IMPORTANT
@@ -186,8 +185,8 @@ Agent tool:
       - `OTTO_*`/API-key reads behind build_router, not in core logic
       - `ui-dioxus/` stays workspace-excluded; `cargo build/test --workspace` must not require dx
       - no AI attribution in commits/comments/docs
-      - out-of-band surfaces the task touched are flagged for Phase 5 (fly image, install.sh,
-        homebrew, CI, bundle guards, feature-gated builds)
+      - out-of-band surfaces the task touched are flagged for Phase 5 (fly image,
+        bundle guards, feature-gated builds)
 
     Report:
     - ✅ Spec compliant
@@ -254,7 +253,7 @@ Agent tool:
     - Repo convention compliance (from CLAUDE.md + otto-development's Load-Bearing Invariants):
       inward dependency flow, security spine intact, offline determinism preserved,
       ui-dioxus workspace-excluded, commit format `<scope>: <subject>`, no AI attribution,
-      out-of-band surfaces (fly/install.sh/homebrew/CI/bundle/feature builds) handled and
+      out-of-band surfaces (fly/bundle/feature builds) handled and
       flagged for Phase 5 verification
 
     Report: Strengths, Issues, Overall assessment (Ready to merge / Needs work).

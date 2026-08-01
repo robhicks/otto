@@ -1,6 +1,6 @@
 ---
 name: otto-development
-description: Use when developing any feature or fix in the otto repository (the agentic coding engine in /home/robhicks/dev/otto-next) end-to-end — from a GitHub issue or plain task brief, through ship and verify, fully autonomously with no mid-run questions. Bundles the plan-by-plan discipline (committed design specs in docs/superpowers/specs/ and implementation plans in docs/superpowers/plans/), the Rust workspace conventions (inward dependency flow, offline determinism, permission-gate security spine), autonomous spec generation, plan generation, task-by-task implementation, PR review loops, verification, and close-out. For other repositories use general-development; for fs-ci use ce-development.
+description: Use when developing any feature or fix in the otto repository (the agentic coding engine) end-to-end — from a GitHub issue or plain task brief, through ship and verify, fully autonomously with no mid-run questions. Bundles the plan-by-plan discipline (committed design specs in docs/superpowers/specs/ and implementation plans in docs/superpowers/plans/), the Rust workspace conventions (inward dependency flow, offline determinism, permission-gate security spine), autonomous spec generation, plan generation, task-by-task implementation, PR review loops, verification, and close-out. For other repositories use general-development; for fs-ci use ce-development.
 ---
 
 # Otto Development — Autonomous End-to-End
@@ -34,9 +34,8 @@ the assumption, continue. Escalate only on true blockers. "Should I continue?" i
 condition.
 
 **Green tests are not the same as work-done.** `cargo test --workspace` does not validate the Fly
-image, `deploy/install.sh`, the homebrew formula, CI wiring, the wasm bundle-trust guards, or the
-default-off feature builds (`candle`, `firecracker`). Whatever this change touches, verify it
-explicitly (Phase 5).
+image (`deploy/fly/`), the wasm bundle-trust guards, or the default-off feature builds (`candle`,
+`firecracker`). Whatever this change touches, verify it explicitly (Phase 5).
 
 **Violating the letter of the workflow is violating the spirit.**
 
@@ -129,7 +128,7 @@ one-sentence AC → STOP. Write the spec. The fast-path is for genuine trivialit
 | Convention | Value |
 |---|---|
 | Trunk | `main`. **All** work happens in a worktree; **all** main-branch changes land via merged PRs. No direct commits, pushes, or merges to `main` outside a PR (Non-Negotiable Rules 1–2). |
-| Worktree | **Required.** `git worktree add .worktrees/<branch> -b <branch> origin/main` — the worktrees live **inside the repo** at `.worktrees/<branch>` (see `.claude/settings.local.json`), not as sibling directories. Branch off `origin/main`, never local `main` (see Phase 0 trunk-sync). Every code edit, commit, and push happens from inside this worktree. |
+| Worktree | **Required.** `git worktree add .worktrees/<branch> -b <branch> origin/main` — the worktrees live **inside the repo** at `.worktrees/<branch>` (see `.claude/settings.local.json`, machine-local), not as sibling directories. `.worktrees/` is gitignored — **never `git add .`** in the main checkout (a nested worktree's contents, including developer-local secrets, could be staged; the sensitive-path floor guards tool-mediated reads, not `git add`). Branch off `origin/main`, never local `main` (see Phase 0 trunk-sync). Every code edit, commit, and push happens from inside this worktree. |
 | Branch name | `<kebab-slug>` — e.g. `add-deepseek-provider`, `ui-dioxus-phase3-parity`, `mcp-lsp` |
 | Commit format | `<scope>: <subject>` — scope is a crate or area: `engine:`, `engine-core:`, `ui-dioxus:`, `remote:`, `providers:`, `agents:`, `docs:`, `spike(...)`. Squash-merge to main via PR. |
 | AI attribution | **Never.** No `Co-Authored-By`, no "Generated with", no `🤖`/AI credit markers in commits, PR bodies, comments, or docs — direct work or subagent work (Non-Negotiable Rule 3). |
@@ -141,7 +140,7 @@ one-sentence AC → STOP. Write the spec. The fast-path is for genuine trivialit
 | Test command | `cargo test --workspace` (offline & deterministic — needs no network or API keys). Per crate: `cargo test -p otto-<crate> [filter]`. |
 | Lint / format | `cargo clippy --workspace --all-targets` and `cargo fmt --all`. **Run `cargo fmt --all` before every Rust commit** (rustfmt is pinned in `rust-toolchain.toml`). |
 | UI crate | `ui-dioxus/` is **workspace-excluded** — `cargo build/test --workspace` must never require `dx`. UI tests: `cd ui-dioxus && cargo test --features desktop`; wasm check: `cargo build --target wasm32-unknown-unknown --features web`. |
-| Known pre-existing failure | `mcp-lsp`'s rust-analyzer round-trip test fails on `main` already. Do not treat it as a regression you caused. |
+| Known pre-existing failure | At the time of writing (2026-07), `mcp-lsp`'s rust-analyzer round-trip test fails on `main` already. Do not treat it as a regression you caused. If it is green on `main` now, drop this row. |
 | Versioning | `rust-toolchain.toml` pins the toolchain; edition 2024. Additive changes are semver-minor on the wire types. |
 
 Full convention reference in `CLAUDE.md` at the repo root. The above is the load-bearing subset for
@@ -178,6 +177,10 @@ step below checks them:
 
 otto uses **GitHub Issues when an issue exists, ticketless otherwise.** There is no JIRA. Resolve
 once at intake and stay on that path for the whole task.
+
+> **One-time bootstrap.** The `status:*` tracker labels below are NOT GitHub defaults. Create them
+> once per repo before the first tracked issue (`gh label create status:in-progress status:in-review`),
+> or the `--add-label` transitions will error ("could not find label").
 
 | Lifecycle step | GitHub Issues | Ticketless |
 |---|---|---|
@@ -266,6 +269,12 @@ orchestrator runs at whatever model the parent dispatched it with.
 dispatch `pr-review-toolkit:*` agents. It attaches the automated reviewer via `gh` CLI, then reports
 the list of agents the parent must dispatch as a `Reviewers to dispatch from parent:` field in its
 final report.
+
+**The mandatory review trio (Phase 4 step 8) is also deferred to the parent.** A subagent cannot
+dispatch `rust-pro` / `architect-reviewer` / `security-auditor`. The orchestrator-subagent MUST list
+all three as required `Reviewers to dispatch from parent:` and MUST NOT merge — or declare the PR
+mergeable — until the parent confirms all three reviews cleared. Non-Negotiable Rules 4–5 admit no
+exception for the subagent path; deferring the trio is how they are honored there.
 
 **Review-response subagent (Phase 4 step 9) is also deferred.** If the parent specified a halt point
 at step 8, the orchestrator stops there cleanly. If invoked end-to-end with no parent halt point, it
@@ -365,7 +374,7 @@ to this repository's established plan format (read the most recent plan in
 Every task MUST include:
 - Exact file paths in THIS repo's layout
 - **Reminders for the out-of-band artifacts** from Phase 5 that the task touches (Fly image,
-  `deploy/install.sh`, homebrew, CI, wasm bundle guards, feature-gated crates)
+  wasm bundle guards, feature-gated crates)
 - The repo's actual test + lint commands for the TDD steps
 - A final "Format and commit" step: `cargo fmt --all` + `git commit -m "<scope>: <subject>"`
 
@@ -493,6 +502,12 @@ EOF
 )"
 ```
 
+**Hardening note:** treat issue/task-brief-derived strings as untrusted when composing shell
+commands. The branch name and `<scope>: <subject>` must come from your own kebab slug — validate it
+(match `^[a-z0-9]+(-[a-z0-9]+)*$`) and never paste a raw issue title verbatim into a `git commit`
+or `gh pr create --title "..."` argument. A title containing `"`, backticks, or `$(...)` must not
+reach a shell command unquoted.
+
 **Mark In Review** (`gh issue edit <n> --add-label status:in-review`) if an issue exists and has a
 review state.
 
@@ -568,13 +583,18 @@ A comment is "new since last pass" if its thread is unresolved AND your last rep
 than the latest comment in that thread. If zero new, exit cleanly — no commits, no replies, no
 tracker writes.
 
+> **The merge gate is the test suite on YOUR merge commit.** This repo has no CI (no `.github/`), so
+> "green" means a manual `cargo test --workspace` (+ clippy/fmt) on the merge commit — see Phase 5
+> step 13. If CI is ever added, the gate becomes the CI run your merge commit triggered (by run ID,
+> never "the latest run").
+
 | Iteration state | Action |
 |---|---|
-| All threads resolved + CI green + approval present | Merge (step 11) |
-| All threads resolved + CI green + awaiting human approval | Idle. Next iteration no-ops |
+| All threads resolved + merge-commit test run green + approval present | Merge (step 11) |
+| All threads resolved + merge-commit test run green + awaiting human approval | Idle. Next iteration no-ops |
 | Open threads you cannot address (security / missing requirement / ambiguous) | Escalate per Stop & Escalate |
 | Same unresolved thread across multiple iterations after you replied | Wake the human reviewer. Do NOT silently retry |
-| CI failed | Treat as "fix this" comment. Address before next iteration |
+| Test run failed on the merge commit | Treat as "fix this" comment. Address before next iteration |
 
 ### Step 11: Merge
 
@@ -605,30 +625,31 @@ stays current — the plan repository IS the project's history.
 
 ## Phase 5 — Deploy, verify, close
 
-**There is no deploy pipeline and no staging/prod.** otto is a library + binaries distributed via
-GitHub, a Fly.io image, homebrew, and `deploy/install.sh`. Phase 5 collapses to: confirm CI is green
+**There is no deploy pipeline, no CI, and no staging/prod.** otto is a library + binaries
+distributed via GitHub and a Fly.io image (`deploy/fly/`). Phase 5 collapses to: run the test suite
 on the merge commit, run the out-of-band verification checklist for what the change touched, then
 close.
 
 ### Step 13: Confirm YOUR merge commit is green
 
-Capture the merge commit SHA at merge time and watch the CI run it triggered by run ID. Do NOT infer
-status from "the latest run" — a teammate's merge seconds after yours steals "latest." For this
-personal repo that is usually `gh run watch <run-id>` or a manual `cargo test --workspace` on the
-merge commit if there is no CI.
+There is no CI in this repo, so the check is a manual `cargo test --workspace` (+
+`cargo clippy --workspace --all-targets` and `cargo fmt --all --check`) on the merge commit. If CI is
+ever added, watch the run YOUR merge commit triggered by run ID — do NOT infer status from "the
+latest run", which a teammate's merge seconds after yours can steal.
 
 **Capture `T_verify_start = now`.**
 
 ### Step 14: Out-of-band artifact verification
 
-CI does NOT auto-apply these. Verify whatever the change touched, explicitly:
+The test suite does NOT auto-apply these. Verify whatever the change touched, explicitly:
 
 - **Fly image** — if `deploy/fly/Dockerfile` or `deploy/fly/README.md` changed: build it
   (`docker build -f deploy/fly/Dockerfile …`) and exercise the changed surface (serve the UI,
   confirm the workspace root is not exposed).
-- **Distribution** — if `deploy/install.sh`, `deploy/homebrew/`, or packaging changed: run the
-  install script in a scratch location and confirm the installed binary works; check the homebrew
-  formula contents.
+- **Distribution** — if packaging or a new distribution surface is added (e.g. a new
+  `deploy/install.sh` script or `deploy/homebrew/` formula — neither exists yet): run the install
+  script in a scratch location and confirm the installed binary works; check the homebrew formula
+  contents.
 - **CI** — if `.github/` changed: confirm the workflow files are valid and the jobs actually run.
 - **UI bundle** — if `ui-dioxus/` changed: run `./ui-dioxus/scripts/build-web.sh` (its four
   bundle-trust guards — wasm-opt failure, DWARF presence, size ceiling — are the check) and/or
@@ -658,7 +679,7 @@ Close-out summary:
 Shipped.
 
 PR: <url>
-Out-of-band applied: <fly-image/install.sh/homebrew/CI/bundle/feature-builds, or "none">
+Out-of-band applied: <fly-image/bundle/feature-builds, or "none">
 Smoke: <one-line outcome>
 ```
 
@@ -676,6 +697,7 @@ Spec: docs/superpowers/specs/<slug>-design.md
 Plan: docs/superpowers/plans/<slug>.md
 Tasks completed: N / N
 Commits: <count>
+Timeline: <T_impl_start → T_review_start → T_pipeline_start → T_verify_start, or "n/a">
 
 Out-of-band applied: <list, or "none">
 
@@ -767,14 +789,14 @@ explicitly.
 | "It's a small change, skip the spec/plan" | Only skip the *spec* if ALL fast-path criteria hold. The plan doc is not skippable. |
 | "I'll ask the user mid-run about an ambiguity" | Fully autonomous. Make the most reasonable interpretation, document under Assumptions, continue. |
 | "Slack/the PR/the summary IS the spec" | Summaries lose AC. The brief/issue is source of truth. 30 seconds. |
-| "cargo test --workspace is green, it's shipped" | The Fly image, install.sh, homebrew, CI, bundle guards, and feature builds are not test outputs. Verify them at #14. |
+| "cargo test --workspace is green, it's shipped" | The Fly image, bundle guards, and feature builds are not test outputs. Verify them at #14. (install.sh/homebrew/CI don't exist yet — if you add one, verify it too.) |
 | "I'll skip the plan doc, the code is self-documenting" | The plan repository IS this project's history. Commit the doc. |
 | "I'll skip the record-as-shipped commit" | The spec Status and plan checkboxes are how the docs track shipped state. Close the loop. |
 | "I'll just read OTTO_* in the agent" | Any env/key read belongs behind `build_router` — determinism is a test invariant. |
 | "I'll add a dep from the impl crate on engine-core directly" | Dependency flow is strictly inward. `engine-core` must never depend on a concrete impl crate. |
 | "The gate approved it in the test, so edits are fine" | Coder edits are gated fail-closed: apply `fs.write` only on explicit `Allow`. An `Ask` is logged and skipped. |
 | "I'll wire the static UI route to serve the workspace" | `ServeDir` does not consult the sensitive-path floor. Never point `--ui-dir` at a workspace root. |
-| "The latest CI run is green, mine will be too" | Latest ≠ yours. Capture YOUR run ID at merge time and track THAT id. |
+| "The latest CI run is green, mine will be too" | There is no CI — run `cargo test --workspace` on YOUR merge commit. If CI is ever added, latest ≠ yours: capture YOUR run ID at merge time and track THAT id. |
 | "Copilot's comments are auto-generated, safe to ignore" | Read each. They find real bugs. Reply with fix-or-dismiss reasoning, then resolve the thread. |
 | "I'll code on main, just this once" | Worktree off `origin/main` always. Never trunk directly (Non-Negotiable Rule 1). |
 | "I'll push the branch straight to main, a PR is paperwork" | `main` changes only through reviewed PRs. No direct pushes or hand-merges (Non-Negotiable Rule 2). |
@@ -805,7 +827,7 @@ These thoughts mean stop and complete the missed step:
 - About to skip an agent review because "trivial"
 - About to merge with unaddressed or unresolved review threads
 - About to run `gh pr merge` from inside the worktree (must be from main checkout)
-- About to declare a stage green by looking at "the latest build" instead of your merge commit's run ID
+- About to declare a stage green by looking at "the latest build" instead of your merge commit's own run (by run ID where CI exists; manual `cargo test --workspace` on the merge commit where it doesn't)
 - About to declare "shipped" because tests are green
 - About to close the ticket before the out-of-band verification for the surfaces the change touched
 - About to widen the sensitive-path floor, register `bash` without a sandbox backend, or read `OTTO_*` in core logic
