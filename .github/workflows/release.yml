@@ -71,10 +71,10 @@ jobs:
   # Fedora/RHEL-family native packages. cargo-generate-rpm needs no rpmbuild or a Fedora host —
   # it packages the cargo-built binary from [package.metadata.generate-rpm] in crates/engine.
   # `recommends: bubblewrap` is encoded in the metadata, so dnf installs the sandbox backend by
-  # default. The asset source in that metadata is relative to crates/engine/ (the dir the tool
-  # must run in) but cargo builds into the workspace-root target/ — the `--target` flag below
-  # tells the tool to look in target/<triple>/release/, so build the binary first, then package.
-  # RPMs land at target/rpms/otto-<version>-1.<arch>.rpm.
+  # default. The tool runs from the workspace root (with -p crates/engine) so the metadata's
+  # `target/release/otto` asset is relative to the root; the `--target` flag below redirects that
+  # to target/<triple>/release/ where the `cargo build --target` above put the binary. RPMs land
+  # at target/rpms/otto-<version>-1.<arch>.rpm.
   build-rpm:
     needs: create-release
     runs-on: ubuntu-latest
@@ -96,10 +96,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p otto-engine
       - name: Build RPM
-        working-directory: crates/engine
         run: |
-          mkdir -p ../../target/rpms
-          cargo generate-rpm --target ${{ matrix.target }} --output ../../target/rpms
+          mkdir -p target/rpms
+          cargo generate-rpm -p crates/engine --target ${{ matrix.target }} --output target/rpms
       - name: Upload RPM to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
