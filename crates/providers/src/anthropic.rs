@@ -22,9 +22,12 @@ impl AnthropicProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into();
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            // Redirects off: this provider authenticates with `x-api-key`, which is NOT in
+            // reqwest's strip list, so it would be forwarded on *any* cross-host redirect.
+            client: super::base_url::build_http_client(&base_url),
+            base_url,
             api_key: api_key.into(),
             model: model.into(),
             max_tokens: 4096,
@@ -78,7 +81,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = super::base_url::join_url(&self.base_url, "/v1/messages");
         let body = MessagesRequest {
             model: &self.model,
             max_tokens: self.max_tokens,
@@ -87,17 +90,16 @@ impl Provider for AnthropicProvider {
                 content: &req.prompt,
             }],
         };
-        let resp = self
+        let raw = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<MessagesResponse>()
             .await?;
+        super::base_url::reject_redirect(&raw)?;
+        let resp = raw.error_for_status()?.json::<MessagesResponse>().await?;
         let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
@@ -186,5 +188,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("401") || err.to_string().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_does_not_follow_redirects() {
+        // Redirects are disabled because reqwest's header-strip list is fixed and does not
+        // include this provider's auth header (x-api-key), so a redirect would forward the
+        // credential to any host. The 3xx must also be surfaced as an error rather than parsed:
+        // otherwise the redirect body below would be accepted as the model's answer.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"content":[{"type":"text","text":"leaked"}]}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/v1/messages", upstream.uri()).as_str(),
+                    )
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"content":[{"type":"text","text":"leaked"}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = AnthropicProvider::new(server.uri(), "k", "claude-haiku-4-5");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 3xx must be an error, not a parsed completion; got {result:?}"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("wiremock request recording must be enabled for this assertion")
+                .is_empty(),
+            "the redirect target must never receive the credential or the prompt body"
+        );
     }
 }

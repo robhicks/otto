@@ -15,9 +15,12 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// `base_url` is the Ollama server root (no trailing slash), e.g. `http://127.0.0.1:11434`.
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let base_url = base_url.into();
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            // Redirects off for the same reason as the keyed providers; Ollama is local and has no
+            // legitimate redirect, and this keeps every provider's client policy identical.
+            client: super::base_url::build_http_client(&base_url),
+            base_url,
             model: model.into(),
         }
     }
@@ -51,21 +54,15 @@ impl Provider for OllamaProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}/api/generate", self.base_url);
+        let url = super::base_url::join_url(&self.base_url, "/api/generate");
         let body = GenerateRequest {
             model: &self.model,
             prompt: &req.prompt,
             stream: false,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<GenerateResponse>()
-            .await?;
+        let raw = self.client.post(&url).json(&body).send().await?;
+        super::base_url::reject_redirect(&raw)?;
+        let resp = raw.error_for_status()?.json::<GenerateResponse>().await?;
         Ok(CompleteResponse {
             text: resp.response,
             usage: Some(otto_engine_core::types::Usage {
@@ -151,5 +148,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500") || err.to_string().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn ollama_does_not_follow_redirects() {
+        // Ollama is keyless, so there is no credential to forward — the reason redirects are
+        // disabled here is the request *body*: a 307/308 would re-POST the prompt, which carries
+        // whatever workspace file contents the ContextFinder gathered, from a loopback-only client
+        // to an arbitrary external host. The 3xx must also be surfaced as an error rather than
+        // parsed: otherwise the redirect body below would be accepted as the model's answer.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"response":"leaked"}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/api/generate", upstream.uri()).as_str(),
+                    )
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"response":"leaked"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(server.uri(), "llama3.2");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 3xx must be an error, not a parsed completion; got {result:?}"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("wiremock request recording must be enabled for this assertion")
+                .is_empty(),
+            "the redirect target must never receive the credential or the prompt body"
+        );
     }
 }

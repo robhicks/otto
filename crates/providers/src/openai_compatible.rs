@@ -37,7 +37,7 @@ impl OpenAiCompatibleProvider {
         token_fields: TokenFields,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::base_url::build_http_client(&base_url),
             base_url,
             path_suffix,
             api_key,
@@ -48,7 +48,7 @@ impl OpenAiCompatibleProvider {
     }
 
     pub(crate) async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}{}", self.base_url, self.path_suffix);
+        let url = super::base_url::join_url(&self.base_url, self.path_suffix);
         let (max_tokens, max_completion_tokens) = (self.token_fields)(&self.model, self.max_tokens);
         let body = ChatRequest {
             model: &self.model,
@@ -59,16 +59,15 @@ impl OpenAiCompatibleProvider {
                 content: &req.prompt,
             }],
         };
-        let resp = self
+        let raw = self
             .client
             .post(&url)
             .header("authorization", format!("Bearer {}", self.api_key))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatResponse>()
             .await?;
+        super::base_url::reject_redirect(&raw)?;
+        let resp = raw.error_for_status()?.json::<ChatResponse>().await?;
         let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,

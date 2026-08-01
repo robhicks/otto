@@ -149,6 +149,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deepseek_tolerates_a_base_url_with_a_trailing_slash() {
+        // Regression for #112, mirroring the OpenAI case against the other path suffix
+        // (`/chat/completions`, no `/v1` segment).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            DeepSeekProvider::new(format!("{}/", server.uri()), "k", "deepseek-v4-flash");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+    }
+
+    #[tokio::test]
     async fn deepseek_returns_empty_text_for_empty_choices() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

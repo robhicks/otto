@@ -432,6 +432,10 @@ fn register_hooks(
 }
 
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
+    // A bad *_BASE_URL makes the engine degrade to the offline canned provider, which still
+    // produces a complete-looking turn. In the CLI — where a human set the variable — refuse to
+    // start instead, so the misconfiguration is obvious in seconds rather than days.
+    otto_engine::preflight_base_urls()?;
     let (root, after_root) = parse_root(&args);
     let (command_name, after_cmd) = parse_command_flag(&after_root);
     let (agent_name, positional) = parse_agent_flag(&after_cmd);
@@ -635,6 +639,10 @@ async fn run_command_in(
 }
 
 async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
+    // Fail fast on a bad *_BASE_URL. This matters most on serve: the offline fallback keeps
+    // answering, so connected clients would receive canned output indefinitely with nothing but a
+    // single startup warning on the server's stderr to show for it.
+    otto_engine::preflight_base_urls()?;
     let (root, positional) = parse_root(&args);
     // Validated (and canonicalized) immediately after parsing, before any other server setup, so
     // a bad --ui-dir fails fast and closed rather than starting a server that looks healthy and

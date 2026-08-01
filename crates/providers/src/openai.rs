@@ -197,6 +197,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_tolerates_a_base_url_with_a_trailing_slash() {
+        // Regression for #112. `server.uri()` has no trailing slash, so append one to mimic an
+        // operator's `OPENAI_BASE_URL=https://host/v1/`. Before the join fix the endpoint was
+        // `<uri>//v1/chat/completions`; the mock below matches only the single-slash path, so a
+        // doubled separator makes this request 404 and the call fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(format!("{}/", server.uri()), "k", "gpt-4o-mini");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+    }
+
+    #[tokio::test]
+    async fn openai_does_not_follow_redirects() {
+        // reqwest's default policy follows up to 10 redirects and strips `Authorization` only on a
+        // host/port change — NOT on an https->http scheme downgrade. Following would therefore
+        // re-send the Bearer token, and on 307/308 the request body, to a host the operator never
+        // validated. `upstream` here stands in for that host: it must receive nothing.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "leaked" } }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/v1/chat/completions", upstream.uri()).as_str(),
+                    )
+                    // The 302 carries a valid-looking completion body ON PURPOSE. Without it the
+                    // `is_err()` below would hold merely because an empty body fails to
+                    // deserialize — i.e. the test would pass even with the 3xx guard removed, and
+                    // would only be checking "the redirect was not followed". With a parseable
+                    // body it also pins "a 3xx is never parsed as a completion".
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"choices":[{"message":{"content":"leaked"}}]}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(server.uri(), "test-key", "gpt-4o-mini");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(result.is_err(), "the redirect must not be followed");
+        let hits = upstream
+            .received_requests()
+            .await
+            .expect("wiremock request recording must be enabled for this assertion");
+        assert!(
+            hits.is_empty(),
+            "the redirect target received {} request(s); the Bearer token and prompt body must \
+             never reach an unvalidated host",
+            hits.len()
+        );
+    }
+
+    #[tokio::test]
     async fn openai_returns_empty_text_for_empty_choices() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
