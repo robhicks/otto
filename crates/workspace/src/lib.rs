@@ -27,6 +27,15 @@ impl LocalWorkspace {
     /// written and are not rolled back.
     pub async fn restore(&self, snapshot: &WorkspaceSnapshot) -> anyhow::Result<()> {
         for (path, bytes) in &snapshot.files {
+            // The ingress mirror of `snapshot`'s floor. `apply_edit` enforces containment only,
+            // and `LoopbackTarget::provision` calls this directly on a caller-supplied bundle
+            // without the `validate_workspace_edits` pass the network paths get. Unreachable
+            // today (the only loopback bundle comes from `promote`, which now filters on the way
+            // out) — but relying on that is delegation to another control, which is the exact
+            // pattern this seam's last leak came from.
+            if path.to_str().is_none_or(otto_protocol::is_sensitive) {
+                continue;
+            }
             let new_contents = String::from_utf8(bytes.clone()).map_err(|_| {
                 anyhow::anyhow!("restore: non-UTF-8 contents for {}", path.display())
             })?;
@@ -158,7 +167,15 @@ impl Workspace for LocalWorkspace {
             // *contents* for shipment off-machine — `otto_remote::promote` puts one straight
             // into a `PromoteBundle` — so the floor is re-asserted here rather than in any one
             // caller, which would leave the next caller to reintroduce the gap.
-            if otto_protocol::is_sensitive(&path.to_string_lossy()) {
+            //
+            // `to_str()`, never `to_string_lossy()`: `validate_workspace_edits` warns in as many
+            // words that U+FFFD substitution could let a non-UTF-8 path slip a marker past the
+            // check. A non-UTF-8 path is skipped rather than shipped — which also stops one such
+            // filename from making a whole bundle unusable, since the receiver refuses them.
+            let Some(path_str) = path.to_str() else {
+                continue;
+            };
+            if otto_protocol::is_sensitive(path_str) {
                 continue;
             }
             let bytes = self.read(&path).await?;
@@ -176,7 +193,9 @@ impl Workspace for LocalWorkspace {
 pub(crate) fn strip_sensitive_files(mut files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
     // `retain` in place rather than filter-and-collect: the element type is unchanged, so there
     // is no reason to allocate a second backing buffer for what is usually a no-op.
-    files.retain(|(p, _)| !otto_protocol::is_sensitive(&p.to_string_lossy()));
+    // Fail closed on a non-UTF-8 path: drop it rather than lossy-convert. See the note in
+    // `LocalWorkspace::snapshot`.
+    files.retain(|(p, _)| p.to_str().is_some_and(|s| !otto_protocol::is_sensitive(s)));
     files
 }
 
@@ -482,5 +501,38 @@ mod tests {
             .map(|(p, _)| p.to_string_lossy().to_string())
             .collect();
         assert_eq!(kept, vec!["ok.txt".to_string()]);
+    }
+
+    /// `restore` is the ingress mirror of `snapshot`, and `apply_edit` enforces containment only.
+    /// `LoopbackTarget::provision` calls this directly on a caller-supplied bundle, without the
+    /// `validate_workspace_edits` pass the network ingress paths get — so the floor is applied
+    /// here too rather than delegated to whoever built the bundle.
+    #[tokio::test]
+    async fn restore_refuses_to_write_floor_sensitive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = LocalWorkspace::new(dir.path());
+
+        ws.restore(&WorkspaceSnapshot {
+            files: vec![
+                (PathBuf::from("ok.txt"), b"fine".to_vec()),
+                (PathBuf::from("id_rsa"), b"PRIVATE KEY".to_vec()),
+                (PathBuf::from("config/local.env"), b"SECRET=xyz".to_vec()),
+            ],
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            dir.path().join("ok.txt").exists(),
+            "ordinary files must land"
+        );
+        assert!(
+            !dir.path().join("id_rsa").exists(),
+            "a floor-sensitive entry must not be written"
+        );
+        assert!(
+            !dir.path().join("config/local.env").exists(),
+            "a nested floor-sensitive entry must not be written"
+        );
     }
 }

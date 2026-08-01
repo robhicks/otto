@@ -21,6 +21,11 @@ pub trait Provider: Send + Sync {
 
 /// Read access to the repository the engine operates on. This is the agent-facing view
 /// (`AgentCtx::workspace()`) — agents may read, but cannot mutate, the workspace.
+///
+/// `read` and `list` are deliberately **not** floor-filtered; only `Workspace::snapshot` is,
+/// because it alone ships whole file contents off-machine. Access through these two is mediated
+/// by the gated `fs.read`/`fs.list` tools, which do enforce the floor. Do not read
+/// `snapshot`'s guarantee as covering the seam.
 #[async_trait]
 pub trait WorkspaceRead: Send + Sync {
     async fn read(&self, path: &Path) -> anyhow::Result<Vec<u8>>;

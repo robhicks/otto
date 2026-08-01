@@ -13,7 +13,13 @@
 ## Global Constraints
 
 - **The floor is not widened.** `SENSITIVE_MARKERS` is untouched. This change *applies* the existing floor in one more place — a tightening, never a relaxation.
-- **No new dependency** in any crate.
+- ~~**No new dependency** in any crate.~~ **Amended during implementation:** `otto-workspace` was
+  added to `crates/remote`'s **`[dev-dependencies]`**. Step 6 requires a `remote` test that fails
+  when the guard is removed, and that needs the real `LocalWorkspace` — `crates/remote`'s test
+  module had never exercised `promote()` against a real workspace, so a stub would have asserted
+  only the stub's own behavior and Step 7's mutation would have exposed it as worthless. Dev-only,
+  no cycle (`otto-workspace` has no path back to `otto-remote`), production graph unchanged. The
+  constraint's intent — do not grow the shipped dependency graph — is preserved.
 - **`promote()` in `crates/remote` is not modified.** It must inherit the filtering. If a task seems to need a change there, stop — that is the rejected alternative in the spec.
 - **`list()` behavior is unchanged** (only its false comment is corrected). Filtering `list` would perturb the ContextFinder for no security gain here.
 - **`EngineService::filtered_workspace_snapshot` stays.** It filters through `tools.check("fs.read", …)`, which is strictly broader than the floor — it also honours `PolicyGate` rules. The two compose.
@@ -30,9 +36,19 @@
 | `crates/workspace/src/lib.rs:84-87` | **Modify.** The walk's comment claims the dotfile skip "also covers the gate's sensitive-path floor". It does not — that false claim is why the raw snapshot was trusted. |
 | `crates/workspace/src/lib.rs` (tests) | **Modify.** Regression test asserting no `is_sensitive` path survives a snapshot. |
 | `crates/remote/src/lib.rs` (tests) | **Modify.** Assert `promote()`'s bundle inherits the filtering. |
-| `CLAUDE.md` | **Modify.** The `workspace` crate row states that `snapshot()` applies the floor. |
+| `CLAUDE.md` | **Modify.** The `workspace` crate row states that `snapshot()` applies the floor; the `remote` row notes the dev-only `otto-workspace` edge. |
+| `crates/workspace/src/remote.rs` | **Modify** *(added during review).* `RemoteWorkspace::snapshot` re-applies the floor instead of trusting the peer. |
+| `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only: the same false dotfile-covers-the-floor claim lived at the seam contract, one level up. |
+| `crates/remote/Cargo.toml` | **Modify** *(added during review).* The dev-dependency above. |
 
 ## Task Order & Rationale
+
+> **What actually shipped: three commits, not one.** Review after Task 1 found the seam's contract
+> was satisfied by *delegation* — `RemoteWorkspace::snapshot` trusted the peer to be an up-to-date
+> otto that filters — which is the same shape of assumption that caused this bug. A second commit
+> enforces the floor locally there too, via a shared `strip_sensitive_files` helper with its own
+> test. A third applies a review nit (`retain` in place rather than filter-and-collect). The
+> File Structure table above is annotated with the files those added.
 
 One task. The change is ~6 lines; splitting it would produce a commit that adds a test for behavior the next commit introduces. Both tests land with the fix so the branch is never in a state where the guarantee is claimed but unenforced.
 
@@ -182,7 +198,10 @@ git commit -m "workspace: apply the sensitive-path floor in snapshot"
 
 ## Self-Review
 
-**Spec coverage.** Design §"Where the filter goes" → Step 3. The false-comment correction → Step 4. Testing §bullet 1 → Step 1. Testing §bullet 2 → Step 6. Testing §"verify by mutation" → Step 7. Success criteria 1 → Steps 1/5; 2 → Step 9; 3 (`promote()` unchanged) → enforced by the Global Constraints and by Step 6 testing it from the outside; 4 → Step 4.
+**Spec coverage** *(updated post-implementation).* `RemoteWorkspace::snapshot` and the
+`strip_sensitive_files` helper are not in the steps below — they came out of review and are
+recorded in the Task Order note above and in the spec's rejected-alternatives section. Everything
+else: Design §"Where the filter goes" → Step 3. The false-comment correction → Step 4. Testing §bullet 1 → Step 1. Testing §bullet 2 → Step 6. Testing §"verify by mutation" → Step 7. Success criteria 1 → Steps 1/5; 2 → Step 9; 3 (`promote()` unchanged) → enforced by the Global Constraints and by Step 6 testing it from the outside; 4 → Step 4.
 
 **No placeholders.** Every step names an exact file, command, and expected result. Step 6 is the one that describes rather than dictates its code, because it must match `crates/remote`'s existing test fixtures, which the implementer should read rather than have guessed at here.
 
