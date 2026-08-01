@@ -15,9 +15,12 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// `base_url` is the Ollama server root (no trailing slash), e.g. `http://127.0.0.1:11434`.
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        let base_url = base_url.into();
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            // Redirects off for the same reason as the keyed providers; Ollama is local and has no
+            // legitimate redirect, and this keeps every provider's client policy identical.
+            client: super::base_url::build_http_client(&base_url),
+            base_url,
             model: model.into(),
         }
     }

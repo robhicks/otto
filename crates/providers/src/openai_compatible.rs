@@ -18,34 +18,6 @@ pub(crate) fn always_max_tokens(_model: &str, budget: u32) -> (Option<u32>, Opti
     (Some(budget), None)
 }
 
-/// Build the HTTP client for a chat-completions endpoint.
-///
-/// Validating the base URL (`base_url::validate_base_url`) only constrains the *first* hop, so two
-/// client settings are needed for that guarantee to survive contact with the network:
-///
-/// - **Redirects are disabled.** reqwest strips `Authorization` only when a redirect changes host
-///   or port — *not* when it changes scheme. A validated `https://gw:8443` answering `302` with
-///   `http://gw:8443` is same-host, same-port, so the `Bearer` token would be re-sent in cleartext.
-///   A 307/308 would additionally re-POST the request body — which carries the goal and whatever
-///   workspace file contents the ContextFinder gathered — to a host the operator never named.
-///   A chat-completions endpoint has no legitimate reason to redirect.
-/// - **The system proxy is disabled for `http` bases.** `Client::new()` honors `HTTP_PROXY`/
-///   `ALL_PROXY`, and neither reqwest nor hyper exempts loopback. Without this, an operator with a
-///   corporate proxy exported who points at `http://127.0.0.1:8080` would send the plaintext
-///   request — key included — to that proxy across the network, defeating the whole justification
-///   for allowing loopback `http` at all. `https` bases keep proxy support: the proxy sees only a
-///   CONNECT tunnel, so the credential stays protected.
-fn build_client(base_url: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    if base_url.starts_with("http://") {
-        builder = builder.no_proxy();
-    }
-    // Mirrors `reqwest::Client::new()`, which panics on the same TLS-backend init failure.
-    builder
-        .build()
-        .expect("provider HTTP client failed to initialize")
-}
-
 pub(crate) struct OpenAiCompatibleProvider {
     client: reqwest::Client,
     base_url: String,
@@ -65,7 +37,7 @@ impl OpenAiCompatibleProvider {
         token_fields: TokenFields,
     ) -> Self {
         Self {
-            client: build_client(&base_url),
+            client: super::base_url::build_http_client(&base_url),
             base_url,
             path_suffix,
             api_key,
@@ -87,16 +59,25 @@ impl OpenAiCompatibleProvider {
                 content: &req.prompt,
             }],
         };
-        let resp = self
+        let raw = self
             .client
             .post(&url)
             .header("authorization", format!("Bearer {}", self.api_key))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatResponse>()
             .await?;
+        // Redirects are disabled, so a 3xx comes back as a response rather than being followed.
+        // `error_for_status` only rejects 4xx/5xx, so without this a redirect body would be parsed
+        // as if it were a model completion — an endpoint answering 302 with valid-looking
+        // Chat-Completions JSON would have its content accepted as the answer.
+        if raw.status().is_redirection() {
+            anyhow::bail!(
+                "provider endpoint returned {} — redirects are disabled for credential safety; \
+                 point the base URL at the final endpoint instead",
+                raw.status()
+            );
+        }
+        let resp = raw.error_for_status()?.json::<ChatResponse>().await?;
         let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,

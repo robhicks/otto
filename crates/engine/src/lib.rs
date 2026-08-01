@@ -294,7 +294,11 @@ fn resolve_base_url(
         return Some(default.to_string());
     };
     match otto_providers::validate_base_url(&value) {
-        Ok(()) => Some(value),
+        // The NORMALIZED form, not the operator's raw string: a downstream decision made by
+        // inspecting the raw text (the provider client's proxy policy) would otherwise disagree
+        // with what was validated here — `HTTP://127.0.0.1` and `http:/127.0.0.1` both validate
+        // as loopback http but neither starts with the literal "http://".
+        Ok(normalized) => Some(normalized),
         Err(e) => {
             // `e` is redacted to scheme://host:port — it carries neither the API key nor any
             // secret embedded in the rejected URL's userinfo or query.
@@ -372,8 +376,12 @@ pub fn preflight_base_urls() -> anyhow::Result<()> {
         if value.is_empty() {
             continue; // Explicitly empty means "unset"; the default endpoint is used.
         }
-        otto_providers::validate_base_url(&value)
-            .map_err(|e| anyhow::anyhow!("{var_name} is invalid: {e}"))?;
+        otto_providers::validate_base_url(&value).map_err(|e| {
+            anyhow::anyhow!(
+                "{var_name} is invalid: {e}\n(checked at startup for every provider, whether or \
+                 not it is the selected remote — unset it if you are not using that provider)"
+            )
+        })?;
     }
     Ok(())
 }
@@ -739,21 +747,45 @@ mod tests {
     }
 
     #[test]
-    fn valid_base_url_override_is_used_verbatim() {
-        // https anywhere, and plain http to loopback (the wiremock shape), are both honored.
+    fn valid_base_url_override_is_accepted_and_normalized() {
+        // https anywhere, and plain http to loopback (the wiremock shape), are both honored. The
+        // value returned is the parser's NORMALIZED form, not the raw input — that is what keeps
+        // the provider client's proxy decision in sync with what was validated. Normalization may
+        // append a trailing `/`, which `join_url` trims when composing the endpoint.
         for candidate in [
             "https://gateway.internal.example.com/v1",
             "http://127.0.0.1:8080",
             "http://localhost:1234",
         ] {
-            assert_eq!(
-                resolve_base_url(
-                    Some(candidate.to_string()),
-                    "https://api.openai.com",
-                    "OPENAI_BASE_URL"
-                ),
+            let resolved = resolve_base_url(
                 Some(candidate.to_string()),
-                "expected {candidate} to be accepted"
+                "https://api.openai.com",
+                "OPENAI_BASE_URL",
+            )
+            .unwrap_or_else(|| panic!("expected {candidate} to be accepted"));
+            assert_eq!(resolved.trim_end_matches('/'), candidate);
+        }
+    }
+
+    #[test]
+    fn accepted_override_always_carries_an_unambiguous_scheme() {
+        // Spellings that validate as loopback http but do NOT start with the literal "http://".
+        // If the raw string were passed through, the provider client would misread the scheme and
+        // skip no_proxy(), shipping the cleartext request (key included) to an HTTP_PROXY.
+        for raw in [
+            "HTTP://127.0.0.1:9",
+            "http:/127.0.0.1:9",
+            " http://127.0.0.1:9",
+        ] {
+            let resolved = resolve_base_url(
+                Some(raw.to_string()),
+                "https://api.openai.com",
+                "OPENAI_BASE_URL",
+            )
+            .unwrap_or_else(|| panic!("expected {raw} to be accepted"));
+            assert!(
+                resolved.starts_with("http://"),
+                "{raw} resolved to {resolved}, which hides the scheme from the client"
             );
         }
     }

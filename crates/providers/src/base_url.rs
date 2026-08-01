@@ -91,10 +91,32 @@ impl fmt::Display for BaseUrlError {
 
 impl std::error::Error for BaseUrlError {}
 
+/// Name a rejected scheme only when it is a recognized one.
+///
+/// The "scheme" of a non-URL is just its text before the first `:`, so a credential pasted into
+/// the wrong variable (`OPENAI_BASE_URL=$OPENAI_API_KEY`, a transposed compose line) would put its
+/// leading segment — `sk-proj-abc` of `sk-proj-abc:123def` — straight into a message that is
+/// printed to stderr and thence to CI logs and journald. Anything unrecognized is withheld.
+fn nameable_scheme(scheme: &str) -> String {
+    const KNOWN: [&str; 8] = [
+        "ftp", "file", "ws", "wss", "gopher", "data", "blob", "mailto",
+    ];
+    if KNOWN.contains(&scheme) {
+        scheme.to_string()
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
 /// Render a parsed URL as `scheme://host[:port]` only — dropping userinfo, path, query, and
 /// fragment, any of which may carry a secret the operator would not want in a log.
 fn redact(parsed: &reqwest::Url) -> String {
-    let scheme = parsed.scheme();
+    // The scheme goes through the same allowlist: for a non-URL it is just the text before the
+    // first `:`, which is where a mis-pasted credential's leading segment would land.
+    let scheme = match parsed.scheme() {
+        s @ ("http" | "https") => s.to_string(),
+        other => nameable_scheme(other),
+    };
     let host = parsed.host_str().unwrap_or("<no-host>");
     match parsed.port() {
         Some(port) => format!("{scheme}://{host}:{port}"),
@@ -106,7 +128,15 @@ fn redact(parsed: &reqwest::Url) -> String {
 ///
 /// Accepts any `https://` URL, and `http://` only when the host is loopback (`localhost`, an IPv4
 /// address in `127.0.0.0/8`, or `[::1]`).
-pub fn validate_base_url(base_url: &str) -> Result<(), BaseUrlError> {
+///
+/// **Returns the NORMALIZED URL, and callers must use that value rather than their input.** The
+/// parser lowercases the scheme, trims surrounding whitespace, strips embedded tab/newline, and
+/// collapses stray slashes after `scheme:` — so `HTTP://127.0.0.1`, `http:/127.0.0.1`, and
+/// `" http://127.0.0.1 "` all validate as loopback `http`, but none of them *starts with* the
+/// literal `"http://"`. Any downstream decision made by inspecting the raw string (choosing a
+/// proxy policy, say) would therefore disagree with what was validated here. Returning the
+/// normalized form is what keeps the two in sync; see [`build_http_client`].
+pub fn validate_base_url(base_url: &str) -> Result<String, BaseUrlError> {
     let parsed = reqwest::Url::parse(base_url).map_err(|_| BaseUrlError::Unparseable)?;
     let redacted = redact(&parsed);
 
@@ -124,7 +154,7 @@ pub fn validate_base_url(base_url: &str) -> Result<(), BaseUrlError> {
         other => {
             return Err(BaseUrlError::UnsupportedScheme {
                 redacted,
-                scheme: other.to_string(),
+                scheme: nameable_scheme(other),
             });
         }
     }
@@ -138,7 +168,36 @@ pub fn validate_base_url(base_url: &str) -> Result<(), BaseUrlError> {
         return Err(BaseUrlError::HasQueryOrFragment(redacted));
     }
 
-    Ok(())
+    Ok(parsed.as_str().to_string())
+}
+
+/// Build the HTTP client for a provider endpoint, given an **already-normalized** base URL from
+/// [`validate_base_url`].
+///
+/// - **Redirects are disabled.** reqwest strips `Authorization` only when a redirect changes host
+///   or port — *not* when it changes scheme — so a same-host `https`→`http` downgrade would re-send
+///   a bearer token in cleartext, and a 307/308 would re-POST the request body (goal plus whatever
+///   workspace file contents were gathered) to a host the operator never named. Worse, the strip
+///   list is fixed: `x-api-key` / `x-goog-api-key` are **never** removed, so providers using a
+///   custom auth header leak on *any* cross-host redirect. No provider endpoint here has a
+///   legitimate reason to redirect.
+/// - **The system proxy is disabled for `http` bases.** `Client::new()` honors `HTTP_PROXY` /
+///   `ALL_PROXY` with no loopback exemption, so a plaintext loopback request would otherwise be
+///   shipped across the network — voiding the entire justification for allowing loopback `http`.
+///   `https` bases keep proxy support: the proxy sees only a CONNECT tunnel.
+///
+/// The `http` test parses the URL rather than inspecting a prefix, so it cannot desynchronize from
+/// what [`validate_base_url`] decided.
+pub(crate) fn build_http_client(base_url: &str) -> reqwest::Client {
+    let is_http = reqwest::Url::parse(base_url).is_ok_and(|u| u.scheme() == "http");
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if is_http {
+        builder = builder.no_proxy();
+    }
+    // Mirrors `reqwest::Client::new()`, which panics on the same TLS-backend init failure.
+    builder
+        .build()
+        .expect("provider HTTP client failed to initialize")
 }
 
 /// Loopback iff the host is literally `localhost`, or an IP the standard library calls loopback.
@@ -196,10 +255,10 @@ mod tests {
             // NOT hostless: this parses with host `foo`, so the https rule accepts it.
             "https:///foo",
         ] {
-            assert_eq!(
-                validate_base_url(url),
-                Ok(()),
-                "expected {url} to be accepted"
+            assert!(
+                validate_base_url(url).is_ok(),
+                "expected {url} to be accepted, got {:?}",
+                validate_base_url(url)
             );
         }
     }
@@ -225,6 +284,58 @@ mod tests {
                 validate_base_url(url)
             );
         }
+    }
+
+    #[test]
+    fn normalizes_accepted_urls_so_the_scheme_cannot_be_misread_downstream() {
+        // Each of these validates as loopback `http`, yet NONE starts with the literal "http://".
+        // A downstream proxy decision made by string prefix would therefore skip `no_proxy()` and
+        // ship the cleartext request — key included — to an operator's HTTP_PROXY. The normalized
+        // return value is what keeps that decision in sync with what was validated here.
+        for raw in [
+            "http:/127.0.0.1:9",
+            "HTTP://127.0.0.1:9",
+            " http://127.0.0.1:9",
+            "http:127.0.0.1:9",
+        ] {
+            let normalized = validate_base_url(raw)
+                .unwrap_or_else(|e| panic!("{raw} should validate as loopback http, got {e:?}"));
+            assert!(
+                normalized.starts_with("http://"),
+                "{raw} normalized to {normalized}, which still hides the scheme"
+            );
+            assert!(
+                reqwest::Url::parse(&normalized).is_ok_and(|u| u.scheme() == "http"),
+                "{normalized} must parse back as http"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_strips_surrounding_whitespace() {
+        // Otherwise join_url would append onto a base with an interior space, which reqwest
+        // percent-encodes into a mis-targeted path.
+        let normalized = validate_base_url(" https://api.openai.com ").unwrap();
+        assert!(!normalized.contains(' '), "got {normalized}");
+        assert!(normalized.starts_with("https://api.openai.com"));
+    }
+
+    #[test]
+    fn unrecognized_schemes_are_not_echoed() {
+        // The "scheme" of a non-URL is just the text before the first ':', so a credential pasted
+        // into the wrong env var would otherwise have its leading segment printed to stderr.
+        for raw in ["sk-proj-abc123:secret", "ghp-tokenvalue:more"] {
+            let msg = validate_base_url(raw).unwrap_err().to_string();
+            assert!(!msg.contains("sk-proj-abc123"), "leaked: {msg}");
+            assert!(!msg.contains("ghp-tokenvalue"), "leaked: {msg}");
+            assert!(
+                msg.contains("<redacted>"),
+                "expected redaction marker: {msg}"
+            );
+        }
+        // A genuinely recognizable scheme is still named, since that is useful and not a secret.
+        let msg = validate_base_url("ftp://host/x").unwrap_err().to_string();
+        assert!(msg.contains("ftp"), "got {msg}");
     }
 
     #[test]

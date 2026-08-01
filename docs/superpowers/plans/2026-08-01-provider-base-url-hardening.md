@@ -200,3 +200,38 @@ added to record the corrected design; this task tracks the implementation.
 - [x] Run the full gate: `cargo fmt --all --check`,
       `cargo clippy --workspace --all-targets -- -D warnings`,
       `cargo test --workspace -- --skip rust_analyzer_integration` — 789 passed, 0 failed.
+
+### Task 5: Second security pass on the round-1 delta
+
+The round-1 fixes were themselves re-reviewed (blind, delta only). That pass found a **Critical**
+flaw introduced by the round-1 proxy fix, plus one Important leak and two Minors.
+
+**Files:** `crates/providers/src/base_url.rs`, `crates/providers/src/openai_compatible.rs`,
+`crates/providers/src/{anthropic,gemini,ollama}.rs`, `crates/engine/src/lib.rs`, `CLAUDE.md`
+
+- [x] **Critical — the proxy carve-out was decided by a raw-string prefix the validator never
+      required.** `build_client` tested `base_url.starts_with("http://")` while `validate_base_url`
+      tested `parsed.scheme()`. The parser lowercases the scheme, trims whitespace and collapses
+      stray slashes, so `HTTP://127.0.0.1`, `http:/127.0.0.1`, `" http://127.0.0.1"` and
+      `http:127.0.0.1` all validate as loopback http yet none *starts with* `"http://"` — so
+      `no_proxy()` was skipped and the reviewer drove the key and prompt body to a proxy in
+      cleartext. Fixed by making `validate_base_url` return the **normalized** URL, threading that
+      through `resolve_base_url`, and having `build_http_client` decide from a re-parsed scheme
+      rather than a prefix. Regression tests pin all four spellings at both layers.
+- [x] Normalization also fixes an interior-whitespace mis-target (` https://host ` previously
+      survived into `join_url` and was percent-encoded into the path).
+- [x] **Important — Anthropic/Gemini/Ollama still followed redirects**, and reqwest's strip list is
+      fixed: `x-api-key`/`x-goog-api-key` are never removed, so those two were *worse off* than the
+      case round 1 fixed — leaking on any cross-host redirect, not just a scheme downgrade. All four
+      providers now build through the shared `build_http_client`.
+- [x] **Important — `UnsupportedScheme` echoed raw operator text.** The "scheme" of a non-URL is
+      its text before the first `:`, so `OPENAI_BASE_URL=$OPENAI_API_KEY` printed the key's leading
+      segment to stderr. Unrecognized schemes are now withheld (`<redacted>`) in both the variant
+      and `redact()`; test extended with a colon-bearing secret.
+- [x] **Minor — a 3xx was parsed as a completion.** With redirects disabled the 3xx is returned,
+      and `error_for_status` only rejects 4xx/5xx, so a redirect body of valid-looking
+      Chat-Completions JSON would have been accepted as the model's answer. Now bails explicitly.
+- [x] **Minor — preflight checks every provider's variable** while `build_remote` reads only the
+      selected one, so a stale unrelated `*_BASE_URL` now blocks startup. Kept (fail-closed) but the
+      error explains it.
+- [x] Full gate re-run: 793 passed, 0 failed; fmt and clippy `-D warnings` clean.

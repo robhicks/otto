@@ -22,9 +22,12 @@ impl AnthropicProvider {
         api_key: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let base_url = base_url.into();
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
+            // Redirects off: this provider authenticates with `x-api-key`, which is NOT in
+            // reqwest's strip list, so it would be forwarded on *any* cross-host redirect.
+            client: super::base_url::build_http_client(&base_url),
+            base_url,
             api_key: api_key.into(),
             model: model.into(),
             max_tokens: 4096,
