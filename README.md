@@ -20,9 +20,56 @@ be embedded in-process or served over the network.
 > The full intended design lives in
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); per-plan history is in `docs/superpowers/plans/`.
 
+## Install
+
+Prebuilt binaries for Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `arm64`) are attached to
+each [GitHub release](https://github.com/robhicks/otto/releases). Release archives are named
+`otto-<target>.tar.gz` with a `SHA256SUMS`, and Linux releases also ship native `.rpm` packages
+(Fedora / RHEL-family). Any of these work:
+
+**curl installer** — detects the platform, verifies the checksum, installs to `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/robhicks/otto/main/deploy/install.sh | sh
+```
+
+**cargo-binstall** (needs [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) once):
+
+```bash
+cargo binstall otto
+```
+
+**Homebrew** (once the current release's checksums are in
+[`deploy/homebrew/otto.rb`](deploy/homebrew/otto.rb)):
+
+```bash
+brew install --formula https://raw.githubusercontent.com/robhicks/otto/main/deploy/homebrew/otto.rb
+```
+
+**Fedora / RHEL-family (dnf)** — the native `.rpm` recommends `bubblewrap`, so dnf installs the
+sandbox backend automatically. Swap `x86_64` for `aarch64` on an ARM machine:
+
+```bash
+sudo dnf install -y https://github.com/robhicks/otto/releases/download/v0.1.0/otto-0.1.0-1.x86_64.rpm
+```
+
+(Or download the `.rpm` asset from the release and `sudo dnf install -y ./otto-*.rpm`.)
+
+**From source** — pinned stable Rust toolchain (`rust-toolchain.toml`; edition 2024, rust 1.85):
+
+```bash
+git clone https://github.com/robhicks/otto.git && cd otto
+cargo build --release -p otto-engine
+./target/release/otto --version
+```
+
+Runtime requirements: the sandbox behind `otto run` needs `bwrap` on Linux (`sandbox-exec` on
+macOS); `otto serve` requires `OTTO_TOKEN`. See "How it works" below.
+
 ## Quick start
 
-Requires the pinned stable Rust toolchain (`rust-toolchain.toml`; edition 2024, rust 1.85).
+If you installed a prebuilt binary, `otto` is on your PATH; from a source checkout use
+`cargo run -p otto-engine -- <args>`:
 
 ```bash
 cargo build --workspace
