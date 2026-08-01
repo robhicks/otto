@@ -872,6 +872,64 @@ mod tests {
         assert!(service.abort(&alice, session).await.is_ok());
     }
 
+    /// `run_command_with_controls` and `run_agent_with_controls` authorize before looking the
+    /// artifact up, and this asserts the *ordering*, not merely that a check exists: the service
+    /// under test has no extensions configured, so the owner fails with the extensions error
+    /// while a non-owner fails with `no session`. If `authorize` were ever moved below the
+    /// lookup, the non-owner would start getting the extensions error and this test would fail.
+    #[tokio::test]
+    async fn command_and_agent_dispatch_authorize_before_looking_anything_up() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                &bob,
+                session,
+                "anything",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(
+            sink.events.is_empty(),
+            "a rejected command must emit nothing"
+        );
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(&bob, session, "anything", "go", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(sink.events.is_empty(), "a rejected agent must emit nothing");
+
+        // The owner gets past the check and fails later, for an unrelated reason. That
+        // difference is what proves the authorization runs first.
+        let mut sink = CollectingSink::default();
+        let owner_err = service
+            .run_agent_with_controls(&alice, session, "anything", "go", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !owner_err.contains("no session"),
+            "the owner must clear authorization, not be rejected by it: {owner_err}"
+        );
+    }
+
     /// export_promotion is machine-to-machine: it derives the owner itself and takes no
     /// principal, so there is no tautological "check" to pass.
     #[tokio::test]
