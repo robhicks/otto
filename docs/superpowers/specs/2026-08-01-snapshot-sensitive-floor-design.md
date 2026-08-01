@@ -1,6 +1,12 @@
 # `Workspace::snapshot` must apply the sensitive-path floor
 
-> **Status:** DRAFT — fixes [#127](https://github.com/robhicks/otto/issues/127).
+> **Status:** IMPLEMENTED — shipped in [#128](https://github.com/robhicks/otto/pull/128), closing
+> [#127](https://github.com/robhicks/otto/issues/127). Review added three things beyond this
+> design: `RemoteWorkspace::snapshot` re-applies the floor rather than trusting the peer, the check
+> fails closed on a non-UTF-8 path instead of lossy-converting (matching the explicit warning in
+> `validate_workspace_edits`), and `LocalWorkspace::restore` — the ingress mirror — applies the
+> floor too. Deeper hardening, including making the invariant hold by type rather than per-impl
+> convention, is tracked in [#129](https://github.com/robhicks/otto/issues/129).
 > **Found by:** the independent security review on [#124](https://github.com/robhicks/otto/pull/124).
 
 `otto_remote::promote` builds its `PromoteBundle` from a raw `workspace.snapshot()`, while the
@@ -60,7 +66,12 @@ real secret-egress path, not an exploit chain.
 `Workspace::snapshot` inherits it; correct the false comment on the walk; regression tests.
 
 **Out:** changing `SENSITIVE_MARKERS` (the floor is not widened — it is *applied* in one more
-place); changing `list()`'s behavior; the gate; the sandbox; anything in `remote`.
+place); changing `list()`'s behavior; the gate; the sandbox; ~~anything in `remote`~~.
+
+**Amended during implementation:** `crates/remote` did change, in two ways that leave `promote()`
+itself byte-for-byte intact — a `[dev-dependencies]` edge on `otto-workspace` and a test, so that
+`promote()`'s inheritance of the floor is pinned from the caller's side by something that actually
+fails when the guard is removed.
 
 ---
 
@@ -104,6 +115,11 @@ async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
 }
 ```
 
+> **What shipped differs in one detail — do not copy the block above verbatim.** Review replaced
+> `to_string_lossy()` with `to_str()`, skipping on `None`, because `validate_workspace_edits` warns
+> in as many words that U+FFFD substitution could let a non-UTF-8 path slip a marker past the
+> check. See `crates/workspace/src/lib.rs`.
+
 Rejected alternatives:
 
 - **Filter in `promote()`** — the reviewer's other suggestion. It fixes the one caller that is
@@ -132,11 +148,20 @@ and bypasses the gated `fs.read`.
 
 ### Consequence for `restore`
 
-`LocalWorkspace::restore` writes a snapshot back through the gated `apply_edit`, and has path
-containment only — it never had a floor check of its own. The fail-closed refusal for a bundle
-carrying a sensitive entry lives in `EngineService::accept_promotion`, and is unchanged: it still
-guards a bundle arriving from a peer that has not been upgraded. (An earlier draft of this section
-attributed that check to `restore`; the behavior described was right, the location was not.)
+**Superseded by what shipped.** As designed, `restore` wrote a snapshot back through the gated
+`apply_edit` with path containment only and no floor check of its own — the fail-closed refusal for
+a bundle carrying a sensitive entry lived solely in `EngineService::accept_promotion`.
+
+Review changed that. `restore` is the ingress mirror of `snapshot`, and `LoopbackTarget::provision`
+calls it directly on a caller-supplied bundle *without* the `validate_workspace_edits` pass the
+network paths get. Relying on "the only loopback bundle comes from `promote`, which now filters on
+the way out" is delegation to another control — the exact pattern this whole change rejects — so
+`restore` now applies the floor itself and skips a sensitive or non-UTF-8 entry. The
+`accept_promotion` refusal is unchanged and still guards the network ingress path; the two compose.
+
+(Two earlier drafts of this section were wrong in different directions: the first attributed the
+fail-closed check to `restore` when it lived in `accept_promotion`, and the second said `restore`
+has no floor check — true of the design, false of what shipped.)
 
 ---
 
@@ -147,7 +172,7 @@ attributed that check to `restore`; the behavior described was right, the locati
 | `id_rsa` / `production.env` / `config/local.env` in the workspace | Silently omitted from the snapshot. Not an error: a snapshot is a best-effort capture, and failing the whole promote because a workspace contains a key would be worse than omitting it. |
 | `.env`, `.ssh/`, `.git/` | Already excluded by the walk; now excluded twice. |
 | A promoted session whose workspace *needed* an omitted file | The remote gets a workspace without it, exactly as `/export` already behaves. Consistency between the two directions is the point. |
-| A `PromoteBundle` from an un-upgraded peer carrying a sensitive entry | Unchanged — `accept_promotion`'s existing fail-closed refusal still catches it. |
+| A `PromoteBundle` from an un-upgraded peer carrying a sensitive entry | `accept_promotion`'s fail-closed refusal still catches it on the network path, and (added during review) `restore`'s own floor covers the loopback path, which `LoopbackTarget::provision` reaches *without* the `validate_workspace_edits` pass. |
 
 ---
 

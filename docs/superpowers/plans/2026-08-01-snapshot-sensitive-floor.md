@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust (edition 2024, toolchain pinned 1.97.0), `tokio` + `tempfile` for tests. **No new dependency** — `crates/workspace` already depends on `otto-protocol`, which exports `is_sensitive`.
 
+> **Status:** SHIPPED 2026-08-01 — landed in [#128](https://github.com/robhicks/otto/pull/128) as
+> four commits rather than the one this plan anticipated. See the Task Order note below for what
+> review added, and the amended Global Constraint for the dev-dependency deviation.
+
 **Spec:** `docs/superpowers/specs/2026-08-01-snapshot-sensitive-floor-design.md` — read it first. This plan implements it exactly.
 
 ## Global Constraints
@@ -38,17 +42,27 @@
 | `crates/remote/src/lib.rs` (tests) | **Modify.** Assert `promote()`'s bundle inherits the filtering. |
 | `CLAUDE.md` | **Modify.** The `workspace` crate row states that `snapshot()` applies the floor; the `remote` row notes the dev-only `otto-workspace` edge. |
 | `crates/workspace/src/remote.rs` | **Modify** *(added during review).* `RemoteWorkspace::snapshot` re-applies the floor instead of trusting the peer. |
-| `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only: the same false dotfile-covers-the-floor claim lived at the seam contract, one level up. |
+| `crates/workspace/src/lib.rs` (`restore`) | **Modify** *(added during review).* The ingress mirror applies the floor too, and every floor check fails closed on a non-UTF-8 path (`to_str()`, never `to_string_lossy()`). |
+| `crates/workspace/src/lib.rs` (`strip_sensitive_files`) | **Create** *(added during review).* A `pub(crate)` helper shared with `RemoteWorkspace::snapshot`. Its crate-privacy is the drift vector #129 item 2 tracks. |
+| `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only, two corrections: the same false dotfile-covers-the-floor claim lived at the seam contract one level up; and the `WorkspaceSnapshot` guarantee is now scoped to snapshots *produced by a `Workspace` impl*, since the type is `Deserialize` with a public field and a peer's bundle can violate it. |
 | `crates/remote/Cargo.toml` | **Modify** *(added during review).* The dev-dependency above. |
 
 ## Task Order & Rationale
 
-> **What actually shipped: three commits, not one.** Review after Task 1 found the seam's contract
-> was satisfied by *delegation* — `RemoteWorkspace::snapshot` trusted the peer to be an up-to-date
-> otto that filters — which is the same shape of assumption that caused this bug. A second commit
-> enforces the floor locally there too, via a shared `strip_sensitive_files` helper with its own
-> test. A third applies a review nit (`retain` in place rather than filter-and-collect). The
-> File Structure table above is annotated with the files those added.
+> **What actually shipped: four code commits, not one.** Each extra one closes the same pattern the
+> original bug came from — one control assumed to cover another.
+>
+> 1. Task 1 as planned: the floor in `LocalWorkspace::snapshot`.
+> 2. `RemoteWorkspace::snapshot` satisfied the seam's contract by *delegation*, trusting the peer to
+>    be an up-to-date otto that filters. Now enforces locally, via a shared `strip_sensitive_files`
+>    helper with its own test.
+> 3. A review nit: `retain` in place rather than filter-and-collect.
+> 4. The check used `to_string_lossy` where `validate_workspace_edits` explicitly warns against it;
+>    now `to_str()`, failing closed. And `LocalWorkspace::restore` — the ingress mirror, reached
+>    directly by `LoopbackTarget::provision` without the `validate_workspace_edits` pass — applies
+>    the floor too.
+>
+> The File Structure table above is annotated with the files these added.
 
 One task. The change is ~6 lines; splitting it would produce a commit that adds a test for behavior the next commit introduces. Both tests land with the fix so the branch is never in a state where the guarantee is claimed but unenforced.
 
