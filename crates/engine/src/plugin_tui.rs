@@ -48,7 +48,7 @@ enum MainChoice {
 }
 
 fn main_menu(base: &Path) -> anyhow::Result<MainChoice> {
-    let is_project = base != &dirs::home_dir().unwrap_or_default();
+    let is_project = base != dirs::home_dir().unwrap_or_default();
     let title = if is_project {
         "Plugin Manager (project scope)"
     } else {
@@ -280,7 +280,7 @@ fn list_marketplaces(home: &Path) -> anyhow::Result<()> {
         println!("No marketplaces in this scope.");
         return Ok(());
     }
-    let is_project = home != &dirs::home_dir().unwrap_or_default();
+    let is_project = home != dirs::home_dir().unwrap_or_default();
     let scope_tag = if is_project { "[project]" } else { "[user]" };
     println!();
     for (name, entry) in &lock.entries {

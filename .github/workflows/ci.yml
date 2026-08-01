@@ -1,0 +1,55 @@
+# The merge gate for `main`. Runs the three commands CLAUDE.md documents as the local gate
+# (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, `cargo test --workspace`)
+# on every PR, so unformatted or lint-dirty code can't reach `main` the way it did before this
+# workflow existed. The `main` push trigger keeps the branch's own status green/red visible.
+#
+# The workspace is offline-deterministic by design: no OTTO_* vars and no provider API keys are
+# set here, so `build_router()` uses LocalProvider on both slots and the suite needs no network.
+# Do not add provider secrets to this workflow.
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A new push to a PR cancels the in-flight run for that PR; `main` runs are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: the gate only reads the tree. Nothing here writes to the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel and pulls in rustfmt + clippy, so the runner's
+      # toolchain matches a developer's local one. `rustup show` materializes it.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `--skip rust_analyzer_integration` excludes mcp-lsp's real-rust-analyzer round-trip,
+      # the known failure CLAUDE.md documents as red on `main`. It self-skips when
+      # rust-analyzer is off PATH, but skipping it explicitly keeps CI deterministic
+      # regardless of what the runner image ships. Drop the flag once that test is fixed.
+      - name: Test
+        run: cargo test --workspace -- --skip rust_analyzer_integration
