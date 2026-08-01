@@ -42,6 +42,13 @@ impl SeamError {
     }
 }
 
+/// Deliberately `Display` but NOT `std::error::Error`.
+///
+/// No production caller uses it today — `render_row` goes through `as_str()`. It is here because
+/// `Display` is what a diagnostic newtype owes an `eprintln!`/`log` call site, and because writing
+/// it explicitly documents where the line is drawn: `Error` is the trait that would pull this type
+/// into `?`-conversion chains and invite a `From<String>` impl, which is a public constructor by
+/// another name and would undo the boundary above.
 impl std::fmt::Display for SeamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

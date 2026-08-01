@@ -583,9 +583,23 @@ mod tests {
     /// the freedom this type removes, with nothing else in the suite noticing.
     #[test]
     fn seam_error_has_no_crate_wide_constructor() {
+        // CORRECTED DURING IMPLEMENTATION — the version originally planned here was unpassable.
+        // This test `include_str!`s the file that CONTAINS it, so a verbatim needle matches the
+        // line that spells it out: `!src.contains("impl From<String> for SeamError")` fires on its
+        // own assert line and can never be satisfied, and `split("impl SeamError {")` finds the
+        // test's own literal as well as the type's — so deleting the real impl block would leave
+        // the positive assertion passing vacuously off the test's own source. The three needles
+        // scanned against the WHOLE file are therefore assembled from fragments; the two
+        // block-scoped needles stay verbatim, since `block` is the real impl body and cannot
+        // self-match. Verified by mutation: widening `new` to `pub(crate)`, adding a
+        // `From<String>` impl, and renaming the impl header each make this test fail.
+        let impl_header = concat!("impl ", "SeamError {");
+        let from_string = concat!("impl From<", "String> for SeamError");
+        let from_str = concat!("impl From<", "&str> for SeamError");
+
         let src = include_str!("mod.rs");
         let block = src
-            .split("impl SeamError {")
+            .split(impl_header)
             .nth(1)
             .expect("SeamError's inherent impl block");
         let block = block.split("\n}").next().expect("end of the impl block");
