@@ -14,9 +14,10 @@ const MAX_LEN: usize = 64;
 
 /// A principal's stable identifier.
 ///
-/// Validated on construction **and on deserialization**: 1–64 characters of `[a-z0-9._-]`. That
-/// charset keeps it safe as a sqlite key, as an `otpauth://` URI label (slice 1b), as a path
-/// segment, and in a log line without escaping.
+/// Validated on construction **and on deserialization**: 1–64 characters of `[a-z0-9._-]`,
+/// and the first character must be `[a-z0-9]`. That charset keeps it safe as a sqlite key, as an
+/// `otpauth://` URI label (slice 1b), as a path segment, and in a log line without escaping; the
+/// leading-character rule is what rules out `..`, `.hidden`, and `-flag`.
 ///
 /// The length bound is on **bytes**, which equals characters here because the charset admits only
 /// ASCII — loosen the charset and the two stop coinciding.

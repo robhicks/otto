@@ -17,8 +17,8 @@ pub use types::{SessionState, SessionStatus, TurnRecord};
 ///
 /// # Which methods are owner-scoped, and why not all of them
 ///
-/// `create_session`, `owner_of`, `replay_since`, `session_status`, and `snapshot` take a
-/// principal: they are the methods a client can reach with a session id it does not own, and the
+/// `create_session`, `replay_since`, `session_status`, and `snapshot` take a principal
+/// (`owner_of` does **not** — it is unscoped by design; see its own doc): they are the methods a client can reach with a session id it does not own, and the
 /// ones that would return another tenant's data. Their ownership predicate lives inside the SQL
 /// statement, so no caller can forget it.
 ///
