@@ -37,9 +37,13 @@ the code and are corrected here.
 
 2. **A private constructor alone is not sufficient; the seam's error type has to change.** With a
    `pub(in crate::transport)` constructor and the seam still returning `Result<_, String>`,
-   `app.rs` would hold a `String` and have no way to turn it into a `SeamError` — the seven genuine
-   call sites would stop compiling. The change that both enforces the boundary *and* leaves those
-   sites working is to make the transport seam itself return `SeamError`:
+   `app.rs` would hold a `String` and have no way to turn it into a `SeamError` — the genuine
+   transport call sites would stop compiling. (The issue says "seven"; the precise count is **six**
+   `Passthrough` sites carrying a transport-seam value — `app.rs:200`, `:222`, `:246`, `:334`,
+   `:354`, `:389` — plus the seventh at `:456`, which is the sidecar-spawn site §3 converts to
+   `Authored`. `app.rs:94` is the one existing `Authored`, for eight `ClientText` constructions
+   total.) The change that both enforces the boundary *and* leaves those sites working is to make
+   the transport seam itself return `SeamError`:
    `Sink::send`, `connect`, `list_files`, `read_file`, and `SocketEvent::Message`'s `Result` all
    carry `SeamError` instead of `String`. `app.rs` then never constructs one — it only forwards
    what the seam handed it. This is exactly the "Named future upgrade" the i18n spec's §2 already
@@ -58,7 +62,12 @@ the code and are corrected here.
 **In:** `ui-dioxus/src/transport/{mod,web,desktop}.rs`, `ui-dioxus/src/net/view_model.rs`,
 `ui-dioxus/src/components/event_log.rs`, `ui-dioxus/src/app.rs`,
 `ui-dioxus/src/desktop_boot.rs`, `ui-dioxus/src/i18n/catalog.rs`; an amendment to the i18n design
-spec recording the §3 decision.
+spec recording the §3 decision; **and the corresponding sentence in the repo-root `CLAUDE.md`** —
+its UI paragraph currently states the boundary as *"server-originated text …, protocol identifiers
+…, **and the crate's own transport/boot diagnostics** all pass through untranslated"*
+(`CLAUDE.md:56`). §3 makes the boot diagnostic translated, so that sentence becomes wrong on merge
+and must be narrowed to the transport diagnostics alone. The rule is written down in two places;
+both are in scope.
 
 **Out:** any workspace crate (`ui-dioxus/` is workspace-excluded and depends only on
 `otto-protocol`, so `cargo test --workspace` is neither exercised by nor exercises this change);
@@ -83,7 +92,14 @@ around an unchanged payload.
   `{detail}` byte-identical across them, and `desktop_boot.rs` authors no user-facing prose.
 - `cd ui-dioxus && cargo test --features desktop` passes (176 tests today, plus the new ones), and
   `cargo build --target wasm32-unknown-unknown --features web` compiles.
-- No `ClientText::Passthrough` in the tree carries crate-authored prose.
+- Every `ClientText::Passthrough` value in the tree is a `SeamError` minted inside `transport/`.
+  (Deliberately **not** "no `Passthrough` carries authored prose": several `SeamError` payloads are
+  crate-authored English — `"socket closed"`, `"workspace rpc failed: HTTP {status}"`,
+  `"unexpected response to List/Read"`, `"no transport feature enabled …"` — and Scope explicitly
+  keeps them untranslated. The checkable property is *provenance*, which is exactly what §1's
+  private constructor enforces, not authorship.)
+- `transport/web.rs`'s bearer-token redaction survives the seam's type change: a `SeamError` from
+  `connect_impl` contains `token=<redacted>`, never the token. Regression-tested (§1).
 
 ---
 
@@ -163,17 +179,33 @@ pub async fn read_file(http_base: &str, token: &str, path: PathBuf) -> Result<Ve
   `app.rs`'s `SocketEvent::Message(Err(detail))` arm holds the value behind a reference. `Clone` is
   required; there is no invariant a clone could break.
 
-### Security property
+### Security property — the two redacting sites are NOT a mechanical rewrite
 
-`transport/web.rs`'s `connect_impl` redacts the bearer token out of a `WebSocket::new` error
-(`redact_token`) before the `String` leaves the transport. That redaction happens *inside* the
-module that owns the constructor, so wrapping the result in `SeamError` preserves it exactly —
-and now no other module can construct a `SeamError` around an unredacted URL either. The change
-narrows the surface; it does not add one. `SeamError` carries no `From<String>`/`From<&str>` impl:
-a blanket conversion would be a public constructor by another name.
+`transport/web.rs` redacts the bearer token out of two errors before the `String` leaves the
+transport, because `ws_url` carries the token as a query parameter and a rejected URL comes back as
+a `SyntaxError` that quotes the URL in full:
+
+- `web.rs:27` — `WebSink::send`: `.map_err(|e| redact_token(&format!("{e:?}")))`
+- `web.rs:50` — `connect_impl`: `.map_err(|e| redact_token(&format!("{e:?}")))?`
+
+**These two sites must become `SeamError::new(redact_token(&format!("{e:?}")))`, not
+`SeamError::new(e.to_string())`.** They are the only two of the twelve `map_err` sites that are not
+a plain `e.to_string()`, and rewriting them uniformly with the other ten would delete the redaction
+and ship the bearer token into the event log — the surface most likely to be pasted into a bug
+report. Nothing in the suite would catch it today: `redact_token`'s tests (`net/url.rs:168-212`)
+exercise the pure function only, never a call site.
+
+Given that, the redaction now happens *inside* the module that owns the constructor, so no other
+module can construct a `SeamError` around an unredacted URL either. The change narrows the surface;
+it does not add one. `SeamError` carries no `From<String>`/`From<&str>` impl: a blanket conversion
+would be a public constructor by another name.
 
 ### Testing
 
+- `connect_error_redacts_the_bearer_token` — the missing call-site regression test. Asserts a
+  `SeamError` produced by `connect_impl` for a URL carrying `token=<secret>` renders
+  `token=<redacted>` and does not contain the secret. Wasm-target test (`web.rs` is
+  `cfg(feature = "web")`), alongside the existing wasm-only tests.
 - `passthrough_can_only_carry_a_transport_value` — a doc-level compile-fail is not worth a
   `trybuild` dependency for one case; instead the invariant is asserted structurally: `SeamError`'s
   only non-`cfg(test)` constructor is `pub(in crate::transport)`, verified by a source-scan test in
@@ -228,8 +260,14 @@ The match is exhaustive with no wildcard arm, for the same reason the catalog's 
 
 ### Testing
 
-- `every_row_class_is_in_the_stylesheet_vocabulary` — assert each variant's `class()` against the
-  fixed vocabulary, so a typo (`"row-aproval"`) fails rather than silently rendering unstyled.
+- `row_classes_are_pinned_per_variant` — one assertion per `RowMsg` variant pinning `class()` to
+  its exact expected string, so a typo (`"row-aproval"`) fails rather than silently rendering
+  unstyled. Deliberately a **pin against a hardcoded expectation**, not a check against
+  `style.css`: `style.css:41-46` defines only `.row-agent`/`.row-edit`/`.row-verify`/`.row-log`/
+  `.row-turn`/`.row-error`, so `row-approval` and `row-meter` — both produced by today's
+  `describe_event` and preserved unchanged here — have no stylesheet rule and inherit `.row`'s
+  colour. That is a **pre-existing** cosmetic gap, out of scope for this change (see Risks); a
+  stylesheet-derived test would fail on merge for a reason this PR did not cause.
 - The existing `assert_eq!(r.class, "row-edit")`-style assertions become `r.class()`.
 
 ---
@@ -351,11 +389,12 @@ BootOutcome::SpawnFailed { bin, detail } => {
 
 Every choice made without asking, with its rationale:
 
-1. **The i18n design spec is amended, not superseded.** §3's decision is recorded as an amendment
-   in `2026-07-31-ui-dioxus-i18n-design.md` §2 (a short "Amended" note pointing here), because that
-   file is where a future contributor looks up the boundary rule. Rationale: the issue's own closing
+1. **The i18n design spec is amended, not superseded — and so is `CLAUDE.md`.** §3's decision is
+   recorded as an amendment in `2026-07-31-ui-dioxus-i18n-design.md` §2 (a short "Amended" note
+   pointing here), because that file is where a future contributor looks up the boundary rule, and
+   the same sentence is narrowed in the repo-root `CLAUDE.md:56`. Rationale: the issue's own closing
    line — "The spec's rule does not cleanly settle it, which is itself a reason to write the answer
-   down" — asks for the answer to live where the rule lives.
+   down" — asks for the answer to live where the rule lives, and the rule lives in two places.
 2. **Translations are authored, not machine-generated.** The five `SidecarSpawnFailed` strings
    follow the register of the existing catalog entries (lowercase leading word in `en`/`es`,
    sentence-case German noun style, etc.). Rationale: consistency with the 40-odd keys already
@@ -368,6 +407,13 @@ Every choice made without asking, with its rationale:
    not a transport-seam value — a different provenance that `SeamError` deliberately does not
    claim. Rationale: `SeamError` means "the transport produced this"; widening it to "any untranslated
    text" would restore exactly the ambiguity §1 removes.
+
+   One acknowledged imprecision: the workspace-RPC path (`web.rs:97`, `desktop.rs:108`) returns
+   `WorkspaceResponse::Error { message }` — a *server* payload — as a transport `Result` error, so
+   it becomes a `Passthrough(SeamError)`. `SeamError` therefore reads as "this value reached the app
+   through the transport seam", not "the transport authored it". That is harmless (both provenances
+   are untranslated under the i18n spec's §2, and both render verbatim) and is the honest reading of
+   the name; it is recorded here so a reviewer does not have to rediscover the tension.
 6. **No `trybuild` dependency.** The "cannot fabricate a `Passthrough` elsewhere" invariant is
    verified by a source-scan test rather than a compile-fail fixture. Rationale: `ui-dioxus/`'s
    dependency set is bundle-budget-sensitive (`scripts/build-web.sh` enforces `MAX_WASM_BYTES`), the
@@ -394,10 +440,22 @@ Every choice made without asking, with its rationale:
 
 ## Risks & open questions
 
-- **Churn across the transport impls.** Every `map_err(|e| e.to_string())` in `web.rs`/`desktop.rs`
-  becomes `map_err(|e| SeamError::new(e.to_string()))`. Mechanical, ~12 sites, and the compiler
-  finds all of them. Mitigation: it is one task, done first, so later tasks build on a compiling
-  seam.
+- **Churn across the transport impls.** Twelve `map_err` sites (7 in `web.rs`, 5 in `desktop.rs`)
+  change. Ten are a plain `map_err(|e| e.to_string())` → `map_err(|e| SeamError::new(e.to_string()))`
+  and are genuinely mechanical; **the two redacting sites (`web.rs:27`, `web.rs:50`) are not** — see
+  §1's Security property. The compiler finds all twelve, but it cannot tell you that two of them
+  must keep `redact_token`, which is why they are enumerated rather than described as a pattern.
+  Mitigation: one task, done first, so later tasks build on a compiling seam, with the redaction
+  regression test in that same task.
+- **`desktop_boot.rs` has source-scanning guard tests that a careless doc comment can break.**
+  `boot_builds_its_sidecar_command_through_serve_command` bans `Command::new` and `.arg(` from
+  `boot()`'s comment-stripped body, and `marker_occurs_exactly_once_in_this_file` bans a second
+  occurrence of the `pub async fn boot()` marker **anywhere in the file, prose included**. The §3
+  edit does not break either, but a new doc comment on `SpawnFailed` that quotes the marker would.
+- **`row-approval` and `row-meter` have no `style.css` rule** (`style.css:41-46` covers the other
+  six). Pre-existing, cosmetic (they inherit `.row`'s colour), and untouched by this change —
+  recorded so it is a known gap rather than a surprise, and deliberately not fixed here, since
+  neither the issue nor this spec's scope covers the stylesheet.
 - **The source-scan test is a weaker guarantee than a compile-fail test** (Assumption 6). If the
   crate ever takes a dev-dependency on `trybuild` for another reason, converting this is a small
   follow-up.
