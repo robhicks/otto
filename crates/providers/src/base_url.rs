@@ -19,12 +19,17 @@
 //! or a fragment is refused outright: none is meaningful on a base, and refusing them is what lets
 //! [`join_url`] be a safe string concatenation rather than a partial one.
 //!
-//! **This module validates a destination, not a route.** Two client-level settings are required
-//! for the guarantee to actually hold, and both live in `openai_compatible.rs`:
-//! redirects must be disabled (reqwest strips `Authorization` only across a host/port change, not
-//! across an https→http *scheme* downgrade), and the system proxy must be off for `http` bases
+//! **This module validates a destination, not a route.** Validation alone does not deliver the
+//! guarantee, so the route controls live here too — [`build_http_client`] and [`reject_redirect`],
+//! applied by **all four** providers. Redirects must be disabled (reqwest strips `Authorization`
+//! only across a host/port change, not across an https→http *scheme* downgrade — and its strip
+//! list is fixed, so `x-api-key`/`x-goog-api-key` are never removed at all), a disabled redirect
+//! must then be rejected rather than parsed, and the system proxy must be off for `http` bases
 //! (otherwise a `HTTP_PROXY` in the environment ships the cleartext request — key included —
 //! across the network, which is exactly what the loopback carve-out assumes cannot happen).
+//!
+//! These pieces live together deliberately: every time one of them was defined in a single
+//! provider's file, a sibling provider was left behind and the guarantee silently regressed.
 
 use std::fmt;
 
@@ -253,9 +258,10 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Join a base URL and a path suffix with exactly one separator.
 ///
-/// `path_suffix` is always a `&'static str` beginning with `/`, so trimming every trailing `/`
-/// from the base is sufficient — and makes the function total over pasted input like
-/// `https://host///`. A path prefix on the base (`https://host/v1`) is preserved.
+/// `path_suffix` always begins with `/` (it may be a runtime-built `String` — Gemini interpolates
+/// its model id into the suffix), so trimming every trailing `/` from the base is sufficient, and
+/// makes the function total over pasted input like `https://host///`. A path prefix on the base
+/// (`https://host/v1`) is preserved.
 pub(crate) fn join_url(base_url: &str, path_suffix: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path_suffix)
 }

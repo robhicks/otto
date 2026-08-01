@@ -259,3 +259,29 @@ Round 2 turned redirects off for Anthropic/Gemini/Ollama but added the 3xx guard
       trailing `/`, so the moment anyone adds an override to the `base_url_var` table for them, the
       double-slash bug #112 fixed would return. All four now use `join_url`.
 - [x] Full gate: 796 passed, 0 failed; fmt and clippy `-D warnings` clean.
+
+### Task 7: Fourth security pass — clean; test-quality fixes only
+
+The round-3 delta was re-reviewed blind. **No new security defect** — the reviewer mutated out all
+four `reject_redirect` calls to confirm the tests have teeth, and verified the proxy inversion and
+`join_url` routing produce byte-identical behavior for every real base. Convergence.
+
+- [x] **The OpenAI redirect test was passing for the wrong reason.** Its 302 mock carried no body,
+      so `is_err()` held because an empty body fails to deserialize — the test passed even with the
+      3xx guard removed. Ironically the one path whose guard was *moved out* of its own file was
+      the one left with an incidental test. Gave the mock a valid-looking completion body; verified
+      it now FAILS when the guard is removed.
+- [x] Module doc still claimed the client settings "both live in `openai_compatible.rs`" — the exact
+      staleness that caused the drift in the first place. Corrected to say they live here and apply
+      to all four providers.
+- [x] `join_url`'s doc claimed `path_suffix` is "always a `&'static str`"; Gemini now passes a
+      runtime `String`. Restated the load-bearing half (begins with `/`).
+- [x] Ollama's copy-pasted redirect comment said a redirect would "forward the credential" — it is
+      keyless. Replaced with the real reason: a 307/308 re-POSTs the prompt body, which carries
+      gathered workspace file contents, from a loopback-only client to an arbitrary host.
+- [x] `received_requests().unwrap_or_default()` made the "upstream received nothing" assertion pass
+      vacuously if recording were ever off; now `.expect(...)`.
+- [x] Full gate: 796 passed, 0 failed; fmt and clippy `-D warnings` clean. (A transient
+      `otto-persistence` sqlite lock failure under machine load was isolated to a pre-existing
+      load-sensitive flake — reproduced on an unmodified checkout of the same commit, passes when
+      unloaded, and in a crate this PR does not touch. Filed as #135.)

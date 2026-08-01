@@ -152,10 +152,11 @@ mod tests {
 
     #[tokio::test]
     async fn ollama_does_not_follow_redirects() {
-        // Redirects are disabled because reqwest's header-strip list is fixed and does not
-        // include this provider's auth header (no auth header), so a redirect would forward the
-        // credential to any host. The 3xx must also be surfaced as an error rather than parsed:
-        // otherwise the redirect body below would be accepted as the model's answer.
+        // Ollama is keyless, so there is no credential to forward — the reason redirects are
+        // disabled here is the request *body*: a 307/308 would re-POST the prompt, which carries
+        // whatever workspace file contents the ContextFinder gathered, from a loopback-only client
+        // to an arbitrary external host. The 3xx must also be surfaced as an error rather than
+        // parsed: otherwise the redirect body below would be accepted as the model's answer.
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/generate"))
@@ -197,7 +198,7 @@ mod tests {
             upstream
                 .received_requests()
                 .await
-                .unwrap_or_default()
+                .expect("wiremock request recording must be enabled for this assertion")
                 .is_empty(),
             "the redirect target must never receive the credential or the prompt body"
         );

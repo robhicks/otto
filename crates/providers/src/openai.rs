@@ -239,10 +239,20 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(302).insert_header(
-                "location",
-                format!("{}/v1/chat/completions", upstream.uri()).as_str(),
-            ))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/v1/chat/completions", upstream.uri()).as_str(),
+                    )
+                    // The 302 carries a valid-looking completion body ON PURPOSE. Without it the
+                    // `is_err()` below would hold merely because an empty body fails to
+                    // deserialize — i.e. the test would pass even with the 3xx guard removed, and
+                    // would only be checking "the redirect was not followed". With a parseable
+                    // body it also pins "a 3xx is never parsed as a completion".
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"choices":[{"message":{"content":"leaked"}}]}"#),
+            )
             .mount(&server)
             .await;
 
@@ -254,7 +264,10 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "the redirect must not be followed");
-        let hits = upstream.received_requests().await.unwrap_or_default();
+        let hits = upstream
+            .received_requests()
+            .await
+            .expect("wiremock request recording must be enabled for this assertion");
         assert!(
             hits.is_empty(),
             "the redirect target received {} request(s); the Bearer token and prompt body must \

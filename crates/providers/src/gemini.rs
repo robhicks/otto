@@ -278,7 +278,7 @@ mod tests {
             upstream
                 .received_requests()
                 .await
-                .unwrap_or_default()
+                .expect("wiremock request recording must be enabled for this assertion")
                 .is_empty(),
             "the redirect target must never receive the credential or the prompt body"
         );
