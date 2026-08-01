@@ -103,9 +103,9 @@ impl Provider for GeminiProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.base_url, self.model
+        let url = super::base_url::join_url(
+            &self.base_url,
+            &format!("/v1beta/models/{}:generateContent", self.model),
         );
         let body = GenerateRequest {
             contents: vec![Content {
@@ -116,16 +116,15 @@ impl Provider for GeminiProvider {
                 max_output_tokens: self.max_output_tokens,
             },
         };
-        let resp = self
+        let raw = self
             .client
             .post(&url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json::<GenerateResponse>()
             .await?;
+        super::base_url::reject_redirect(&raw)?;
+        let resp = raw.error_for_status()?.json::<GenerateResponse>().await?;
         let usage = resp
             .usage_metadata
             .as_ref()
@@ -222,5 +221,66 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403") || err.to_string().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn gemini_does_not_follow_redirects() {
+        // Redirects are disabled because reqwest's header-strip list is fixed and does not
+        // include this provider's auth header (x-goog-api-key), so a redirect would forward the
+        // credential to any host. The 3xx must also be surfaced as an error rather than parsed:
+        // otherwise the redirect body below would be accepted as the model's answer.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"candidates":[{"content":{"parts":[{"text":"leaked"}]}}]}"#,
+                    )
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-flash:generateContent"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!(
+                            "{}/v1beta/models/gemini-2.5-flash:generateContent",
+                            upstream.uri()
+                        )
+                        .as_str(),
+                    )
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"candidates":[{"content":{"parts":[{"text":"leaked"}]}}]}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new(server.uri(), "k", "gemini-2.5-flash");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 3xx must be an error, not a parsed completion; got {result:?}"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the redirect target must never receive the credential or the prompt body"
+        );
     }
 }

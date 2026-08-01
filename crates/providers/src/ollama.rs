@@ -54,21 +54,15 @@ impl Provider for OllamaProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}/api/generate", self.base_url);
+        let url = super::base_url::join_url(&self.base_url, "/api/generate");
         let body = GenerateRequest {
             model: &self.model,
             prompt: &req.prompt,
             stream: false,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<GenerateResponse>()
-            .await?;
+        let raw = self.client.post(&url).json(&body).send().await?;
+        super::base_url::reject_redirect(&raw)?;
+        let resp = raw.error_for_status()?.json::<GenerateResponse>().await?;
         Ok(CompleteResponse {
             text: resp.response,
             usage: Some(otto_engine_core::types::Usage {
@@ -154,5 +148,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("500") || err.to_string().contains("status"));
+    }
+
+    #[tokio::test]
+    async fn ollama_does_not_follow_redirects() {
+        // Redirects are disabled because reqwest's header-strip list is fixed and does not
+        // include this provider's auth header (no auth header), so a redirect would forward the
+        // credential to any host. The 3xx must also be surfaced as an error rather than parsed:
+        // otherwise the redirect body below would be accepted as the model's answer.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"response":"leaked"}"#)
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header(
+                        "location",
+                        format!("{}/api/generate", upstream.uri()).as_str(),
+                    )
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"response":"leaked"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(server.uri(), "llama3.2");
+        let result = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a 3xx must be an error, not a parsed completion; got {result:?}"
+        );
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the redirect target must never receive the credential or the prompt body"
+        );
     }
 }

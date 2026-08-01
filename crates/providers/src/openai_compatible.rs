@@ -66,17 +66,7 @@ impl OpenAiCompatibleProvider {
             .json(&body)
             .send()
             .await?;
-        // Redirects are disabled, so a 3xx comes back as a response rather than being followed.
-        // `error_for_status` only rejects 4xx/5xx, so without this a redirect body would be parsed
-        // as if it were a model completion — an endpoint answering 302 with valid-looking
-        // Chat-Completions JSON would have its content accepted as the answer.
-        if raw.status().is_redirection() {
-            anyhow::bail!(
-                "provider endpoint returned {} — redirects are disabled for credential safety; \
-                 point the base URL at the final endpoint instead",
-                raw.status()
-            );
-        }
+        super::base_url::reject_redirect(&raw)?;
         let resp = raw.error_for_status()?.json::<ChatResponse>().await?;
         let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
             input_tokens: u.prompt_tokens,

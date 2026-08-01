@@ -189,15 +189,42 @@ pub fn validate_base_url(base_url: &str) -> Result<String, BaseUrlError> {
 /// The `http` test parses the URL rather than inspecting a prefix, so it cannot desynchronize from
 /// what [`validate_base_url`] decided.
 pub(crate) fn build_http_client(base_url: &str) -> reqwest::Client {
-    let is_http = reqwest::Url::parse(base_url).is_ok_and(|u| u.scheme() == "http");
+    // Phrased as "only a base that parses as https KEEPS the proxy" so the decision fails
+    // **closed**: an unparseable base loses proxy support rather than gaining it. (`"http:"`
+    // fails to parse, yet `format!("{base}/v1/messages")` still yields a requestable
+    // `http://v1/messages` — the base and the final URL do not have the same parseability.)
+    let allow_proxy = reqwest::Url::parse(base_url).is_ok_and(|u| u.scheme() == "https");
     let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-    if is_http {
+    if !allow_proxy {
         builder = builder.no_proxy();
     }
     // Mirrors `reqwest::Client::new()`, which panics on the same TLS-backend init failure.
     builder
         .build()
         .expect("provider HTTP client failed to initialize")
+}
+
+/// Reject a 3xx before the body is parsed.
+///
+/// [`build_http_client`] disables redirects, so a 3xx arrives as an ordinary response — and
+/// `error_for_status()` rejects only 4xx/5xx. Without this, a redirect body would be handed to the
+/// response parser: an endpoint answering `302` with valid-looking JSON would have its content
+/// accepted as the model's answer, and a provider whose response fields are all `#[serde(default)]`
+/// would instead yield a silent empty completion that never triggers the router's remote→local
+/// fallback.
+///
+/// This lives beside `build_http_client` on purpose: the two are a pair, and every provider that
+/// takes the client must take this. Keeping it in one provider's file is how the guard and the
+/// policy drifted apart in the first place.
+pub(crate) fn reject_redirect(resp: &reqwest::Response) -> anyhow::Result<()> {
+    if resp.status().is_redirection() {
+        anyhow::bail!(
+            "provider endpoint returned {} — redirects are disabled for credential safety; \
+             point the base URL at the final endpoint instead",
+            resp.status()
+        );
+    }
+    Ok(())
 }
 
 /// Loopback iff the host is literally `localhost`, or an IP the standard library calls loopback.

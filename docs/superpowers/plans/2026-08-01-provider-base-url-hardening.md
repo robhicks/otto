@@ -235,3 +235,27 @@ flaw introduced by the round-1 proxy fix, plus one Important leak and two Minors
       selected one, so a stale unrelated `*_BASE_URL` now blocks startup. Kept (fail-closed) but the
       error explains it.
 - [x] Full gate re-run: 793 passed, 0 failed; fmt and clippy `-D warnings` clean.
+
+### Task 6: Third security pass — the redirect guard had to follow the redirect policy
+
+Round 2 turned redirects off for Anthropic/Gemini/Ollama but added the 3xx guard only to
+`openai_compatible.rs`, creating a regression in exactly the three providers it had just changed.
+
+- [x] **Important — a 3xx was parsed as a completion for three providers.** With redirects off the
+      3xx returns as a response and `error_for_status` accepts it, so the redirect body reached the
+      parser. Anthropic yielded `Ok("INJECTED")` — attacker-controlled text becoming a Planner plan
+      or Coder edit; Gemini yielded `Ok("")` because every response field is `#[serde(default)]`,
+      which is worse than an error since the router's remote→local fallback never fires and the
+      turn silently completes with canned output. Fixed by hoisting `reject_redirect` into
+      `base_url.rs` beside `build_http_client` — the two are a pair, and keeping the guard in one
+      provider's file is precisely how they drifted apart.
+- [x] Added a `*_does_not_follow_redirects` test for all three (their absence is why this slipped).
+      Verified the Anthropic one FAILS with the guard removed.
+- [x] **Minor — `build_http_client` failed open.** `is_ok_and(scheme == "http")` meant an
+      unparseable base skipped `no_proxy()` and kept the system proxy. Inverted to "only a base
+      that parses as https KEEPS the proxy", so the odd case loses it. (`"http:"` fails to parse
+      yet `format!("{base}/v1/messages")` is still a requestable `http://v1/messages`.)
+- [x] **Minor — three providers still joined with `format!`.** Normalization now guarantees a
+      trailing `/`, so the moment anyone adds an override to the `base_url_var` table for them, the
+      double-slash bug #112 fixed would return. All four now use `join_url`.
+- [x] Full gate: 796 passed, 0 failed; fmt and clippy `-D warnings` clean.
