@@ -17,6 +17,17 @@ use otto_workspace::LocalWorkspace;
 mod plugin_cli;
 mod plugin_tui;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const USAGE: &str = "usage:
+  otto run \"<goal>\" [--root <path>] [--agent <name>]
+  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
+  otto plugin                                  interactive TUI (default)
+  otto plugin marketplace add|remove|update|list
+  otto plugin install|uninstall|list
+  otto --version | -V
+  otto --help | -h";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -27,14 +38,20 @@ async fn main() -> anyhow::Result<()> {
         "run" => cmd_run(rest).await,
         "serve" => cmd_serve(rest).await,
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
+        "version" | "--version" | "-V" => {
+            println!("otto {VERSION}");
+            Ok(())
+        }
+        "help" | "--help" | "-h" => {
+            println!("{USAGE}");
+            Ok(())
+        }
         _ => {
             eprintln!(
                 "{}\n",
                 otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
             );
-            eprintln!(
-                "usage:\n  otto run \"<goal>\" [--root <path>] [--agent <name>]\n  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]\n  otto plugin                                  interactive TUI (default)\n  otto plugin marketplace add|remove|update|list\n  otto plugin install|uninstall|list"
-            );
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     }
