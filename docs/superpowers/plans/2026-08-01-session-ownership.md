@@ -30,23 +30,32 @@
 |---|---|
 | `crates/protocol/src/user.rs` | **Create.** `UserId` newtype + `InvalidUserId` + validation + `local()`, with its own `#[cfg(test)] mod tests`. |
 | `crates/protocol/src/lib.rs` | **Modify.** `mod user; pub use user::{InvalidUserId, UserId};` alongside the existing `sensitive` re-export at `:9-10`. |
-| `crates/persistence/src/types.rs:52-60` | **Modify.** `SessionState` gains `pub owner: UserId`. |
+| `crates/persistence/src/types.rs:52-60` | **Modify.** `SessionState` gains `pub owner: UserId`; its test module's literal at `:87` updated. |
+| `crates/remote/src/lib.rs:150-161` | **Modify.** `promote()` derives the owner via `owner_of` for the now-scoped `snapshot`. **Library code** — this is not a test-only change. |
+| `crates/remote/src/lib.rs:370,410` / `src/fly.rs:493` | **Modify.** Three `SessionState` test literals. |
 | `crates/persistence/src/sqlite.rs:31-67` | **Modify.** `owner` column + index; `init_schema` becomes version-guarded. |
 | `crates/persistence/src/sqlite.rs:70-358` | **Modify.** `create_session`, `owner_of`, and the three scoped reads. |
 | `crates/persistence/src/lib.rs:17-68` | **Modify.** The `SessionStore` trait signatures + the doc note on unscoped methods. |
-| `crates/engine/src/service.rs` | **Modify.** `authorize` choke point; `&UserId` on five client-facing methods; owner derived internally on the three machine-to-machine ones; ~24 test call sites. |
+| `crates/engine/src/service.rs` | **Modify.** `authorize` choke point; `&UserId` on five client-facing methods; owner derived internally on the three machine-to-machine ones; 33 test call sites (21 `create_session`, 11 `run_prompt`, 1 `abort`) + 4 `SessionState` literals at `:822,861,897,1032`. |
 | `crates/engine/src/lib.rs:554-575` | **Modify.** `run_goal` passes `UserId::local()`. |
-| `crates/engine/src/serve.rs:576,1055-1068` | **Modify.** Replay and `resolve_session` pass `UserId::local()`. |
-| `crates/engine/tests/*.rs` | **Modify.** Seven harnesses, mechanically. |
+| `crates/engine/src/serve.rs:576,1055-1068` | **Modify.** Replay and `create_session` pass `UserId::local()`. **No ownership check is added to `resolve_session`** — see Task 5 Step 3 and spec §3.4. |
+| `crates/engine/tests/{serve,promote,vps_promote,microvm}.rs` | **Modify.** Four harnesses, mechanically. `cors.rs`, `ui_dir.rs`, `remote_workspace.rs` need no edit. |
 | `CLAUDE.md` | **Modify.** The `persistence` crate-table row states ownership. |
 
 ## Task Order & Rationale
 
-Forced by the inward dependency rule: `protocol` (Task 1) → `persistence` (Tasks 2–3) → `engine` (Tasks 4–5).
+Forced by the inward dependency rule: `protocol` (Task 1) → `persistence` (Tasks 2–3) → `remote` (Task 3) → `engine` (Tasks 4–5).
 
-**An intermediate-state warning the implementer must expect:** changing the `SessionStore` trait in Task 3 breaks `crates/engine`, which is a *different crate*. So after Tasks 3, `cargo test -p otto-persistence` passes while `cargo build --workspace` does **not**. That is expected and stated per task. The workspace returns to green at the end of Task 5, and only Tasks 1, 2, and 5 end with a workspace-green commit. Do not "fix" the intermediate breakage by shimming old signatures — there is no installed base to preserve them for.
+**An intermediate-state warning the implementer must expect, stated precisely because the distinction matters:**
 
-Task 2 lands the schema and `SessionState.owner` while `create_session` still has its old signature (defaulting the column to `local` internally), so persistence stays self-consistent and its 26 tests keep passing. Task 3 then changes the trait surface. Splitting them this way keeps each task's test cycle meaningful.
+- `cargo build --workspace` stays green after **every** task. Every out-of-crate `SessionState` literal is inside `#[cfg(test)]` or an integration test, and `cargo build` does not compile those.
+- `cargo test --workspace` does **not**. After Task 3, `cargo test -p otto-persistence` and `-p otto-remote` pass while `cargo test -p otto-engine` fails to compile. That is expected, is stated per task, and is resolved at the end of Task 5.
+
+Do not "fix" the intermediate breakage by shimming old signatures — there is no installed base to preserve them for.
+
+Task 2 lands the schema and `SessionState.owner` while `create_session` keeps its old signature (writing `local` into the column internally), so `persistence` stays self-consistent and its tests keep passing. Task 3 then changes the trait surface **and repairs `otto-remote` in the same task**, so the breakage is confined to one crate (`otto-engine`) and one task rather than spreading. Splitting this way keeps each task's test cycle meaningful.
+
+**Test counts, since two steps assert on them:** `crates/persistence` has 26 tests total — 23 in `sqlite.rs:369-759` and 3 in `types.rs`. `crates/engine/src/service.rs`'s test module has 21 `create_session`, 11 `run_prompt`, and 1 `abort` call.
 
 ---
 
@@ -243,8 +252,9 @@ git commit -m "protocol: add the validated UserId principal newtype"
 ### Task 2: The `owner` column and the `user_version` guard
 
 **Files:**
-- Modify: `crates/persistence/src/sqlite.rs:31-67` (`init_schema`), `:72-92` (`create_session`), `:187-227` (`snapshot`)
+- Modify: `crates/persistence/src/sqlite.rs:19-29` (`open`), `:31-67` (`init_schema`), `:72-92` (`create_session`), `:187-227` (`snapshot`), `:248-295` (`restore`), `:297-358` (`restore_over`)
 - Modify: `crates/persistence/src/types.rs:52-60` (`SessionState`)
+- Modify: **the three `SessionState` literals inside this crate** — `sqlite.rs:634`, `sqlite.rs:667`, `types.rs:87`. Adding a field breaks them, so `cargo test -p otto-persistence` will not compile until they carry `owner: otto_protocol::UserId::local(),`.
 
 **Interfaces:**
 - Consumes: `otto_protocol::UserId` from Task 1.
@@ -321,6 +331,9 @@ Append to the `mod tests` block in `crates/persistence/src/sqlite.rs` (it ends a
         let err = SqliteStore::open(&path).await.unwrap_err().to_string();
         assert!(err.contains("predates session ownership"), "unexpected: {err}");
         assert!(err.contains("delete the file"), "unexpected: {err}");
+        // Spec success criterion 5: the message must name the file, or an operator cannot act
+        // on it. This is why the probe takes the path (see Step 4).
+        assert!(err.contains("legacy.db"), "error must name the file: {err}");
     }
 
     /// sqlite will happily let an older binary open a newer file; refuse instead of corrupting it.
@@ -365,7 +378,26 @@ In `crates/persistence/src/sqlite.rs`, add near the top (after the `use` block a
 const SCHEMA_VERSION: i64 = 1;
 ```
 
-Replace `init_schema`'s body (`:31-67`) so the probe runs first. Keep the three `CREATE TABLE`
+`init_schema` must **take the path**, because its error has to name the file (spec success
+criterion 5) and `&self` alone has no path in scope. In `open` (`:19-29`), bind the path once so it
+can be used twice:
+
+```rust
+    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            // WAL lets one writer proceed concurrently with readers.
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        let store = Self { pool };
+        store.init_schema(path).await?;
+        Ok(store)
+    }
+```
+
+Then replace `init_schema`'s body (`:31-67`) so the probe runs first. Keep the three `CREATE TABLE`
 statements exactly as they are apart from the new `owner` column and index:
 
 ```rust
@@ -376,7 +408,9 @@ statements exactly as they are apart from the new `owner` column and index:
     /// at query time with "no such column: owner". The probe turns that into one clear error at
     /// open. `PRAGMA user_version` is 0 on both a brand-new file and every pre-ownership one;
     /// the two are told apart by whether `sessions` already exists.
-    async fn init_schema(&self) -> anyhow::Result<()> {
+    ///
+    /// Takes `path` solely so the error can name the file an operator has to delete.
+    async fn init_schema(&self, path: &Path) -> anyhow::Result<()> {
         let (user_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&self.pool)
             .await?;
@@ -388,14 +422,16 @@ statements exactly as they are apart from the new `owner` column and index:
         match (user_version, sessions_exists.is_some()) {
             (0, false) => {}
             (0, true) => anyhow::bail!(
-                "session database predates session ownership (issue #115) and has no owner \
-                 column. otto has no installed base, so there is no migration: delete the file \
-                 and let otto re-create it."
+                "session database at {} predates session ownership (issue #115) and has no \
+                 owner column. otto has no installed base, so there is no migration: delete \
+                 the file and let otto re-create it.",
+                path.display()
             ),
             (v, _) if v == SCHEMA_VERSION => return Ok(()),
             (v, _) => anyhow::bail!(
-                "session database has schema version {v}, newer than this otto build \
-                 understands ({SCHEMA_VERSION}); upgrade otto"
+                "session database at {} has schema version {v}, newer than this otto build \
+                 understands ({SCHEMA_VERSION}); upgrade otto",
+                path.display()
             ),
         }
 
@@ -486,18 +522,28 @@ binding `state.owner.as_str()`. Both statements currently list
 `(id, goal, status, created_at, updated_at, config)`; add `owner` in the same position the
 `create_session` insert uses.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 6: Fix the three `SessionState` literals inside this crate**
+
+Adding a field breaks them. Add `owner: otto_protocol::UserId::local(),` to each:
+`crates/persistence/src/sqlite.rs:634`, `sqlite.rs:667`, `crates/persistence/src/types.rs:87`.
+The compiler names all three.
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo test -p otto-persistence`
-Expected: PASS — the five new tests plus all 26 pre-existing ones.
+Expected: PASS — the five new tests plus all 26 pre-existing ones (23 in `sqlite.rs`, 3 in
+`types.rs`).
 
-- [ ] **Step 7: Verify the workspace still builds**
+- [ ] **Step 8: Verify the workspace still builds**
 
 Run: `cargo build --workspace`
-Expected: SUCCESS. `SessionState` gained a field, so any struct-literal construction outside
-`persistence` would break — if the build fails here, fix those call sites now rather than deferring.
+Expected: SUCCESS. The nine `SessionState` literals in *other* crates
+(`engine/src/service.rs:822,861,897,1032`, `remote/src/lib.rs:370,410`, `remote/src/fly.rs:493`,
+`engine/tests/vps_promote.rs:29`, `engine/tests/microvm.rs:35`) are all inside `#[cfg(test)]` or
+integration tests, which `cargo build` does not compile — so this genuinely passes. They are fixed
+in Tasks 3 and 5. `cargo test --workspace` would fail here; that is expected.
 
-- [ ] **Step 8: Format and commit**
+- [ ] **Step 9: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -512,6 +558,8 @@ git commit -m "persistence: add the session owner column behind a schema-version
 **Files:**
 - Modify: `crates/persistence/src/lib.rs:17-68` (the trait)
 - Modify: `crates/persistence/src/sqlite.rs` (`create_session`, `owner_of`, `replay_since`, `session_status`, `snapshot`)
+- Modify: `crates/remote/src/lib.rs:150-161` (`promote()` — **library code**) and its test literals at `:370,410`
+- Modify: `crates/remote/src/fly.rs:493` (test literal)
 
 **Interfaces:**
 - Consumes: Task 2's column; Task 1's `UserId`.
@@ -716,8 +764,9 @@ fn no_such_session(op: &str, session: otto_protocol::SessionId) -> anyhow::Error
             .fetch_optional(&self.pool)
             .await?;
         let (owner,) = row.ok_or_else(|| no_such_session("owner_of", session))?;
-        Ok(otto_protocol::UserId::parse(&owner)
-            .map_err(|e| anyhow::anyhow!("owner_of: stored owner is invalid: {e}"))?)
+        // No `Ok(...?)` here — clippy's needless_question_mark fires on it.
+        otto_protocol::UserId::parse(&owner)
+            .map_err(|e| anyhow::anyhow!("owner_of: stored owner is invalid: {e}"))
     }
 ```
 
@@ -760,27 +809,61 @@ fn no_such_session(op: &str, session: otto_protocol::SessionId) -> anyhow::Error
         .bind(owner.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        let (owner_str, goal, status, config) =
+        let (_owner_str, goal, status, config) =
             row.ok_or_else(|| no_such_session("snapshot", session))?;
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 5: Run the persistence tests to verify they pass**
 
 Run: `cargo test -p otto-persistence`
 Expected: PASS — all tests including the six new ones.
 
-- [ ] **Step 6: Confirm the expected intermediate breakage**
+- [ ] **Step 6: Repair `otto-remote`, whose library calls the now-scoped `snapshot`**
 
-Run: `cargo build -p otto-engine`
-Expected: **FAILS** with argument-count errors at the `SessionStore` call sites. This is the
-intermediate state described in Task Order & Rationale. Task 4 fixes it. Do not add compatibility
-shims.
+`promote()` (`crates/remote/src/lib.rs:150-161`) calls `store.snapshot(session)`. This is **library
+code**, not a test — `otto-remote` does not compile until it is fixed. Derive the owner the same way
+`export_promotion` will in Task 4:
 
-- [ ] **Step 7: Format and commit**
+```rust
+pub async fn promote(
+    store: &dyn SessionStore,
+    workspace: &dyn Workspace,
+    session: SessionId,
+    target: &dyn RemoteTarget,
+) -> anyhow::Result<RemoteHandle> {
+    // Machine-to-machine: `promote` is reached from a path that has already authorized the
+    // caller, so the owner is derived here purely to satisfy the owner-scoped `snapshot`.
+    // Passing it back in as an authorization check would be a tautology.
+    let owner = store.owner_of(session).await?;
+    let bundle = PromoteBundle {
+        session: store.snapshot(&owner, session).await?,
+        workspace: workspace.snapshot().await?,
+    };
+    target.provision(&bundle).await
+}
+```
+
+Then add `owner: otto_protocol::UserId::local(),` to the three `SessionState` test literals at
+`crates/remote/src/lib.rs:370`, `:410`, and `crates/remote/src/fly.rs:493`.
+
+- [ ] **Step 7: Run the remote tests to verify they pass**
+
+Run: `cargo test -p otto-remote`
+Expected: PASS.
+
+- [ ] **Step 8: Confirm the expected intermediate breakage is confined to `otto-engine`**
+
+Run: `cargo build --workspace` → expected SUCCESS (the remaining broken literals are all
+test-only).
+Run: `cargo test -p otto-engine` → expected **FAILS** to compile, with argument-count errors at the
+`SessionStore` call sites. This is the intermediate state described in Task Order & Rationale, and
+it is now confined to one crate. Tasks 4–5 fix it. Do not add compatibility shims.
+
+- [ ] **Step 9: Format and commit**
 
 ```bash
 cargo fmt --all
-git add crates/persistence/src
+git add crates/persistence/src crates/remote/src
 git commit -m "persistence: scope session reads by owner"
 ```
 
@@ -807,7 +890,7 @@ Append to `mod tests` in `crates/engine/src/service.rs`:
 ```rust
     #[tokio::test]
     async fn client_facing_methods_reject_a_non_owner() {
-        let (service, _dir) = test_service().await;
+        let (service, _tmp) = build_service_for_test().await;  // see the helper note below
         let alice = otto_protocol::UserId::parse("alice").unwrap();
         let bob = otto_protocol::UserId::parse("bob").unwrap();
         let session = service
@@ -833,7 +916,7 @@ Append to `mod tests` in `crates/engine/src/service.rs`:
     /// principal, so there is no tautological "check" to pass.
     #[tokio::test]
     async fn export_promotion_needs_no_principal() {
-        let (service, _dir) = test_service().await;
+        let (service, _tmp) = build_service_for_test().await;  // see the helper note below
         let alice = otto_protocol::UserId::parse("alice").unwrap();
         let session = service
             .create_session(&alice, "g", &serde_json::json!({}))
@@ -844,8 +927,12 @@ Append to `mod tests` in `crates/engine/src/service.rs`:
     }
 ```
 
-If no `test_service()` helper exists in that module, build the service inline in the same shape the
-neighbouring tests already use — match the surrounding style rather than inventing a new fixture.
+**Helper note.** The module's real helper is
+`async fn build_test_service(ws_root: &Path, db_path: PathBuf) -> EngineService`
+(`crates/engine/src/service.rs:757`). It returns no `TempDir`, so write a tiny local wrapper that
+creates one and returns `(EngineService, TempDir)` — the tempdir must stay bound for the test's
+lifetime or the database file is deleted mid-test. Name it `build_service_for_test` to match the
+snippets above, or inline it in each test in whatever style the neighbouring tests use.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -901,7 +988,24 @@ owner-scoped `snapshot`:
 ```
 
 `accept_promotion`'s duplicate probe at `:595` uses `session_status`, which is now scoped — read the
-owner from `bundle.session.owner` and pass it.
+owner from `bundle.session.owner` and pass it. Add this comment, because the scoping narrows the
+probe in a way that is invisible later:
+
+```rust
+        // Scoping this probe by the bundle's owner narrows it: a session id that already exists
+        // under a DIFFERENT owner no longer reports AlreadyExists, and instead falls through to
+        // `restore`'s primary-key failure and a generic error. Unreachable while `local` is the
+        // only principal; slice 1b must decide whether that is the behavior it wants.
+```
+
+Two more notes worth writing into the code so nobody "optimizes" them away:
+
+- `run_prompt` delegates to `run_prompt_with_controls`, and `run_command_with_controls` runs through
+  it too, so `authorize` (and its `owner_of` query) fires two or three times per turn. That is
+  harmless and deliberate — each entry point must be safe on its own. Do not remove the inner call.
+- In `snapshot`, build `SessionState.owner` from the `owner: &UserId` parameter the method already
+  holds (`owner.clone()`), not by re-parsing the string column. The row was selected with
+  `AND owner = ?2`, so the two are equal by construction and the parse is redundant.
 
 In `crates/engine/src/lib.rs`, `run_goal` (`:554-575`) passes the reserved principal:
 
@@ -955,7 +1059,7 @@ Append to `crates/engine/tests/serve.rs`:
 #[tokio::test]
 async fn served_sessions_are_owned_by_the_local_principal() {
     let (port, dir) = start_server().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, None)).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, "")).await.unwrap();
     let ready: serde_json::Value = next_json(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     let session = ready["session"].as_str().unwrap().to_string();
@@ -977,31 +1081,43 @@ Match the file's existing helper names (`start_server`, `authed_request`, `next_
 Run: `cargo test -p otto-engine --test serve`
 Expected: FAIL to compile — the harness itself does not build yet against Task 4's signatures.
 
-- [ ] **Step 3: Update `serve.rs`**
+- [ ] **Step 3: Update `serve.rs` — and note carefully what NOT to change**
 
-`resolve_session` (`:1055-1068`) and the replay call (`:576`) pass `UserId::local()`. Add a comment
-at `resolve_session` recording why:
+`resolve_session` (`:1055-1068`) passes `UserId::local()` to `create_session`, and the replay call
+(`:576`) passes it to `replay_since`. Add this comment above the principal:
 
 ```rust
     // One principal exists until slice 1b adds identity, so every served session is owned by
-    // `local` and the ownership check below always passes. The check is wired now so that slice
-    // 1b turns isolation on by supplying a real principal here — not by restructuring this.
+    // `local`. Enforcement lives in `EngineService::authorize`, which every command routes
+    // through; the store's reads are owner-scoped too, so a replay for the wrong owner is empty.
     let owner = otto_protocol::UserId::local();
 ```
 
-Where `resolve_session` accepts a client-supplied `?session=` uuid, verify ownership through the
-service rather than attaching blind, so the seam is real rather than notional.
+**Do NOT add an ownership check to `resolve_session` itself.** It is tempting — attaching to an
+arbitrary `?session=` is the hole issue #115 opens with — but it would break this plan's
+no-behavior-change constraint. Today an unknown `?session=` uuid is accepted blind and receives a
+`Ready` frame; routing attach through `owner_of` turns that into an error and a closed socket, and
+`ui-dioxus/src/net/url.rs:21` appends `&session=` on reconnect, so a stale client id would hard-fail
+where it previously attached — a `ui-dioxus`-visible change from a slice that promises none.
 
-**Do not touch** `authorized`/`authorized_ws` (`:73-85`), `ConnectParams` (`:39-50`), or any route
-definition. Authentication is slice 1b.
+Nothing is lost: a connection attaching to a session it does not own gets the shared not-found error
+on its **first command**, and learns nothing before that. Slice 1b adds the attach-time check
+together with real principals, where the behavior change is in scope. See spec §3.4.
 
-- [ ] **Step 4: Update the seven integration harnesses**
+**Also do not touch** `authorized`/`authorized_ws` (`:73-85`), `ConnectParams` (`:39-50`), or any
+route definition. Authentication is slice 1b.
+
+- [ ] **Step 4: Update the four integration harnesses that actually need it**
 
 Mechanically add `&otto_protocol::UserId::local()` to the `create_session`/`run_prompt`/`abort`/
 `snapshot`/`replay_since`/`session_status` calls in
-`crates/engine/tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs`.
-`promote.rs:72,80` and `vps_promote.rs:600,608` are the `SessionStore` call sites the survey found;
-the compiler will name the rest.
+`crates/engine/tests/{serve,promote,vps_promote,microvm}.rs`, and add
+`owner: otto_protocol::UserId::local(),` to the `SessionState` literals at `vps_promote.rs:29` and
+`microvm.rs:35`. `promote.rs:72,80` and `vps_promote.rs:600,608` are the store call sites.
+
+`cors.rs`, `ui_dir.rs`, and `remote_workspace.rs` need **no** edit — `remote_workspace.rs`'s
+`snapshot()` calls are `Workspace::snapshot`, not the store's. Do not change them just to be
+consistent.
 
 If any harness needs a **semantic** change rather than an extra argument, stop and report it — that
 is a signal the slice has grown beyond its scope.
@@ -1051,7 +1167,12 @@ step 1; 4 → Task 3's `restore_preserves_the_owner`; 5 → Task 2's two guard t
 `snapshot`. `SCHEMA_VERSION` is defined in Task 2 and used by Task 2's tests. Every scoped method
 takes `owner` **first**, matching the trait in Task 3 step 3.
 
-**Known gap, deliberate:** Task 5 step 3 says `resolve_session` should verify ownership "through the
-service" without pinning the exact call, because the right shape depends on whether the handler
-holds an `EngineService` or a bare store at that point. The implementer picks the one that compiles
-without widening a public surface, and reports which.
+**Resolved since the first draft:** an earlier version of Task 5 step 3 asked the implementer to add
+an ownership check inside `resolve_session`. That is now explicitly forbidden — it would have been
+an observable behavior change (an unknown `?session=` currently attaches blind and gets `Ready`;
+the check turns that into a closed socket, and `ui-dioxus/src/net/url.rs:21` sends `&session=` on
+reconnect). Enforcement lives in `EngineService::authorize` instead, and the attach-time check moves
+to slice 1b. See spec §3.4.
+
+**No remaining gaps.** Every step names an exact command and exact file paths; every type used in a
+later task is defined in an earlier one.

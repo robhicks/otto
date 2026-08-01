@@ -65,8 +65,9 @@ Both from the combined spec's review; both verified against the tree and both lo
 
 **In:** `UserId` in `protocol`; `sessions.owner` + the `user_version` guard + `SessionState.owner` in
 `persistence`; a principal on `create_session`, `owner_of`, and owner-scoped
-`replay_since`/`session_status`/`snapshot`; the `authorize` choke point on `EngineService`;
-`UserId::local()` threaded through every existing call site so behavior is unchanged.
+`replay_since`/`session_status`/`snapshot`; the owner derivation in `otto-remote`'s `promote()`;
+the `authorize` choke point on `EngineService`; `UserId::local()` threaded through every existing
+call site so behavior is unchanged.
 
 **Out:** every credential-bearing thing — the `Authenticator` seam, TOTP, JWT, `Login`/`Logout`,
 the WS handshake, `--single-user`, the `OTTO_TOKEN` rename, and all `ui-dioxus` changes. Those are
@@ -234,16 +235,39 @@ This is the bulk of the diff and the reason the slice exists separately. All of 
 | Location | Count |
 |---|---|
 | `crates/engine/src/lib.rs:570` (`run_goal`) | 1 |
-| `crates/engine/src/serve.rs:1064` (`resolve_session`) and `:576` (replay) | 2 |
-| `crates/engine/src/service.rs`'s `#[cfg(test)]` module | ~24 `create_session` sites |
-| `crates/engine/tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs` | 7 files |
-| `crates/persistence/src/sqlite.rs`'s test module | 26 tests |
+| `crates/engine/src/serve.rs:576` (replay) | 1 |
+| `crates/engine/src/service.rs`'s `#[cfg(test)]` module | 21 `create_session`, 11 `run_prompt`, 1 `abort` |
+| **`crates/remote/src/lib.rs:158`** (`promote()` calls `store.snapshot`) | **library code, not tests** |
+| `crates/persistence/src/{sqlite.rs,types.rs}` test modules | 23 + 3 tests |
+| `SessionState` struct literals (a field is being added) | 12: `persistence/src/sqlite.rs:634,667`, `persistence/src/types.rs:87`, `engine/src/service.rs:822,861,897,1032`, `remote/src/lib.rs:370,410`, `remote/src/fly.rs:493`, `engine/tests/vps_promote.rs:29`, `engine/tests/microvm.rs:35` |
+| `crates/engine/tests/{serve,promote,vps_promote,microvm}.rs` | 4 files (`cors.rs`, `ui_dir.rs`, and `remote_workspace.rs` need no edit — the last one's `snapshot()` calls are `Workspace::snapshot`, not the store's) |
 | `crates/engine/src/loopback.rs:50` (`restore`) | owner rides in the bundle — no change |
 
-`serve.rs` gains **no** authentication change: the existing `authorized`/`authorized_ws` bearer
-check is untouched, and the resolved principal is simply `UserId::local()`. The ownership check on
-`resolve_session` therefore becomes live but always passes — which is what makes success criterion 2
-(unchanged behavior) achievable, and what slice 1b flips on.
+**`crates/remote` is affected, and its library is.** `promote()` (`crates/remote/src/lib.rs:150-161`)
+calls `store.snapshot(session)`; with `snapshot` owner-scoped it must derive the owner via
+`owner_of`, exactly as `export_promotion` does and for the same reason — `promote()` is invoked from
+a path that has already authorized the caller, and re-deriving the owner from the session would be a
+tautology if used as a check. It is used only to satisfy the scoped read.
+
+### 3.4 What `serve.rs` deliberately does *not* get
+
+`serve.rs` gains **no** authentication change: `authorized`/`authorized_ws` (`:73-85`) and
+`ConnectParams` (`:39-50`) are untouched. Only the replay call at `:576` passes a principal.
+
+**`resolve_session` (`:1055-1068`) deliberately does not gain an ownership check in this slice.**
+It is tempting — it is the hole issue #115 opens with — but adding it here would break success
+criterion 2. Today an unknown `?session=` uuid is accepted blind and receives a `Ready` frame;
+routing attach through `owner_of` turns that into an error and a closed socket, and
+`ui-dioxus/src/net/url.rs:21` appends `&session=` on reconnect, so a stale client-side id would
+hard-fail where it previously attached. That is a `ui-dioxus`-visible behavior change from a slice
+that promises none.
+
+Nothing is lost by waiting: enforcement lives in `EngineService::authorize`, so a connection that
+attaches to a session it does not own gets the shared not-found error on its **first command** and
+learns nothing in the meantime — `replay_since` at `:576` is already owner-scoped and returns empty.
+With exactly one principal the attach-time check is unobservable anyway. Slice 1b adds it together
+with real principals, and can fix the pre-existing "unknown session attaches blind" oddity at the
+same time, where the behavior change is in scope and reviewable.
 
 ---
 
