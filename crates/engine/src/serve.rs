@@ -516,7 +516,7 @@ async fn run_turn_loop(
                             pause_state.resume_all();
                         }
                         Ok(Command::Abort { .. }) => {
-                            let _ = state.service.abort(session).await;
+                            let _ = state.service.abort(&otto_protocol::UserId::local(), session).await;
                             approvals.clear();
                             pause_state.resume_all();
                             return TurnLoopOutcome::StopOuterLoop;
@@ -573,7 +573,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
         match state
             .service
             .store()
-            .replay_since(session, Some(after))
+            .replay_since(&otto_protocol::UserId::local(), session, Some(after))
             .await
         {
             Ok(events) => {
@@ -634,13 +634,14 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
                 // `writer` (via the sink); `run_turn_loop` borrows `reader` — disjoint, so it can
                 // poll both.
+                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
                     };
                     let turn = state
                         .service
-                        .run_prompt_with_controls(session, &text, &mut sink, controls);
+                        .run_prompt_with_controls(&owner, session, &text, &mut sink, controls);
                     run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
                         .await
                 }; // `sink` dropped here → `writer` is free again
@@ -650,7 +651,10 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 }
             }
             Command::Abort { .. } => {
-                let _ = state.service.abort(session).await;
+                let _ = state
+                    .service
+                    .abort(&otto_protocol::UserId::local(), session)
+                    .await;
                 break;
             }
             Command::ApproveDiff { .. } => {
@@ -674,12 +678,13 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::RunCommand { name, args, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
                 let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
+                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
                     };
                     let turn = state.service.run_command_with_controls(
-                        session, &name, &args, &mut sink, approver, pauser,
+                        &owner, session, &name, &args, &mut sink, approver, pauser,
                     );
                     run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
                         .await
@@ -698,7 +703,13 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     };
                     state
                         .service
-                        .run_agent_with_controls(session, &name, &prompt, &mut sink)
+                        .run_agent_with_controls(
+                            &otto_protocol::UserId::local(),
+                            session,
+                            &name,
+                            &prompt,
+                            &mut sink,
+                        )
                         .await
                 }; // `sink` dropped here → `writer` is free again
 
@@ -1061,7 +1072,11 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
         None => {
             state
                 .service
-                .create_session("(serve/ws)", &serde_json::json!({}))
+                .create_session(
+                    &otto_protocol::UserId::local(),
+                    "(serve/ws)",
+                    &serde_json::json!({}),
+                )
                 .await
         }
     }
