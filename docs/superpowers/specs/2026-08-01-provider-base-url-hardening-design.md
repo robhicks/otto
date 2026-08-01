@@ -1,9 +1,23 @@
 # Provider base-URL hardening: scheme validation and slash-safe composition
 
-> **Status:** DRAFT — fixes [#111](https://github.com/robhicks/otto/issues/111) and
+> **Status:** IMPLEMENTED — shipped in [#132](https://github.com/robhicks/otto/pull/132), closing
+> [#111](https://github.com/robhicks/otto/issues/111) and
 > [#112](https://github.com/robhicks/otto/issues/112).
 > **Found by:** the independent security review on [#108](https://github.com/robhicks/otto/pull/108)
 > (both filed as Minor and deliberately deferred out of that PR).
+>
+> **§4–§6 were added mid-flight**, after review found that §1–§3 as originally written did not
+> deliver the property this spec claimed. Four blind security passes ran over the branch; three of
+> them found a defect introduced by the *previous* round's fix. The pattern is recorded in the plan
+> (Tasks 4–7) because it is the useful lesson here: every regression came from satisfying a coupled
+> invariant in one place and leaving its sibling behind — validate ↔ client policy, redirect policy
+> ↔ 3xx guard, normalize ↔ join. The structural fix was co-locating each pair so they cannot drift.
+>
+> Follow-ups deliberately not absorbed: [#133](https://github.com/robhicks/otto/issues/133) (same
+> credential-to-operator-URL shape in `RemoteWorkspace` / `/promote` / `/export` / Fly),
+> [#134](https://github.com/robhicks/otto/issues/134) (unencoded Gemini model path segment),
+> [#135](https://github.com/robhicks/otto/issues/135) (pre-existing persistence flake observed
+> during the work).
 
 `OpenAiProvider` and `DeepSeekProvider` share one wire implementation
 (`crates/providers/src/openai_compatible.rs`). Two defects in how that implementation treats its
