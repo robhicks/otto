@@ -281,13 +281,10 @@ Environment sources, per target:
   `Navigator` and `Storage` (§4), plus `Document` and `Element` for the
   `document.documentElement.lang` write (§5). All four are additive and wasm-only.
 
-  It also requires **one new direct dependency**: `Navigator::languages()` returns a
-  `js_sys::Array`, and `js-sys` is currently only a transitive lock entry — nothing under `src/`
-  uses it. It is added `optional = true` under the `web` feature. This costs no bundle bytes
-  (`wasm-bindgen` already pulls it in); it is a manifest edit, not new code weight. The
-  alternative — using only `navigator.language()`, which returns `Option<String>` and needs
-  nothing new — is rejected because it discards the ordered preference list, which is exactly what
-  makes the "first *parseable* tag" rule below worth having.
+  It needs **no new direct dependency**. `Navigator::languages()` returns a `js_sys::Array`, but
+  `Array::iter()` and `JsValue::as_string()` are inherent methods — callable without naming
+  `js_sys`, which the detection code never does. (`js-sys` is present transitively via
+  `wasm-bindgen`; adding it directly would be inert.)
 - **desktop:** `sys_locale::get_locales()`.
 - **neither feature:** an empty slice, so `resolve_locale` yields `En`. (`cargo build
   --no-default-features` is an existing supported configuration — `editor/mod.rs:94` accommodates
