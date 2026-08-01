@@ -35,7 +35,8 @@ Agent tool:
     Repo context to check against (from otto-development's Load-Bearing Invariants):
     <PASTE THE LOAD-BEARING INVARIANTS SECTION — sensitive-path floor, gated edits, sandbox-only
      bash, inward dependency flow, offline determinism, unauthenticated-by-design static UI route,
-     remote-ready trait seams — plus the test/lint commands and plan-by-plan doc conventions>
+     remote-ready trait seams, semver-constrained wire types — plus the test/lint commands and
+     plan-by-plan doc conventions>
 
     Check:
     - Completeness: TODOs, placeholders, "TBD", incomplete sections

@@ -37,10 +37,10 @@ One task: the two files are a required mirror pair (the SKILL.md references `age
 
 **Interfaces:**
 - Consumes: the skill's existing load-bearing sections (Non-Negotiable Rules, Repository Conventions, Load-Bearing Invariants, fast-path criteria, Phase 2 plan format, Common Rationalizations, Red Flags).
-- Produces: an inviolate semver rule (additive = semver-minor; breaking = semver-major + version bump in the same PR), enforced by the spec-compliance/quality/architect reviews.
+- Produces: an inviolate semver rule (additive = semver-minor, no `Cargo.toml` bump; breaking = semver-major — the 0.x minor-position bump at this repo's pre-1.0 state — with a version bump in the same PR), enforced by the quality and architect reviews (and visible to the independent security reviewer via the `Cargo.toml` bump in the diff).
 
 - [ ] **Step 1: Add Non-Negotiable Rule 6 to `SKILL.md`**
-  After Rule 5, add: wire types and every crate's public API stay semver-minor (additive only); a breaking change is semver-major, must be named in the spec and plan, bump the affected crate(s)' `version` in `Cargo.toml` within the same PR, and be flagged to the architect + security reviewers; a silent breaking change is a rejected PR.
+  After Rule 5, add: wire types and every crate's public API stay semver-minor (additive only), which needs no `Cargo.toml` bump; a breaking change (renaming/removing/reordering a field or variant, changing a signature or shape) is semver-major — the 0.x minor-position bump at this repo's pre-1.0 state — must be named in the spec and plan, bump the affected crate(s)' `version` in `Cargo.toml` within the same PR, and be flagged to the architect reviewer (visible to the security reviewer via the bump in the diff); a silent breaking change is a rejected PR.
 
 - [ ] **Step 2: Upgrade the Repository Conventions `Versioning` row**
   Replace "Additive changes are semver-minor on the wire types." with a hard-requirement statement referencing Non-Negotiable Rule 6 (additive-only default; breaking = version bump in the same PR, documented in the spec).
@@ -52,7 +52,7 @@ One task: the two files are a required mirror pair (the SKILL.md references `age
   Wire types and public APIs are semver-constrained: additions stay additive so old receivers parse; renaming/removing/reordering a field or variant breaks the protocol and is semver-major (version bump in the PR + explicit review, never an incidental refactor side-effect).
 
 - [ ] **Step 5: Add the plan-task semver step to Phase 2**
-  In "Every task MUST include", add: a `- [ ]` step bumping the affected crate(s)' `version` in `Cargo.toml` per semver (additive → minor; breaking → major) before the final commit, when the task touches a public interface or wire type.
+  In "Every task MUST include", add: a `- [ ]` step bumping the affected crate(s)' `version` in `Cargo.toml` (semver-major — the 0.x minor-position bump at this repo's pre-1.0 state) before the final commit, when the task makes a breaking change to a public interface or wire type. Additive changes need no bump.
 
 - [ ] **Step 6: Add the Common Rationalizations row + Red Flag**
   Rationalization: "I'll just rename/remove that protocol field — nothing's released yet" → semver-constrained, version bump in the same PR. Red Flag: "About to rename, remove, or reorder a wire-type field or variant without a version bump in the same PR."

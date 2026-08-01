@@ -66,11 +66,15 @@ These hold for every run of this skill, no exceptions, no fast-path carve-outs:
    that evaluates what was actually built, unmediated.
 6. **Semver is a requirement on every change to a public interface.** The `protocol` wire types and
    every crate's public API stay **semver-minor** (additive only): new optional serde fields, new
-   enum variants, new event kinds, new tools/agents/events — never renames, removals, reorderings,
-   or shape changes that break an old receiver. A **breaking** change is semver-major: it must be
-   named in the spec and plan, bump the affected crate(s)' `version` in `Cargo.toml` within the same
-   PR, and be flagged explicitly to the architect and security reviewers — it is never an incidental
-   side-effect of a refactor. A silent breaking change is a rejected PR.
+   enum variants, new event kinds, new tools/agents/events — the repo's convention that additions
+   to the wire types are semver-minor. Additive changes need no `Cargo.toml` bump. A **breaking**
+   change — renaming, removing, or reordering a field or variant; changing a signature or shape —
+   is semver-major and is never an incidental refactor side-effect or a fast-path change. It must
+   be named in the spec and plan, bump the affected crate(s)' `version` in `Cargo.toml` within the
+   same PR (at this repo's pre-1.0 state, where every crate is 0.x, that is the 0.x minor-position
+   bump, `0.1.0` → `0.2.0`), and be flagged explicitly to the architect reviewer — the bump makes
+   it visible to the independent security reviewer in the diff. A silent breaking change is a
+   rejected PR.
 
 ## When to Use This Skill vs. Alternatives
 
@@ -151,7 +155,7 @@ one-sentence AC → STOP. Write the spec. The fast-path is for genuine trivialit
 | Lint / format | `cargo clippy --workspace --all-targets` and `cargo fmt --all`. **Run `cargo fmt --all` before every Rust commit** (rustfmt is pinned in `rust-toolchain.toml`). |
 | UI crate | `ui-dioxus/` is **workspace-excluded** — `cargo build/test --workspace` must never require `dx`. UI tests: `cd ui-dioxus && cargo test --features desktop`; wasm check: `cargo build --target wasm32-unknown-unknown --features web`. |
 | Known pre-existing failure | At the time of writing (2026-07), `mcp-lsp`'s rust-analyzer round-trip test fails on `main` already. Do not treat it as a regression you caused. If it is green on `main` now, drop this row. |
-| Versioning | `rust-toolchain.toml` pins the toolchain; edition 2024. **Semver is a hard requirement (Non-Negotiable Rule 6):** wire-type and public-API changes are additive-only (semver-minor); a breaking change is semver-major and bumps the affected crate(s)' `version` in `Cargo.toml` within the same PR, documented in the spec. |
+| Versioning | `rust-toolchain.toml` pins the toolchain; edition 2024. **Semver is a hard requirement (Non-Negotiable Rule 6):** wire-type and public-API changes are additive-only (semver-minor); a breaking change is semver-major — the 0.x minor-position bump while crates are pre-1.0 — and bumps the affected crate(s)' `version` in `Cargo.toml` within the same PR, documented in the spec. |
 
 Full convention reference in `CLAUDE.md` at the repo root. The above is the load-bearing subset for
 this workflow.
@@ -390,9 +394,10 @@ Every task MUST include:
 - Exact file paths in THIS repo's layout
 - **Reminders for the out-of-band artifacts** from Phase 5 that the task touches (Fly image,
   wasm bundle guards, feature-gated crates)
-- **A semver step when the task touches a public interface or wire type:** a `- [ ]` step bumping
-  the affected crate(s)' `version` in `Cargo.toml` per semver (additive → minor; breaking → major,
-  per Non-Negotiable Rule 6) before the final commit
+- **A semver step when the task makes a breaking change to a public interface or wire type:** a
+  `- [ ]` step bumping the affected crate(s)' `version` in `Cargo.toml` (semver-major per
+  Non-Negotiable Rule 6 — the 0.x minor-position bump at this repo's pre-1.0 state) before the
+  final commit. Additive changes need no bump.
 - The repo's actual test + lint commands for the TDD steps
 - A final "Format and commit" step: `cargo fmt --all` + `git commit -m "<scope>: <subject>"`
 
