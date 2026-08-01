@@ -13,7 +13,8 @@ use otto_extensions::PermissionRules;
 use otto_persistence::SessionStore;
 use otto_protocol::{CapabilitiesManifest, Event, Role};
 use otto_providers::{
-    AnthropicProvider, GeminiProvider, LocalProvider, OllamaProvider, OpenAiProvider,
+    AnthropicProvider, DeepSeekProvider, GeminiProvider, LocalProvider, OllamaProvider,
+    OpenAiProvider,
 };
 use otto_router::{BrainBlendRouter, PinnedModelRouter, SingleProviderRouter};
 use otto_tools::{
@@ -57,6 +58,7 @@ const DEFAULT_OLLAMA_MODEL: &str = "llama3.2";
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5";
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
+const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
 /// Build the registry of built-in agents: the whole spine is real: LLM-backed Planner +
 /// ContextFinder + Coder and a cargo-check Verifier. No stubs remain.
@@ -139,6 +141,7 @@ enum RemoteChoice {
     Anthropic,
     OpenAi,
     Gemini,
+    DeepSeek,
 }
 
 impl RemoteChoice {
@@ -148,6 +151,7 @@ impl RemoteChoice {
             RemoteChoice::Anthropic => "anthropic",
             RemoteChoice::OpenAi => "openai",
             RemoteChoice::Gemini => "gemini",
+            RemoteChoice::DeepSeek => "deepseek",
         }
     }
 }
@@ -155,16 +159,17 @@ impl RemoteChoice {
 /// Pure remote-slot selection for the default (non-pinned) path. Takes explicit inputs so it
 /// is unit-testable without mutating process-global env (mirrors `capabilities_from_env`).
 ///
-/// `selector` is the raw `OTTO_REMOTE_PROVIDER` value; the three bools are "this provider's key
+/// `selector` is the raw `OTTO_REMOTE_PROVIDER` value; the four bools are "this provider's key
 /// is present and non-empty". A valid selector wins when its key is present; a selector whose
 /// key is absent yields `None` (offline) rather than silently falling back to another
 /// provider; an unknown selector is ignored and precedence applies:
-/// Anthropic > OpenAI > Gemini.
+/// Anthropic > OpenAI > Gemini > DeepSeek.
 fn select_remote_from(
     selector: Option<&str>,
     anthropic: bool,
     openai: bool,
     gemini: bool,
+    deepseek: bool,
 ) -> Option<RemoteChoice> {
     if let Some(sel) = selector {
         match sel.to_ascii_lowercase().as_str() {
@@ -173,10 +178,13 @@ fn select_remote_from(
             }
             "openai" => return present_or_warn(openai, RemoteChoice::OpenAi, "OPENAI_API_KEY"),
             "gemini" => return present_or_warn(gemini, RemoteChoice::Gemini, "GEMINI_API_KEY"),
+            "deepseek" => {
+                return present_or_warn(deepseek, RemoteChoice::DeepSeek, "DEEPSEEK_API_KEY");
+            }
             other => {
                 eprintln!(
                     "warning: OTTO_REMOTE_PROVIDER='{other}' is not a known provider \
-                     (anthropic|openai|gemini); using key precedence instead"
+                     (anthropic|openai|gemini|deepseek); using key precedence instead"
                 );
             }
         }
@@ -187,6 +195,8 @@ fn select_remote_from(
         Some(RemoteChoice::OpenAi)
     } else if gemini {
         Some(RemoteChoice::Gemini)
+    } else if deepseek {
+        Some(RemoteChoice::DeepSeek)
     } else {
         None
     }
@@ -220,6 +230,8 @@ fn infer_remote(model: &str) -> Option<RemoteChoice> {
         Some(RemoteChoice::Gemini)
     } else if model.starts_with("claude-") {
         Some(RemoteChoice::Anthropic)
+    } else if model.starts_with("deepseek-") {
+        Some(RemoteChoice::DeepSeek)
     } else {
         None
     }
@@ -231,6 +243,7 @@ fn has_key(choice: RemoteChoice) -> bool {
         RemoteChoice::Anthropic => "ANTHROPIC_API_KEY",
         RemoteChoice::OpenAi => "OPENAI_API_KEY",
         RemoteChoice::Gemini => "GEMINI_API_KEY",
+        RemoteChoice::DeepSeek => "DEEPSEEK_API_KEY",
     };
     std::env::var(var).map(|k| !k.is_empty()).unwrap_or(false)
 }
@@ -242,6 +255,7 @@ fn select_remote() -> Option<RemoteChoice> {
         has_key(RemoteChoice::Anthropic),
         has_key(RemoteChoice::OpenAi),
         has_key(RemoteChoice::Gemini),
+        has_key(RemoteChoice::DeepSeek),
     )
 }
 
@@ -256,6 +270,8 @@ fn default_model_for(choice: RemoteChoice) -> String {
         RemoteChoice::Gemini => {
             std::env::var("OTTO_GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_GEMINI_MODEL.to_string())
         }
+        RemoteChoice::DeepSeek => std::env::var("OTTO_DEEPSEEK_MODEL")
+            .unwrap_or_else(|_| DEFAULT_DEEPSEEK_MODEL.to_string()),
     }
 }
 
@@ -282,6 +298,15 @@ fn build_remote(choice: RemoteChoice, model: String) -> Arc<dyn Provider> {
             std::env::var("GEMINI_API_KEY").unwrap_or_default(),
             model,
         )),
+        RemoteChoice::DeepSeek => {
+            let base = std::env::var("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|_| DeepSeekProvider::api_base_default().to_string());
+            Arc::new(DeepSeekProvider::new(
+                base,
+                std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
+                model,
+            ))
+        }
     }
 }
 
@@ -294,8 +319,9 @@ pub fn build_router() -> Box<dyn otto_engine_core::Router> {
 /// command/agent `model:` field).
 ///
 /// - `model_override = None`: select a remote via [`select_remote`] (an `OTTO_REMOTE_PROVIDER`
-///   selector, else key precedence Anthropic > OpenAI > Gemini). Some -> `BrainBlendRouter`
-///   over that provider at its default model; None -> the offline `SingleProviderRouter`.
+///   selector, else key precedence Anthropic > OpenAI > Gemini > DeepSeek). Some ->
+///   `BrainBlendRouter` over that provider at its default model; None -> the offline
+///   `SingleProviderRouter`.
 /// - `model_override = Some(m)`: infer the provider from `m`'s prefix ([`infer_remote`]); an
 ///   unrecognized prefix uses the active remote from [`select_remote`]. If the chosen
 ///   provider's key is present, build it pinned to `m` in a `PinnedModelRouter`; otherwise warn
@@ -440,7 +466,7 @@ pub fn session_config() -> serde_json::Value {
     serde_json::json!({
         "ollama": ollama,
         "remote": remote.is_some(),
-        // The resolved remote provider id ("anthropic"|"openai"|"gemini") or "none".
+        // The resolved remote provider id ("anthropic"|"openai"|"gemini"|"deepseek") or "none".
         "remote_provider": remote.map(RemoteChoice::id).unwrap_or("none"),
         // Record the EFFECTIVE models (the build_router defaults when the env vars are unset),
         // so a restored session's config reflects the routing it actually used.
@@ -575,6 +601,7 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
             std::env::remove_var("OTTO_REMOTE_PROVIDER");
         }
         let router = build_router();
@@ -610,6 +637,7 @@ mod tests {
             std::env::remove_var("ANTHROPIC_API_KEY");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("DEEPSEEK_API_KEY");
             std::env::remove_var("OTTO_REMOTE_PROVIDER");
         }
         // Naming a model with no provider key must NOT change routing: it falls back to the
@@ -638,37 +666,49 @@ mod tests {
 
     #[test]
     fn select_remote_from_precedence_when_no_selector() {
-        // Precedence: Anthropic > OpenAi > Gemini among present keys.
+        // Precedence: Anthropic > OpenAi > Gemini > DeepSeek among present keys.
         assert_eq!(
-            select_remote_from(None, true, true, true),
+            select_remote_from(None, true, true, true, true),
             Some(RemoteChoice::Anthropic)
         );
         assert_eq!(
-            select_remote_from(None, false, true, true),
+            select_remote_from(None, false, true, true, true),
             Some(RemoteChoice::OpenAi)
         );
         assert_eq!(
-            select_remote_from(None, false, false, true),
+            select_remote_from(None, false, false, true, true),
             Some(RemoteChoice::Gemini)
         );
-        assert_eq!(select_remote_from(None, false, false, false), None);
+        assert_eq!(
+            select_remote_from(None, false, false, false, true),
+            Some(RemoteChoice::DeepSeek)
+        );
+        assert_eq!(select_remote_from(None, false, false, false, false), None);
     }
 
     #[test]
     fn select_remote_from_selector_wins_when_its_key_present() {
         // A valid selector overrides precedence even when a higher-precedence key exists.
         assert_eq!(
-            select_remote_from(Some("openai"), true, true, true),
+            select_remote_from(Some("openai"), true, true, true, true),
             Some(RemoteChoice::OpenAi)
         );
         assert_eq!(
-            select_remote_from(Some("gemini"), true, false, true),
+            select_remote_from(Some("gemini"), true, false, true, true),
             Some(RemoteChoice::Gemini)
+        );
+        assert_eq!(
+            select_remote_from(Some("deepseek"), true, true, true, true),
+            Some(RemoteChoice::DeepSeek)
         );
         // Case-insensitive.
         assert_eq!(
-            select_remote_from(Some("OpenAI"), false, true, false),
+            select_remote_from(Some("OpenAI"), false, true, false, false),
             Some(RemoteChoice::OpenAi)
+        );
+        assert_eq!(
+            select_remote_from(Some("DeepSeek"), true, true, true, true),
+            Some(RemoteChoice::DeepSeek)
         );
     }
 
@@ -676,17 +716,30 @@ mod tests {
     fn select_remote_from_selector_without_key_is_none() {
         // Selector names a provider whose key is absent -> None (offline), NOT a fallback to
         // another provider's key.
-        assert_eq!(select_remote_from(Some("openai"), true, false, true), None);
-        assert_eq!(select_remote_from(Some("gemini"), true, true, false), None);
+        assert_eq!(
+            select_remote_from(Some("openai"), true, false, true, false),
+            None
+        );
+        assert_eq!(
+            select_remote_from(Some("gemini"), true, true, false, false),
+            None
+        );
+        assert_eq!(
+            select_remote_from(Some("deepseek"), true, true, true, false),
+            None
+        );
     }
 
     #[test]
     fn select_remote_from_unknown_selector_falls_through_to_precedence() {
         assert_eq!(
-            select_remote_from(Some("bogus"), true, false, false),
+            select_remote_from(Some("bogus"), true, false, false, false),
             Some(RemoteChoice::Anthropic)
         );
-        assert_eq!(select_remote_from(Some("bogus"), false, false, false), None);
+        assert_eq!(
+            select_remote_from(Some("bogus"), false, false, false, false),
+            None
+        );
     }
 
     #[test]
@@ -699,6 +752,14 @@ mod tests {
         assert_eq!(
             infer_remote("claude-opus-4-8"),
             Some(RemoteChoice::Anthropic)
+        );
+        assert_eq!(
+            infer_remote("deepseek-v4-flash"),
+            Some(RemoteChoice::DeepSeek)
+        );
+        assert_eq!(
+            infer_remote("deepseek-reasoner"),
+            Some(RemoteChoice::DeepSeek)
         );
         assert_eq!(infer_remote("llama3.2"), None);
         assert_eq!(infer_remote("mistral-large"), None);
@@ -721,7 +782,7 @@ mod tests {
         // OTTO_OLLAMA must equal exactly "1" to count as a local LLM.
         assert!(capabilities_from_env(Some("1"), false, false).local_llm);
         assert!(!capabilities_from_env(Some("0"), false, false).local_llm);
-        // remote_llm now reflects "a remote provider is selectable" (any of the three keys /
+        // remote_llm now reflects "a remote provider is selectable" (any of the four keys /
         // a valid selector), computed by the caller via select_remote().is_some().
         assert!(capabilities_from_env(None, true, false).remote_llm);
         assert!(!capabilities_from_env(None, false, false).remote_llm);
