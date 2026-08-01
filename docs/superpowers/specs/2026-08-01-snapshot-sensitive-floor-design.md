@@ -109,6 +109,12 @@ Rejected alternatives:
 - **Filter in `promote()`** — the reviewer's other suggestion. It fixes the one caller that is
   broken today and leaves the seam unsafe, so the next `RemoteTarget` or bundle-builder
   reintroduces it. `remote` also has no gate, so it would duplicate the floor rather than share it.
+- **Leave `RemoteWorkspace::snapshot` as a pure proxy** — rejected during review. It satisfied the
+  seam's contract by *delegation*: it trusted the peer to be an up-to-date otto that filters. That
+  is the same shape of assumption that caused this bug (one control believed to cover another), so
+  `snapshot` now re-applies the floor to what the peer returned, via a shared
+  `strip_sensitive_files` helper. Normally a no-op against an otto peer; locally true regardless.
+
 - **Filter in `list()`** — broader than needed and changes what agents see. `fs.list` returns
   paths, not contents, and a subsequent `fs.read` is gate-denied, so listing is a much weaker
   disclosure. Changing it would perturb the ContextFinder for no security gain here. Out of scope.
@@ -126,10 +132,11 @@ and bypasses the gated `fs.read`.
 
 ### Consequence for `restore`
 
-`LocalWorkspace::restore` writes a snapshot back through the gated `apply_edit`. A snapshot can no
-longer carry a sensitive entry, so restore's own floor check becomes unreachable for that class.
-It stays — defense in depth, and it still guards a bundle arriving from a peer that has not been
-upgraded.
+`LocalWorkspace::restore` writes a snapshot back through the gated `apply_edit`, and has path
+containment only — it never had a floor check of its own. The fail-closed refusal for a bundle
+carrying a sensitive entry lives in `EngineService::accept_promotion`, and is unchanged: it still
+guards a bundle arriving from a peer that has not been upgraded. (An earlier draft of this section
+attributed that check to `restore`; the behavior described was right, the location was not.)
 
 ---
 

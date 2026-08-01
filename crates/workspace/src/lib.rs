@@ -168,6 +168,18 @@ impl Workspace for LocalWorkspace {
     }
 }
 
+/// Drop floor-sensitive entries from a snapshot's file list.
+///
+/// `LocalWorkspace::snapshot` skips these *before* reading, so the bytes are never loaded at all;
+/// this is for the case where the list arrives already-populated from elsewhere
+/// (`RemoteWorkspace::snapshot`, which receives it over the wire).
+pub(crate) fn strip_sensitive_files(files: Vec<(PathBuf, Vec<u8>)>) -> Vec<(PathBuf, Vec<u8>)> {
+    files
+        .into_iter()
+        .filter(|(p, _)| !otto_protocol::is_sensitive(&p.to_string_lossy()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +462,25 @@ mod tests {
         }
         // snapshot reads each listed file; an unreadable one must fail loudly, not be skipped.
         assert!(ws.snapshot().await.is_err());
+    }
+
+    /// `RemoteWorkspace::snapshot` receives its file list from a peer. An otto peer already
+    /// filters, so this is normally a no-op — but satisfying the seam's contract by *delegation*
+    /// means trusting the peer to be an up-to-date otto, and trusting one control to cover
+    /// another is exactly what caused this seam's last leak.
+    #[test]
+    fn strip_sensitive_files_drops_floor_paths_and_keeps_the_rest() {
+        let files = vec![
+            (PathBuf::from("ok.txt"), b"fine".to_vec()),
+            (PathBuf::from("id_rsa"), b"KEY".to_vec()),
+            (PathBuf::from("production.env"), b"PW".to_vec()),
+            (PathBuf::from("config/local.env"), b"S".to_vec()),
+            (PathBuf::from(".env"), b"H".to_vec()),
+        ];
+        let kept: Vec<String> = strip_sensitive_files(files)
+            .into_iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(kept, vec!["ok.txt".to_string()]);
     }
 }

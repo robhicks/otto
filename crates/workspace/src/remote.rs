@@ -1,6 +1,8 @@
 //! `RemoteWorkspace`: a `Workspace` implemented over the bearer-authed `POST /workspace` RPC
 //! of a remote engine. Each trait method is one unary request. The server enforces the
-//! permission floor and path containment, so this client is a thin proxy.
+//! permission floor and path containment, so this client is a thin proxy — with one deliberate
+//! exception: `snapshot` re-applies the sensitive-path floor to what the peer returned, because
+//! "the server enforces it" is a statement about a peer this client does not control.
 
 use std::path::{Path, PathBuf};
 
@@ -97,7 +99,17 @@ impl Workspace for RemoteWorkspace {
 
     async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot> {
         match self.rpc(&WorkspaceRequest::Snapshot).await? {
-            WorkspaceResponse::Snapshot { files } => Ok(WorkspaceSnapshot { files }),
+            WorkspaceResponse::Snapshot { files } => {
+                // Re-apply the floor to what the peer sent. An otto peer already filters (its
+                // `/workspace` handler is gate-filtered, a superset of the floor), so this is
+                // normally a no-op — but satisfying the seam's contract by *delegation* means
+                // trusting the peer to be an up-to-date otto. That is precisely the shape of
+                // assumption that caused this seam's last leak: the walk was believed to cover
+                // the floor because it skipped dotfiles, and it did not. Enforce locally.
+                Ok(WorkspaceSnapshot {
+                    files: crate::strip_sensitive_files(files),
+                })
+            }
             other => anyhow::bail!("unexpected response to Snapshot: {other:?}"),
         }
     }
