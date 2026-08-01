@@ -48,3 +48,60 @@ pub fn ApprovalPanel(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Locale;
+
+    #[component]
+    fn Harness(start: Locale) -> Element {
+        use_context_provider(|| Signal::new(start));
+        let pending = use_signal(|| {
+            Some((
+                Uuid::nil(),
+                PathBuf::from("src/main.rs"),
+                None,
+                "fn main() {}\n".to_string(),
+            ))
+        });
+        rsx! {
+            ApprovalPanel {
+                pending,
+                on_decide: move |_: (Uuid, bool)| {},
+            }
+        }
+    }
+
+    fn render(start: Locale) -> String {
+        let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { start });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_header_and_both_verdict_buttons_follow_the_locale() {
+        let en = render(Locale::En);
+        assert!(
+            en.contains("approval needed") && en.contains("Approve") && en.contains("Reject"),
+            "{en}"
+        );
+        let de = render(Locale::De);
+        assert!(
+            de.contains("Genehmigung erforderlich")
+                && de.contains("Genehmigen")
+                && de.contains("Ablehnen"),
+            "{de}"
+        );
+        // The English copy must be fully displaced, not merely accompanied.
+        assert!(!de.contains("approval needed"), "{de}");
+    }
+
+    #[test]
+    fn the_path_is_never_translated() {
+        // A path is data, not copy (spec §2) — byte-identical in every language.
+        for loc in Locale::ALL {
+            assert!(render(loc).contains("src/main.rs"), "{loc:?}");
+        }
+    }
+}

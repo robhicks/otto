@@ -18,6 +18,10 @@ macro_rules! messages {
 
         impl Msg {
             /// Every key, for the catalog-integrity tests.
+            ///
+            /// `cfg(test)` because it exists to be asserted against, not consumed: production code
+            /// names the variants it needs. Without the gate it is dead code in every real build.
+            #[cfg(test)]
             pub const ALL: &'static [Msg] = &[$(Msg::$key),+];
         }
 
