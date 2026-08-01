@@ -10,6 +10,8 @@ pub use approval_panel::{ApprovalPanel, PendingApproval};
 pub use connection_form::ConnectionForm;
 pub use event_log::EventLog;
 pub use file_tree::FileTree;
-pub use language_picker::{set_document_lang, LanguagePicker};
+#[cfg(feature = "web")]
+pub use language_picker::set_document_lang;
+pub use language_picker::LanguagePicker;
 pub use prompt_bar::PromptBar;
 pub use status_line::StatusLine;

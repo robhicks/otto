@@ -27,9 +27,10 @@ pub fn LanguagePicker() -> Element {
             "aria-label": "{t(active, Msg::LanguageLabel)}",
             onchange: move |e| {
                 let Some(next) = Locale::from_tag(&e.value()) else { return };
-                if let Some(mut sig) = sink {
-                    sig.set(next);
-                }
+                // A provider-less mount is fully inert: with nowhere to publish the choice, the
+                // pick cannot take effect, so it must not persist or relabel the document either.
+                let Some(mut sig) = sink else { return };
+                sig.set(next);
                 // Persisted ONLY on an explicit pick, never at startup, so environment detection
                 // never becomes accidentally sticky for a user who has not chosen.
                 store_persisted_locale(next.tag());
