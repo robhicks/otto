@@ -1,6 +1,12 @@
 # `Workspace::snapshot` must apply the sensitive-path floor
 
-> **Status:** DRAFT — fixes [#127](https://github.com/robhicks/otto/issues/127).
+> **Status:** IMPLEMENTED — shipped in [#128](https://github.com/robhicks/otto/pull/128), closing
+> [#127](https://github.com/robhicks/otto/issues/127). Review added three things beyond this
+> design: `RemoteWorkspace::snapshot` re-applies the floor rather than trusting the peer, the check
+> fails closed on a non-UTF-8 path instead of lossy-converting (matching the explicit warning in
+> `validate_workspace_edits`), and `LocalWorkspace::restore` — the ingress mirror — applies the
+> floor too. Deeper hardening, including making the invariant hold by type rather than per-impl
+> convention, is tracked in [#129](https://github.com/robhicks/otto/issues/129).
 > **Found by:** the independent security review on [#124](https://github.com/robhicks/otto/pull/124).
 
 `otto_remote::promote` builds its `PromoteBundle` from a raw `workspace.snapshot()`, while the

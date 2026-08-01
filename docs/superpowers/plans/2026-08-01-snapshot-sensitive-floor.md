@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust (edition 2024, toolchain pinned 1.97.0), `tokio` + `tempfile` for tests. **No new dependency** — `crates/workspace` already depends on `otto-protocol`, which exports `is_sensitive`.
 
+> **Status:** SHIPPED 2026-08-01 — landed in [#128](https://github.com/robhicks/otto/pull/128) as
+> four commits rather than the one this plan anticipated. See the Task Order note below for what
+> review added, and the amended Global Constraint for the dev-dependency deviation.
+
 **Spec:** `docs/superpowers/specs/2026-08-01-snapshot-sensitive-floor-design.md` — read it first. This plan implements it exactly.
 
 ## Global Constraints
