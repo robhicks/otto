@@ -516,7 +516,7 @@ async fn run_turn_loop(
                             pause_state.resume_all();
                         }
                         Ok(Command::Abort { .. }) => {
-                            let _ = state.service.abort(session).await;
+                            let _ = state.service.abort(&otto_protocol::UserId::local(), session).await;
                             approvals.clear();
                             pause_state.resume_all();
                             return TurnLoopOutcome::StopOuterLoop;
@@ -573,7 +573,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
         match state
             .service
             .store()
-            .replay_since(session, Some(after))
+            .replay_since(&otto_protocol::UserId::local(), session, Some(after))
             .await
         {
             Ok(events) => {
@@ -634,13 +634,14 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
                 // `writer` (via the sink); `run_turn_loop` borrows `reader` — disjoint, so it can
                 // poll both.
+                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
                     };
                     let turn = state
                         .service
-                        .run_prompt_with_controls(session, &text, &mut sink, controls);
+                        .run_prompt_with_controls(&owner, session, &text, &mut sink, controls);
                     run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
                         .await
                 }; // `sink` dropped here → `writer` is free again
@@ -650,7 +651,10 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 }
             }
             Command::Abort { .. } => {
-                let _ = state.service.abort(session).await;
+                let _ = state
+                    .service
+                    .abort(&otto_protocol::UserId::local(), session)
+                    .await;
                 break;
             }
             Command::ApproveDiff { .. } => {
@@ -665,21 +669,37 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::Resume { .. } => {
                 pause_state.resume_all();
             }
-            Command::PromoteToRemote { .. } => {
-                handle_handover(&state, &mut writer, session, true).await;
-            }
-            Command::DemoteToLocal { .. } => {
-                handle_handover(&state, &mut writer, session, false).await;
+            // Handover is the one client-facing command that does not route through an
+            // `EngineService` method — `handle_handover` reaches `otto_remote::promote` via the
+            // `store()` accessor — so it authorizes explicitly here. Trivially passing today
+            // (one principal), but promote ships a session's whole event log off-machine and
+            // demote overwrites the local row including its owner, so this is the wrong check
+            // to leave for later.
+            Command::PromoteToRemote { .. } | Command::DemoteToLocal { .. } => {
+                let to_remote = matches!(command, Command::PromoteToRemote { .. });
+                let owner = otto_protocol::UserId::local();
+                if let Err(e) = state.service.authorize_session(&owner, session).await {
+                    let _ = send_msg(
+                        &mut writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                handle_handover(&state, &mut writer, session, to_remote).await;
             }
             Command::RunCommand { name, args, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
                 let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
+                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
                     };
                     let turn = state.service.run_command_with_controls(
-                        session, &name, &args, &mut sink, approver, pauser,
+                        &owner, session, &name, &args, &mut sink, approver, pauser,
                     );
                     run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
                         .await
@@ -698,7 +718,13 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     };
                     state
                         .service
-                        .run_agent_with_controls(session, &name, &prompt, &mut sink)
+                        .run_agent_with_controls(
+                            &otto_protocol::UserId::local(),
+                            session,
+                            &name,
+                            &prompt,
+                            &mut sink,
+                        )
                         .await
                 }; // `sink` dropped here → `writer` is free again
 
@@ -752,7 +778,7 @@ async fn handle_handover(
                     return;
                 }
             };
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
@@ -828,7 +854,7 @@ async fn handle_handover(
 
             // Restore into THIS engine, overwriting our stale pre-promote copy (fail-closed
             // sensitive-path floor first). On failure, leave the VM running and report.
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
@@ -905,7 +931,7 @@ async fn handle_handover(
                     return;
                 }
             };
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
@@ -1059,9 +1085,20 @@ async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::
             Ok(SessionId(uuid))
         }
         None => {
+            // One principal exists until slice 1b adds identity, so every served session is owned
+            // by `local` — the same principal every command handler in this file passes.
+            // Enforcement lives in `EngineService::authorize`, which every command routes through;
+            // the store's reads are owner-scoped too, so a replay for the wrong owner is empty.
+            //
+            // Deliberately *not* checked in the `Some(s)` arm above: attaching to an explicit
+            // `?session=` stays blind, because rejecting an unowned id would close a socket that
+            // today receives `Ready`, and `ui-dioxus` appends `&session=` on reconnect. Nothing
+            // leaks — the first command on such a connection hits `authorize` and fails. The
+            // attach-time check lands in slice 1b alongside real principals.
+            let owner = otto_protocol::UserId::local();
             state
                 .service
-                .create_session("(serve/ws)", &serde_json::json!({}))
+                .create_session(&owner, "(serve/ws)", &serde_json::json!({}))
                 .await
         }
     }

@@ -567,9 +567,12 @@ pub async fn run_goal(
         tools,
     )
     .with_retriever(retriever);
-    let session = service.create_session(goal, &session_config()).await?;
+    let owner = otto_protocol::UserId::local();
+    let session = service
+        .create_session(&owner, goal, &session_config())
+        .await?;
     let mut sink = CollectingSink::default();
-    let outcome = service.run_prompt(session, goal, &mut sink).await?;
+    let outcome = service.run_prompt(&owner, session, goal, &mut sink).await?;
     Ok((sink.events, outcome))
 }
 

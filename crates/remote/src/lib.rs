@@ -154,8 +154,14 @@ pub async fn promote(
     session: SessionId,
     target: &dyn RemoteTarget,
 ) -> anyhow::Result<RemoteHandle> {
+    // Machine-to-machine: there is no principal here, so the owner is derived purely to satisfy
+    // the owner-scoped `snapshot`. Passing it back in as an authorization check would be a
+    // tautology. The caller is responsible for authorizing first — `serve.rs`'s handover arm
+    // calls `EngineService::authorize_session` before reaching this function. Do not read this
+    // comment as saying `promote` itself checks anything.
+    let owner = store.owner_of(session).await?;
     let bundle = PromoteBundle {
-        session: store.snapshot(session).await?,
+        session: store.snapshot(&owner, session).await?,
         workspace: workspace.snapshot().await?,
     };
     target.provision(&bundle).await
@@ -369,6 +375,7 @@ mod tests {
         let bundle = PromoteBundle {
             session: SessionState {
                 id: SessionId::new(),
+                owner: otto_protocol::UserId::local(),
                 goal: "g".to_string(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),
@@ -409,6 +416,7 @@ mod tests {
         let bundle = PromoteBundle {
             session: SessionState {
                 id: SessionId::new(),
+                owner: otto_protocol::UserId::local(),
                 goal: "g".to_string(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),

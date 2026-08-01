@@ -14,11 +14,47 @@ pub use types::{SessionState, SessionStatus, TurnRecord};
 
 /// Persists sessions and their event/turn history. Implementations are `Send + Sync`
 /// so the engine can hold one as `Box<dyn SessionStore>` across await points.
+///
+/// # Which methods are owner-scoped, and why not all of them
+///
+/// `create_session`, `replay_since`, `session_status`, and `snapshot` take a principal
+/// (`owner_of` does **not** — it is unscoped by design; see its own doc): they are the methods a client can reach with a session id it does not own, and the
+/// ones that would return another tenant's data. Their ownership predicate lives inside the SQL
+/// statement, so no caller can forget it.
+///
+/// `append_event`, `record_turn`, `next_seq`, `next_turn`, and `set_status` are deliberately
+/// UNSCOPED, and the honest framing is that this closes **confidentiality but not integrity**.
+/// None of them *returns* another tenant's data, so the five scoped reads above fully close the
+/// read side. But `append_event` and `set_status` can *write* to a session the caller does not
+/// own: a holder of a session id could inject events into, or abort, someone else's session.
+/// Today they are reachable only from inside a turn `EngineService` has already authorized, and
+/// there is one principal, so this is inert — but it is deferred work, not analyzed-and-safe.
+/// Scoping the write side belongs to the identity slice, together with narrowing
+/// `EngineService::store()` so the unscoped half is not reachable from outside the service at
+/// all. Do not read this paragraph as saying the write side was considered and found safe.
+///
+/// `restore` and `restore_over` are also unscoped, and are the highest-authority methods here:
+/// they take the owner from caller-supplied `SessionState`, i.e. off the wire on the promote /
+/// demote path. `restore` refuses to overwrite an existing id; `restore_over` does not, so it can
+/// reassign an existing session's owner. The caller is responsible for the pusher's authority to
+/// name that owner.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
-    /// Create a new session for `goal`, storing `config` (router/model selection) as
-    /// JSON. Returns the new session id.
-    async fn create_session(&self, goal: &str, config: &Value) -> anyhow::Result<SessionId>;
+    /// Create a session owned by `owner`.
+    async fn create_session(
+        &self,
+        owner: &otto_protocol::UserId,
+        goal: &str,
+        config: &Value,
+    ) -> anyhow::Result<SessionId>;
+
+    /// The owner of `session`, or `Err` if there is no such session.
+    ///
+    /// UNSCOPED, and deliberately a reverse existence oracle: it distinguishes "exists, owned by
+    /// someone else" from "does not exist" — exactly the distinction the scoped reads below
+    /// hide. `EngineService::authorize` needs that comparison, so it cannot be removed. It must
+    /// therefore NEVER back a client-facing path.
+    async fn owner_of(&self, session: SessionId) -> anyhow::Result<otto_protocol::UserId>;
 
     /// Append one already-sequenced event to the session's log. `(session, seq)` is a
     /// primary key, so re-appending the same seq is an error.
@@ -33,15 +69,22 @@ pub trait SessionStore: Send + Sync {
     /// Replay events for `session` in ascending seq order. `None` returns the full
     /// log; `Some(n)` returns only events with `seq > n` (strictly after n) — a
     /// client that has seen up through seq n passes `Some(n)` to get the gap.
-    /// Returns an empty Vec for an unknown session.
+    /// Returns an empty Vec for an unknown session — and, identically, for a session `owner`
+    /// does not own.
     async fn replay_since(
         &self,
+        owner: &otto_protocol::UserId,
         session: SessionId,
         after_seq: Option<u64>,
     ) -> anyhow::Result<Vec<Event>>;
 
-    /// Read a session's current status. Errors if the session does not exist.
-    async fn session_status(&self, session: SessionId) -> anyhow::Result<SessionStatus>;
+    /// Read a session's current status. Errors if the session does not exist — or, with a
+    /// byte-identical message, if `owner` does not own it.
+    async fn session_status(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<SessionStatus>;
 
     /// The next event seq for `session` (`MAX(seq) + 1`, or 0 if none). Lets a long-lived
     /// or reconnected writer continue the seq sequence without holding an in-memory counter.
@@ -52,8 +95,13 @@ pub trait SessionStore: Send + Sync {
 
     /// Capture the full state of `session` — metadata, config, the complete event log, and
     /// turn history — as a serializable `SessionState`. Errors if the session does not
-    /// exist. (The workspace patch-bundle is deferred until `RemoteWorkspace`.)
-    async fn snapshot(&self, session: SessionId) -> anyhow::Result<SessionState>;
+    /// exist — or, with a byte-identical message, if `owner` does not own it. (The workspace
+    /// patch-bundle is deferred until `RemoteWorkspace`.)
+    async fn snapshot(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<SessionState>;
 
     /// Write a previously captured `SessionState` into this store, preserving its id, seqs,
     /// status, config, and turn history. Intended for a fresh store (e.g. a remote engine);

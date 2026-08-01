@@ -134,41 +134,94 @@ impl EngineService {
         &*self.workspace
     }
 
-    /// Create and persist a new session. (≙ `Command::CreateSession`.)
+    /// The authorization choke point for session access. Returns the same error a nonexistent
+    /// session produces, so a caller cannot tell "not yours" from "not there".
+    ///
+    /// Every client-facing method **on this type** calls it before touching a session. It is not
+    /// automatic for the whole server: the handover path in `serve.rs` reaches
+    /// `otto_remote::promote` through the `store()` accessor rather than through an
+    /// `EngineService` method, so it must call [`Self::authorize_session`] explicitly — which it
+    /// does. Any future path that takes a `SessionId` from a client and bypasses this type owes
+    /// the same call.
+    ///
+    /// `store.owner_of` is an unscoped reverse existence oracle — it DOES distinguish the two —
+    /// so its error must never reach a client. That is why both arms below bail with the same
+    /// message, and why this is the only client-facing caller of `owner_of`.
+    async fn authorize(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<()> {
+        match self.store.owner_of(session).await {
+            Ok(actual) if &actual == owner => Ok(()),
+            // Both arms produce the same message on purpose.
+            _ => anyhow::bail!("no session {}", session.0),
+        }
+    }
+
+    /// [`Self::authorize`] for callers outside this type — specifically `serve.rs`'s handover
+    /// path, which does not route through an `EngineService` method and would otherwise be the
+    /// one client-facing command that skips the check.
+    pub async fn authorize_session(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<()> {
+        self.authorize(owner, session).await
+    }
+
+    /// Create and persist a new session owned by `owner`. (≙ `Command::CreateSession`.)
     pub async fn create_session(
         &self,
+        owner: &otto_protocol::UserId,
         goal: &str,
         config: &serde_json::Value,
     ) -> anyhow::Result<SessionId> {
-        self.store.create_session(goal, config).await
+        self.store.create_session(owner, goal, config).await
     }
 
     /// Mark a session aborted. (≙ `Command::Abort`.)
-    pub async fn abort(&self, session: SessionId) -> anyhow::Result<()> {
+    pub async fn abort(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<()> {
+        self.authorize(owner, session).await?;
         self.store.set_status(session, SessionStatus::Aborted).await
     }
 
     /// Run one turn with the headless defaults (deny approvals, never pause). (≙ `SendPrompt`.)
     pub async fn run_prompt(
         &self,
+        owner: &otto_protocol::UserId,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
     ) -> anyhow::Result<TurnOutcome> {
-        self.run_prompt_with_controls(session, goal, sink, TurnControls::default())
+        self.authorize(owner, session).await?;
+        self.run_prompt_with_controls(owner, session, goal, sink, TurnControls::default())
             .await
     }
 
     /// Run one orchestrator turn for `goal`, streaming each event to `sink` after persisting it
     /// (fail-closed), recording the turn, and updating status. `controls` supply the approver
     /// and pause controller. The seq sequence continues from the store. One turn at a time.
+    ///
+    /// `run_prompt` delegates here, and `run_command_with_controls` runs through it too, so
+    /// `authorize` (and its `owner_of` query) fires two or three times per turn. That is harmless
+    /// and deliberate — each entry point must be safe on its own. Do not remove the inner call.
     pub async fn run_prompt_with_controls(
         &self,
+        owner: &otto_protocol::UserId,
         session: SessionId,
         goal: &str,
         sink: &mut dyn EventSink,
         controls: TurnControls,
     ) -> anyhow::Result<TurnOutcome> {
+        // Before the turn lock, before the first store write, before any event: a rejected call
+        // must leave no trace.
+        self.authorize(owner, session).await?;
+
         let _guard = self.turn_lock.lock().await;
 
         let start_seq = self.store.next_seq(session).await?;
@@ -273,8 +326,14 @@ impl EngineService {
     /// injection failure (e.g. the sensitive-path floor denying `@.env`), or no extensions
     /// having been attached via `with_extensions` at all — so no `seq` is consumed and the
     /// session is untouched.
+    // The principal pushes this one past clippy's 7-argument threshold. Folding `approver`/
+    // `pauser` into a `TurnControls` would fix the count, but this method builds the rest of the
+    // `TurnControls` itself (the narrowed tools + pinned router), so a caller-supplied one would
+    // be half-ignored — a worse signature than a long one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_command_with_controls(
         &self,
+        owner: &otto_protocol::UserId,
         session: SessionId,
         name: &str,
         args: &[String],
@@ -282,6 +341,8 @@ impl EngineService {
         approver: Arc<dyn Approver>,
         pauser: Arc<dyn PauseController>,
     ) -> anyhow::Result<TurnOutcome> {
+        self.authorize(owner, session).await?;
+
         let extensions = self.extensions.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "no command named '{name}': this server was not configured with any extensions"
@@ -318,7 +379,7 @@ impl EngineService {
             tools: Some(narrowed_tools),
             router: Some(pinned_router),
         };
-        self.run_prompt_with_controls(session, &goal, sink, controls)
+        self.run_prompt_with_controls(owner, session, &goal, sink, controls)
             .await
     }
 
@@ -338,11 +399,13 @@ impl EngineService {
     /// `TurnComplete` has already streamed for the same call.
     pub async fn run_agent_with_controls(
         &self,
+        owner: &otto_protocol::UserId,
         session: SessionId,
         name: &str,
         prompt: &str,
         sink: &mut dyn EventSink,
     ) -> anyhow::Result<TurnOutcome> {
+        self.authorize(owner, session).await?;
         self.run_agent_with_controls_inner(session, name, prompt, sink, None)
             .await
     }
@@ -592,7 +655,17 @@ impl EngineService {
         // fast-path label — the real guard is `store.restore`'s atomic INSERT, which fails the
         // primary-key constraint on a duplicate, so a probe that errors for any other reason
         // (and falls through here) still cannot overwrite an existing session.
-        if self.store.session_status(id).await.is_ok() {
+        //
+        // Scoping this probe by the bundle's owner narrows it: a session id that already exists
+        // under a DIFFERENT owner no longer reports AlreadyExists, and instead falls through to
+        // `restore`'s primary-key failure and a generic error. Unreachable while `local` is the
+        // only principal; slice 1b must decide whether that is the behavior it wants.
+        if self
+            .store
+            .session_status(&bundle.session.owner, id)
+            .await
+            .is_ok()
+        {
             return Err(AcceptError::AlreadyExists);
         }
 
@@ -620,9 +693,20 @@ impl EngineService {
     /// The sensitive-path floor is still enforced up front (fail-closed) before anything is written.
     pub async fn accept_demotion(
         &self,
+        expected: SessionId,
         bundle: &otto_remote::PromoteBundle,
     ) -> Result<SessionId, AcceptError> {
         let id = bundle.session.id;
+        // The bundle is whatever the remote chose to return, and `restore_over` is an
+        // unconditional overwrite — so without this check a receiver could answer an export for
+        // session X with a bundle for session Y and overwrite Y's row, including its `owner`,
+        // on the source. Bind the response to the request.
+        if id != expected {
+            return Err(AcceptError::Refused(format!(
+                "demotion bundle is for session {}, but {} was requested",
+                id.0, expected.0
+            )));
+        }
         let edits = self.validate_workspace_edits(bundle)?;
         // Overwrite the source's own (stale) session row, then the pre-validated workspace files.
         self.store
@@ -738,8 +822,20 @@ impl EngineService {
         &self,
         session: SessionId,
     ) -> anyhow::Result<otto_remote::PromoteBundle> {
+        // Machine-to-machine: there is no connected principal. The owner is derived from the
+        // session purely to satisfy the owner-scoped `snapshot`; passing it back in as an
+        // authorization check would be a tautology.
+        //
+        // NOT YET CHECKED ANYWHERE: the ownership check for handover belongs on the source, in
+        // `serve.rs`'s WS command loop where a principal exists — but `handle_handover` does not
+        // perform one today, so `PromoteToRemote`/`DemoteToLocal` reach this path without the
+        // caller having proved ownership. That is not a regression (before session ownership
+        // existed there was nothing to check) and it is unobservable while `local` is the only
+        // principal, but it is a real gap that the identity slice must close. Do not read this
+        // comment as saying the check already exists.
+        let owner = self.store.owner_of(session).await?;
         Ok(otto_remote::PromoteBundle {
-            session: self.store.snapshot(session).await?,
+            session: self.store.snapshot(&owner, session).await?,
             workspace: self.filtered_workspace_snapshot().await?,
         })
     }
@@ -752,6 +848,11 @@ mod tests {
     use otto_providers::ScriptedProvider;
     use otto_router::SingleProviderRouter;
     use otto_workspace::LocalWorkspace;
+
+    /// The reserved principal every test that is not specifically about ownership uses.
+    fn local() -> otto_protocol::UserId {
+        otto_protocol::UserId::local()
+    }
 
     /// A receiver-style service over a fresh empty store + temp workspace, offline router.
     async fn build_test_service(
@@ -772,6 +873,178 @@ mod tests {
         )
     }
 
+    /// `build_test_service` over a fresh temp workspace + database, returning the `TempDir` too:
+    /// it must stay bound for the test's lifetime or the database file is deleted mid-test.
+    async fn build_service_for_test() -> (EngineService, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_root = dir.path().join("ws");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        let service = build_test_service(&ws_root, dir.path().join("s.db")).await;
+        (service, dir)
+    }
+
+    #[tokio::test]
+    async fn client_facing_methods_reject_a_non_owner() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_prompt(&bob, session, "go", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(sink.events.is_empty(), "a rejected turn must emit nothing");
+
+        // Not just "it errored": the rejected call must not have *done* anything. Asserting
+        // only `is_err()` here let a mutant that ran `set_status` and then authorized survive
+        // the whole suite — a non-owner aborting someone else's session while still getting an
+        // Err back. Read the state through.
+        assert!(service.abort(&bob, session).await.is_err());
+        assert_eq!(
+            service.store.session_status(&alice, session).await.unwrap(),
+            otto_persistence::SessionStatus::Active,
+            "a rejected abort must leave the session untouched"
+        );
+        assert_eq!(
+            service.store.next_seq(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a seq"
+        );
+
+        // ...and the owner still works.
+        assert!(service.abort(&alice, session).await.is_ok());
+    }
+
+    /// `serve.rs` dispatches `Command::SendPrompt` straight to `run_prompt_with_controls` — it
+    /// does NOT go through `run_prompt` — so this method's own `authorize` call is the served
+    /// hot path's only authorization. It needs its own test: deleting that inner call left the
+    /// entire suite green, because every other test reached it through `run_prompt`'s check.
+    #[tokio::test]
+    async fn run_prompt_with_controls_rejects_a_non_owner_directly() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_prompt_with_controls(
+                &bob,
+                session,
+                "go",
+                &mut sink,
+                TurnControls {
+                    approver: Arc::new(DenyApprover),
+                    pauser: Arc::new(NeverPause),
+                    tools: None,
+                    router: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(sink.events.is_empty(), "a rejected turn must emit nothing");
+        assert_eq!(
+            service.store.next_seq(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a seq"
+        );
+        assert_eq!(
+            service.store.next_turn(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a turn index"
+        );
+        assert_eq!(
+            service.store.session_status(&alice, session).await.unwrap(),
+            otto_persistence::SessionStatus::Active,
+            "a rejected turn must not change the session's status"
+        );
+    }
+
+    /// `run_command_with_controls` and `run_agent_with_controls` authorize before looking the
+    /// artifact up, and this asserts the *ordering*, not merely that a check exists: the service
+    /// under test has no extensions configured, so the owner fails with the extensions error
+    /// while a non-owner fails with `no session`. If `authorize` were ever moved below the
+    /// lookup, the non-owner would start getting the extensions error and this test would fail.
+    #[tokio::test]
+    async fn command_and_agent_dispatch_authorize_before_looking_anything_up() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_command_with_controls(
+                &bob,
+                session,
+                "anything",
+                &[],
+                &mut sink,
+                Arc::new(DenyApprover),
+                Arc::new(NeverPause),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(
+            sink.events.is_empty(),
+            "a rejected command must emit nothing"
+        );
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_agent_with_controls(&bob, session, "anything", "go", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(sink.events.is_empty(), "a rejected agent must emit nothing");
+
+        // The owner gets past the check and fails later, for an unrelated reason. That
+        // difference is what proves the authorization runs first.
+        let mut sink = CollectingSink::default();
+        let owner_err = service
+            .run_agent_with_controls(&alice, session, "anything", "go", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !owner_err.contains("no session"),
+            "the owner must clear authorization, not be rejected by it: {owner_err}"
+        );
+    }
+
+    /// export_promotion is machine-to-machine: it derives the owner itself and takes no
+    /// principal, so there is no tautological "check" to pass.
+    #[tokio::test]
+    async fn export_promotion_needs_no_principal() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let bundle = service.export_promotion(session).await.unwrap();
+        assert_eq!(bundle.session.owner, alice);
+    }
+
     #[tokio::test]
     async fn export_promotion_returns_bundle_without_sensitive_files() {
         let ws = tempfile::tempdir().unwrap();
@@ -781,7 +1054,7 @@ mod tests {
         std::fs::write(ws.path().join(".env"), b"SECRET=1").unwrap();
         let service = build_test_service(ws.path(), db.path().join("s.db")).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
@@ -821,6 +1094,7 @@ mod tests {
         let bundle = PromoteBundle {
             session: SessionState {
                 id,
+                owner: local(),
                 goal: "g".to_string(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),
@@ -834,7 +1108,7 @@ mod tests {
 
         let restored = service.accept_promotion(&bundle).await.unwrap();
         assert_eq!(restored, id);
-        assert!(service.store().session_status(id).await.is_ok());
+        assert!(service.store().session_status(&local(), id).await.is_ok());
         assert_eq!(
             service
                 .workspace()
@@ -860,6 +1134,7 @@ mod tests {
         let bundle = PromoteBundle {
             session: SessionState {
                 id,
+                owner: local(),
                 goal: "g".to_string(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),
@@ -882,7 +1157,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     /// Build a one-file bundle for the edge-case restore tests below.
@@ -896,6 +1171,7 @@ mod tests {
         otto_remote::PromoteBundle {
             session: SessionState {
                 id,
+                owner: local(),
                 goal: "g".to_string(),
                 status: SessionStatus::Active,
                 config: serde_json::json!({}),
@@ -924,7 +1200,7 @@ mod tests {
             Err(AcceptError::Refused(_))
         ));
         assert!(!ws_dir.path().parent().unwrap().join("escape.txt").exists());
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     #[tokio::test]
@@ -940,7 +1216,7 @@ mod tests {
             service.accept_promotion(&bundle).await,
             Err(AcceptError::Refused(_))
         ));
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     #[cfg(unix)]
@@ -961,7 +1237,7 @@ mod tests {
             service.accept_promotion(&bundle).await,
             Err(AcceptError::Refused(_))
         ));
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     #[tokio::test]
@@ -983,7 +1259,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     #[tokio::test]
@@ -996,10 +1272,10 @@ mod tests {
         let service = build_test_service(ws_dir.path(), db_dir.path().join("r.db")).await;
 
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
-        let state = service.store().snapshot(id).await.unwrap();
+        let state = service.store().snapshot(&local(), id).await.unwrap();
         let bundle = PromoteBundle {
             session: state,
             workspace: WorkspaceSnapshot { files: vec![] },
@@ -1023,7 +1299,7 @@ mod tests {
 
         // Seed S with an original copy of the session.
         let id = service
-            .create_session("old", &serde_json::json!({}))
+            .create_session(&local(), "old", &serde_json::json!({}))
             .await
             .unwrap();
 
@@ -1031,6 +1307,7 @@ mod tests {
         let bundle = PromoteBundle {
             session: SessionState {
                 id,
+                owner: local(),
                 goal: "advanced".to_string(),
                 status: otto_persistence::SessionStatus::Done,
                 config: serde_json::json!({}),
@@ -1043,9 +1320,15 @@ mod tests {
         };
 
         // accept_demotion overwrites S's stale row (no AlreadyExists), and writes the file.
-        let restored = service.accept_demotion(&bundle).await.unwrap();
+        let restored = service
+            .accept_demotion(bundle.session.id, &bundle)
+            .await
+            .unwrap();
         assert_eq!(restored, id);
-        assert_eq!(service.store().snapshot(id).await.unwrap().goal, "advanced");
+        assert_eq!(
+            service.store().snapshot(&local(), id).await.unwrap().goal,
+            "advanced"
+        );
         assert_eq!(
             service
                 .workspace()
@@ -1065,7 +1348,7 @@ mod tests {
         let id = SessionId::new();
         let bundle = bundle_with(id, std::path::PathBuf::from(".env"), b"SECRET=1".to_vec());
         assert!(matches!(
-            service.accept_demotion(&bundle).await,
+            service.accept_demotion(bundle.session.id, &bundle).await,
             Err(crate::service::AcceptError::Refused(_))
         ));
         // Fail-closed: nothing landed — neither the file nor the session.
@@ -1076,7 +1359,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(service.store().session_status(id).await.is_err());
+        assert!(service.store().session_status(&local(), id).await.is_err());
     }
 
     fn scripted_router() -> Arc<dyn Router> {
@@ -1119,12 +1402,12 @@ mod tests {
             tools,
         );
         let id = service
-            .create_session("add a greeting", &serde_json::json!({}))
+            .create_session(&local(), "add a greeting", &serde_json::json!({}))
             .await
             .unwrap();
         let mut sink = CollectingSink::default();
         service
-            .run_prompt(id, "add a greeting", &mut sink)
+            .run_prompt(&local(), id, "add a greeting", &mut sink)
             .await
             .unwrap();
 
@@ -1203,13 +1486,14 @@ mod tests {
             .await
             .with_extensions(Arc::new(Extensions::default()));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let err = service
             .run_command_with_controls(
+                &local(),
                 id,
                 "nope",
                 &[],
@@ -1221,7 +1505,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("no command named 'nope'"));
 
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
     }
 
@@ -1237,13 +1525,14 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let outcome = service
             .run_command_with_controls(
+                &local(),
                 id,
                 "greet",
                 &["thing".to_string()],
@@ -1256,7 +1545,7 @@ mod tests {
         assert!(outcome.ok);
 
         // Expansion: the recorded turn's goal is the expanded template, not the raw one.
-        let state = service.store().snapshot(id).await.unwrap();
+        let state = service.store().snapshot(&local(), id).await.unwrap();
         assert_eq!(state.turns.last().unwrap().goal, "do thing");
     }
 
@@ -1280,13 +1569,14 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let err = service
             .run_command_with_controls(
+                &local(),
                 id,
                 "narrow",
                 &["plain.txt".to_string()],
@@ -1304,7 +1594,11 @@ mod tests {
             "expected the expanded path in the error, got: {err}"
         );
 
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
     }
 
@@ -1314,13 +1608,14 @@ mod tests {
         // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let err = service
             .run_command_with_controls(
+                &local(),
                 id,
                 "anything",
                 &[],
@@ -1348,13 +1643,14 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let result = service
             .run_command_with_controls(
+                &local(),
                 id,
                 "leak",
                 &[],
@@ -1368,7 +1664,11 @@ mod tests {
             "the sensitive-path floor must fail the @.env injection closed"
         );
 
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
     }
 
@@ -1379,18 +1679,22 @@ mod tests {
             .await
             .with_extensions(Arc::new(Extensions::default()));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let err = service
-            .run_agent_with_controls(id, "ghost", "do it", &mut sink)
+            .run_agent_with_controls(&local(), id, "ghost", "do it", &mut sink)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no custom agent named 'ghost'"));
 
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert!(replayed.is_empty(), "no turn should have started");
     }
 
@@ -1400,13 +1704,13 @@ mod tests {
         // No `.with_extensions(...)` call at all — `self.extensions` stays `None`.
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let err = service
-            .run_agent_with_controls(id, "anything", "do it", &mut sink)
+            .run_agent_with_controls(&local(), id, "anything", "do it", &mut sink)
             .await
             .unwrap_err();
         assert!(
@@ -1432,13 +1736,13 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let outcome = service
-            .run_agent_with_controls(id, "reviewer", "look at auth.rs", &mut sink)
+            .run_agent_with_controls(&local(), id, "reviewer", "look at auth.rs", &mut sink)
             .await
             .unwrap();
         assert!(outcome.ok);
@@ -1472,11 +1776,15 @@ mod tests {
         ));
 
         // Persisted log matches what was streamed, with contiguous seqs from 0.
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert_eq!(replayed, sink.events);
 
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Done
         );
     }
@@ -1497,13 +1805,13 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut sink = CollectingSink::default();
         let outcome = service
-            .run_agent_with_controls(id, "second", "ping", &mut sink)
+            .run_agent_with_controls(&local(), id, "second", "ping", &mut sink)
             .await
             .unwrap();
         assert!(outcome.ok);
@@ -1542,7 +1850,7 @@ mod tests {
             .await
             .with_extensions(Arc::new(extensions));
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
@@ -1587,11 +1895,15 @@ mod tests {
         ));
 
         // Persisted log matches what was streamed.
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert_eq!(replayed, sink.events);
 
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Failed
         );
     }
@@ -1601,11 +1913,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("do a thing", &serde_json::json!({}))
+            .create_session(&local(), "do a thing", &serde_json::json!({}))
             .await
             .unwrap();
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Active
         );
     }
@@ -1615,12 +1927,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
-        service.abort(id).await.unwrap();
+        service.abort(&local(), id).await.unwrap();
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Aborted
         );
     }
@@ -1630,22 +1942,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("add a greeting", &serde_json::json!({}))
+            .create_session(&local(), "add a greeting", &serde_json::json!({}))
             .await
             .unwrap();
         let mut sink = CollectingSink::default();
         let outcome = service
-            .run_prompt(id, "add a greeting", &mut sink)
+            .run_prompt(&local(), id, "add a greeting", &mut sink)
             .await
             .unwrap();
 
         assert!(outcome.ok);
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Done
         );
         // The streamed events equal the persisted log, with contiguous seqs from 0.
-        let replayed = service.store().replay_since(id, None).await.unwrap();
+        let replayed = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert_eq!(replayed, sink.events);
         assert!(!sink.events.is_empty());
         for (i, event) in sink.events.iter().enumerate() {
@@ -1658,7 +1974,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
@@ -1676,7 +1992,7 @@ mod tests {
         };
         let mut sink = CollectingSink::default();
         service
-            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .run_prompt_with_controls(&local(), id, "g", &mut sink, controls)
             .await
             .unwrap();
 
@@ -1697,7 +2013,7 @@ mod tests {
         // The service's OWN default router (scripted_router()) would write "hi g".
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
@@ -1719,7 +2035,7 @@ mod tests {
         };
         let mut sink = CollectingSink::default();
         service
-            .run_prompt_with_controls(id, "g", &mut sink, controls)
+            .run_prompt_with_controls(&local(), id, "g", &mut sink, controls)
             .await
             .unwrap();
 
@@ -1736,19 +2052,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_in(&dir, crate::build_default_registry()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
 
         let mut s1 = CollectingSink::default();
-        service.run_prompt(id, "g", &mut s1).await.unwrap();
+        service
+            .run_prompt(&local(), id, "g", &mut s1)
+            .await
+            .unwrap();
         let mut s2 = CollectingSink::default();
-        service.run_prompt(id, "g", &mut s2).await.unwrap();
+        service
+            .run_prompt(&local(), id, "g", &mut s2)
+            .await
+            .unwrap();
 
         let last1 = s1.events.last().unwrap().seq;
         assert_eq!(s2.events.first().unwrap().seq, last1 + 1);
 
-        let all = service.store().replay_since(id, None).await.unwrap();
+        let all = service
+            .store()
+            .replay_since(&local(), id, None)
+            .await
+            .unwrap();
         assert_eq!(all.len(), s1.events.len() + s2.events.len());
         for (i, event) in all.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
@@ -1938,14 +2264,14 @@ mod tests {
         // Empty registry: the orchestrator can't find the Planner, so run_turn errors.
         let service = service_in(&dir, AgentRegistry::new()).await;
         let id = service
-            .create_session("g", &serde_json::json!({}))
+            .create_session(&local(), "g", &serde_json::json!({}))
             .await
             .unwrap();
         let mut sink = CollectingSink::default();
-        let result = service.run_prompt(id, "g", &mut sink).await;
+        let result = service.run_prompt(&local(), id, "g", &mut sink).await;
         assert!(result.is_err());
         assert_eq!(
-            service.store().session_status(id).await.unwrap(),
+            service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Failed
         );
     }
