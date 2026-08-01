@@ -138,11 +138,20 @@ and bypasses the gated `fs.read`.
 
 ### Consequence for `restore`
 
-`LocalWorkspace::restore` writes a snapshot back through the gated `apply_edit`, and has path
-containment only — it never had a floor check of its own. The fail-closed refusal for a bundle
-carrying a sensitive entry lives in `EngineService::accept_promotion`, and is unchanged: it still
-guards a bundle arriving from a peer that has not been upgraded. (An earlier draft of this section
-attributed that check to `restore`; the behavior described was right, the location was not.)
+**Superseded by what shipped.** As designed, `restore` wrote a snapshot back through the gated
+`apply_edit` with path containment only and no floor check of its own — the fail-closed refusal for
+a bundle carrying a sensitive entry lived solely in `EngineService::accept_promotion`.
+
+Review changed that. `restore` is the ingress mirror of `snapshot`, and `LoopbackTarget::provision`
+calls it directly on a caller-supplied bundle *without* the `validate_workspace_edits` pass the
+network paths get. Relying on "the only loopback bundle comes from `promote`, which now filters on
+the way out" is delegation to another control — the exact pattern this whole change rejects — so
+`restore` now applies the floor itself and skips a sensitive or non-UTF-8 entry. The
+`accept_promotion` refusal is unchanged and still guards the network ingress path; the two compose.
+
+(Two earlier drafts of this section were wrong in different directions: the first attributed the
+fail-closed check to `restore` when it lived in `accept_promotion`, and the second said `restore`
+has no floor check — true of the design, false of what shipped.)
 
 ---
 

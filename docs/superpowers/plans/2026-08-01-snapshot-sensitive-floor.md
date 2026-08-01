@@ -42,17 +42,26 @@
 | `crates/remote/src/lib.rs` (tests) | **Modify.** Assert `promote()`'s bundle inherits the filtering. |
 | `CLAUDE.md` | **Modify.** The `workspace` crate row states that `snapshot()` applies the floor; the `remote` row notes the dev-only `otto-workspace` edge. |
 | `crates/workspace/src/remote.rs` | **Modify** *(added during review).* `RemoteWorkspace::snapshot` re-applies the floor instead of trusting the peer. |
+| `crates/workspace/src/lib.rs` (`restore`) | **Modify** *(added during review).* The ingress mirror applies the floor too, and the check fails closed on non-UTF-8 paths. |
 | `crates/engine-core/src/{traits.rs,types.rs}` | **Modify** *(added during review).* Doc-only: the same false dotfile-covers-the-floor claim lived at the seam contract, one level up. |
 | `crates/remote/Cargo.toml` | **Modify** *(added during review).* The dev-dependency above. |
 
 ## Task Order & Rationale
 
-> **What actually shipped: three commits, not one.** Review after Task 1 found the seam's contract
-> was satisfied by *delegation* — `RemoteWorkspace::snapshot` trusted the peer to be an up-to-date
-> otto that filters — which is the same shape of assumption that caused this bug. A second commit
-> enforces the floor locally there too, via a shared `strip_sensitive_files` helper with its own
-> test. A third applies a review nit (`retain` in place rather than filter-and-collect). The
-> File Structure table above is annotated with the files those added.
+> **What actually shipped: four code commits, not one.** Each extra one closes the same pattern the
+> original bug came from — one control assumed to cover another.
+>
+> 1. Task 1 as planned: the floor in `LocalWorkspace::snapshot`.
+> 2. `RemoteWorkspace::snapshot` satisfied the seam's contract by *delegation*, trusting the peer to
+>    be an up-to-date otto that filters. Now enforces locally, via a shared `strip_sensitive_files`
+>    helper with its own test.
+> 3. A review nit: `retain` in place rather than filter-and-collect.
+> 4. The check used `to_string_lossy` where `validate_workspace_edits` explicitly warns against it;
+>    now `to_str()`, failing closed. And `LocalWorkspace::restore` — the ingress mirror, reached
+>    directly by `LoopbackTarget::provision` without the `validate_workspace_edits` pass — applies
+>    the floor too.
+>
+> The File Structure table above is annotated with the files these added.
 
 One task. The change is ~6 lines; splitting it would produce a commit that adds a test for behavior the next commit introduces. Both tests land with the fix so the branch is never in a state where the guarantee is claimed but unenforced.
 
