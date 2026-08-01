@@ -52,6 +52,9 @@ pub struct TurnRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub id: SessionId,
+    /// The principal that owns this session. Travels with the session across a promote, so a
+    /// restored session belongs to whoever owned it on the source — not to whoever pushed it.
+    pub owner: otto_protocol::UserId,
     pub goal: String,
     pub status: SessionStatus,
     pub config: serde_json::Value,
@@ -86,6 +89,7 @@ mod tests {
         let id = SessionId::new();
         let state = SessionState {
             id,
+            owner: otto_protocol::UserId::local(),
             goal: "the goal".to_string(),
             status: SessionStatus::Done,
             config: serde_json::json!({ "ollama": false }),

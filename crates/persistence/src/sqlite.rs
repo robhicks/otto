@@ -8,7 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+/// Bumped whenever the on-disk schema changes shape. Stamped into `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 1;
+
 /// A session store backed by a single sqlite database file.
+#[derive(Debug)]
 pub struct SqliteStore {
     pool: SqlitePool,
 }
@@ -17,6 +21,7 @@ impl SqliteStore {
     /// Open (creating if absent) the sqlite database at `path` and ensure the schema
     /// exists.
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -24,14 +29,48 @@ impl SqliteStore {
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
         let store = Self { pool };
-        store.init_schema().await?;
+        store.init_schema(path).await?;
         Ok(store)
     }
 
-    async fn init_schema(&self) -> anyhow::Result<()> {
+    /// Create the schema on a fresh database, or verify an existing one is the shape we expect.
+    ///
+    /// The crate has no migration mechanism — `CREATE TABLE IF NOT EXISTS` cannot alter an
+    /// existing table — so a pre-ownership file would silently keep its old shape and then fail
+    /// at query time with "no such column: owner". The probe turns that into one clear error at
+    /// open. `PRAGMA user_version` is 0 on both a brand-new file and every pre-ownership one;
+    /// the two are told apart by whether `sessions` already exists.
+    ///
+    /// Takes `path` solely so the error can name the file an operator has to delete.
+    async fn init_schema(&self, path: &Path) -> anyhow::Result<()> {
+        let (user_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await?;
+        let sessions_exists: Option<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+                .fetch_optional(&self.pool)
+                .await?;
+
+        match (user_version, sessions_exists.is_some()) {
+            (0, false) => {}
+            (0, true) => anyhow::bail!(
+                "session database at {} predates session ownership (issue #115) and has no \
+                 owner column. otto has no installed base, so there is no migration: delete \
+                 the file and let otto re-create it.",
+                path.display()
+            ),
+            (v, _) if v == SCHEMA_VERSION => return Ok(()),
+            (v, _) => anyhow::bail!(
+                "session database at {} has schema version {v}, newer than this otto build \
+                 understands ({SCHEMA_VERSION}); upgrade otto",
+                path.display()
+            ),
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
                 goal TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
@@ -41,6 +80,9 @@ impl SqliteStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS sessions_owner_idx ON sessions (owner)")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT NOT NULL,
@@ -63,6 +105,10 @@ impl SqliteStore {
         )
         .execute(&self.pool)
         .await?;
+
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -77,10 +123,11 @@ impl crate::SessionStore for SqliteStore {
         let id = otto_protocol::SessionId::new();
         let now = now_millis();
         sqlx::query(
-            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, owner, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(id.0.to_string())
+        .bind(otto_protocol::UserId::local().as_str())
         .bind(goal)
         .bind(crate::SessionStatus::Active.as_db_str())
         .bind(now)
@@ -188,13 +235,15 @@ impl crate::SessionStore for SqliteStore {
         &self,
         session: otto_protocol::SessionId,
     ) -> anyhow::Result<crate::SessionState> {
-        let row: Option<(String, String, String)> =
-            sqlx::query_as("SELECT goal, status, config FROM sessions WHERE id = ?1")
+        let row: Option<(String, String, String, String)> =
+            sqlx::query_as("SELECT owner, goal, status, config FROM sessions WHERE id = ?1")
                 .bind(session.0.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        let (goal, status, config) =
+        let (owner, goal, status, config) =
             row.ok_or_else(|| anyhow::anyhow!("snapshot: no session {}", session.0))?;
+        let owner = otto_protocol::UserId::parse(&owner)
+            .map_err(|e| anyhow::anyhow!("snapshot: stored owner is invalid: {e}"))?;
         let status = crate::SessionStatus::from_db_str(&status)?;
         let config: serde_json::Value = serde_json::from_str(&config)?;
 
@@ -218,6 +267,7 @@ impl crate::SessionStore for SqliteStore {
 
         Ok(crate::SessionState {
             id: session,
+            owner,
             goal,
             status,
             config,
@@ -255,10 +305,11 @@ impl crate::SessionStore for SqliteStore {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, owner, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(state.id.0.to_string())
+        .bind(state.owner.as_str())
         .bind(&state.goal)
         .bind(state.status.as_db_str())
         .bind(now)
@@ -318,10 +369,11 @@ impl crate::SessionStore for SqliteStore {
             .await?;
 
         sqlx::query(
-            "INSERT INTO sessions (id, goal, status, created_at, updated_at, config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, owner, goal, status, created_at, updated_at, config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&id)
+        .bind(state.owner.as_str())
         .bind(&state.goal)
         .bind(state.status.as_db_str())
         .bind(now)
@@ -633,6 +685,7 @@ mod tests {
         // A SessionState with a duplicate seq in its event log is internally inconsistent.
         let state = SessionState {
             id,
+            owner: otto_protocol::UserId::local(),
             goal: "g".to_string(),
             status: SessionStatus::Done,
             config: serde_json::json!({}),
@@ -666,6 +719,7 @@ mod tests {
         // A different snapshot for the SAME id: new goal, fresh event, Done status.
         let advanced = SessionState {
             id,
+            owner: otto_protocol::UserId::local(),
             goal: "new goal".to_string(),
             status: SessionStatus::Done,
             config: serde_json::json!({ "m": "y" }),
@@ -754,6 +808,98 @@ mod tests {
         assert_eq!(
             store.replay_since(b, None).await.unwrap(),
             vec![log_event(b, 0, "for-b")]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_defaults_the_owner_to_local() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let owner: (String,) = sqlx::query_as("SELECT owner FROM sessions WHERE id = ?1")
+            .bind(id.0.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(owner.0, "local");
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_the_owner() {
+        let (store, _dir) = temp_store().await;
+        let id = store
+            .create_session("g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let state = store.snapshot(id).await.unwrap();
+        assert_eq!(state.owner, otto_protocol::UserId::local());
+    }
+
+    #[tokio::test]
+    async fn fresh_database_is_stamped_with_the_schema_version() {
+        let (store, _dir) = temp_store().await;
+        let v: (i64,) = sqlx::query_as("PRAGMA user_version")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(v.0, SCHEMA_VERSION);
+    }
+
+    /// A pre-ownership database must fail loudly at open, not at some later query with a
+    /// confusing "no such column: owner". There is no installed base, so there is no migration.
+    #[tokio::test]
+    async fn opening_a_pre_ownership_database_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+
+        // Build the OLD schema by hand: `sessions` with no `owner`, user_version left at 0.
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+            sqlx::query(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, config TEXT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let err = SqliteStore::open(&path).await.unwrap_err().to_string();
+        assert!(
+            err.contains("predates session ownership"),
+            "unexpected: {err}"
+        );
+        assert!(err.contains("delete the file"), "unexpected: {err}");
+        // Spec success criterion 5: the message must name the file, or an operator cannot act
+        // on it. This is why the probe takes the path (see Step 4).
+        assert!(err.contains("legacy.db"), "error must name the file: {err}");
+    }
+
+    /// sqlite will happily let an older binary open a newer file; refuse instead of corrupting it.
+    #[tokio::test]
+    async fn opening_a_forward_version_database_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        {
+            let store = SqliteStore::open(&path).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+                .execute(&store.pool)
+                .await
+                .unwrap();
+            store.pool.close().await;
+        }
+        let err = SqliteStore::open(&path).await.unwrap_err().to_string();
+        assert!(
+            err.contains("newer than this otto build"),
+            "unexpected: {err}"
         );
     }
 }
