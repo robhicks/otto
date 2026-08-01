@@ -71,6 +71,9 @@ path rather than a suffix. Not exploitable — `base_url` is env config and `pat
   `OPENAI_BASE_URL` and `DEEPSEEK_BASE_URL`.
 - `OpenAiCompatibleProvider::complete` composes the endpoint without doubled separators.
 - Tests for both, including the loopback carve-out that keeps wiremock working.
+- A `CLAUDE.md` update: the "Runtime configuration (env vars)" section documents
+  `OPENAI_BASE_URL`/`DEEPSEEK_BASE_URL` as plain endpoint overrides. Since this is a user-visible
+  behavior change with no escape hatch, that section must state the https-or-loopback constraint.
 
 **Out:**
 - Changing `OpenAiProvider::new` / `DeepSeekProvider::new` to return `Result`. See §2.
@@ -94,10 +97,22 @@ Accept:
   `is_loopback()` holds (`127.0.0.0/8`), or IPv6 `::1`.
 
 Reject, with a distinct error variant each:
-- an unparseable URL;
-- a URL with no host (`https:///foo`, `file:///x`);
-- any scheme that is not `http`/`https` (`ftp`, `file`, `ws`);
-- `http://` to a non-loopback host — **the security case**.
+- `Unparseable` — the string is not a URL at all;
+- `UnsupportedScheme` — any scheme that is not `http`/`https` (`ftp`, `file`, `ws`);
+- `InsecureScheme` — `http://` to a non-loopback host — **the security case**;
+- `MissingHost` — a URL with no host at all.
+
+**On `MissingHost` being defensive-only.** For the `http`/`https` schemes the `url` crate
+guarantees a non-empty host: `https://` and `http://` fail parsing outright with `EmptyHost` (so
+they land in `Unparseable`), and `https:///foo` does **not** mean "no host" — it parses with host
+`Domain("foo")` and is therefore *accepted*. The only genuinely hostless inputs (`file:///x`) are
+caught by the scheme check first. So `MissingHost` is unreachable in practice; it exists so the
+`host()` match is total rather than an `unwrap`. **Do not write a test asserting some input
+produces `MissingHost` — there is none.**
+
+Host comparison is exact equality against the parsed host, never a suffix or substring match, and
+never a DNS resolution. `url` lowercases the host during parsing, so the `localhost` check is
+case-insensitive for free.
 
 **Why loopback-`http` is allowed:** every provider test constructs against `server.uri()` from
 wiremock, which is `http://127.0.0.1:<port>`. Rejecting plain `http` outright would break the
@@ -111,10 +126,11 @@ resolve — we match the literal host — so `http://evil.example.com` is reject
 it resolves to. Conversely `http://localhost.evil.com` does not match, because the check is
 equality, not suffix.
 
-`BaseUrlError` is a `thiserror`-free plain enum implementing `Display` (the crate has no
-`thiserror` dep and does not need one for four variants). Its `Display` names the offending URL and
-says what was expected, so the operator can see which env var to fix. **The API key is never
-included in any error string.**
+`BaseUrlError` is a `thiserror`-free plain enum implementing `Display` **and a four-line empty
+`impl std::error::Error`** (still no new dep), so the public error type composes with `anyhow`/`?`
+for future callers. Its `Display` names the offending URL and says what was expected, so the
+operator can see which env var to fix. **The API key is never included in any error string** — the
+key is never in scope in this module.
 
 ## §2 — Where validation runs, and how it fails
 
@@ -131,13 +147,20 @@ through ~12 test call sites for no safety gain.
 **Failure mode: warn loudly and fall back to the offline router.**
 
 `build_remote` changes signature from `-> Arc<dyn Provider>` to `-> Option<Arc<dyn Provider>>`,
-returning `None` when validation fails. Both call sites in `build_router_with_model` already have a
-"no usable provider" arm that prints a warning and returns `SingleProviderRouter(local)`; the `None`
-case joins it.
+returning `None` when validation fails. Both call sites in `build_router_with_model` fall back to
+`SingleProviderRouter(local)` on `None`.
 
-This is the established idiom in this file — `build_router_with_model:345-351` already degrades to
-offline with a warning when a pinned model's key is absent. Degrading to offline is strictly safer
-than the alternatives:
+**Correction to an earlier draft of this spec:** only the `Some(model)` arm has an existing warning
+(`crates/engine/src/lib.rs:346-349`). The `None` arm — the branch every ordinary `otto run` /
+`otto serve` takes — falls through to `SingleProviderRouter(local)` at `lib.rs:359` with **no
+output at all**. Reusing that arm as-is would make a rejected base URL a *silent* downgrade,
+contradicting #111's "fail with a clear error message". The warning therefore must not live in the
+router arms.
+
+**The warning is emitted by the resolver itself** (see below), so it fires on both branches by
+construction and neither arm needs new printing code.
+
+Degrading to offline is strictly safer than the alternatives:
 
 | Alternative | Why not |
 |---|---|
@@ -147,6 +170,36 @@ than the alternatives:
 
 The warning goes to stderr, names the env var and the rejected value, and states that the engine is
 falling back to offline. **It must not print the API key.**
+
+### §2a — A pure resolver seam, so this is testable without mutating the environment
+
+`crates/engine/src/lib.rs:596-601` carries an explicit SAFETY contract on the two env-touching
+tests in this test binary: both only ever *remove* provider-selection vars, "so ordering is
+irrelevant and they cannot race destructively", and it states verbatim: **"Do not add a test here
+that SETS these vars without revisiting this comment."**
+
+Proving #111's engine-level behavior by setting `OPENAI_API_KEY` + `OPENAI_BASE_URL` inside a test
+would violate that contract and introduce a real data race under edition 2024's
+`unsafe { set_var }`, run in parallel with the sibling tests. So the env read is separated from the
+decision:
+
+```rust
+/// Resolve a provider's base URL from an optional env override.
+/// `Some(url)` to use; `None` when an override was present but rejected — the caller
+/// falls back to the offline router. Warns to stderr on rejection.
+fn resolve_base_url(override_value: Option<String>, default: &str, var_name: &str) -> Option<String>
+```
+
+`resolve_base_url` is **pure with respect to the environment** — the caller passes the value in.
+`build_remote` does `std::env::var("OPENAI_BASE_URL").ok()` and hands it over. The engine-level
+tests call `resolve_base_url` directly with literal `Some("http://evil.example.com".into())` and
+assert `None`, touching no environment variable, so the SAFETY comment stays true as written and no
+new serialization or mutex is needed.
+
+**Assumption:** covering #111's engine AC through this pure seam plus the exhaustive
+`validate_base_url` unit tests in `otto-providers` satisfies "a non-loopback `http://` base is
+rejected" — the issue explicitly permits "`build_router` **or** provider-construction unit test".
+No test in this repo will set a provider env var.
 
 **Determinism is preserved:** with no env vars set, neither `OPENAI_BASE_URL` nor `DEEPSEEK_BASE_URL`
 is present, `build_remote` is not reached (no key ⇒ no remote selected), and both router slots stay
@@ -189,6 +242,8 @@ key over cleartext to a non-loopback host, and never emit a malformed endpoint.
 - `cargo test -p otto-providers` and `cargo test -p otto-engine --lib` stay green (the pre-existing
   counts were 25 and 74; new tests add to them).
 - The offline-deterministic default path is unchanged.
+- **No test added by this change sets or removes a process environment variable**, so the SAFETY
+  contract at `crates/engine/src/lib.rs:596-601` remains true verbatim.
 
 ## Error Handling & Edge Cases
 
@@ -202,9 +257,13 @@ key over cleartext to a non-loopback host, and never emit a malformed endpoint.
 | `http://api.openai.com` | **reject** — cleartext to a public host |
 | `http://localhost.evil.com` | **reject** — equality, not suffix match |
 | `http://169.254.169.254` (cloud metadata) | **reject** — not loopback |
-| `ftp://host` / `file:///etc/passwd` | reject — scheme not HTTP(S) |
-| `not a url` / `""` | reject — unparseable |
-| `https://` (no host) | reject — hostless |
+| `http://2130706433` | **accept** — parses to `Ipv4(127.0.0.1)`, i.e. genuinely loopback |
+| `http://localhost.` | **reject** — trailing dot parses as `Domain("localhost.")`, not equal to `localhost` |
+| `http://LOCALHOST` | accept — `url` lowercases the host during parsing |
+| `ftp://host` / `file:///etc/passwd` | reject — scheme not HTTP(S) (`UnsupportedScheme`) |
+| `not a url` / `""` | reject — `Unparseable` |
+| `https://` / `http://` | reject — `url` fails these with `EmptyHost`, so they land in `Unparseable` |
+| `https:///foo` | **accept** — this is NOT hostless; it parses as host `Domain("foo")` |
 
 An empty-string env var (`OPENAI_BASE_URL=`) is *present but unparseable*, so it is rejected rather
 than treated as unset. **Assumption:** this is the desired behavior — an explicitly-empty override
