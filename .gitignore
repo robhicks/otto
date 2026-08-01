@@ -1,5 +1,8 @@
 # Rust / Cargo
 /target
+# Crate-local build dirs (e.g. `cargo generate-rpm` run from inside a member writes
+# target/generate-rpm/ there)
+**/target
 **/*.rs.bk
 # Stray compiler outputs outside target/ (e.g. ad-hoc `rustc` probes)
 *.rlib

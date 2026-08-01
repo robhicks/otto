@@ -23,9 +23,11 @@ be embedded in-process or served over the network.
 ## Install
 
 Prebuilt binaries for Linux (`x86_64`, `aarch64`) and macOS (`x86_64`, `arm64`) are attached to
-each [GitHub release](https://github.com/robhicks/otto/releases). Release archives are named
-`otto-<target>.tar.gz` with a `SHA256SUMS`, and Linux releases also ship native `.rpm` packages
-(Fedora / RHEL-family). Any of these work:
+each [GitHub release](https://github.com/robhicks/otto/releases). Linux ships both a glibc build
+(`...-unknown-linux-gnu`) and a static musl build (`...-unknown-linux-musl`, for Alpine and older
+glibc distros). Release archives are named `otto-<target>.tar.gz` with a per-archive `.sha256`
+checksum (a sidecar named `otto-<target>.tar.gz.sha256`), and Linux releases also ship native
+`.rpm` packages (Fedora / RHEL-family). Any of these work:
 
 **curl installer** — detects the platform, verifies the checksum, installs to `~/.local/bin`:
 

@@ -2,12 +2,15 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# This builds a stripped `otto` release binary for the four supported targets, tars each as
+# This builds a stripped `otto` release binary for six targets (Linux/macOS × x86_64/aarch64, with
+# Linux also in a static musl flavor for Alpine and older glibc distros), tars each as
 # `otto-<target>.tar.gz` (the cargo-binstall quick-install convention, so `cargo binstall otto`
-# works with no extra config), attaches a `SHA256SUMS`, and drafts a GitHub Release. Linux also
-# gets native `.rpm` packages (Fedora/RHEL-family) built from `[package.metadata.generate-rpm]`
-# in crates/engine/Cargo.toml. Publish the draft once the checksums look right. The same archive
-# layout is what `deploy/install.sh` and `deploy/homebrew/otto.rb` expect — keep the three in sync.
+# works with no extra config), attaches a per-archive `.sha256` checksum (a sidecar named
+# `otto-<target>.tar.gz.sha256` — NOT a combined SHA256SUMS file), and drafts a GitHub Release.
+# Linux also gets native `.rpm` packages (Fedora/RHEL-family) built from
+# `[package.metadata.generate-rpm]` in crates/engine/Cargo.toml. Publish the draft once the
+# checksums look right. The same archive layout is what `deploy/install.sh` and
+# `deploy/homebrew/otto.rb` expect — keep the three in sync.
 
 name: release
 
@@ -41,6 +44,13 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+          # Static musl builds run on Alpine and on older glibc distros whose glibc is newer than
+          # the Ubuntu-runner build's (the glibc RPMs need GLIBC_2.39+). The action falls back to
+          # `cross` (auto-installed) for these targets.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -54,6 +64,7 @@ jobs:
           bin: otto
           target: ${{ matrix.target }}
           checksum: sha256
+          include: LICENSE-MIT,LICENSE-APACHE
           ref: ${{ github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -61,8 +72,9 @@ jobs:
   # it packages the cargo-built binary from [package.metadata.generate-rpm] in crates/engine.
   # `recommends: bubblewrap` is encoded in the metadata, so dnf installs the sandbox backend by
   # default. The asset source in that metadata is relative to crates/engine/ (the dir the tool
-  # must run in) but cargo builds into the workspace-root target/ — so build the binary first,
-  # then package. RPMs land at target/rpms/otto-<version>-1.<arch>.rpm.
+  # must run in) but cargo builds into the workspace-root target/ — the `--target` flag below
+  # tells the tool to look in target/<triple>/release/, so build the binary first, then package.
+  # RPMs land at target/rpms/otto-<version>-1.<arch>.rpm.
   build-rpm:
     needs: create-release
     runs-on: ubuntu-latest

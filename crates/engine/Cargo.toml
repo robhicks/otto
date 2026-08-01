@@ -22,10 +22,12 @@ candle = ["otto-providers/candle"]
 candle-cuda = ["candle", "otto-providers/candle-cuda"]
 candle-metal = ["candle", "otto-providers/candle-metal"]
 
-# RPM packaging for Fedora/RHEL-family — `cargo generate-rpm -p otto-engine`. Consumed by the
-# release workflow's build-rpm job; keep the two in sync. bubblewrap is a weak (recommends)
-# dependency: dnf pulls it by default so `otto run`'s sandbox works out of the box, but a
-# serve-only install can opt out with --no-recommends.
+# RPM packaging for Fedora/RHEL-family — `cargo generate-rpm` (run from this dir). Consumed by the
+# release workflow's build-rpm job; keep the two in sync. The asset source is relative to this dir
+# but cargo builds into the workspace root's target/ — the workflow passes `--target <triple>`,
+# which makes the tool read target/<triple>/release/ instead of target/release/. bubblewrap is a
+# weak (recommends) dependency: dnf pulls it by default so `otto run`'s sandbox works out of the
+# box, but a serve-only install can opt out with --no-recommends.
 [package.metadata.generate-rpm]
 name = "otto"
 summary = "Agentic coding engine: a deterministic orchestrator drives a spine of atomic agents"

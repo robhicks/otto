@@ -9,7 +9,7 @@
 #   OTTO_BASE_URL  download base, for mirrors (default: GitHub releases)
 #
 # Requires: curl, tar, and sha256sum (Linux) or shasum (macOS). The archive is verified against
-# the SHA256SUMS published with the release before anything is written.
+# the per-archive `.sha256` checksum published with the release before anything is written.
 
 set -eu
 
@@ -25,7 +25,14 @@ target_triple() {
     os="$(uname -s)"
     arch="$(uname -m)"
     case "$os" in
-        Linux) os_triple="unknown-linux-gnu" ;;
+        Linux)
+            os_triple="unknown-linux-gnu"
+            # glibc hosts fetch the glibc build; musl hosts (Alpine et al.) need the static musl
+            # build. Both Linux triples are published by the release workflow.
+            if [ -f /etc/alpine-release ] || (ldd --version 2>/dev/null | grep -qi musl); then
+                os_triple="unknown-linux-musl"
+            fi
+            ;;
         Darwin) os_triple="apple-darwin" ;;
         *) die "unsupported OS: $os (only Linux and macOS releases are built)" ;;
     esac
@@ -65,10 +72,10 @@ trap 'rm -rf "$tmp"' EXIT
 
 say "downloading otto ($target, $OTTO_VERSION)…"
 curl -fsSL "$release_url/$archive" -o "$tmp/$archive" || die "download failed ($release_url/$archive)"
-curl -fsSL "$release_url/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "checksum file not found"
+curl -fsSL "$release_url/$archive.sha256" -o "$tmp/$archive.sha256" || die "checksum file not found"
 
-expected="$(grep "$archive" "$tmp/SHA256SUMS" | awk '{print $1}' || true)"
-[ -n "$expected" ] || die "no checksum for $archive in SHA256SUMS"
+expected="$(awk '{print $1}' "$tmp/$archive.sha256" || true)"
+[ -n "$expected" ] || die "no checksum for $archive"
 actual="$(
     (sha256sum "$tmp/$archive" 2>/dev/null || shasum -a 256 "$tmp/$archive") |
         awk '{print $1}'
