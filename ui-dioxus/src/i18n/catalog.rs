@@ -1,0 +1,332 @@
+//! The message catalog: one entry per key, all five locales side by side.
+//!
+//! Adding a key requires all five translations at the call site or the macro does not parse;
+//! adding a `Locale` variant without extending the macro fails `t`'s exhaustive match. Missing
+//! translations are therefore a COMPILE error, not a runtime gap.
+//!
+//! Keys whose template embeds a protocol identifier (`FileEdit`, `Verify`, `TurnComplete`) keep
+//! that identifier byte-identical in every locale — spec §2, enforced by
+//! `protocol_identifiers_survive_translation`.
+
+use super::Locale;
+
+macro_rules! messages {
+    ($($key:ident { en: $en:expr, de: $de:expr, es: $es:expr, hi: $hi:expr, zh: $zh:expr $(,)? })+) => {
+        /// A catalog key. One variant per message; see this module's `messages!` block.
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        pub enum Msg { $($key),+ }
+
+        impl Msg {
+            /// Every key, for the catalog-integrity tests.
+            pub const ALL: &'static [Msg] = &[$(Msg::$key),+];
+        }
+
+        /// Look up a message. Exhaustive over `(Locale, Msg)` with NO wildcard arm — that is what
+        /// makes an unhandled locale a compile error.
+        pub fn t(locale: Locale, m: Msg) -> &'static str {
+            match (locale, m) {
+                $(
+                    (Locale::En, Msg::$key) => $en,
+                    (Locale::De, Msg::$key) => $de,
+                    (Locale::Es, Msg::$key) => $es,
+                    (Locale::Hi, Msg::$key) => $hi,
+                    (Locale::ZhHans, Msg::$key) => $zh,
+                )+
+            }
+        }
+    };
+}
+
+/// Substitute `{name}` placeholders from `args`.
+///
+/// Single-pass by construction: the output is built by walking the TEMPLATE and pushing either
+/// literal text or a substituted value, so a value that itself contains `{...}` is never rescanned.
+/// This matters — `{path}` and `{message}` carry attacker-influenceable content.
+///
+/// A placeholder with no matching arg is emitted verbatim (`{name}`): visibly wrong and therefore
+/// reportable, rather than silently blanking user-facing text.
+pub fn tf(locale: Locale, m: Msg, args: &[(&str, &str)]) -> String {
+    let template = t(locale, m);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let name = &after[..close];
+                match args.iter().find(|(k, _)| *k == name) {
+                    Some((_, v)) => out.push_str(v),
+                    None => {
+                        out.push('{');
+                        out.push_str(name);
+                        out.push('}');
+                    }
+                }
+                rest = &after[close + 1..];
+            }
+            None => {
+                // Unbalanced brace: emit the remainder verbatim rather than dropping it.
+                out.push_str(&rest[open..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+messages! {
+    // ---- Buttons and actions -------------------------------------------------------------
+    Connect { en: "Connect", de: "Verbinden", es: "Conectar", hi: "कनेक्ट करें", zh: "连接" }
+    Connecting { en: "Connecting…", de: "Verbinde…", es: "Conectando…", hi: "कनेक्ट हो रहा है…", zh: "连接中…" }
+    Disconnect { en: "Disconnect", de: "Trennen", es: "Desconectar", hi: "डिस्कनेक्ट करें", zh: "断开连接" }
+    Send { en: "Send", de: "Senden", es: "Enviar", hi: "भेजें", zh: "发送" }
+    Pause { en: "Pause", de: "Pausieren", es: "Pausar", hi: "रोकें", zh: "暂停" }
+    Resume { en: "Resume", de: "Fortsetzen", es: "Reanudar", hi: "जारी रखें", zh: "继续" }
+    Abort { en: "Abort", de: "Abbrechen", es: "Cancelar", hi: "निरस्त करें", zh: "中止" }
+    Approve { en: "Approve", de: "Genehmigen", es: "Aprobar", hi: "स्वीकृत करें", zh: "批准" }
+    Reject { en: "Reject", de: "Ablehnen", es: "Rechazar", hi: "अस्वीकार करें", zh: "拒绝" }
+    RefreshFiles { en: "Refresh files", de: "Dateien aktualisieren", es: "Actualizar archivos", hi: "फ़ाइलें रीफ़्रेश करें", zh: "刷新文件" }
+    PromoteToRemote { en: "Promote to remote", de: "Auf Remote hochstufen", es: "Promover a remoto", hi: "रिमोट पर प्रमोट करें", zh: "提升到远程" }
+    DemoteToLocal { en: "Demote to local", de: "Auf Lokal herabstufen", es: "Degradar a local", hi: "लोकल पर डिमोट करें", zh: "降级到本地" }
+
+    // ---- Form fields ---------------------------------------------------------------------
+    // The URL field's placeholder (`ws://127.0.0.1:8787`) is an example VALUE, not copy — it is
+    // deliberately not a catalog key (spec §2).
+    TokenPlaceholder { en: "token", de: "Token", es: "token", hi: "टोकन", zh: "令牌" }
+
+    // ---- Status strip --------------------------------------------------------------------
+    StatusDisconnected { en: "disconnected", de: "getrennt", es: "desconectado", hi: "डिस्कनेक्ट किया गया", zh: "已断开" }
+    StatusConnecting { en: "connecting…", de: "verbinde…", es: "conectando…", hi: "कनेक्ट हो रहा है…", zh: "连接中…" }
+    StatusConnected { en: "connected", de: "verbunden", es: "conectado", hi: "कनेक्ट किया गया", zh: "已连接" }
+    SeqLabel { en: "seq {seq}", de: "Seq {seq}", es: "sec {seq}", hi: "क्रम {seq}", zh: "序号 {seq}" }
+
+    // ---- Capability segments -------------------------------------------------------------
+    // Values are translated, not left as diagnostics: this strip exists so lost capability is
+    // visible, and a user who cannot read "off" cannot see that the sandbox is off (spec §2).
+    CapEngine { en: "engine", de: "Engine", es: "motor", hi: "इंजन", zh: "引擎" }
+    CapLlm { en: "LLM", de: "LLM", es: "LLM", hi: "एलएलएम", zh: "大模型" }
+    CapSandbox { en: "sandbox", de: "Sandbox", es: "entorno aislado", hi: "सैंडबॉक्स", zh: "沙箱" }
+    CapLocal { en: "local", de: "lokal", es: "local", hi: "लोकल", zh: "本地" }
+    CapRemote { en: "remote", de: "remote", es: "remoto", hi: "रिमोट", zh: "远程" }
+    CapLocalRemote { en: "local+remote", de: "lokal+remote", es: "local+remoto", hi: "लोकल+रिमोट", zh: "本地+远程" }
+    CapOffline { en: "offline (deterministic)", de: "offline (deterministisch)", es: "sin conexión (determinista)", hi: "ऑफ़लाइन (नियतात्मक)", zh: "离线（确定性）" }
+    CapOn { en: "on", de: "an", es: "activado", hi: "चालू", zh: "开启" }
+    CapOff { en: "off", de: "aus", es: "desactivado", hi: "बंद", zh: "关闭" }
+
+    // ---- Token/cost meter ----------------------------------------------------------------
+    Meter { en: "↑{input} ↓{output} tok", de: "↑{input} ↓{output} Tok", es: "↑{input} ↓{output} tok", hi: "↑{input} ↓{output} टोकन", zh: "↑{input} ↓{output} 词元" }
+
+    // ---- Editor --------------------------------------------------------------------------
+    EditorNoFileOpen { en: "No file open", de: "Keine Datei geöffnet", es: "Ningún archivo abierto", hi: "कोई फ़ाइल खुली नहीं है", zh: "未打开文件" }
+    EditorBinary { en: "binary file — not editable", de: "Binärdatei — nicht bearbeitbar", es: "archivo binario — no editable", hi: "बाइनरी फ़ाइल — संपादन योग्य नहीं", zh: "二进制文件 — 不可编辑" }
+    EditorTooLarge { en: "file too large to edit", de: "Datei zu groß zum Bearbeiten", es: "archivo demasiado grande para editar", hi: "फ़ाइल संपादित करने के लिए बहुत बड़ी है", zh: "文件过大，无法编辑" }
+
+    // ---- Approval ------------------------------------------------------------------------
+    ApprovalNeeded { en: "approval needed: {path}", de: "Genehmigung erforderlich: {path}", es: "se necesita aprobación: {path}", hi: "अनुमोदन आवश्यक: {path}", zh: "需要批准：{path}" }
+
+    // ---- Diff markers --------------------------------------------------------------------
+    DiffTrailingNewlineAdded { en: "(trailing newline added)", de: "(abschließender Zeilenumbruch hinzugefügt)", es: "(salto de línea final añadido)", hi: "(अंत में नई पंक्ति जोड़ी गई)", zh: "（已添加行尾换行符）" }
+    DiffTrailingNewlineRemoved { en: "(trailing newline removed)", de: "(abschließender Zeilenumbruch entfernt)", es: "(salto de línea final eliminado)", hi: "(अंत की नई पंक्ति हटाई गई)", zh: "（已移除行尾换行符）" }
+
+    // ---- Client-authored, actionable ------------------------------------------------------
+    UrlAndTokenRequired { en: "URL and token are required", de: "URL und Token sind erforderlich", es: "se requieren URL y token", hi: "URL और टोकन आवश्यक हैं", zh: "需要 URL 和令牌" }
+
+    // ---- Desktop shell -------------------------------------------------------------------
+    ChooseWorkspaceFolder { en: "Choose a workspace folder", de: "Arbeitsbereichsordner auswählen", es: "Elegir una carpeta de espacio de trabajo", hi: "कार्यस्थान फ़ोल्डर चुनें", zh: "选择工作区文件夹" }
+
+    // ---- Language picker -----------------------------------------------------------------
+    // The picker's accessible name. The OPTION labels are endonyms (`Locale::endonym`) and are
+    // deliberately NOT catalog entries.
+    LanguageLabel { en: "Language", de: "Sprache", es: "Idioma", hi: "भाषा", zh: "语言" }
+
+    // ---- Event-log rows ------------------------------------------------------------------
+    // `{role}` is a protocol identifier substituted verbatim; `FileEdit`/`Verify`/`TurnComplete`
+    // are protocol identifiers embedded in the template and byte-identical across locales.
+    RowAgentStarted { en: "▸ {role} started", de: "▸ {role} gestartet", es: "▸ {role} iniciado", hi: "▸ {role} शुरू हुआ", zh: "▸ {role} 已启动" }
+    RowAgentFinished { en: "▸ {role} finished", de: "▸ {role} beendet", es: "▸ {role} finalizado", hi: "▸ {role} समाप्त हुआ", zh: "▸ {role} 已完成" }
+    RowFileEdit { en: "✎ FileEdit {path} (+{bytes} bytes)", de: "✎ FileEdit {path} (+{bytes} Bytes)", es: "✎ FileEdit {path} (+{bytes} bytes)", hi: "✎ FileEdit {path} (+{bytes} बाइट)", zh: "✎ FileEdit {path} （+{bytes} 字节）" }
+    RowVerify { en: "{mark} Verify {detail}", de: "{mark} Verify {detail}", es: "{mark} Verify {detail}", hi: "{mark} Verify {detail}", zh: "{mark} Verify {detail}" }
+    VerifyOk { en: "ok", de: "ok", es: "correcto", hi: "ठीक", zh: "正常" }
+    RowTurnCompleteOk { en: "● TurnComplete ok", de: "● TurnComplete ok", es: "● TurnComplete correcto", hi: "● TurnComplete ठीक", zh: "● TurnComplete 成功" }
+    RowTurnCompleteFailed { en: "● TurnComplete failed", de: "● TurnComplete fehlgeschlagen", es: "● TurnComplete fallido", hi: "● TurnComplete विफल", zh: "● TurnComplete 失败" }
+    RowApprovalNeeded { en: "⏸ approval needed: {path}", de: "⏸ Genehmigung erforderlich: {path}", es: "⏸ se necesita aprobación: {path}", hi: "⏸ अनुमोदन आवश्यक: {path}", zh: "⏸ 需要批准：{path}" }
+    RowMeter { en: "◷ tokens ↑{input} ↓{output}", de: "◷ Tokens ↑{input} ↓{output}", es: "◷ tokens ↑{input} ↓{output}", hi: "◷ टोकन ↑{input} ↓{output}", zh: "◷ 词元 ↑{input} ↓{output}" }
+    RowServerError { en: "error: {message}", de: "Fehler: {message}", es: "error: {message}", hi: "त्रुटि: {message}", zh: "错误：{message}" }
+    RowClientError { en: "client: {message}", de: "Client: {message}", es: "cliente: {message}", hi: "क्लाइंट: {message}", zh: "客户端：{message}" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Locale;
+
+    /// Collect the `{name}` placeholders in a template, in order of appearance.
+    fn placeholders(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = s;
+        while let Some(open) = rest.find('{') {
+            let after = &rest[open + 1..];
+            match after.find('}') {
+                Some(close) => {
+                    out.push(after[..close].to_string());
+                    rest = &after[close + 1..];
+                }
+                None => break,
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn no_message_is_empty_in_any_locale() {
+        // A missing key or locale is a COMPILE error (the macro requires all five per entry and
+        // `t`'s match has no wildcard arm). This catches what the compiler cannot: a stub left as
+        // an empty or whitespace-only string.
+        for &m in Msg::ALL {
+            for loc in Locale::ALL {
+                let s = t(loc, m);
+                assert!(
+                    !s.trim().is_empty(),
+                    "empty catalog entry for {m:?} in {loc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placeholder_sets_match_across_locales() {
+        // `tf` substitutes by name, so a locale whose template drops or renames a placeholder
+        // would silently render an un-substituted `{name}` to that language's users only.
+        for &m in Msg::ALL {
+            let expected = placeholders(t(Locale::En, m));
+            for loc in Locale::ALL {
+                assert_eq!(
+                    placeholders(t(loc, m)),
+                    expected,
+                    "placeholder mismatch for {m:?} in {loc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_brace_is_a_closed_placeholder() {
+        // `tf` cannot escape a literal brace, so an unbalanced one is always a catalog bug.
+        for &m in Msg::ALL {
+            for loc in Locale::ALL {
+                let s = t(loc, m);
+                assert_eq!(
+                    s.matches('{').count(),
+                    s.matches('}').count(),
+                    "unbalanced braces for {m:?} in {loc:?}: {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_identifiers_survive_translation() {
+        // Three templates embed a protocol identifier (spec §2: shared wire vocabulary, never
+        // translated). This fails if a future translation pass localizes one of them.
+        for loc in Locale::ALL {
+            assert!(
+                t(loc, Msg::RowFileEdit).contains("FileEdit"),
+                "RowFileEdit lost the FileEdit identifier in {loc:?}"
+            );
+            assert!(
+                t(loc, Msg::RowVerify).contains("Verify"),
+                "RowVerify lost the Verify identifier in {loc:?}"
+            );
+            for m in [Msg::RowTurnCompleteOk, Msg::RowTurnCompleteFailed] {
+                assert!(
+                    t(loc, m).contains("TurnComplete"),
+                    "{m:?} lost the TurnComplete identifier in {loc:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tf_substitutes_named_placeholders() {
+        assert_eq!(
+            tf(Locale::En, Msg::ApprovalNeeded, &[("path", "src/main.rs")]),
+            "approval needed: src/main.rs"
+        );
+    }
+
+    #[test]
+    fn tf_leaves_an_unsupplied_placeholder_verbatim() {
+        // Visibly wrong beats silently blank: a missing arg must be reportable, not invisible.
+        assert_eq!(
+            tf(Locale::En, Msg::ApprovalNeeded, &[]),
+            "approval needed: {path}"
+        );
+    }
+
+    #[test]
+    fn tf_never_rescans_substituted_values() {
+        // `{path}` and `{message}` carry attacker-influenceable content. A value containing a
+        // brace sequence must render verbatim, never trigger a second substitution round.
+        assert_eq!(
+            tf(Locale::En, Msg::ApprovalNeeded, &[("path", "{path}")]),
+            "approval needed: {path}"
+        );
+        assert_eq!(
+            tf(
+                Locale::En,
+                Msg::ApprovalNeeded,
+                &[("path", "a{b}c"), ("b", "BOOM")]
+            ),
+            "approval needed: a{b}c"
+        );
+    }
+
+    #[test]
+    fn locale_tags_round_trip() {
+        for loc in Locale::ALL {
+            assert_eq!(Locale::from_tag(loc.tag()), Some(loc), "{loc:?}");
+        }
+    }
+
+    #[test]
+    fn from_tag_normalizes_case_separator_and_whitespace() {
+        assert_eq!(Locale::from_tag("en_US"), Some(Locale::En));
+        assert_eq!(Locale::from_tag("EN-us"), Some(Locale::En));
+        assert_eq!(Locale::from_tag("  en  "), Some(Locale::En));
+        assert_eq!(Locale::from_tag("de-AT"), Some(Locale::De));
+        assert_eq!(Locale::from_tag("es-419"), Some(Locale::Es));
+    }
+
+    #[test]
+    fn from_tag_rejects_locales_with_no_catalog() {
+        assert_eq!(Locale::from_tag("pt-BR"), None);
+        assert_eq!(Locale::from_tag("fr"), None);
+        assert_eq!(Locale::from_tag(""), None);
+    }
+
+    #[test]
+    fn chinese_is_matched_by_script_not_primary_subtag() {
+        // Simplified is the only Chinese catalog we ship.
+        assert_eq!(Locale::from_tag("zh-Hans"), Some(Locale::ZhHans));
+        assert_eq!(Locale::from_tag("zh-Hans-CN"), Some(Locale::ZhHans));
+        assert_eq!(Locale::from_tag("zh-CN"), Some(Locale::ZhHans));
+        assert_eq!(Locale::from_tag("zh-SG"), Some(Locale::ZhHans));
+        assert_eq!(Locale::from_tag("zh"), Some(Locale::ZhHans));
+        // Traditional falls back to en rather than being served the wrong script.
+        assert_eq!(Locale::from_tag("zh-Hant"), None);
+        assert_eq!(Locale::from_tag("zh-TW"), None);
+        assert_eq!(Locale::from_tag("zh-HK"), None);
+    }
+
+    #[test]
+    fn endonyms_are_distinct_and_untranslated() {
+        let names: Vec<&str> = Locale::ALL.iter().map(|l| l.endonym()).collect();
+        assert_eq!(
+            names,
+            ["English", "Deutsch", "Español", "हिन्दी", "中文（简体）"]
+        );
+    }
+}
