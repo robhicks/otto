@@ -23,6 +23,7 @@
 - Run `cargo fmt --all` before every Rust commit (rustfmt is pinned in `rust-toolchain.toml`). Run it **from inside `ui-dioxus/`** — that crate is its own workspace, so a repo-root `cargo fmt --all` does not reach it.
 - Default test command for every task: `cd ui-dioxus && cargo test --features desktop`. **Baseline on `main`: 176 passed, 2 ignored.**
 - Wasm compile check for every task: `cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web`.
+- **Every line number in this plan is as of `origin/main`.** Tasks 1 and 2 shift `net/view_model.rs` and `app.rs` by roughly +13 and −11 lines respectively, and `cargo fmt` shifts them again. Each citation is paired with the exact source text it refers to — **anchor on the quoted text, not the number**, and never gate a verification step on a line number (see Task 2 Step 8, which is written as a property check for exactly this reason).
 
 ## File Structure
 
@@ -271,7 +272,7 @@ use crate::net::view_model::{
 
 At `:51`: `let mut rows = use_signal(Vec::<RowMsg>::new);`
 
-No other `app.rs` change — the seven push sites already push whatever the constructors return.
+No other `app.rs` change — all ten `rows.write().push(..)` sites (`:94`, `:174`, `:178`, `:200`, `:222`, `:246`, `:334`, `:354`, `:389`, `:456`) already push whatever the constructors return.
 
 - [ ] **Step 7: Run the tests**
 
@@ -522,7 +523,14 @@ Expected: PASS. (`desktop_boot` is desktop-only, but `ClientText` is shared, so 
 - [ ] **Step 8: Verify Task 3's precondition**
 
 Run: `cd ui-dioxus && grep -rn "ClientText::Passthrough" src/`
-Expected: exactly **six** construction sites, all in `app.rs` (`:200`, `:222`, `:246`, `:334`, `:354`, `:389`), each forwarding a value returned by `crate::transport`. Plus non-construction mentions: `net/view_model.rs`'s `render_row` arm, the `:582` test, and two doc-comment references (`transport/web.rs:47`, `net/url.rs:34`). **The `desktop_boot`-sourced site at `app.rs:456` must be gone.** Paste the actual output into the task report; if any `app.rs` site other than those six remains, stop — Task 3 will not compile.
+
+Gate on the **property, not on line numbers** — Steps 4 and 6 have already shifted every line in `view_model.rs` and `app.rs`, and Step 9's `cargo fmt` will shift them again:
+
+- Exactly **six** construction sites, **all in `app.rs`**, each forwarding a binding that came from `crate::transport` (the `connect`/`send`/`list_files`/`read_file` error arms and the `SocketEvent::Message(Err(..))` arm).
+- **Zero** construction sites in `desktop_boot.rs`, and **zero** inside the `BootOutcome::SpawnFailed` arm — that site must now read `ClientText::authored_with(Msg::SidecarSpawnFailed, ..)`.
+- Plus non-construction mentions, which are expected and fine: `net/view_model.rs`'s `render_row` arm, the passthrough test in the same file, and two doc-comment references (`transport/web.rs`, `net/url.rs`).
+
+Paste the actual output into the task report. If a seventh `app.rs` construction remains, or any construction survives in `desktop_boot.rs`, **stop** — Task 3 will not compile, and `SeamError::new` is deliberately unreachable from those modules, so there is no local fix.
 
 - [ ] **Step 9: Format and commit**
 
@@ -647,9 +655,12 @@ Append to `ui-dioxus/src/web_mount_test.rs` (the module is already gated `#[cfg(
 /// asserts the actual string a user would see in the event log.
 ///
 /// The URL must be malformed, not merely wrong-scheme: WHATWG normalizes `http`/`https` to
-/// `ws`/`wss`, so `connect("http://…")` succeeds and yields no diagnostic at all. Port 65533
-/// matches `TEST_WS_BASE`'s reasoning — above Linux's ephemeral range, so nothing is listening
-/// and this can never fire a bogus-token connection at a developer's live `otto serve`.
+/// `ws`/`wss`, so `connect("http://…")` succeeds and yields no diagnostic at all.
+///
+/// Unlike the launch-param tests above, this one needs no unreachable port: `WebSocket::new`
+/// rejects the URL during construction, so no socket is ever opened and there is nothing to keep
+/// away from a developer's live `otto serve`. Do NOT "fix" the missing port by adding one — that
+/// would turn a construction-time rejection into a real connection attempt.
 #[wasm_bindgen_test]
 fn connect_error_redacts_the_bearer_token() {
     let err = crate::transport::connect("ws://[::1/ws?token=supersecret")
@@ -847,7 +858,7 @@ git commit -m "ui-dioxus: make the transport seam carry a typed SeamError"
 The i18n design spec states the boundary rule in three places and `CLAUDE.md` in one. Task 2 changed the rule, so all four need amending — §9 in particular *prescribes* the `CLAUDE.md` wording, so leaving it would make the spec instruct a future contributor to restore the superseded sentence.
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md` — §2 (the "Named future upgrade" paragraph at `:224-229`), §6 (`:511-518`), §9 (`:626-635`)
+- Modify: `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md` — §2 (the "Named future upgrade" paragraph at `:224-227`), §6 (`:511-519`), §9 (`:630-637`)
 - Modify: `CLAUDE.md:53-58`
 
 **Interfaces:**
@@ -884,7 +895,7 @@ In `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`, immediately aft
 
 - [ ] **Step 2: Amend §6 — the superseded implementation description**
 
-`:511-518` describes `client_error_row`'s call sites and `LogRow`'s derives as of #118. It is a historical record, so do not rewrite it — append one blockquote directly beneath that paragraph:
+`:511-519` describes `client_error_row`'s call sites (`:511-516`) and `LogRow`'s derives (`:518-519`) as of #118. It is a historical record, so do not rewrite it — append one blockquote directly beneath `:519`:
 
 ```markdown
 > **Superseded 2026-08-01 (issue #120).** `LogRow` no longer exists — `RowMsg::class()` derives the
@@ -896,7 +907,7 @@ In `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md`, immediately aft
 
 - [ ] **Step 3: Amend §9 — the prescribed `CLAUDE.md` wording**
 
-§9's first bullet (`:629-635`) tells a future contributor what `CLAUDE.md` must say, including "***and the crate's own transport/boot diagnostics*** pass through untranslated", and warns that "a doc line that restates the wrong rule is worse than none". Replace `transport/boot diagnostics` with `transport diagnostics` in that bullet and append one sentence to it:
+§9's first bullet (`:630-637`) tells a future contributor what `CLAUDE.md` must say, including "***and the crate's own transport/boot diagnostics*** pass through untranslated", and warns that "a doc line that restates the wrong rule is worse than none". Replace `transport/boot diagnostics` with `transport diagnostics` on `:633` and append one sentence after `:637`:
 
 ```markdown
   As amended 2026-08-01, the carve-out is **transport** diagnostics only — the desktop boot
@@ -936,7 +947,18 @@ and `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md`.
 - [ ] **Step 5: Verify no live rule still states the superseded wording**
 
 Run: `grep -rn "transport/boot diagnostics" CLAUDE.md README.md docs/`
-Expected: matches ONLY in `docs/superpowers/plans/2026-07-31-ui-dioxus-i18n.md` (the #118 plan — a historical record, correctly left alone) and in this plan's own prose. **Zero** matches in `CLAUDE.md`, and none in `2026-07-31-ui-dioxus-i18n-design.md` outside the amended §2/§9 text. Paste the output into the task report.
+
+Before Task 4 this returns **9 matches in 5 files**. After Steps 1–4 it must return **7 matches in 4 files**, all of them legitimate:
+
+| File | Matches | Why it stays |
+|---|---|---|
+| `CLAUDE.md` | **0** | Step 4 narrowed it. This is the assertion that matters. |
+| `docs/superpowers/specs/2026-07-31-ui-dioxus-i18n-design.md` | **1** (`:515`, in §6) | Step 2 deliberately does not rewrite §6 — it appends a "Superseded" blockquote beside it. The historical sentence stays. Step 3 removes the §9 occurrence, so `:633` must be gone. |
+| `docs/superpowers/specs/2026-08-01-ui-dioxus-i18n-type-design.md` | **1** (`:67`) | The type-design spec *quotes* the old wording in its Scope section to say what it is changing. |
+| `docs/superpowers/plans/2026-07-31-ui-dioxus-i18n.md` | **2** | The #118 plan — a historical record, correctly left alone. |
+| `docs/superpowers/plans/2026-08-01-ui-dioxus-i18n-type-design.md` | **3** | This plan's own prose. |
+
+Paste the output into the task report. The only failure conditions are a surviving match in `CLAUDE.md` or a second match in `2026-07-31-ui-dioxus-i18n-design.md`.
 
 Run: `grep -rn "LogRow" --include='*.rs' ui-dioxus/`
 Note the quoting — zsh expands a bare `--include=*.rs` and aborts with `no matches found`.
