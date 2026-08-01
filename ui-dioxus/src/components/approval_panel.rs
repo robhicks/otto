@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+use crate::i18n::use_locale;
 use crate::net::view_model::{diff_lines, DiffKind};
 
 /// A pending edit approval surfaced to the user: the correlation id, the path, and the diff
@@ -16,10 +17,13 @@ pub fn ApprovalPanel(
     pending: Signal<Option<PendingApproval>>,
     on_decide: EventHandler<(Uuid, bool)>,
 ) -> Element {
+    // Hooks are positional, so this must run before the early return below — a component that
+    // sometimes skips a hook call desynchronizes every hook after it.
+    let locale = use_locale();
     let Some((id, path, old, new)) = pending.read().clone() else {
         return rsx! {};
     };
-    let lines = diff_lines(old.as_deref(), &new);
+    let lines = diff_lines(locale, old.as_deref(), &new);
     rsx! {
         div { class: "approval-panel",
             div { class: "approval-head", "approval needed: {path.display()}" }

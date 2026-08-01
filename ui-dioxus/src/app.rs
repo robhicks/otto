@@ -10,10 +10,12 @@ use crate::components::{
     ApprovalPanel, ConnectionForm, EventLog, FileTree, PendingApproval, PromptBar, StatusLine,
 };
 use crate::editor::{DirtyState, Editor};
+use crate::i18n::Msg;
 use crate::net::tree::{build_tree, decode_or_binary, FileBody, TreeNode};
 use crate::net::url::{advance_last_seq, build_ws_url, should_apply, ws_to_http_base};
 use crate::net::view_model::{
-    can_demote, can_promote, client_error_row, describe_event, error_row, ConnState, LogRow,
+    can_demote, can_promote, client_error_row, describe_event, error_row, ClientText, ConnState,
+    LogRow,
 };
 use crate::transport::{connect, list_files, read_file, Sink, SocketEvent};
 
@@ -74,8 +76,9 @@ pub fn App() -> Element {
         let base = url.read().clone();
         let tok = token.read().clone();
         if base.trim().is_empty() || tok.trim().is_empty() {
-            rows.write()
-                .push(client_error_row("URL and token are required"));
+            rows.write().push(client_error_row(ClientText::Authored(
+                Msg::UrlAndTokenRequired,
+            )));
             return;
         }
         let target = build_ws_url(&base, &tok, session.read().as_deref(), *last_seq.read());
@@ -179,7 +182,9 @@ pub fn App() -> Element {
                                 reconnect_to.set(Some(endpoint));
                             }
                             SocketEvent::Message(Err(detail)) => {
-                                rows.write().push(client_error_row(&detail));
+                                rows.write().push(client_error_row(ClientText::Passthrough(
+                                    detail.clone(),
+                                )));
                             }
                             SocketEvent::Closed | SocketEvent::Errored => {
                                 // Guarded above, so this is the CURRENT connection's close — safe
@@ -198,7 +203,8 @@ pub fn App() -> Element {
                 });
             }
             Err(e) => {
-                rows.write().push(client_error_row(&e));
+                rows.write()
+                    .push(client_error_row(ClientText::Passthrough(e)));
                 conn.set(ConnState::Disconnected);
             }
         }
@@ -221,7 +227,8 @@ pub fn App() -> Element {
     let mut send = move |cmd: Command| {
         if let Some(s) = sink.read().as_ref() {
             if let Err(e) = s.send(&cmd) {
-                rows.write().push(client_error_row(&e));
+                rows.write()
+                    .push(client_error_row(ClientText::Passthrough(e)));
             }
         }
     };
@@ -307,7 +314,9 @@ pub fn App() -> Element {
         };
         match s.send(&cmd) {
             Ok(()) => pending_approval.set(None),
-            Err(e) => rows.write().push(client_error_row(&e)),
+            Err(e) => rows
+                .write()
+                .push(client_error_row(ClientText::Passthrough(e))),
         }
     };
 
@@ -325,7 +334,9 @@ pub fn App() -> Element {
         spawn(async move {
             match list_files(&http_base, &tok).await {
                 Ok(paths) => tree.set(build_tree(&paths)),
-                Err(e) => rows.write().push(client_error_row(&e)),
+                Err(e) => rows
+                    .write()
+                    .push(client_error_row(ClientText::Passthrough(e))),
             }
         });
     };
@@ -358,7 +369,9 @@ pub fn App() -> Element {
                     editor_dirty.set(DirtyState::clean());
                     open_file.set(Some((path, body)));
                 }
-                Err(e) => rows.write().push(client_error_row(&e)),
+                Err(e) => rows
+                    .write()
+                    .push(client_error_row(ClientText::Passthrough(e))),
             }
         });
     };
@@ -424,7 +437,8 @@ pub fn App() -> Element {
                 // Spawn failure (missing/misconfigured `otto` binary): surface it so the user knows
                 // why auto-connect didn't happen, then fall back to the manual form.
                 BootOutcome::SpawnFailed(msg) => {
-                    rows.write().push(client_error_row(&msg));
+                    rows.write()
+                        .push(client_error_row(ClientText::Passthrough(msg)));
                 }
                 // User cancelled the picker: silent fallback to the manual ConnectionForm.
                 BootOutcome::Cancelled => {}
