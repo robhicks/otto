@@ -74,6 +74,9 @@ pub fn store_persisted_locale(_tag: &str) {}
 
 #[cfg(test)]
 mod tests {
+    // Every test below is desktop-gated (the web arm's `localStorage` needs a browser), so on a
+    // web-only test build this module is empty and an unconditional import would be unused.
+    #[cfg(feature = "desktop")]
     use super::*;
 
     #[cfg(feature = "desktop")]
