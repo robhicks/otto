@@ -1,6 +1,9 @@
 # Session ownership — `UserId`, the owner column, and the authorization choke points
 
-> **Status:** DRAFT — slice 1a of GitHub issue #115 (multitenancy).
+> **Status:** IMPLEMENTED — shipped in [#123](https://github.com/robhicks/otto/pull/123) as slice 1a
+> of GitHub issue #115 (multitenancy). Review closed two gaps this spec had deferred: the handover
+> ownership check (`PromoteToRemote`/`DemoteToLocal`) landed here rather than in slice 1b, and
+> `accept_demotion` now binds the returned bundle to the requested session id.
 > **Implements:** the session-ownership half of the "Suggested first slice" of
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Blocks:** `docs/superpowers/specs/2026-08-01-multitenant-identity-design.md` (slice 1b —
@@ -269,7 +272,7 @@ tautology if used as a check. It is used only to satisfy the scoped read.
 `serve.rs` gains **no** authentication change: `authorized`/`authorized_ws` (`:73-85`) and
 `ConnectParams` (`:39-50`) are untouched. Only the replay call at `:576` passes a principal.
 
-**`resolve_session` (`:1055-1068`) deliberately does not gain an ownership check in this slice.**
+**`resolve_session` (in `crates/engine/src/serve.rs`) deliberately does not gain an ownership check in this slice.**
 It is tempting — it is the hole issue #115 opens with — but adding it here would break success
 criterion 2. Today an unknown `?session=` uuid is accepted blind and receives a `Ready` frame;
 routing attach through `owner_of` turns that into an error and a closed socket, and
@@ -284,19 +287,23 @@ With exactly one principal the attach-time check is unobservable anyway. Slice 1
 with real principals, and can fix the pre-existing "unknown session attaches blind" oddity at the
 same time, where the behavior change is in scope and reviewable.
 
-**`PromoteToRemote` / `DemoteToLocal` are also not ownership-checked, and this one is a real gap.**
-`serve.rs:672-676` dispatches both straight into `handle_handover`, which calls `promote()` /
-`accept_demotion` on the session id without consulting a principal. Unlike the `SendPrompt` path
-there is no `EngineService::authorize` behind it to catch the case, because handover does not go
-through a client-facing `EngineService` method — `export_promotion` is machine-to-machine and
-derives the owner from the session itself. So a connection attached via an explicit `?session=`
-could move a session it does not own.
+**`PromoteToRemote` / `DemoteToLocal` were the exception, and the check shipped here rather than
+being deferred.** This section originally recorded them as an open gap for the identity slice.
+Review argued that the reasoning above does not transfer: unlike attach, adding the check is
+behaviour-neutral, and promote ships a session's whole event log off-machine while demote
+overwrites the local row *including its owner*. So `serve.rs`'s handover arm now calls
+`EngineService::authorize_session` before `handle_handover`, and
+`crates/engine/tests/serve.rs::handover_refuses_a_session_the_connection_does_not_own` is the
+regression test.
 
-This is **not a regression** — before this slice there was no ownership concept to check against,
-and it is unobservable while `local` is the only principal — but it is the one place where slice 1a
-leaves a hole rather than merely deferring a check to a layer that already covers it. Slice 1b must
-add an explicit `authorize` call in the WS command loop for both commands. It is called out here and
-in a `NOT YET CHECKED ANYWHERE` comment at `crates/engine/src/service.rs:797` so it cannot be missed.
+The gap existed because that path does not route through an `EngineService` method — it reaches
+`otto_remote::promote` via the `store()` accessor — so `authorize` was bypassed by construction
+rather than by omission.
+
+**Still owner-blind, and genuinely deferred:** `POST /export` and `POST /promote` are bearer-only,
+so any token holder can export any session id or restore a bundle naming any owner; and
+`resolve_session`'s explicit `?session=` arm attaches without a check. All three are inert while
+`local` is the only principal.
 
 ---
 

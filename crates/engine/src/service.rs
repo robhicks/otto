@@ -826,13 +826,21 @@ impl EngineService {
         // session purely to satisfy the owner-scoped `snapshot`; passing it back in as an
         // authorization check would be a tautology.
         //
-        // NOT YET CHECKED ANYWHERE: the ownership check for handover belongs on the source, in
-        // `serve.rs`'s WS command loop where a principal exists — but `handle_handover` does not
-        // perform one today, so `PromoteToRemote`/`DemoteToLocal` reach this path without the
-        // caller having proved ownership. That is not a regression (before session ownership
-        // existed there was nothing to check) and it is unobservable while `local` is the only
-        // principal, but it is a real gap that the identity slice must close. Do not read this
-        // comment as saying the check already exists.
+        // The ownership check for handover lives on the source, in `serve.rs`'s WS command loop
+        // where a principal exists: the `PromoteToRemote`/`DemoteToLocal` arm calls
+        // `EngineService::authorize_session` before `handle_handover`. It is there rather than
+        // here because this function's only non-test caller is `POST /export`, which is
+        // machine-to-machine and has no connected principal.
+        //
+        // Still unchecked, and deliberately so until the identity slice:
+        //   - `POST /export` is bearer-only, so any token holder can export any session id.
+        //   - `POST /promote` is bearer-only and takes the owner from the pushed bundle, so a
+        //     token holder can plant a session row owned by an arbitrary principal. Unlike the
+        //     other two this is not merely inert — it is a live authorization concern the moment
+        //     real principals exist, since nothing today enumerates sessions by owner.
+        //   - `resolve_session`'s explicit `?session=` arm attaches without an ownership check.
+        //     Inert: every command then routes through `authorize`, and connect-time replay is
+        //     owner-scoped, so an attach to a foreign session yields `Ready` and nothing else.
         let owner = self.store.owner_of(session).await?;
         Ok(otto_remote::PromoteBundle {
             session: self.store.snapshot(&owner, session).await?,
@@ -1285,6 +1293,60 @@ mod tests {
             service.accept_promotion(&bundle).await,
             Err(AcceptError::AlreadyExists)
         ));
+    }
+
+    /// `restore_over` is an unconditional overwrite and the bundle is whatever the remote chose
+    /// to return, so without the id binding a receiver could answer an export for session X with
+    /// a bundle for session Y and overwrite Y — including its `owner`. This is the regression
+    /// test for that binding: delete the check in `accept_demotion` and this goes red.
+    #[tokio::test]
+    async fn accept_demotion_refuses_a_bundle_for_a_different_session() {
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
+
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        let victim = service
+            .create_session(&local(), "victim", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let requested = otto_protocol::SessionId::new();
+
+        // A well-formed bundle — but for the victim, not for the session we asked to demote.
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id: victim,
+                owner: local(),
+                goal: "attacker supplied".to_string(),
+                status: otto_persistence::SessionStatus::Done,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        let err = service
+            .accept_demotion(requested, &bundle)
+            .await
+            .expect_err("a bundle for a different session must be refused");
+        assert!(
+            format!("{err:?}").contains("was requested"),
+            "unexpected: {err:?}"
+        );
+        // ...and the victim's row is untouched.
+        assert_eq!(
+            service
+                .store()
+                .snapshot(&local(), victim)
+                .await
+                .unwrap()
+                .goal,
+            "victim"
+        );
     }
 
     #[tokio::test]
