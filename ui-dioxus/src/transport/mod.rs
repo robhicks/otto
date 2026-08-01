@@ -4,29 +4,60 @@ use std::path::PathBuf;
 
 use otto_protocol::{Command, ServerMessage};
 
-/// A failure diagnostic produced on the transport seam.
+/// A failure diagnostic that reached the app through the transport seam.
 ///
-/// The i18n boundary (design spec `2026-07-31-ui-dioxus-i18n-design.md` §2) says these render
-/// verbatim in every locale. That was a convention enforced by review; this type is the
-/// enforcement. `new` is `pub(in crate::transport)`, so only this module and its per-target impls
-/// can mint one — `net/`, `app.rs`, `components/`, and `desktop_boot.rs` can hold, compare, and
-/// display a `SeamError`, but can never fabricate one out of crate-authored prose. That is what
-/// makes `ClientText::Passthrough(SeamError)` a boundary rather than a comment.
+/// # What this type guarantees, precisely
 ///
-/// The name means "this value reached the app through the transport seam", NOT "the transport
-/// authored it": the workspace-RPC path (`web.rs`, `desktop.rs`) returns a server-sent
-/// `WorkspaceResponse::Error` payload as a seam error. Both provenances are untranslated under
-/// §2, so the distinction does not change how it renders.
+/// **"Minted under `transport/`"** — a *location* claim, not a provenance one. `new` is callable
+/// only from this module and its descendants, so `net/`, `app.rs`, `components/`, and
+/// `desktop_boot.rs` can hold, compare, and render a `SeamError` but can never fabricate one.
+/// That is what makes `ClientText::Passthrough(SeamError)` a boundary rather than a comment, and
+/// it collapses the review surface for "is this text wrongly escaping localization?" from the
+/// whole crate to three files.
 ///
-/// Deliberately no `From<String>`/`From<&str>` and no `std::error::Error`: a blanket conversion
-/// would be a public constructor by another name.
+/// It does **not** guarantee the text is server-authored. Two ways it is not:
+/// - The workspace-RPC path returns a server-sent `WorkspaceResponse::Error` payload as a seam
+///   error — server-authored, which is the direction you would expect.
+/// - Four diagnostics in this subtree are crate-authored English (`"socket closed"`,
+///   `"workspace rpc failed: HTTP {status}"`, `"unexpected response to List/Read"`, and the
+///   no-feature fallback below). They render untranslated in every locale by design (i18n spec
+///   §2), but the rule that keeps *new* interface copy out of `transport/` is still review, not
+///   the compiler. Do not write user-facing instructions here.
+///
+/// # Why the redaction lives in the constructor
+///
+/// `build_ws_url` puts the bearer token in a query parameter, and a rejected URL comes back from
+/// the browser quoting the URL in full. Redacting at each call site made "did this one remember?"
+/// a per-site review question that a source-scanning test could only approximate — and it left
+/// the desktop transport uncovered entirely. Because `new` is the single constructor, it is the
+/// one place that makes the property structural: **no diagnostic can leave this seam carrying a
+/// bearer token, whatever a future call site formats.** `redact_token` is idempotent, so double
+/// redaction is harmless.
+///
+/// # Deliberate omissions
+///
+/// No `From<String>`/`From<&str>`, no `Default`, no `std::error::Error`: each is a public
+/// constructor by another name, and `Error` additionally pulls this type into `?`-conversion
+/// chains that invite one.
+///
+/// # Known limit
+///
+/// The visibility is scoped to *this crate's* `transport` module. If `transport/` is ever
+/// extracted into its own crate, `pub(in crate::transport)` becomes crate-wide there — the
+/// non-enforcing shape this type exists to avoid — and no test would notice. Re-derive the
+/// boundary if that move happens.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SeamError(String);
 
 impl SeamError {
-    /// Mint a diagnostic. Callable only from `transport/` and its per-target impls.
+    /// Mint a diagnostic, redacting any bearer token it carries.
+    ///
+    /// The `pub(in crate::transport)` equals plain private here — a private item is already
+    /// visible to its module's descendants, which is exactly `transport::{web,desktop}`. It is
+    /// written explicitly because it states the intended boundary to a reader, and keeps its
+    /// meaning if this type is ever moved up a level.
     pub(in crate::transport) fn new(detail: impl Into<String>) -> Self {
-        Self(detail.into())
+        Self(crate::net::url::redact_token(&detail.into()))
     }
 
     /// The diagnostic text, for rendering. Read-only by construction.
@@ -35,10 +66,12 @@ impl SeamError {
     }
 
     /// Mint one in a test that exercises a *consumer* of the seam rather than the seam itself
-    /// (e.g. `net::view_model`'s row-rendering tests). `cfg(test)` so no production path reaches it.
+    /// (e.g. `net::view_model`'s row-rendering tests). `cfg(test)` so no production path reaches
+    /// it — dropping that gate would hand every module a constructor, which
+    /// `seam_error_has_no_crate_wide_constructor` asserts against.
     #[cfg(test)]
     pub fn for_test(detail: impl Into<String>) -> Self {
-        Self(detail.into())
+        Self::new(detail)
     }
 }
 
@@ -189,80 +222,112 @@ pub async fn read_file(http_base: &str, token: &str, path: PathBuf) -> Result<Ve
 
 #[cfg(test)]
 mod tests {
-    /// `SeamError`'s constructor must stay narrower than `pub(crate)`.
+    use super::SeamError;
+
+    /// `SeamError` must expose exactly one production constructor, narrower than `pub(crate)`.
     ///
-    /// This is the whole point of the type (spec §1): only `transport/` may mint one, so
-    /// `ClientText::Passthrough` cannot be handed crate-authored prose from `net/`, `app.rs`,
-    /// `components/`, or `desktop_boot.rs`. `pub(crate)` — the shape issue #120 originally
-    /// sketched — is visible to every module in the crate and would silently restore exactly
-    /// the freedom this type removes, with nothing else in the suite noticing.
+    /// The compiler is the real enforcement; this test catches a later *widening*. An earlier
+    /// version asserted `!block.contains("pub(crate)")` — a blocklist, which review showed
+    /// green-lit every actual bypass: a `pub` tuple field, `derive(Default)`, an extra `pub fn`,
+    /// a `FromStr`, and a `From` impl in a sibling module the scan never read. It is now a
+    /// whitelist over four independently-bypassable surfaces, and it scans the siblings too.
+    ///
+    /// Every needle checked against a whole file is assembled with `concat!`: this test reads its
+    /// own source, so a verbatim literal would match the line that spells it out.
     #[test]
     fn seam_error_has_no_crate_wide_constructor() {
-        // Every needle scanned against the WHOLE file is assembled from fragments: this test
-        // reads its own source, so a verbatim needle would match the line that spells it out —
-        // the impl header would split on the test rather than on the type, and the two `From`
-        // scans would fire on themselves and never be satisfiable.
+        let struct_decl = concat!("pub struct ", "SeamError(String);");
         let impl_header = concat!("impl ", "SeamError {");
-        let from_string = concat!("impl From<", "String> for SeamError");
-        let from_str = concat!("impl From<", "&str> for SeamError");
+        let trait_impl_marker = concat!("for ", "SeamError");
 
-        let src = include_str!("mod.rs");
-        let block = src
+        let mod_rs = include_str!("mod.rs");
+        let siblings = [include_str!("web.rs"), include_str!("desktop.rs")];
+
+        // 1. A `pub` tuple field is a total bypass, and lives outside the impl block.
+        assert!(
+            mod_rs.contains(struct_decl),
+            "SeamError's tuple field is no longer private"
+        );
+
+        // 2. `derive(Default)` synthesizes a public constructor.
+        let derives = mod_rs
+            .lines()
+            .find(|l| l.trim_start().starts_with("#[derive(") && l.contains("Clone"))
+            .expect("SeamError's derive line");
+        assert!(
+            !derives.contains("Default"),
+            "derive(Default) synthesizes a public SeamError constructor"
+        );
+
+        // 3. Whitelist the impl block's fns, so a new `pub fn mint(..)` fails.
+        let block = mod_rs
             .split(impl_header)
             .nth(1)
             .expect("SeamError's inherent impl block");
         let block = block.split("\n}").next().expect("end of the impl block");
-        assert!(
-            block.contains("pub(in crate::transport) fn new("),
-            "SeamError::new lost its transport-private visibility"
+        let fns: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains(" fn "))
+            .collect();
+        assert_eq!(
+            fns,
+            [
+                "pub(in crate::transport) fn new(detail: impl Into<String>) -> Self {",
+                "pub fn as_str(&self) -> &str {",
+                "pub fn for_test(detail: impl Into<String>) -> Self {",
+            ],
+            "SeamError's constructor set changed — a new one must be justified here"
         );
-        assert!(
-            !block.contains("pub(crate)"),
-            "a pub(crate) item in SeamError's impl re-opens the constructor to the whole crate"
-        );
-        // A blanket conversion is a public constructor by another name.
-        assert!(
-            !src.contains(from_string),
-            "From<String> for SeamError is a public constructor by another name"
-        );
-        assert!(
-            !src.contains(from_str),
-            "From<&str> for SeamError is a public constructor by another name"
-        );
-    }
 
-    /// The two `web.rs` sites that format a `JsValue` with `{e:?}` must keep `redact_token`.
-    ///
-    /// `ws_url` carries the bearer token as a query parameter (`build_ws_url`), and a rejected
-    /// URL comes back as a `SyntaxError` that QUOTES THE URL IN FULL — so a `{e:?}` that skips
-    /// `redact_token` ships the token into the visible event log, the surface most likely to be
-    /// pasted into a bug report. Ten of the twelve `map_err` sites in `web.rs`/`desktop.rs` ARE
-    /// a mechanical `e.to_string()` rewrite; these two are not, and the compiler cannot say so.
-    ///
-    /// A source scan rather than a behavioral test because `web.rs` is `cfg(feature = "web")`:
-    /// its call sites can only be EXERCISED on wasm (which needs a webdriver and a version-matched
-    /// `wasm-bindgen-test-runner`, and this repo has no CI), while `include_str!` sees the source
-    /// under every feature combination — including the default `--features desktop` gate. The
-    /// wasm test in `web_mount_test.rs` is the real guarantee; this is the one that runs by
-    /// default.
-    #[test]
-    fn web_socket_error_paths_still_redact_the_bearer_token() {
-        let src = include_str!("web.rs");
-        let mut sites = 0;
-        for (i, line) in src.lines().enumerate() {
-            if line.contains("{e:?}") {
-                sites += 1;
-                assert!(
-                    line.contains("redact_token"),
-                    "web.rs:{}: a `{{e:?}}` diagnostic reaches the seam without redact_token: {}",
-                    i + 1,
-                    line.trim()
-                );
+        // 4. Ungating `for_test` alone makes it a crate-wide public constructor.
+        assert!(
+            block.contains(concat!("#[cfg(", "test)]\n    pub fn for_test")),
+            "SeamError::for_test lost its cfg(test) gate — it is now a public constructor"
+        );
+
+        // 5. No trait impl under `transport/` may launder a value in. `Display` is the one
+        //    allowed impl; `From`/`FromStr`/`Deref` are constructors by another name, and a
+        //    sibling module is exactly where the previous version of this test was blind.
+        for src in std::iter::once(mod_rs).chain(siblings) {
+            for line in src.lines() {
+                let t = line.trim();
+                if t.starts_with("impl") && t.contains(trait_impl_marker) {
+                    assert!(
+                        t.contains("std::fmt::Display"),
+                        "disallowed trait impl for SeamError: {t}"
+                    );
+                }
             }
         }
-        assert_eq!(
-            sites, 2,
-            "expected exactly the two JsValue error paths (WebSink::send, connect_impl) in web.rs"
-        );
+    }
+
+    /// `new` redacts, so every diagnostic leaving the seam is safe by construction.
+    ///
+    /// This replaces a source scan asserting the two `web.rs` sites called `redact_token` by
+    /// hand. That scan was evadable (it keyed on the literal `{e:?}`, so a site formatting a
+    /// differently-named binding slipped past) and brittle (funnelling both sites through one
+    /// helper — the correct refactor — failed it). Redaction now lives in the single
+    /// constructor: a property rather than a formatting snapshot, and it covers `desktop.rs`.
+    #[test]
+    fn new_redacts_a_bearer_token_whatever_the_call_site_formats() {
+        let e = SeamError::new("SyntaxError: 'ws://h/ws?token=supersecret' is invalid");
+        assert!(!e.as_str().contains("supersecret"), "{}", e.as_str());
+        assert!(e.as_str().contains("token=<redacted>"), "{}", e.as_str());
+
+        // Idempotent, so a call site that also redacts is harmless.
+        let twice = SeamError::new(e.as_str());
+        assert_eq!(twice.as_str(), e.as_str());
+
+        // Token-free text is untouched.
+        assert_eq!(SeamError::new("socket closed").as_str(), "socket closed");
+    }
+
+    /// `Display` has no production caller yet, so pin it to `as_str` — a future
+    /// `write!(f, "SeamError({})", ..)` would otherwise reshape any log line adopting it.
+    #[test]
+    fn display_matches_as_str() {
+        let e = SeamError::for_test("boom");
+        assert_eq!(e.to_string(), e.as_str());
     }
 }

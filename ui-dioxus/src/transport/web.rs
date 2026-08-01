@@ -13,7 +13,6 @@ use wasm_bindgen::JsCast;
 use web_sys::{CloseEvent, ErrorEvent, MessageEvent, WebSocket};
 
 use super::{SeamError, Sink, SocketEvent};
-use crate::net::url::redact_token;
 
 struct WebSink(WebSocket);
 impl Sink for WebSink {
@@ -24,7 +23,7 @@ impl Sink for WebSink {
         // event log, so the whole seam is redacted rather than the one site we happened to audit.
         self.0
             .send_with_str(&json)
-            .map_err(|e| SeamError::new(redact_token(&format!("{e:?}"))))
+            .map_err(|e| SeamError::new(format!("{e:?}")))
     }
 
     fn close(&self) {
@@ -45,9 +44,12 @@ pub fn connect_impl(
     // `ws_url` carries the bearer token as a query parameter (`build_ws_url`), and a rejected URL
     // comes back as a `SyntaxError` that QUOTES THE URL IN FULL. This `SeamError` is a transport
     // diagnostic, so `app.rs` routes it to `client_error_row(ClientText::Passthrough(..))` and it
-    // renders in the event log — the surface most likely to be copied into a bug report. Redact
-    // the secret while keeping host/path/session/last_seq, which are what make the error useful.
-    let ws = WebSocket::new(ws_url).map_err(|e| SeamError::new(redact_token(&format!("{e:?}"))))?;
+    // renders in the event log — the surface most likely to be copied into a bug report.
+    //
+    // The redaction is NOT applied here: `SeamError::new` does it for every diagnostic on the
+    // seam, so this site cannot forget and neither can the next one. Host/path/session/last_seq
+    // survive; only the secret goes.
+    let ws = WebSocket::new(ws_url).map_err(|e| SeamError::new(format!("{e:?}")))?;
 
     let tx_msg: UnboundedSender<SocketEvent> = tx.clone();
     let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
