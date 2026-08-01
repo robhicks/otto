@@ -1,17 +1,14 @@
 //! `OpenAiProvider`: talks to the OpenAI Chat Completions API over HTTP.
 //! Remote, requires an API key. `base_url` is configurable for testing.
+//! The wire implementation is shared with `DeepSeekProvider` (see `openai_compatible`).
 
+use super::openai_compatible::{OpenAiCompatibleProvider, always_max_tokens};
 use async_trait::async_trait;
 use otto_engine_core::traits::Provider;
 use otto_engine_core::types::{CompleteRequest, CompleteResponse};
-use serde::{Deserialize, Serialize};
 
 pub struct OpenAiProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model: String,
-    max_tokens: u32,
+    inner: OpenAiCompatibleProvider,
 }
 
 impl OpenAiProvider {
@@ -21,11 +18,13 @@ impl OpenAiProvider {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model: model.into(),
-            max_tokens: 4096,
+            inner: OpenAiCompatibleProvider::new(
+                base_url.into(),
+                "/v1/chat/completions",
+                api_key.into(),
+                model.into(),
+                o_series_token_fields,
+            ),
         }
     }
 
@@ -37,52 +36,16 @@ impl OpenAiProvider {
 
 /// OpenAI reasoning (o-series) models reject the `max_tokens` field and require
 /// `max_completion_tokens` instead.
+fn o_series_token_fields(model: &str, budget: u32) -> (Option<u32>, Option<u32>) {
+    if is_o_series(model) {
+        (None, Some(budget))
+    } else {
+        always_max_tokens(model, budget)
+    }
+}
+
 fn is_o_series(model: &str) -> bool {
     model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4")
-}
-
-#[derive(Serialize)]
-struct Message<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u32>,
-    messages: Vec<Message<'a>>,
-}
-
-#[derive(Deserialize)]
-struct RespMessage {
-    #[serde(default)]
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    #[serde(default)]
-    message: Option<RespMessage>,
-}
-
-#[derive(Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    #[serde(default)]
-    choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<ApiUsage>,
 }
 
 #[async_trait]
@@ -92,43 +55,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let (max_tokens, max_completion_tokens) = if is_o_series(&self.model) {
-            (None, Some(self.max_tokens))
-        } else {
-            (Some(self.max_tokens), None)
-        };
-        let body = ChatRequest {
-            model: &self.model,
-            max_tokens,
-            max_completion_tokens,
-            messages: vec![Message {
-                role: "user",
-                content: &req.prompt,
-            }],
-        };
-        let resp = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatResponse>()
-            .await?;
-        let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-        let text = resp
-            .choices
-            .into_iter()
-            .filter_map(|c| c.message)
-            .map(|m| m.content)
-            .collect::<Vec<_>>()
-            .join("");
-        Ok(CompleteResponse { text, usage })
+        self.inner.complete(req).await
     }
 }
 

@@ -1,18 +1,14 @@
 //! `DeepSeekProvider`: talks to the DeepSeek Chat Completions API over HTTP.
-//! The wire format is OpenAI-compatible, so this mirrors `OpenAiProvider`'s request/response
-//! shape. Remote, requires an API key. `base_url` is configurable for testing.
+//! The wire format is OpenAI-compatible, so this shares `OpenAiCompatibleProvider` with
+//! `OpenAiProvider`. Remote, requires an API key. `base_url` is configurable for testing.
 
+use super::openai_compatible::{OpenAiCompatibleProvider, always_max_tokens};
 use async_trait::async_trait;
 use otto_engine_core::traits::Provider;
 use otto_engine_core::types::{CompleteRequest, CompleteResponse};
-use serde::{Deserialize, Serialize};
 
 pub struct DeepSeekProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model: String,
-    max_tokens: u32,
+    inner: OpenAiCompatibleProvider,
 }
 
 impl DeepSeekProvider {
@@ -22,11 +18,13 @@ impl DeepSeekProvider {
         model: impl Into<String>,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model: model.into(),
-            max_tokens: 4096,
+            inner: OpenAiCompatibleProvider::new(
+                base_url.into(),
+                "/chat/completions",
+                api_key.into(),
+                model.into(),
+                always_max_tokens,
+            ),
         }
     }
 
@@ -37,47 +35,6 @@ impl DeepSeekProvider {
     }
 }
 
-#[derive(Serialize)]
-struct Message<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    max_tokens: u32,
-    messages: Vec<Message<'a>>,
-}
-
-#[derive(Deserialize)]
-struct RespMessage {
-    #[serde(default)]
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    #[serde(default)]
-    message: Option<RespMessage>,
-}
-
-#[derive(Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    #[serde(default)]
-    choices: Vec<Choice>,
-    #[serde(default)]
-    usage: Option<ApiUsage>,
-}
-
 #[async_trait]
 impl Provider for DeepSeekProvider {
     fn id(&self) -> &str {
@@ -85,37 +42,7 @@ impl Provider for DeepSeekProvider {
     }
 
     async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let body = ChatRequest {
-            model: &self.model,
-            max_tokens: self.max_tokens,
-            messages: vec![Message {
-                role: "user",
-                content: &req.prompt,
-            }],
-        };
-        let resp = self
-            .client
-            .post(&url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ChatResponse>()
-            .await?;
-        let usage = resp.usage.as_ref().map(|u| otto_engine_core::types::Usage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
-        let text = resp
-            .choices
-            .into_iter()
-            .filter_map(|c| c.message)
-            .map(|m| m.content)
-            .collect::<Vec<_>>()
-            .join("");
-        Ok(CompleteResponse { text, usage })
+        self.inner.complete(req).await
     }
 }
 

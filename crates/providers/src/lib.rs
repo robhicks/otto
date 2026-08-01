@@ -8,6 +8,7 @@ pub mod gemini;
 pub mod local;
 pub mod ollama;
 pub mod openai;
+mod openai_compatible;
 pub mod scripted;
 
 pub use anthropic::AnthropicProvider;
