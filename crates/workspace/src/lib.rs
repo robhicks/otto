@@ -82,9 +82,12 @@ impl WorkspaceRead for LocalWorkspace {
         }
 
         // Recursive mode (`**`): walk the subtree, returning files only. Skips a fixed set of
-        // ignored directories (build/VCS/dependency dirs and any dotfile/dotdir, which also
-        // covers the gate's sensitive-path floor), does not follow symlinks, and caps the
-        // number of files to bound cost. Output is sorted for determinism.
+        // ignored directories (build/VCS/dependency dirs and any dotfile/dotdir). NOTE: the
+        // dotfile skip is NOT the sensitive-path floor and must not be mistaken for it — the
+        // floor's markers match as substrings, so `id_rsa` and `production.env` have no leading
+        // dot and are returned by this walk. `snapshot` applies the floor itself for exactly
+        // that reason. Does not follow symlinks, and caps the number of files to bound cost.
+        // Output is sorted for determinism.
         const MAX_ENTRIES: usize = 5000;
         fn ignored(name: &str) -> bool {
             name == ".git" || name == "target" || name == "node_modules" || name.starts_with('.')
@@ -149,6 +152,15 @@ impl Workspace for LocalWorkspace {
         let paths = self.list("**").await?;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
+            // The floor, applied at the seam every caller shares. `list`'s dotfile skip is NOT
+            // equivalent: the markers match as substrings, so `id_rsa` and `production.env`
+            // pass it. A snapshot is the one `Workspace` operation that reads whole file
+            // *contents* for shipment off-machine — `otto_remote::promote` puts one straight
+            // into a `PromoteBundle` — so the floor is re-asserted here rather than in any one
+            // caller, which would leave the next caller to reintroduce the gap.
+            if otto_protocol::is_sensitive(&path.to_string_lossy()) {
+                continue;
+            }
             let bytes = self.read(&path).await?;
             files.push((path, bytes));
         }
@@ -295,6 +307,48 @@ mod tests {
             .find(|(p, _)| p == &PathBuf::from("src/lib.rs"))
             .unwrap();
         assert_eq!(lib.1, b"L");
+    }
+
+    /// The walk skips dotfiles, which is NOT the same as the sensitive-path floor: the markers
+    /// match as substrings, so `id_rsa` and `production.env` have no leading dot and sail
+    /// through. A snapshot reads whole file *contents* for shipment off-machine (it is what
+    /// `otto_remote::promote` puts in a `PromoteBundle`), so the floor has to be re-asserted
+    /// here. Measured before the fix: the snapshot contained `id_rsa`, `production.env`, and
+    /// `config/local.env`.
+    #[tokio::test]
+    async fn snapshot_excludes_floor_sensitive_files_that_are_not_dotfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("id_rsa"), b"PRIVATE KEY").unwrap();
+        std::fs::write(dir.path().join("production.env"), b"DB_PASSWORD=hunter2").unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/local.env"), b"SECRET=xyz").unwrap();
+        std::fs::write(dir.path().join(".env"), b"HIDDEN=1").unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"fine").unwrap();
+
+        let ws = LocalWorkspace::new(dir.path());
+        let snap = ws.snapshot().await.unwrap();
+        let names: Vec<String> = snap
+            .files
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+
+        // Asserted against `is_sensitive` rather than a hardcoded list, so the test tracks the
+        // floor automatically if a marker is ever added.
+        let leaked: Vec<&String> = names
+            .iter()
+            .filter(|n| otto_protocol::is_sensitive(n))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "floor-sensitive files in a snapshot: {leaked:?}"
+        );
+
+        // ...and the snapshot is not vacuously empty.
+        assert!(
+            names.iter().any(|n| n == "ok.txt"),
+            "ordinary files must still be captured: {names:?}"
+        );
     }
 
     #[tokio::test]

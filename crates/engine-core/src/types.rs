@@ -35,7 +35,9 @@ pub struct Edit {
 }
 
 /// A transferable capture of a workspace's current files (relative path -> contents).
-/// Excludes the same paths `list("**")` excludes (`target`/`.git`/`node_modules`/dotfiles).
+/// Excludes the same paths `list("**")` excludes (`target`/`.git`/`node_modules`/dotfiles) and,
+/// additionally, every path the sensitive-path floor marks — the dotfile skip does not imply the
+/// floor (see `Workspace::snapshot`).
 /// Serde-serializable so it can later cross the wire to a remote engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {

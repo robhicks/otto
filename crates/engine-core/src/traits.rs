@@ -36,7 +36,11 @@ pub trait Workspace: WorkspaceRead {
     async fn apply_edit(&self, edit: &Edit) -> anyhow::Result<u64>;
 
     /// Capture the workspace's current files as a transferable snapshot, for handover.
-    /// Excludes the same paths `list` excludes. (`RemoteWorkspace` reconstitutes from this.)
+    /// Excludes the same paths `list` excludes, **and** every path the sensitive-path floor
+    /// marks (`otto_protocol::is_sensitive`) — the two are not the same, since the floor's
+    /// markers match as substrings, so `id_rsa`/`production.env` survive `list`'s dotfile skip.
+    /// An impl must apply the floor: a snapshot is what leaves the machine in a promote bundle.
+    /// (`RemoteWorkspace` reconstitutes from this.)
     async fn snapshot(&self) -> anyhow::Result<WorkspaceSnapshot>;
 }
 

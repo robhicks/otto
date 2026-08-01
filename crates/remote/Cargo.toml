@@ -30,3 +30,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = "0.6"
+# Test-only, and deliberately the real `LocalWorkspace`: `promote()` inherits the sensitive-path
+# floor from `Workspace::snapshot` rather than filtering itself, so a stub workspace here would
+# assert nothing. Dev-only, so the lib's dependency graph is unchanged.
+otto-workspace = { path = "../workspace" }
