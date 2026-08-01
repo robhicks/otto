@@ -12,27 +12,27 @@
 class Otto < Formula
   desc "Agentic coding engine: a deterministic orchestrator drives a spine of atomic agents"
   homepage "https://github.com/robhicks/otto"
-  version "0.1.0"
+  version "0.3.0"
   license "MIT OR Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.1.0/otto-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-aarch64-apple-darwin.tar.gz"
       sha256 "TODO-fill-in-at-release"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.1.0/otto-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-x86_64-apple-darwin.tar.gz"
       sha256 "TODO-fill-in-at-release"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.1.0/otto-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "TODO-fill-in-at-release"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.1.0/otto-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "TODO-fill-in-at-release"
     end
   end

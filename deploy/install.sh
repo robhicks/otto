@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/robhicks/otto/main/deploy/install.sh | sh
 #
 # Environment overrides:
-#   OTTO_VERSION   release tag to fetch, e.g. v0.1.0 (default: latest)
+#   OTTO_VERSION   release tag to fetch, e.g. v0.3.0 (default: latest)
 #   OTTO_BINDIR    install directory (default: $HOME/.local/bin)
 #   OTTO_BASE_URL  download base, for mirrors (default: GitHub releases)
 #

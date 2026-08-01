@@ -1,6 +1,6 @@
 # Cut a release by pushing a `v*` tag:
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.3.0 && git push origin v0.3.0
 #
 # This builds a stripped `otto` release binary for six targets (Linux/macOS × x86_64/aarch64, with
 # Linux also in a static musl flavor for Alpine and older glibc distros), tars each as

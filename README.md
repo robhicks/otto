@@ -52,7 +52,7 @@ brew install --formula https://raw.githubusercontent.com/robhicks/otto/main/depl
 sandbox backend automatically. Swap `x86_64` for `aarch64` on an ARM machine:
 
 ```bash
-sudo dnf install -y https://github.com/robhicks/otto/releases/download/v0.1.0/otto-0.1.0-1.x86_64.rpm
+sudo dnf install -y https://github.com/robhicks/otto/releases/download/v0.3.0/otto-0.3.0-1.x86_64.rpm
 ```
 
 (Or download the `.rpm` asset from the release and `sudo dnf install -y ./otto-*.rpm`.)
