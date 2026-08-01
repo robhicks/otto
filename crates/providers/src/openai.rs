@@ -197,6 +197,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_tolerates_a_base_url_with_a_trailing_slash() {
+        // Regression for #112. `server.uri()` has no trailing slash, so append one to mimic an
+        // operator's `OPENAI_BASE_URL=https://host/v1/`. Before the join fix the endpoint was
+        // `<uri>//v1/chat/completions`; the mock below matches only the single-slash path, so a
+        // doubled separator makes this request 404 and the call fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": "ok" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(format!("{}/", server.uri()), "k", "gpt-4o-mini");
+        let out = provider
+            .complete(CompleteRequest {
+                prompt: "hi".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+    }
+
+    #[tokio::test]
     async fn openai_returns_empty_text_for_empty_choices() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

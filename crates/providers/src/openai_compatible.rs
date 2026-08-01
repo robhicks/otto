@@ -48,7 +48,7 @@ impl OpenAiCompatibleProvider {
     }
 
     pub(crate) async fn complete(&self, req: CompleteRequest) -> anyhow::Result<CompleteResponse> {
-        let url = format!("{}{}", self.base_url, self.path_suffix);
+        let url = super::base_url::join_url(&self.base_url, self.path_suffix);
         let (max_tokens, max_completion_tokens) = (self.token_fields)(&self.model, self.max_tokens);
         let body = ChatRequest {
             model: &self.model,
