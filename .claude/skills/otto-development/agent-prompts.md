@@ -262,14 +262,16 @@ Agent tool:
 
 ---
 
-## Mandatory Review Pair — Phase 4 Step 8 — `subagent_type: rust-pro` / `architect-reviewer`
+## Mandatory Review Trio — Phase 4 Step 8 — `subagent_type: rust-pro` / `architect-reviewer` / `security-auditor`
 
-Every PR gets both reviews, no exceptions (Non-Negotiable Rule 4). Capture the diff range first:
-`git log --oneline <merge-base>..HEAD` from inside the worktree, or use `gh pr diff <PR>`. Dispatch
-both in the same parallel batch, each reading the actual diff, not the summary.
+Every PR gets all three reviews, no exceptions (Non-Negotiable Rules 4–5). Capture the diff range
+first: `git log --oneline <merge-base>..HEAD` from inside the worktree, or use `gh pr diff <PR>`.
+Dispatch all three in the same parallel batch, each reading the actual diff, not the summary.
+
+### Rust expert — `subagent_type: rust-pro`
 
 ```
-Agent tool (Rust expert):
+Agent tool:
   subagent_type: rust-pro
   description: "Rust review: <scope>: <subject>"
   prompt: |
@@ -292,8 +294,12 @@ Agent tool (Rust expert):
     - No AI attribution in commits, comments, or docs
 
     Report: Strengths, Issues (Critical / Important / Minor), Assessment (Approve / Request changes).
+```
 
-Agent tool (architect):
+### Architect — `subagent_type: architect-reviewer`
+
+```
+Agent tool:
   subagent_type: architect-reviewer
   description: "Architect review: <scope>: <subject>"
   prompt: |
@@ -319,9 +325,47 @@ Agent tool (architect):
     Report: Strengths, Issues (Critical / Important / Minor), Assessment (Approve / Request changes).
 ```
 
-Aggregate both reports — plus the pr-review-toolkit and Copilot findings — into the single PR
+### Independent security review — `subagent_type: security-auditor`
+
+> **CRITICAL — this review is blind by design.** The security agent receives **only the diff**. It
+> is never given the spec, the plan, the task brief, the PR body summary, the issue, or the
+> implementer's report. Its findings must come from the code alone. This independence is a
+> Non-Negotiable Rule — do not paste spec/plan context into this dispatch, and do not ask the agent
+> to read the docs.
+
+```
+Agent tool:
+  subagent_type: security-auditor
+  description: "Independent security review: <scope>: <subject>"
+  prompt: |
+    You are the independent security reviewer for PR #<N> on robhicks/otto.
+
+    You receive ONLY the diff — deliberately. Do not read the PR description, the linked issue,
+    any design spec or plan, or any implementer summary. Your findings must be derived from the
+    code changes alone.
+
+    The diff:
+      gh pr diff <N>
+
+    Evaluate the change for security defects, focusing hardest on otto's security spine:
+    - Sensitive-path floor: anything that could read, serve, or expose `.env*`, `.ssh/`, `.git/`,
+      `.aws/`, or ssh keys; any path-containment or traversal hole
+    - Authentication/authorization: the bearer-token checks on /ws, /workspace, /promote, /export,
+      and the unauthenticated-by-design static --ui-dir route (which must never be defaulted or
+      point at a workspace root)
+    - The permission gate: any route that bypasses or weakens gating, any edit applied without an
+      explicit Allow, any bash registered without a sandbox backend
+    - Secrets/PII: logging, exposing, or persisting secrets; sensitive data crossing a trust boundary
+    - Injection: shell/argv injection (mcp-git's leading-dash and URL-scheme rules), SQL, path
+      traversal, template injection, untrusted-input panics or overflows
+    - Sandbox escapes, unsafe blocks, TLS/auth bypass, algorithm confusion
+
+    Report: Strengths, Issues (Critical / Important / Minor), Assessment (Approve / Request changes).
+```
+
+Aggregate all three reports — plus the pr-review-toolkit and Copilot findings — into the single PR
 comment grouped by **Critical / Important / Suggestions / Strengths**. Critical/Important findings
-from either reviewer must be fixed or explicitly dismissed (with reasoning) before merge.
+from any reviewer must be fixed or explicitly dismissed (with reasoning) before merge.
 
 ---
 
@@ -336,8 +380,8 @@ Agent tool:
     Follow otto-development requirements (Phase 4 step 9).
 
     Your job:
-    - Read all unresolved review threads on the PR (including the aggregated rust-pro and
-      architect-reviewer findings if they were posted as comments)
+    - Read all unresolved review threads on the PR (including the aggregated rust-pro,
+      architect-reviewer, and independent security-auditor findings if they were posted as comments)
     - For each comment: either fix-and-reply ("Fixed in <sha>") or explicitly dismiss
       with reasoning. NEVER silent dismissal.
     - After each reply, resolve the conversation thread via GraphQL:

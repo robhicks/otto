@@ -55,10 +55,16 @@ These hold for every run of this skill, no exceptions, no fast-path carve-outs:
    footers, no `🤖`/`AI`/credit markers of any kind — in commit messages, PR bodies, code comments,
    docs, or READMEs. This applies to direct work and to anything delegated to a subagent. An
    otherwise-perfect commit that carries attribution is rejected and rewritten.
-4. **Every PR is reviewed by a Rust expert and an architect.** No PR opens, merges, or is pushed
-   through the review loop without a dedicated `rust-pro` (Rust expert) review AND a dedicated
-   `architect-reviewer` (architectural) review on record. Fast-path and trivial PRs included — there
-   is no size-based carve-out. Both must pass (or their issues resolved) before merge.
+4. **Every PR is reviewed by a Rust expert, an architect, and an independent security agent.** No
+   PR opens, merges, or is pushed through the review loop without a dedicated `rust-pro` (Rust
+   expert) review, a dedicated `architect-reviewer` (architectural) review, AND a dedicated
+   `security-auditor` review on record. Fast-path and trivial PRs included — there is no size-based
+   carve-out. All three must pass (or their issues resolved) before merge.
+5. **The security review is independent.** The `security-auditor` agent receives **only the PR
+   diff** — never the spec, never the plan, never the task brief, never the PR body summary, never
+   the implementer's report. Its findings must be produced from the diff alone, so it cannot be
+   steered by the implementer's framing. This is deliberate: the security review is the one pass
+   that evaluates what was actually built, unmediated.
 
 ## When to Use This Skill vs. Alternatives
 
@@ -513,21 +519,23 @@ Agent tool calls. Always include `pr-review-toolkit:code-reviewer`. Add conditio
 | new or modified types, interfaces, dataclasses, schemas (incl. `protocol` wire types) | `pr-review-toolkit:type-design-analyzer` |
 | after correctness reviews pass — polish pass only | `pr-review-toolkit:code-simplifier` |
 
-**Mandatory review pair (no exceptions, no fast-path carve-out — Non-Negotiable Rule 4):** every PR
-gets BOTH of these dispatched in the same parallel batch, regardless of size:
+**Mandatory review trio (no exceptions, no fast-path carve-out — Non-Negotiable Rules 4–5):** every
+PR gets ALL THREE dispatched in the same parallel batch, regardless of size:
 
 | Reviewer | Why |
 |---|---|
 | `rust-pro` (Rust expert) | Idiomatic Rust: ownership/lifetimes, error handling, `Send + Sync` async seams, unsafe boundaries, test placement — against this repo's Rust conventions (tests next to code, wiremock/tempfile, determinism invariant). |
 | `architect-reviewer` (architect) | Architectural consistency: inward dependency flow (`protocol` → `engine-core` → impl crates → `engine`), crate boundaries, trait-seam design, whether the change follows or erodes the documented architecture (`docs/ARCHITECTURE.md` + latest plan), spec/plan alignment. |
+| `security-auditor` (independent) | Security of the actual diff. **Receives ONLY the diff** — never the spec/plan/brief/PR-body summary (Non-Negotiable Rule 5). See the Independent Security Review template in `agent-prompts.md`. |
 
-Both review the actual diff (commit range), not the summary. Treat their findings like any other
-review: Critical/Important must be fixed or explicitly dismissed before merge; both must clear
-before merge (step 11).
+The rust-pro and architect-reviewer reviews the actual diff (commit range), not the summary. Treat
+their findings like any other review: Critical/Important must be fixed or explicitly dismissed before
+merge; all three must clear before merge (step 11).
 
-Add ad-hoc domain agents (`security-auditor`, `frontend-developer`) on top by
-topic if the change warrants it. For any change touching the permission gate, sandbox, or sensitive
-paths, an explicit security review pass is mandatory.
+Add ad-hoc domain agents (`frontend-developer`) on top by topic if the change warrants it. The
+independent `security-auditor` pass above already covers every PR; for changes touching the
+permission gate, sandbox, or sensitive paths, give it the extra instruction to scrutinize those
+specific invariants hardest.
 
 Aggregate the agent reports into a single PR comment grouped by **Critical / Important / Suggestions
 / Strengths** so review threads stay flat instead of one comment per agent.
@@ -740,7 +748,7 @@ Within each step you may calibrate effort to risk. You may NEVER eliminate a ste
 | Spec compliance review | 1 reviewer dispatch reading actual commits | NEVER |
 | Quality review | 1 code-reviewer Agent dispatch | NEVER |
 | Automated reviewer | 1 `gh pr edit --add-reviewer …` | Only if the repo has none configured |
-| Rust expert + architect review | 1 parallel Agent dispatch each (`rust-pro`, `architect-reviewer`) | NEVER |
+| Rust expert + architect + independent security review | 1 parallel Agent dispatch each (`rust-pro`, `architect-reviewer`, blind-diff `security-auditor`) | NEVER |
 | pr-review-toolkit agents | 1 parallel Agent dispatch | NEVER |
 | Review-response subagent | 1 Agent dispatch with PR# + ref | NEVER |
 | Branch + worktree cleanup | `git branch -d` + `git worktree remove` | NEVER |
@@ -770,7 +778,8 @@ explicitly.
 | "Copilot's comments are auto-generated, safe to ignore" | Read each. They find real bugs. Reply with fix-or-dismiss reasoning, then resolve the thread. |
 | "I'll code on main, just this once" | Worktree off `origin/main` always. Never trunk directly (Non-Negotiable Rule 1). |
 | "I'll push the branch straight to main, a PR is paperwork" | `main` changes only through reviewed PRs. No direct pushes or hand-merges (Non-Negotiable Rule 2). |
-| "The rust/architect review is overkill for this small PR" | Every PR gets `rust-pro` + `architect-reviewer`. There is no size carve-out (Non-Negotiable Rule 4). |
+| "The rust/architect review is overkill for this small PR" | Every PR gets `rust-pro` + `architect-reviewer` + `security-auditor`. There is no size carve-out (Non-Negotiable Rules 4–5). |
+| "I'll give the security agent the spec too, so it understands" | The security review is blind by design — it receives ONLY the diff. Giving it the spec/plan defeats the independence (Non-Negotiable Rule 5). |
 | "It's just a typo / nit / one-line change" | Smallness invites mistakes. The workflow is the safety net. |
 | "I already manually tested it" | Manual tests don't replace the out-of-band verification. Run #14 and #15. |
 | "Spec/plan/implementer can ask the user" | They cannot. This is the autonomous spine. They make assumptions and document them. |
@@ -791,7 +800,8 @@ These thoughts mean stop and complete the missed step:
 - About to dispatch implementers in parallel on the same branch
 - About to commit without reading the task brief/issue AC
 - About to open a PR without requesting available automated/agent review
-- About to open or merge a PR without the mandatory `rust-pro` and `architect-reviewer` passes
+- About to open or merge a PR without the mandatory `rust-pro`, `architect-reviewer`, and independent `security-auditor` passes
+- About to hand the security agent the spec/plan/brief instead of the bare diff
 - About to skip an agent review because "trivial"
 - About to merge with unaddressed or unresolved review threads
 - About to run `gh pr merge` from inside the worktree (must be from main checkout)
