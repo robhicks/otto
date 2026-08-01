@@ -23,9 +23,21 @@ pub use types::{SessionState, SessionStatus, TurnRecord};
 /// statement, so no caller can forget it.
 ///
 /// `append_event`, `record_turn`, `next_seq`, `next_turn`, and `set_status` are deliberately
-/// UNSCOPED. They are reachable only from inside a turn that `EngineService` has already
-/// authorized, none of them returns another tenant's data, and scoping them would roughly triple
-/// the churn for no gain. This is a deliberate trade, not an oversight.
+/// UNSCOPED, and the honest framing is that this closes **confidentiality but not integrity**.
+/// None of them *returns* another tenant's data, so the five scoped reads above fully close the
+/// read side. But `append_event` and `set_status` can *write* to a session the caller does not
+/// own: a holder of a session id could inject events into, or abort, someone else's session.
+/// Today they are reachable only from inside a turn `EngineService` has already authorized, and
+/// there is one principal, so this is inert — but it is deferred work, not analyzed-and-safe.
+/// Scoping the write side belongs to the identity slice, together with narrowing
+/// `EngineService::store()` so the unscoped half is not reachable from outside the service at
+/// all. Do not read this paragraph as saying the write side was considered and found safe.
+///
+/// `restore` and `restore_over` are also unscoped, and are the highest-authority methods here:
+/// they take the owner from caller-supplied `SessionState`, i.e. off the wire on the promote /
+/// demote path. `restore` refuses to overwrite an existing id; `restore_over` does not, so it can
+/// reassign an existing session's owner. The caller is responsible for the pusher's authority to
+/// name that owner.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// Create a session owned by `owner`.

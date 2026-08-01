@@ -669,11 +669,26 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::Resume { .. } => {
                 pause_state.resume_all();
             }
-            Command::PromoteToRemote { .. } => {
-                handle_handover(&state, &mut writer, session, true).await;
-            }
-            Command::DemoteToLocal { .. } => {
-                handle_handover(&state, &mut writer, session, false).await;
+            // Handover is the one client-facing command that does not route through an
+            // `EngineService` method — `handle_handover` reaches `otto_remote::promote` via the
+            // `store()` accessor — so it authorizes explicitly here. Trivially passing today
+            // (one principal), but promote ships a session's whole event log off-machine and
+            // demote overwrites the local row including its owner, so this is the wrong check
+            // to leave for later.
+            Command::PromoteToRemote { .. } | Command::DemoteToLocal { .. } => {
+                let to_remote = matches!(command, Command::PromoteToRemote { .. });
+                let owner = otto_protocol::UserId::local();
+                if let Err(e) = state.service.authorize_session(&owner, session).await {
+                    let _ = send_msg(
+                        &mut writer,
+                        &ServerMessage::Error {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+                handle_handover(&state, &mut writer, session, to_remote).await;
             }
             Command::RunCommand { name, args, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
@@ -763,7 +778,7 @@ async fn handle_handover(
                     return;
                 }
             };
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
@@ -839,7 +854,7 @@ async fn handle_handover(
 
             // Restore into THIS engine, overwriting our stale pre-promote copy (fail-closed
             // sensitive-path floor first). On failure, leave the VM running and report.
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),
@@ -916,7 +931,7 @@ async fn handle_handover(
                     return;
                 }
             };
-            if let Err(e) = state.service.accept_demotion(&bundle).await {
+            if let Err(e) = state.service.accept_demotion(session, &bundle).await {
                 let msg = match e {
                     crate::service::AcceptError::Refused(m) => m,
                     crate::service::AcceptError::Failed(err) => err.to_string(),

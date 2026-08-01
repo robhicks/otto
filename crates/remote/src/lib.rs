@@ -154,9 +154,11 @@ pub async fn promote(
     session: SessionId,
     target: &dyn RemoteTarget,
 ) -> anyhow::Result<RemoteHandle> {
-    // Machine-to-machine: `promote` is reached from a path that has already authorized the
-    // caller, so the owner is derived here purely to satisfy the owner-scoped `snapshot`.
-    // Passing it back in as an authorization check would be a tautology.
+    // Machine-to-machine: there is no principal here, so the owner is derived purely to satisfy
+    // the owner-scoped `snapshot`. Passing it back in as an authorization check would be a
+    // tautology. The caller is responsible for authorizing first — `serve.rs`'s handover arm
+    // calls `EngineService::authorize_session` before reaching this function. Do not read this
+    // comment as saying `promote` itself checks anything.
     let owner = store.owner_of(session).await?;
     let bundle = PromoteBundle {
         session: store.snapshot(&owner, session).await?,

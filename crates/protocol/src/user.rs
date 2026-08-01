@@ -81,12 +81,15 @@ impl TryFrom<String> for UserId {
 
 /// A `UserId` that failed validation. Carries no detail: the rejected value is attacker-controlled
 /// and echoing it into an error string invites log injection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidUserId;
 
 impl std::fmt::Display for InvalidUserId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid user id: expected 1-64 characters of [a-z0-9._-]")
+        f.write_str(
+            "invalid user id: expected 1-64 characters of [a-z0-9._-], \
+             starting with a letter or digit",
+        )
     }
 }
 
@@ -134,6 +137,12 @@ mod tests {
     #[test]
     fn local_is_the_reserved_principal() {
         assert_eq!(UserId::local().as_str(), "local");
+        // `local()` builds from a const without going through `parse`, so nothing else would
+        // notice if the const were changed to something the grammar rejects.
+        assert!(
+            UserId::parse(LOCAL).is_ok(),
+            "the reserved principal must itself be a legal UserId"
+        );
     }
 
     #[test]

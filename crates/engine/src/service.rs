@@ -134,9 +134,15 @@ impl EngineService {
         &*self.workspace
     }
 
-    /// The single authorization choke point: every client-facing method calls this before
-    /// touching a session. Returns the same error a nonexistent session produces, so a caller
-    /// cannot tell "not yours" from "not there".
+    /// The authorization choke point for session access. Returns the same error a nonexistent
+    /// session produces, so a caller cannot tell "not yours" from "not there".
+    ///
+    /// Every client-facing method **on this type** calls it before touching a session. It is not
+    /// automatic for the whole server: the handover path in `serve.rs` reaches
+    /// `otto_remote::promote` through the `store()` accessor rather than through an
+    /// `EngineService` method, so it must call [`Self::authorize_session`] explicitly — which it
+    /// does. Any future path that takes a `SessionId` from a client and bypasses this type owes
+    /// the same call.
     ///
     /// `store.owner_of` is an unscoped reverse existence oracle — it DOES distinguish the two —
     /// so its error must never reach a client. That is why both arms below bail with the same
@@ -151,6 +157,17 @@ impl EngineService {
             // Both arms produce the same message on purpose.
             _ => anyhow::bail!("no session {}", session.0),
         }
+    }
+
+    /// [`Self::authorize`] for callers outside this type — specifically `serve.rs`'s handover
+    /// path, which does not route through an `EngineService` method and would otherwise be the
+    /// one client-facing command that skips the check.
+    pub async fn authorize_session(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<()> {
+        self.authorize(owner, session).await
     }
 
     /// Create and persist a new session owned by `owner`. (≙ `Command::CreateSession`.)
@@ -676,9 +693,20 @@ impl EngineService {
     /// The sensitive-path floor is still enforced up front (fail-closed) before anything is written.
     pub async fn accept_demotion(
         &self,
+        expected: SessionId,
         bundle: &otto_remote::PromoteBundle,
     ) -> Result<SessionId, AcceptError> {
         let id = bundle.session.id;
+        // The bundle is whatever the remote chose to return, and `restore_over` is an
+        // unconditional overwrite — so without this check a receiver could answer an export for
+        // session X with a bundle for session Y and overwrite Y's row, including its `owner`,
+        // on the source. Bind the response to the request.
+        if id != expected {
+            return Err(AcceptError::Refused(format!(
+                "demotion bundle is for session {}, but {} was requested",
+                id.0, expected.0
+            )));
+        }
         let edits = self.validate_workspace_edits(bundle)?;
         // Overwrite the source's own (stale) session row, then the pre-validated workspace files.
         self.store
@@ -874,9 +902,75 @@ mod tests {
         assert!(err.contains("no session"), "unexpected: {err}");
         assert!(sink.events.is_empty(), "a rejected turn must emit nothing");
 
+        // Not just "it errored": the rejected call must not have *done* anything. Asserting
+        // only `is_err()` here let a mutant that ran `set_status` and then authorized survive
+        // the whole suite — a non-owner aborting someone else's session while still getting an
+        // Err back. Read the state through.
         assert!(service.abort(&bob, session).await.is_err());
+        assert_eq!(
+            service.store.session_status(&alice, session).await.unwrap(),
+            otto_persistence::SessionStatus::Active,
+            "a rejected abort must leave the session untouched"
+        );
+        assert_eq!(
+            service.store.next_seq(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a seq"
+        );
+
         // ...and the owner still works.
         assert!(service.abort(&alice, session).await.is_ok());
+    }
+
+    /// `serve.rs` dispatches `Command::SendPrompt` straight to `run_prompt_with_controls` — it
+    /// does NOT go through `run_prompt` — so this method's own `authorize` call is the served
+    /// hot path's only authorization. It needs its own test: deleting that inner call left the
+    /// entire suite green, because every other test reached it through `run_prompt`'s check.
+    #[tokio::test]
+    async fn run_prompt_with_controls_rejects_a_non_owner_directly() {
+        let (service, _tmp) = build_service_for_test().await;
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let session = service
+            .create_session(&alice, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let mut sink = CollectingSink::default();
+        let err = service
+            .run_prompt_with_controls(
+                &bob,
+                session,
+                "go",
+                &mut sink,
+                TurnControls {
+                    approver: Arc::new(DenyApprover),
+                    pauser: Arc::new(NeverPause),
+                    tools: None,
+                    router: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no session"), "unexpected: {err}");
+        assert!(sink.events.is_empty(), "a rejected turn must emit nothing");
+        assert_eq!(
+            service.store.next_seq(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a seq"
+        );
+        assert_eq!(
+            service.store.next_turn(session).await.unwrap(),
+            0,
+            "a rejected turn must not consume a turn index"
+        );
+        assert_eq!(
+            service.store.session_status(&alice, session).await.unwrap(),
+            otto_persistence::SessionStatus::Active,
+            "a rejected turn must not change the session's status"
+        );
     }
 
     /// `run_command_with_controls` and `run_agent_with_controls` authorize before looking the
@@ -1226,7 +1320,10 @@ mod tests {
         };
 
         // accept_demotion overwrites S's stale row (no AlreadyExists), and writes the file.
-        let restored = service.accept_demotion(&bundle).await.unwrap();
+        let restored = service
+            .accept_demotion(bundle.session.id, &bundle)
+            .await
+            .unwrap();
         assert_eq!(restored, id);
         assert_eq!(
             service.store().snapshot(&local(), id).await.unwrap().goal,
@@ -1251,7 +1348,7 @@ mod tests {
         let id = SessionId::new();
         let bundle = bundle_with(id, std::path::PathBuf::from(".env"), b"SECRET=1".to_vec());
         assert!(matches!(
-            service.accept_demotion(&bundle).await,
+            service.accept_demotion(bundle.session.id, &bundle).await,
             Err(crate::service::AcceptError::Refused(_))
         ));
         // Fail-closed: nothing landed — neither the file nor the session.

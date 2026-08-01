@@ -51,32 +51,51 @@ impl SqliteStore {
     ///
     /// Takes `path` solely so the error can name the file an operator has to delete.
     ///
-    /// The probe, the DDL, and the version stamp all run inside one `BEGIN IMMEDIATE`
-    /// transaction. That is load-bearing rather than tidiness: each `execute` auto-commits on
-    /// its own, so without the transaction a second process opening the same fresh file could
-    /// probe in the window after `CREATE TABLE sessions` committed but before the version was
-    /// stamped — seeing `user_version == 0` *and* an existing `sessions` table, which is the
-    /// pre-ownership signature. It would then refuse a perfectly good brand-new database and
-    /// tell the operator to delete it. `BEGIN IMMEDIATE` takes the write lock up front, so the
-    /// second process blocks until the first commits and then observes the stamped version.
+    /// Creation runs inside one `BEGIN IMMEDIATE` transaction. That is load-bearing rather than
+    /// tidiness: each `execute` auto-commits on its own, so without the transaction a second
+    /// process opening the same fresh file could probe in the window after `CREATE TABLE
+    /// sessions` committed but before the version was stamped — seeing `user_version == 0`
+    /// *and* an existing `sessions` table, which is the pre-ownership signature. It would then
+    /// refuse a perfectly good brand-new database and tell the operator to delete it.
+    /// `BEGIN IMMEDIATE` takes the write lock up front, so the second process blocks until the
+    /// first commits and then re-probes to find the stamped version.
     async fn init_schema(&self, path: &Path) -> anyhow::Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        match Self::init_schema_txn(&mut conn, path).await {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
-            Err(e) => {
-                // Best-effort: the transaction is aborted either way once the connection drops.
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
+        // Fast path, and the overwhelmingly common one: an already-stamped database needs no
+        // schema work, so probe read-only and take **no write lock at all**. This matters —
+        // several processes can share one file (`otto run` and `otto serve` both default to
+        // `otto-sessions.db` in the cwd), and taking a write lock on every open serializes
+        // unrelated processes against each other for no benefit.
+        {
+            let mut conn = self.pool.acquire().await?;
+            if Self::schema_is_current(&mut conn, path).await? {
+                return Ok(());
             }
         }
+
+        // Slow path, taken once per database. `begin_with` rather than a hand-rolled
+        // BEGIN/COMMIT/ROLLBACK: `Transaction`'s `Drop` rolls back on every path that does not
+        // reach `commit()`, *including a failed commit*. Rolling that by hand leaks an open
+        // transaction back into the pool if COMMIT itself errors, and whichever caller next
+        // acquires that connection would then run inside it.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Re-probe under the write lock: another process may have created and stamped the
+        // database while we waited for it.
+        if !Self::schema_is_current(&mut tx, path).await? {
+            Self::create_schema(&mut tx, path).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    /// The body of [`Self::init_schema`], run inside the caller's transaction.
-    async fn init_schema_txn(conn: &mut sqlx::SqliteConnection, path: &Path) -> anyhow::Result<()> {
+    /// `Ok(true)` when the database is already at `SCHEMA_VERSION`, `Ok(false)` when it is empty
+    /// and must be created. Errors on a database this build cannot use.
+    ///
+    /// Safe to call outside a transaction: every arm either errors or is re-checked under the
+    /// write lock before anything is created.
+    async fn schema_is_current(
+        conn: &mut sqlx::SqliteConnection,
+        path: &Path,
+    ) -> anyhow::Result<bool> {
         let (user_version,): (i64,) = sqlx::query_as("PRAGMA user_version")
             .fetch_one(&mut *conn)
             .await?;
@@ -86,14 +105,14 @@ impl SqliteStore {
                 .await?;
 
         match (user_version, sessions_exists.is_some()) {
-            (0, false) => {}
+            (0, false) => Ok(false),
             (0, true) => anyhow::bail!(
                 "session database at {} predates session ownership (issue #115) and has no \
                  owner column. otto has no installed base, so there is no migration: delete \
                  the file and let otto re-create it.",
                 path.display()
             ),
-            (v, _) if v == SCHEMA_VERSION => return Ok(()),
+            (v, _) if v == SCHEMA_VERSION => Ok(true),
             // Split by direction: once SCHEMA_VERSION is next bumped, a genuinely older
             // database would otherwise be told it is "newer", which is backwards. Neither
             // direction has a migration story, but the message has to be true.
@@ -109,7 +128,10 @@ impl SqliteStore {
                 path.display()
             ),
         }
+    }
 
+    /// Create the schema and stamp the version. Runs inside the caller's write transaction.
+    async fn create_schema(conn: &mut sqlx::SqliteConnection, _path: &Path) -> anyhow::Result<()> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
