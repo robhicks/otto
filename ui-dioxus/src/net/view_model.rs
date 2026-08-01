@@ -14,11 +14,35 @@ pub enum ConnState {
 }
 
 /// A client-side row's payload: authored copy (retranslates on a locale switch) or a passthrough
-/// diagnostic (rendered verbatim in every locale — spec §2's boundary rule).
+/// diagnostic (rendered verbatim in every locale — i18n spec §2's boundary rule).
 #[derive(Clone, PartialEq, Debug)]
 pub enum ClientText {
-    Authored(Msg),
+    /// Authored copy, retranslated on every locale switch. `args` fill the template's `{name}`
+    /// placeholders and are rendered VERBATIM — they carry filesystem paths and OS errors, not
+    /// copy. One variant rather than a separate parameterized sibling: two variants differing only
+    /// in whether a `Vec` is empty is the same representable-illegal-state shape `RowMsg::class()`
+    /// exists to avoid.
+    Authored {
+        msg: Msg,
+        args: Vec<(String, String)>,
+    },
+    /// A diagnostic produced on the transport seam. Verbatim in every locale.
     Passthrough(String),
+}
+
+impl ClientText {
+    /// Authored copy with no placeholders — the common case.
+    pub fn authored(msg: Msg) -> Self {
+        Self::Authored {
+            msg,
+            args: Vec::new(),
+        }
+    }
+
+    /// Authored copy framing a payload that cannot be translated (a path, an OS error).
+    pub fn authored_with(msg: Msg, args: Vec<(String, String)>) -> Self {
+        Self::Authored { msg, args }
+    }
 }
 
 /// A rendered row's content, kept STRUCTURED rather than pre-formatted.
@@ -37,9 +61,9 @@ pub enum ClientText {
 /// - `Verify.detail` is verbatim only when NON-EMPTY. An empty `detail` has always rendered the
 ///   authored word "ok" (including when `ok` is false), so `render_row` substitutes the translated
 ///   `Msg::VerifyOk` there — client-authored copy, not a passed-through server payload.
-/// - `ClientError(ClientText)` carries both kinds: the `Authored(Msg)` arm IS translated (it is
-///   this crate's own copy, e.g. `Msg::UrlAndTokenRequired`); only `Passthrough(String)` is
-///   verbatim.
+/// - `ClientError(ClientText)` carries both kinds: the `Authored { msg, args }` arm IS translated
+///   (it is this crate's own copy, e.g. `Msg::UrlAndTokenRequired`, or a localized frame around an
+///   untranslatable payload, e.g. `Msg::SidecarSpawnFailed`); only `Passthrough` is verbatim.
 /// - The numeric fields (`bytes`, `input`, `output`) render as Western digits in every locale —
 ///   `u64::to_string()`, with no locale-aware numeral system or digit grouping (spec §8).
 #[derive(Clone, PartialEq, Debug)]
@@ -127,7 +151,11 @@ pub fn render_row(locale: Locale, msg: &RowMsg) -> String {
         RowMsg::ServerError { message } => tf(locale, Msg::RowServerError, &[("message", message)]),
         RowMsg::ClientError(text) => {
             let message = match text {
-                ClientText::Authored(m) => t(locale, *m).to_string(),
+                ClientText::Authored { msg, args } => {
+                    let pairs: Vec<(&str, &str)> =
+                        args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    tf(locale, *msg, &pairs)
+                }
                 ClientText::Passthrough(s) => s.clone(),
             };
             tf(locale, Msg::RowClientError, &[("message", &message)])
@@ -561,7 +589,7 @@ mod tests {
     #[test]
     fn client_error_rows_carry_authored_or_passthrough_text() {
         // Authored copy retranslates…
-        let authored = client_error_row(ClientText::Authored(Msg::UrlAndTokenRequired));
+        let authored = client_error_row(ClientText::authored(Msg::UrlAndTokenRequired));
         assert_ne!(
             render_row(Locale::En, &authored),
             render_row(Locale::De, &authored)
@@ -569,6 +597,39 @@ mod tests {
         // …a transport diagnostic does not (spec §2's boundary rule).
         let passthrough = client_error_row(ClientText::Passthrough("socket closed".into()));
         assert!(render_row(Locale::De, &passthrough).contains("socket closed"));
+    }
+
+    #[test]
+    fn sidecar_spawn_failure_localizes_its_framing() {
+        // i18n spec §2 as amended by the 2026-08-01 type-design spec §3: the sidecar-spawn failure
+        // is interface copy (it tells the user auto-connect did not happen and to use the manual
+        // form), so the SENTENCE localizes — but `{bin}` and `{detail}` are a filesystem path and
+        // an OS error, so they pass through byte-identically in every locale.
+        let row = client_error_row(ClientText::authored_with(
+            Msg::SidecarSpawnFailed,
+            vec![
+                ("bin".to_string(), "/usr/bin/otto-sidecar".to_string()),
+                (
+                    "detail".to_string(),
+                    "No such file or directory".to_string(),
+                ),
+            ],
+        ));
+        let en = render_row(Locale::En, &row);
+        let de = render_row(Locale::De, &row);
+        assert_ne!(en, de, "the framing sentence must differ per locale");
+        for rendered in [&en, &de] {
+            assert!(rendered.contains("/usr/bin/otto-sidecar"), "{rendered}");
+            assert!(rendered.contains("No such file or directory"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn authored_client_text_with_no_args_still_retranslates() {
+        // The no-parameter case keeps working through the same single `Authored` variant — an
+        // empty `args` is the normal shape, not an error state.
+        let row = client_error_row(ClientText::authored(Msg::UrlAndTokenRequired));
+        assert_ne!(render_row(Locale::En, &row), render_row(Locale::De, &row));
     }
 
     #[test]
@@ -860,7 +921,7 @@ mod tests {
                 "row-error",
             ),
             (
-                RowMsg::ClientError(ClientText::Authored(Msg::UrlAndTokenRequired)),
+                RowMsg::ClientError(ClientText::authored(Msg::UrlAndTokenRequired)),
                 "row-error",
             ),
         ];

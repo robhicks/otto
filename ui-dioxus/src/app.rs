@@ -91,7 +91,7 @@ pub fn App() -> Element {
         let base = url.read().clone();
         let tok = token.read().clone();
         if base.trim().is_empty() || tok.trim().is_empty() {
-            rows.write().push(client_error_row(ClientText::Authored(
+            rows.write().push(client_error_row(ClientText::authored(
                 Msg::UrlAndTokenRequired,
             )));
             return;
@@ -450,10 +450,15 @@ pub fn App() -> Element {
                     do_connect();
                 }
                 // Spawn failure (missing/misconfigured `otto` binary): surface it so the user knows
-                // why auto-connect didn't happen, then fall back to the manual form.
-                BootOutcome::SpawnFailed(msg) => {
+                // why auto-connect didn't happen, then fall back to the manual form. Localized
+                // framing, verbatim payload — the sentence is interface copy, the binary path and
+                // the OS error are not.
+                BootOutcome::SpawnFailed { bin, detail } => {
                     rows.write()
-                        .push(client_error_row(ClientText::Passthrough(msg)));
+                        .push(client_error_row(ClientText::authored_with(
+                            Msg::SidecarSpawnFailed,
+                            vec![("bin".to_string(), bin), ("detail".to_string(), detail)],
+                        )));
                 }
                 // User cancelled the picker: silent fallback to the manual ConnectionForm.
                 BootOutcome::Cancelled => {}

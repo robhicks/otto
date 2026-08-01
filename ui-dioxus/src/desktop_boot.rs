@@ -35,9 +35,13 @@ const FALLBACK_GRACE: Duration = Duration::from_millis(400);
 pub enum BootOutcome {
     /// The user dismissed the folder picker. No sidecar was spawned; fall back to the manual form.
     Cancelled,
-    /// `otto serve` failed to spawn (e.g. `otto` not on `PATH` and `OTTO_BIN` unset/wrong). The
-    /// carried message is suitable for a `client_error_row` so the UI explains the fallback.
-    SpawnFailed(String),
+    /// `otto serve` failed to spawn (e.g. `otto` not on `PATH` and `OTTO_BIN` unset/wrong).
+    ///
+    /// Carries the resolved binary and the OS error SEPARATELY rather than a pre-formatted
+    /// English sentence: the caller frames them with `Msg::SidecarSpawnFailed` so the sentence
+    /// localizes while both payloads pass through verbatim. The old pre-formatted shape was the
+    /// one place in the tree that shipped authored prose as a passthrough diagnostic.
+    SpawnFailed { bin: String, detail: String },
     /// The sidecar spawned and (best-effort) signalled readiness. The `Child` is `kill_on_drop`,
     /// so storing it in a component signal keeps it alive for the app's lifetime and kills it when
     /// that signal's value is dropped.
@@ -146,10 +150,11 @@ pub async fn boot() -> BootOutcome {
         Err(e) => {
             // Surface spawn failure both to the terminal/log and (via the returned variant) to the
             // UI — otherwise a misconfigured `OTTO_BIN` / missing `otto` would silently fall
-            // through to the manual form with no explanation.
-            let msg = format!("failed to launch `{bin} serve` sidecar: {e}");
-            eprintln!("desktop_boot: {msg}");
-            return BootOutcome::SpawnFailed(msg);
+            // through to the manual form with no explanation. The terminal line stays English:
+            // stderr is not UI copy (i18n spec, Scope "Out").
+            let detail = e.to_string();
+            eprintln!("desktop_boot: failed to launch `{bin} serve` sidecar: {detail}");
+            return BootOutcome::SpawnFailed { bin, detail };
         }
     };
 
