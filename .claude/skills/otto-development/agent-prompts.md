@@ -35,7 +35,8 @@ Agent tool:
     Repo context to check against (from otto-development's Load-Bearing Invariants):
     <PASTE THE LOAD-BEARING INVARIANTS SECTION — sensitive-path floor, gated edits, sandbox-only
      bash, inward dependency flow, offline determinism, unauthenticated-by-design static UI route,
-     remote-ready trait seams — plus the test/lint commands and plan-by-plan doc conventions>
+     remote-ready trait seams, semver-constrained wire types — plus the test/lint commands and
+     plan-by-plan doc conventions>
 
     Check:
     - Completeness: TODOs, placeholders, "TBD", incomplete sections
@@ -317,6 +318,8 @@ Agent tool:
     - Crate boundaries respected; new capabilities added via AgentCtx accessors or new seams,
       never by widening public surface
     - The change matches the spec/plan it claims to implement; wire types stay semver-minor
+      (additive only — a breaking change bumps the affected crate version(s) in Cargo.toml within
+      this same PR, per Non-Negotiable Rule 6)
     - Trait seams stay remote-ready (Send + Sync + async); extensible payloads stay JSON Value
     - ui-dioxus stays workspace-excluded; workspace build/test never requires dx
     - The change follows the documented design rather than eroding it; deviations are justified

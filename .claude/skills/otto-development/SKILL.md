@@ -64,6 +64,17 @@ These hold for every run of this skill, no exceptions, no fast-path carve-outs:
    the implementer's report. Its findings must be produced from the diff alone, so it cannot be
    steered by the implementer's framing. This is deliberate: the security review is the one pass
    that evaluates what was actually built, unmediated.
+6. **Semver is a requirement on every change to a public interface.** The `protocol` wire types and
+   every crate's public API stay **semver-minor** (additive only): new optional serde fields, new
+   enum variants, new event kinds, new tools/agents/events — the repo's convention that additions
+   to the wire types are semver-minor. Additive changes need no `Cargo.toml` bump. A **breaking**
+   change — renaming, removing, or reordering a field or variant; changing a signature or shape —
+   is semver-major and is never an incidental refactor side-effect or a fast-path change. It must
+   be named in the spec and plan, bump the affected crate(s)' `version` in `Cargo.toml` within the
+   same PR (at this repo's pre-1.0 state, where every crate is 0.x, that is the 0.x minor-position
+   bump, `0.1.0` → `0.2.0`), and be flagged explicitly to the architect reviewer — the bump makes
+   it visible to the independent security reviewer in the diff. A silent breaking change is a
+   rejected PR.
 
 ## When to Use This Skill vs. Alternatives
 
@@ -87,6 +98,9 @@ are true:
   and its required mirror/duplicate count as one logical file)
 - No new public interface: no new protocol variant, no new event kind, no new tool, no new agent,
   no new config key, no new CLI flag, no new crate or binary
+- No **breaking** change to wire types or a crate's public API — renamed/removed/reordered serde
+  fields or enum variants, changed signatures. Breaking changes are semver-major by Non-Negotiable
+  Rule 6 and never fast-path
 - No change to the orchestrator spine, an agent's behavior, the permission gate, the sensitive-path
   floor, or the sandbox
 - No change to dependency flow (no crate gains/loses an inward/outward edge; no workspace-excluded
@@ -141,7 +155,7 @@ one-sentence AC → STOP. Write the spec. The fast-path is for genuine trivialit
 | Lint / format | `cargo clippy --workspace --all-targets` and `cargo fmt --all`. **Run `cargo fmt --all` before every Rust commit** (rustfmt is pinned in `rust-toolchain.toml`). |
 | UI crate | `ui-dioxus/` is **workspace-excluded** — `cargo build/test --workspace` must never require `dx`. UI tests: `cd ui-dioxus && cargo test --features desktop`; wasm check: `cargo build --target wasm32-unknown-unknown --features web`. |
 | Known pre-existing failure | At the time of writing (2026-07), `mcp-lsp`'s rust-analyzer round-trip test fails on `main` already. Do not treat it as a regression you caused. If it is green on `main` now, drop this row. |
-| Versioning | `rust-toolchain.toml` pins the toolchain; edition 2024. Additive changes are semver-minor on the wire types. |
+| Versioning | `rust-toolchain.toml` pins the toolchain; edition 2024. **Semver is a hard requirement (Non-Negotiable Rule 6):** wire-type and public-API changes are additive-only (semver-minor); a breaking change is semver-major — the 0.x minor-position bump while crates are pre-1.0 — and bumps the affected crate(s)' `version` in `Cargo.toml` within the same PR, documented in the spec. |
 
 Full convention reference in `CLAUDE.md` at the repo root. The above is the load-bearing subset for
 this workflow.
@@ -172,6 +186,17 @@ step below checks them:
    not consult the sensitive-path floor.
 7. **Trait seams are remote-ready.** Keep seams `Send + Sync` and async; the orchestrator holds
    trait objects, never concrete impls.
+8. **Wire types and public APIs are semver-constrained.** `protocol` wire types are typed serde
+   records; extensible payloads are JSON `Value`. Additions — new optional fields, new enum
+   variants, new event kinds — are **semver-minor by this repo's convention** (CLAUDE.md:
+   "Adding a tool/agent/event should stay a semver-minor change to the wire types"). Know the
+   limit: `Command`/`EventKind`/`ServerMessage` are externally tagged with no `#[serde(other)]`,
+   so an old receiver still fails to decode a *new variant* — additive is a versioning and
+   source-compatibility guarantee, not wire forward-compatibility. `CapabilitiesManifest`
+   (`#[serde(default)]` → absent means `false`) is how a peer learns what it may be sent.
+   Renaming, removing, or reordering a field or variant breaks the protocol and is semver-major:
+   version bump in the PR + explicit review, never an incidental refactor side-effect
+   (Non-Negotiable Rule 6).
 
 ## Tracker abstraction (GitHub Issues or ticketless)
 
@@ -375,6 +400,10 @@ Every task MUST include:
 - Exact file paths in THIS repo's layout
 - **Reminders for the out-of-band artifacts** from Phase 5 that the task touches (Fly image,
   wasm bundle guards, feature-gated crates)
+- **A semver step when the task makes a breaking change to a public interface or wire type:** a
+  `- [ ]` step bumping the affected crate(s)' `version` in `Cargo.toml` (semver-major per
+  Non-Negotiable Rule 6 — the 0.x minor-position bump at this repo's pre-1.0 state) before the
+  final commit. Additive changes need no bump.
 - The repo's actual test + lint commands for the TDD steps
 - A final "Format and commit" step: `cargo fmt --all` + `git commit -m "<scope>: <subject>"`
 
@@ -809,6 +838,7 @@ explicitly.
 | "Quality reviewer flagged Minor issues, must loop" | Minor / optional ≠ blockers. Treat "Approved with suggestions" as DONE. |
 | "Subagent re-reads the plan" | NO. Provide the full task text inline. Re-reading wastes context and risks divergence. |
 | "I'll add attribution to the commit" | Never. No AI attribution in commits, comments, or docs (Non-Negotiable Rule 3). |
+| "I'll just rename/remove that protocol field — nothing's released yet" | Wire types and public APIs are semver-constrained (Non-Negotiable Rule 6). Breaking changes need a documented version bump in the same PR, never an incidental side-effect. |
 
 ## Red Flags — STOP
 
@@ -830,6 +860,7 @@ These thoughts mean stop and complete the missed step:
 - About to declare a stage green by looking at "the latest build" instead of your merge commit's own run (by run ID where CI exists; manual `cargo test --workspace` on the merge commit where it doesn't)
 - About to declare "shipped" because tests are green
 - About to close the ticket before the out-of-band verification for the surfaces the change touched
+- About to rename, remove, or reorder a wire-type field or variant without a version bump in the same PR
 - About to widen the sensitive-path floor, register `bash` without a sandbox backend, or read `OTTO_*` in core logic
 - About to skip the record-as-shipped commit
 - "I already manually tested it"
