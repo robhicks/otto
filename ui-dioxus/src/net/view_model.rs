@@ -38,8 +38,16 @@ pub enum ClientText {
     ///
     /// The coupling it leaves open: `authored(Msg::SidecarSpawnFailed)` compiles and renders the
     /// literal text `{bin}` to the user, because `tf` emits an unsupplied placeholder verbatim by
-    /// design. `arity_matches_the_catalog_for_every_authored_construction` is what stops that
-    /// reaching a release; keys are `&'static str` so at least they cannot be computed at runtime.
+    /// design. Keys are `&'static str`, so at least they cannot be computed at runtime.
+    ///
+    /// What guards it, stated honestly rather than optimistically: the constructors
+    /// `debug_assert` on `Msg::has_placeholders`, which fires only if a **test executes that
+    /// path**, and only in a debug build. It is a real guard for the two call sites this crate has
+    /// (both covered), not a general one — a new `authored(..)` in an untested component would
+    /// still ship braces. And `has_placeholders` is a *presence* check, not an arity one:
+    /// `authored_with(Msg::SidecarSpawnFailed, vec![])` satisfies it and still renders `{bin}`.
+    /// Closing that properly needs the required key set, which the macro could expose if this
+    /// surface ever grows past two call sites.
     Authored {
         msg: Msg,
         args: Vec<(&'static str, String)>,
