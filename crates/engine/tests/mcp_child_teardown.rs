@@ -529,7 +529,8 @@ fn mcp_server_dies_when_parent_is_hard_killed() {
 /// even though the intermediate process is itself killed only by EOF (never signalled directly).
 ///
 /// Skipped when `rust-analyzer` is absent — `mcp-lsp` refuses to start with no supported server on
-/// PATH, and the repo has no CI, so a developer without it should not see a hard failure.
+/// PATH, so a developer without it should not see a hard failure. The CI runner image does not ship
+/// `rust-analyzer` either, so this self-skips there too and the merge gate never exercises it.
 #[test]
 fn language_server_grandchild_dies_when_parent_is_hard_killed() {
     let ra = std::env::var("OTTO_RUST_ANALYZER_BIN").unwrap_or_else(|_| "rust-analyzer".into());
