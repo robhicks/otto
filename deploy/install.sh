@@ -66,15 +66,19 @@ else
     release_url="$OTTO_BASE_URL/download/$OTTO_VERSION"
 fi
 archive="otto-$target.tar.gz"
+# The release publishes the checksum as `otto-<target>.sha256` — the target stem WITHOUT the
+# `.tar.gz` suffix. Deriving it as "$archive.sha256" 404s and, since verification fails closed,
+# breaks every install.
+checksum="otto-$target.sha256"
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/otto-install.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 say "downloading otto ($target, $OTTO_VERSION)…"
 curl -fsSL "$release_url/$archive" -o "$tmp/$archive" || die "download failed ($release_url/$archive)"
-curl -fsSL "$release_url/$archive.sha256" -o "$tmp/$archive.sha256" || die "checksum file not found"
+curl -fsSL "$release_url/$checksum" -o "$tmp/$checksum" || die "checksum file not found"
 
-expected="$(awk '{print $1}' "$tmp/$archive.sha256" || true)"
+expected="$(awk '{print $1}' "$tmp/$checksum" || true)"
 [ -n "$expected" ] || die "no checksum for $archive"
 actual="$(
     (sha256sum "$tmp/$archive" 2>/dev/null || shasum -a 256 "$tmp/$archive") |
