@@ -11,8 +11,18 @@
 use dioxus::prelude::*;
 
 mod catalog;
+mod resolve;
+mod store;
 
 pub use catalog::{t, tf, Msg};
+pub use resolve::{env_locale_tags, resolve_locale};
+pub use store::{load_persisted_locale, store_persisted_locale};
+
+/// The locale to start in: a persisted choice if there is one, else the environment's preference,
+/// else English. The single call the app makes at startup.
+pub fn initial_locale() -> Locale {
+    resolve_locale(load_persisted_locale().as_deref(), &env_locale_tags())
+}
 
 /// A shipped UI language. Adding a variant is a compile error until every catalog entry supplies
 /// it — see the `messages!` macro in `catalog.rs`.
