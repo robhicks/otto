@@ -305,7 +305,11 @@ impl EngineService {
                 &TurnRecord {
                     turn_index,
                     goal: goal.to_string(),
-                    outcome: serde_json::json!({ "ok": outcome.ok }),
+                    // Serialize the whole outcome, not a hand-built object: conversation history
+                    // is rebuilt from these rows, so a field added to `TurnOutcome` must reach
+                    // the store without anyone having to remember to widen a `json!()` literal
+                    // here.
+                    outcome: serde_json::to_value(&outcome)?,
                 },
             )
             .await?;
@@ -1003,6 +1007,53 @@ mod tests {
             otto_persistence::SessionStatus::Active,
             "a rejected turn must not change the session's status"
         );
+    }
+
+    /// `record_turn` must persist the whole `TurnOutcome`, not a hand-built `{"ok": ...}` —
+    /// conversation history is rebuilt from these rows (a later task), so every field on
+    /// `TurnOutcome` has to survive the round trip through the store without anyone having to
+    /// remember to widen a `json!()` literal at the call site.
+    #[tokio::test]
+    async fn record_turn_persists_the_full_outcome_not_just_ok() {
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let store: Arc<dyn SessionStore> =
+            Arc::new(SqliteStore::open(db.path().join("s.db")).await.unwrap());
+        let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws.path()));
+        let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(ws.path()));
+        let tools = Arc::new(crate::build_tool_registry(
+            tools_ws,
+            ws.path().to_path_buf(),
+        ));
+        let service = EngineService::new(
+            Arc::clone(&store),
+            Arc::new(crate::build_default_registry()),
+            Arc::from(crate::build_router()),
+            workspace,
+            tools,
+        );
+
+        let owner = local();
+        let session = service
+            .create_session(&owner, "goal", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt(&owner, session, "add a hello function", &mut sink)
+            .await
+            .unwrap();
+
+        let state = store.snapshot(&owner, session).await.unwrap();
+        let stored = &state.turns[0].outcome;
+        let parsed: TurnOutcome = serde_json::from_value(stored.clone()).unwrap();
+
+        assert!(
+            !parsed.milestones.is_empty(),
+            "milestones must reach the store; record_turn built a hand-rolled json!() before this change"
+        );
+        assert!(stored.get("files_edited").is_some());
+        assert!(stored.get("verify").is_some());
     }
 
     /// `run_command_with_controls` and `run_agent_with_controls` authorize before looking the
