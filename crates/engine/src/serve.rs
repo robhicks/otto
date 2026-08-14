@@ -1637,8 +1637,9 @@ async fn handle_handover(
     let msg = if to_remote {
         // Deliver a token only when the remote uses a different bearer than the source (Fly mints
         // a fresh per-session token); reuse-targets (loopback/vps/microvm) carry cfg.token, so send
-        // None.
-        let handover_token = (tok != cfg.token).then(|| tok.clone());
+        // None. A provisioned engine with no bearer (a `SingleUser` loopback, §6.5) also sends
+        // None — an empty token is never a credential to switch to.
+        let handover_token = (!tok.is_empty() && tok != cfg.token).then(|| tok.clone());
         ServerMessage::Promoted {
             session,
             endpoint,
