@@ -1,6 +1,6 @@
 # Handover Credentials Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Narrow the handover credential from a machine-wide secret to a per-session secret. `ServerMessage::Promoted.token` becomes a required `String` (always present); every `RemoteTarget` mints a fresh opaque per-session secret at provision time, delivered to the receiver over the provisioning channel (machine env for Fly, the restore-push for vps/microvm) and reported to the client via `Promoted.token`; a long-lived `--accept-promotions`/`--promotion-receiver` receiver keeps a session→secret map consulted by `/export`, `/workspace`, and the `Machine`-mode WS handshake; secrets are disposed when the session is demoted. Carries the slice-1a review items: an actionable `/promote` 400 for pre-ownership bundles, an owner-match check in `accept_demotion`, and a documented source/client-side-only contract for `RemoteWorkspace`.
 
@@ -74,7 +74,7 @@ compile — until Task 6 migrates them. Task 3's own gate is `cargo test -p otto
   - `ServerMessage::Promoted { session, endpoint, token: String }` — the field is now a required `String`; `#[serde(default)]` is **removed** (spec §2): a frame with a `null` token **or** a missing `token` field fails to deserialize. This is the deliberate, semver-major wire break.
   - The `serve.rs` construction site is updated in this task because the type change forces it: `handle_handover`'s reuse branch drops the `handover_token` filter (`(!tok.is_empty() && tok != cfg.token).then(..)`) and the stale "stays `None`" comments (spec §1.6), building `Promoted { token: tok }` unconditionally.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/protocol/src/lib.rs`'s `#[cfg(test)]` module:
 
@@ -85,12 +85,12 @@ In `crates/protocol/src/lib.rs`'s `#[cfg(test)]` module:
   - `promoted_with_null_token_fails_to_deserialize`: hand-build the JSON `{"type":"promoted","session":"<uuid>","endpoint":"ws://x","token":null}` and assert `serde_json::from_str::<ServerMessage>` errors.
   - `promoted_with_missing_token_fails_to_deserialize`: the same JSON **without** the `token` key; assert it errors too.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-protocol`
 Expected: FAIL to compile — `Promoted`'s `token` is still `Option<String>`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/protocol/src/lib.rs`:
 - `Promoted { token: String }` — remove the `#[serde(default)]` attribute on `token`.
@@ -104,17 +104,17 @@ Expected: FAIL to compile — `Promoted`'s `token` is still `Option<String>`.
 
 `crates/protocol/Cargo.toml`: `version = "0.1.0"` → `"0.2.0"`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-protocol`
 Expected: PASS — new deserialize-failure tests + all pre-existing.
 
-- [ ] **Step 5: Verify the workspace still builds and the library tests pass**
+- [x] **Step 5: Verify the workspace still builds and the library tests pass**
 
 Run: `cargo build --workspace` then `cargo test -p otto-engine --lib`
 Expected: SUCCESS — the `serve.rs` edit is the only non-protocol touch and it compiles; nothing else constructs `Promoted`. The integration harnesses still compile (they read frames, never construct them).
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -139,7 +139,7 @@ git commit -m "protocol: make Promoted.token a required String (always present; 
   - `FlyTarget::provision` uses `mint_session_secret` and pushes with bearer=token + session_secret=token (spec A3).
   - `MicrovmTarget::provision` pushes with bearer=`machine.token` + session_secret=`machine.token` (spec A3).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/remote/src/lib.rs`'s `#[cfg(test)]` module:
 - `mint_session_secret_is_32_hex_and_unique` — the shape of fly's current `mint_token_is_unique_hex`, moved here (the fly test is deleted in Step 3).
@@ -149,12 +149,12 @@ In `crates/remote/src/fly.rs` tests:
 - `create_machine_body_has_image_env_guest_and_services` — unchanged (the env is still `OTTO_PROMOTION_SECRET`).
 - The `provision_*` wiremock tests: assert the `/promote` POST carries the `X-Otto-Session-Secret` header using **`wiremock::matchers::header_exists("x-otto-session-secret")`** (presence-only — the token is minted inside `provision`, so an exact-value matcher mounted before provision cannot know it) optionally chained with `header_regex("x-otto-session-secret", "^[0-9a-f]{32}$")` for the 32-hex shape. **No custom `Match` impl** — that is a needless rabbit hole. The value-equality claim is covered by `create_machine_body_has_image_env_guest_and_services` (env injection) + the existing `handle.token.len() == 32` assert, since header and env share the same mint. Note in the report that `header_exists` asserts presence only.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-remote`
 Expected: FAIL to compile — `mint_session_secret` not found, `push_promote_bundle` signature drift, fly's `mint_token` deleted.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/remote/src/lib.rs`:
 - Add `pub fn mint_session_secret() -> String` (doc: fresh 32-hex per-session credential; blast radius one session). `use uuid::Uuid;`.
@@ -174,17 +174,17 @@ Expected: FAIL to compile — `mint_session_secret` not found, `push_promote_bun
 
 `crates/remote/Cargo.toml`: `version = "0.1.0"` → `"0.2.0"`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-remote`
 Expected: PASS — mint tests + updated fly wiremock tests.
 
-- [ ] **Step 5: Verify the workspace builds and the engine library tests pass**
+- [x] **Step 5: Verify the workspace builds and the engine library tests pass**
 
 Run: `cargo build --workspace` then `cargo test -p otto-engine --lib`
 Expected: SUCCESS — the vps demote arm edit is the only engine touch and compiles.
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -232,7 +232,7 @@ git commit -m "remote: mint per-session secrets and push them over X-Otto-Sessio
 
 **`crates/engine/src/lib.rs`:** re-export `mint_session_secret` alongside the existing `use otto_remote::{ ... }` block.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to the `#[cfg(test)]` module in `crates/engine/src/serve.rs` (or a new `#[cfg(test)]` submodule) unit tests for the pure pieces:
 - `machine_workspace_authorized` accepts the machine secret, accepts a recorded session secret, and rejects a wrong secret (build a small `ServeState`-like fixture — note `ServeState` fields are private; if unit-testing is awkward, cover these behaviors in `tests/auth.rs` in Task 6 and skip here).
@@ -240,21 +240,21 @@ Add to the `#[cfg(test)]` module in `crates/engine/src/serve.rs` (or a new `#[cf
 
 **Mandatory report note:** if the `machine_workspace_authorized` unit fixture is disproportionate (private fields), that is a *decision to defer to Task 6's integration coverage*, and the implementer must say so explicitly in the report rather than silently skipping. The pre-ownership helper is small and pure; it must be unit-tested here.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-engine --lib`
 Expected: the new tests fail to compile (no helpers yet).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Per the design points above. `use otto_protocol::SessionId` is already imported. All map accesses take the lock briefly and release before any await (clone the secret out).
 
-- [ ] **Step 4: Run the library tests**
+- [x] **Step 4: Run the library tests**
 
 Run: `cargo test -p otto-engine --lib`
 Expected: PASS.
 
-- [ ] **Step 5: Build the workspace; confirm the integration failures are behavioral, not compile**
+- [x] **Step 5: Build the workspace; confirm the integration failures are behavioral, not compile**
 
 Run: `cargo build --workspace --tests` (or `cargo check --all-targets`) — `cargo build --workspace` alone does not compile the `tests/*.rs` targets, so this is the gate that genuinely proves the red window is compile-green.
 Expected: SUCCESS — the pre-existing integration harnesses still **compile** (they never construct `Promoted` and never call the changed private helpers). They now fail at **runtime**:
@@ -265,7 +265,7 @@ Expected: SUCCESS — the pre-existing integration harnesses still **compile** (
 
 **This is the stated red window, closed by Task 6.** Do NOT fix the harnesses here.
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -284,27 +284,27 @@ git commit -m "engine: per-session receiver secrets — session→secret map, se
 - Consumes: `otto_remote::mint_session_secret` (re-exported via `crate::mint_session_secret`).
 - Produces: `Promoted.token` for loopback is a fresh non-empty mint (spec success criterion 2). The provisioned engine is `SingleUser` and ignores credentials, so this is a uniform invariant, not a functional credential.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/engine/tests/promote.rs`: the test already drives `LoopbackTarget` and reads `handle`. Assert `handle.token` is 32 hex and non-empty (spec success criterion 2), flipping the current comment at `:97-98` that says "`Promoted.token` stays `None`". (The frame-level assert lives in Task 6's `tests/serve.rs`; here the handle is the observable.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p otto-engine --test promote`
 Expected: FAIL — `handle.token` is currently the empty `promotion_secret`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crates/engine/src/loopback.rs`, `provision`:
 - Replace the `promotion_secret.clone().unwrap_or_default()` handle-token computation with `let secret = crate::mint_session_secret();`.
 - Keep the loopback engine's own `PromoteConfig { token: ... }` wiring as it is (the provisioned engine's inbound `/promote`/`/export` stay disabled; `PromoteConfig.token` there remains the threaded secret — this slice does not change nested-loopback semantics).
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p otto-engine --test promote`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -323,19 +323,19 @@ git commit -m "engine: mint a fresh per-session secret for loopback promote"
 - Consumes: the existing id-binding in `accept_demotion` (spec §4).
 - Produces: refusal of a demotion bundle whose owner differs from the local row's current owner — closing the overwrite-including-owner hole.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/engine/src/service.rs`'s `#[cfg(test)]` module, after the existing `accept_demotion`/`accept_promotion` tests:
 - `accept_demotion_refuses_a_bundle_with_a_different_owner`: create a session as `alice`, promote a bundle for it, then `accept_demotion` with the same id but `bundle.session.owner = bob` → `Err(AcceptError::Refused(_))`, and the store row still shows `alice`.
 - `accept_demotion_accepts_a_bundle_with_the_same_owner`: the same id, same owner → `Ok`, row owner unchanged.
 - `accept_demotion_refuses_an_unknown_local_row`: `accept_demotion` for a session id with no local row → `Err` (the `owner_of` call fails closed).
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-engine --lib`
 Expected: FAIL — the owner check does not exist yet.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `accept_demotion` (`:694-723`), after the existing `id != expected` check and before `validate_workspace_edits`:
 ```rust
@@ -348,12 +348,12 @@ if bundle.session.owner != current_owner {
 }
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-engine --lib`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -372,7 +372,7 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 - Consumes: the Task 3 behavior (session-secret `/promote`/`/export`/`/workspace`/WS auth, disposal, `Promoted.token: String`).
 - Produces: a workspace-green tree (`cargo test --workspace` passes except the known `mcp-lsp` failure), asserting the spec's success criteria 2–6.
 
-- [ ] **Step 1: Migrate `tests/vps_promote.rs`**
+- [x] **Step 1: Migrate `tests/vps_promote.rs`**
 
 - Add a session-secret constant, e.g. `const SESSION_SECRET: &str = "session-secret";`, distinct from `TOKEN` (the machine secret) — the whole point is proving the two differ (spec success criterion 3).
 - `post_promote(base, token, body)` gains a session-secret param and sends `X-Otto-Session-Secret`; every call passes `SESSION_SECRET` (or a per-test fresh value).
@@ -383,7 +383,7 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 - `handover_vps_demote_pulls_session_back_to_source` / `vps_demote_round_trip_brings_advanced_state_back_to_source`: after promote, the demote arm uses the stored handle's secret for the pull — the test flow is unchanged (the source's `handle_handover` handles it), but the final `post_export(&recv_http, Some(TOKEN), &session)` in the round-trip test (copy-semantics assertion) must switch to a fresh push+secret or assert against the store directly (the receiver's retained copy exists but its original secret was disposed by the demote — spec §7). Update to assert copy semantics via the store (`SqliteStore::open(db_dir...)` + `session_status`), not a second `/export`.
 - `vps_promote_resumes_session_and_workspace_on_receiver`: the reconnect to the receiver uses the handle's session secret (from `promote()`'s returned handle), not `TOKEN`; the `RemoteWorkspace::new(recv_http, ...)` uses the session secret.
 
-- [ ] **Step 2: Migrate `tests/microvm.rs`**
+- [x] **Step 2: Migrate `tests/microvm.rs`**
 
 - `TestServeProvisioner::provision` mints a fresh per-provision secret (spec §1.2), boots the serve with it as `promotion_secret`, and returns it in `ProvisionedMachine.token`.
 - `microvm_target_seam_round_trip`: the `/export` after provision authenticates with the **session secret** from the provisioned machine (`provisioner`'s token, or the handle's token), not `TOKEN`.
@@ -391,7 +391,7 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 - `microvm_target_teardown_stops_the_machine`: unchanged (the POST `/promote` after teardown just needs a valid bearer; use the machine's session secret).
 - `handover_microvm_*`: the source's `handle_handover` drives the mint; assertions unchanged except any that mention the machine secret.
 
-- [ ] **Step 3: Migrate `tests/auth.rs`**
+- [x] **Step 3: Migrate `tests/auth.rs`**
 
 - **`start_machine` (`:190-202`) must build with `accept_promotions = true`** — it currently passes `false` as the last arg to `serve_app(service, auth, test_capabilities(), None, false)`. Under slice 3 the Machine-mode tests seed `session_secrets` via `POST /promote`, which 403s unless acceptance is on. Flipping it is safe for the helper's other consumers (`machine_rejects_session_creation` and `machine_handshake_has_a_deadline` don't depend on the flag).
 - The `Machine`-mode tests that currently attach with the **machine secret** (`SECRET`) and expect `Ready` — **`machine_attach_with_the_promotion_secret_adopts_the_session_owner` (`:669`) AND `machine_attach_with_the_promotion_secret_reaches_ready` (`:978`)** — must switch to the session's **per-session** secret. Rework each: push a bundle via `POST /promote` (with `X-Otto-Session-Secret: <secret>`) to seed `session_secrets`, then:
@@ -402,12 +402,12 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 - `machine_handshake_has_a_deadline` (`:953`): its assertions still pass (no `?session=` → immediate opaque failure instead of a deadline wait), but its premise comment is now stale — update the one-line comment to note the Machine credential is the per-session secret, so a header-less `?session=`-less connection now fails at the lookup rather than the deadline.
 - Any test that pushes to a `Machine` receiver directly (`POST /promote`) gains the header.
 
-- [ ] **Step 4: Migrate `tests/serve.rs`**
+- [x] **Step 4: Migrate `tests/serve.rs`**
 
 - `promote_then_demote_round_trip_preserves_session` (`:1236`): after reading the `Promoted` frame (`:1271`), assert `frame["token"]` is a non-empty string (spec criterion 2 for loopback via the socket). The reconnect uses `authed_endpoint_request` with `Bearer TOKEN` — under loopback→`SingleUser` this is ignored, so it still works; keep it.
 - Any other handover assertions updated to the always-`Some` frame.
 
-- [ ] **Step 5: Add the new integration tests**
+- [x] **Step 5: Add the new integration tests**
 
 In `tests/vps_promote.rs` (or a new `tests/handover_credentials.rs` if the file grows too large — prefer the existing file per the repo's harness-adjacent convention):
 - `/export` with the machine secret → `401` (spec criterion 3).
@@ -417,12 +417,12 @@ In `tests/vps_promote.rs` (or a new `tests/handover_credentials.rs` if the file 
 - `POST /promote` with a hand-built pre-ownership bundle (JSON whose `session` object has no `owner`) → `400` whose body contains "predates session ownership" (spec criterion 6, byte-for-byte).
 - A `Promoted` frame from a vps promote carries a fresh 32-hex token != the machine secret.
 
-- [ ] **Step 6: Run the workspace suite**
+- [x] **Step 6: Run the workspace suite**
 
 Run: `cargo test --workspace`
 Expected: PASS except the known `otto-mcp-lsp` rust-analyzer test. This commit closes the Task 3–6 red window.
 
-- [ ] **Step 7: Format and commit**
+- [x] **Step 7: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -440,16 +440,16 @@ git commit -m "engine: migrate the handover harnesses to per-session secrets and
 **Interfaces:**
 - Produces: the spec §5 doc contract on `RemoteWorkspace::new` (source/client-side only; never constructed on a promoted machine). Documentation only — no structural change (there is no production construction site to remove).
 
-- [ ] **Step 1: Make the change**
+- [x] **Step 1: Make the change**
 
 On `RemoteWorkspace::new` (`:21-36`), add the doc block from spec §5 verbatim.
 
-- [ ] **Step 2: Verify**
+- [x] **Step 2: Verify**
 
 Run: `cargo test -p otto-workspace`
 Expected: PASS (docs-only change; nothing else touched).
 
-- [ ] **Step 3: Format and commit**
+- [x] **Step 3: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -468,11 +468,11 @@ git commit -m "workspace: document RemoteWorkspace as source/client-side only (s
 - Consumes: `Promoted.token` is now a required `String` (Task 1; `ui-dioxus`'s `path =` dep resolves it).
 - Produces: the `Promoted` arm stores the token so the post-promote `/workspace` RPCs (`load_files`/`open_path`) present the session secret (spec §6). The desktop path (loopback → `SingleUser`) is behaviorally unchanged.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 There is no host-side unit test that pins the `Promoted` arm's token handling (it lives in the wasm-only `web_mount_test` flow). Add the minimal assertion the slice can support: in `ui-dioxus/src/app.rs`'s existing host-test surface if any touches `Promoted`; otherwise rely on the compile-time type change (the arm must destructure `token`) plus the desktop suite. If no existing test covers it, note in the report that the arm change is verified by the wasm compile + desktop suite, not a unit test.
 
-- [ ] **Step 2: Implement**
+- [x] **Step 2: Implement**
 
 `ui-dioxus/src/app.rs` `:199-210`:
 ```rust
@@ -483,14 +483,14 @@ SocketEvent::Message(Ok(ServerMessage::Promoted { endpoint, token, .. })) => {
 ```
 The current arm is a **combined or-pattern** `Promoted { endpoint, .. } | Demoted { endpoint, .. }` — it must be **split** into two arms so the `token` field can bind in the `Promoted` arm (the compiler will force this once `token` is destructured; the `Demoted` arm keeps `{ endpoint, .. }`).
 
-- [ ] **Step 3: Verify the desktop suite and the wasm compile**
+- [x] **Step 3: Verify the desktop suite and the wasm compile**
 
 Run: `cd ui-dioxus && cargo test --features desktop`
 Expected: PASS.
 Run: `cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web`
 Expected: SUCCESS.
 
-- [ ] **Step 4: Format and commit**
+- [x] **Step 4: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -508,20 +508,20 @@ git commit -m "ui-dioxus: adopt the Promoted frame's session token for the recon
 **Interfaces:**
 - Produces: the multitenancy notes describe the new credential model. The spec's `Status` flip to IMPLEMENTED and the plan checkboxes are the record-as-shipped commit, which per house style happens **after merge** in a fresh worktree — this task only updates the prose docs in the feature PR.
 
-- [ ] **Step 1: Update `CLAUDE.md`**
+- [x] **Step 1: Update `CLAUDE.md`**
 
 In the `engine` crate-table row and the serve command block: note that `Promoted.token` is always `Some` (a fresh per-session secret minted by the target), that `--promotion-receiver` receivers keep a session→secret map consulted by `/export`/`/workspace`/the `Machine` WS handshake, and that the per-session secret rides `X-Otto-Session-Secret` on the `/promote` push. Keep the `OTTO_PROMOTION_SECRET` description accurate (it is now the *admission* credential for `/promote`, no longer a session credential). **Also update the `remote` crate-table row**, which currently describes `VpsTarget` as having an `export` that "pulls a bundle back for demote" — that method is removed by Task 2; the row should say the demote pull uses the shared `export_bundle` with the stored handle's session secret.
 
-- [ ] **Step 2: Update `README.md`**
+- [x] **Step 2: Update `README.md`**
 
 The same notes at the summary level (promote flow: fresh per-session secret, always-present `Promoted.token`).
 
-- [ ] **Step 3: Verify no stale claims remain**
+- [x] **Step 3: Verify no stale claims remain**
 
 Run: `grep -rn "Promoted.token\|reuse the current token\|stays .None" CLAUDE.md README.md docs/superpowers/specs/2026-08-14-handover-credentials-design.md`
 Expected: no "reuse the current token" or "stays None" claims anywhere except historical references clearly marked as superseded.
 
-- [ ] **Step 4: Format and commit**
+- [x] **Step 4: Format and commit**
 
 ```bash
 git add CLAUDE.md README.md
