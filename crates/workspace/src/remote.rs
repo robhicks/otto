@@ -19,6 +19,12 @@ pub struct RemoteWorkspace {
 }
 
 impl RemoteWorkspace {
+    /// `RemoteWorkspace` is **source/client-side only**. It is constructed by a client (or a source
+    /// engine acting for a client) to reach a served engine over the `/workspace` RPC. It must never be
+    /// constructed on a promoted machine: a remote that can reach yet another machine's workspace, or
+    /// that holds a source-valid credential, is a pivot. It has no production construction site on a
+    /// promoted machine; keep it that way.
+    ///
     /// `base_url` is the engine origin (e.g. `http://127.0.0.1:7878` or `https://host:port`);
     /// `token` is the bearer token the server requires.
     ///
