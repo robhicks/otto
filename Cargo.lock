@@ -2966,9 +2966,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs",
  "otto-engine",
+ "otto-extensions",
+ "otto-persistence",
  "otto-protocol",
+ "otto-workspace",
  "rustyline",
+ "tempfile",
  "tokio",
  "uuid",
 ]

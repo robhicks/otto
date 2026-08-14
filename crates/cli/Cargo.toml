@@ -8,10 +8,20 @@ license.workspace = true
 [dependencies]
 otto-protocol = { path = "../protocol" }
 otto-engine = { path = "../engine" }
+# The three crates below are named by `embedded.rs` alone — the one deliberate exception to this
+# crate's protocol-only boundary, because `EmbeddedTransport` IS the adapter between the protocol
+# seam and an in-process engine. `transport.rs`, `render.rs`, and the REPL stay protocol-only.
+# Note there is deliberately no `otto-engine-core` edge: the trait objects are unsized at the
+# call sites, so not one `engine-core` seam is named here.
+otto-persistence = { path = "../persistence" }
+otto-extensions = { path = "../extensions" }
+otto-workspace = { path = "../workspace" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+dirs = "5"
 rustyline = "14"
 
 [dev-dependencies]
 uuid = { workspace = true }
+tempfile = { workspace = true }

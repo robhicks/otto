@@ -5,6 +5,7 @@
 //! translated through a compile-time catalog) does not extend to this crate — the CLI has no
 //! catalog, no `t`/`tf`, no locale, by design, not by omission.
 
+pub mod embedded;
 pub mod render;
 pub mod transport;
 
