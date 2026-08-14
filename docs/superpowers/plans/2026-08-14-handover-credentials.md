@@ -138,9 +138,7 @@ In `crates/remote/src/lib.rs`'s `#[cfg(test)]` module:
 
 In `crates/remote/src/fly.rs` tests:
 - `create_machine_body_has_image_env_guest_and_services` — unchanged (the env is still `OTTO_PROMOTION_SECRET`).
-- The `provision_*` wiremock tests: add an assertion that the `/promote` POST carries the `X-Otto-Session-Secret` header matching the machine token. `mount_happy_path`'s `/promote` mock gains `.and(header("x-otto-session-secret", ..))` — but the token is minted inside `provision`, so the mock must match "any value of that header": use `header("x-otto-session-secret", HeaderValue)` matcher with any-value semantics (wiremock's `header` matcher with a wildcard is not built-in; use a custom approach — see Step 3 note) or match via `header("x-otto-session-secret", HeaderValue::from_static(..))` against a captured value.
-
-Implementation note for the header assertion: wiremock's `matchers::header` takes an exact value. To assert "a session-secret header is present", mount the `/promote` mock with a custom `Match` impl (or match `header("x-otto-session-secret", ...)` with the value derived from `handle.token` after provision — but the mock must be mounted *before* provision). Simplest deterministic approach: give `mint_session_secret` no injection seam, and in the fly tests assert the header is present using `wiremock::matchers::header` with an "any non-empty value" matcher implemented inline (`impl Match for SessionSecretPresent`). Fall back to asserting presence via a `Mock` with `.and(matcher)` that checks the header key exists and is non-empty.
+- The `provision_*` wiremock tests: assert the `/promote` POST carries the `X-Otto-Session-Secret` header using **`wiremock::matchers::header_exists("x-otto-session-secret")`** (presence-only — the token is minted inside `provision`, so an exact-value matcher mounted before provision cannot know it) optionally chained with `header_regex("x-otto-session-secret", "^[0-9a-f]{32}$")` for the 32-hex shape. **No custom `Match` impl** — that is a needless rabbit hole. The value-equality claim is covered by `create_machine_body_has_image_env_guest_and_services` (env injection) + the existing `handle.token.len() == 32` assert, since header and env share the same mint. Note in the report that `header_exists` asserts presence only.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -153,7 +151,7 @@ Expected: FAIL to compile — `mint_session_secret` not found, `push_promote_bun
 - Add `pub fn mint_session_secret() -> String` (doc: fresh 32-hex per-session credential; blast radius one session). `use uuid::Uuid;`.
 - `push_promote_bundle(endpoint: &str, bearer: &str, session_secret: &str, bundle: &PromoteBundle)` — add `.header("X-Otto-Session-Secret", session_secret)` to the POST (alongside the existing `.bearer_auth(bearer)`).
 - `VpsTarget::provision`: `let secret = mint_session_secret(); push_promote_bundle(&self.endpoint, &self.token, &secret, bundle).await?; Ok(RemoteHandle::new(self.endpoint.clone(), secret))`. Update `VpsTarget::new`'s doc (token is the machine-wide pusher credential; the handle carries the session secret).
-- **Remove** `VpsTarget::export` (the whole `pub async fn export` at `:305-307`).
+- **Remove** `VpsTarget::export` (the whole `pub async fn export` at `:305-307`). In the same edit, update the stale doc on `export_bundle` (`:262-263`, "Shared by `VpsTarget::export` (vps demote)…") — it is now shared by the vps/microvm/fly demote pulls via the stored handle.
 - `MicrovmTarget::provision`: `push_promote_bundle(&handle.endpoint, &handle.token, &machine.token, bundle)` — note `handle.token == machine.token`; pass it explicitly as the session secret.
 
 `crates/remote/src/fly.rs`:
@@ -228,8 +226,10 @@ git commit -m "remote: mint per-session secrets and push them over X-Otto-Sessio
 - [ ] **Step 1: Write the failing tests**
 
 Add to the `#[cfg(test)]` module in `crates/engine/src/serve.rs` (or a new `#[cfg(test)]` submodule) unit tests for the pure pieces:
-- `machine_workspace_authorized` accepts the machine secret, accepts a recorded session secret, and rejects a wrong secret (build a small `ServeState`-like fixture — note `ServeState` fields are private; if unit-testing is awkward, cover these behaviors in `tests/auth.rs` in Task 6 and skip here). Prefer the integration coverage in Task 6 if a unit fixture is disproportionate; state that choice in the report.
+- `machine_workspace_authorized` accepts the machine secret, accepts a recorded session secret, and rejects a wrong secret (build a small `ServeState`-like fixture — note `ServeState` fields are private; if unit-testing is awkward, cover these behaviors in `tests/auth.rs` in Task 6 and skip here).
 - The pre-ownership detection helper (a `fn` extracting "is this a legacy bundle?" from raw bytes) — unit-test `is_pre_ownership_bundle(bytes)` against a legacy-shaped body, a garbage body, and a valid bundle.
+
+**Mandatory report note:** if the `machine_workspace_authorized` unit fixture is disproportionate (private fields), that is a *decision to defer to Task 6's integration coverage*, and the implementer must say so explicitly in the report rather than silently skipping. The pre-ownership helper is small and pure; it must be unit-tested here.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -247,8 +247,14 @@ Expected: PASS.
 
 - [ ] **Step 5: Build the workspace; confirm the integration failures are behavioral, not compile**
 
-Run: `cargo build --workspace`
-Expected: SUCCESS — the pre-existing integration harnesses still **compile** (they never construct `Promoted` and never call the changed private helpers). They now fail at **runtime** (e.g. `vps_promote.rs`'s `post_promote` sends no header → 400; `auth.rs`'s Machine attach uses the machine secret → 401; `microvm.rs`'s `/export` uses the machine secret → 401). **This is the stated red window, closed by Task 6.** Do NOT fix the harnesses here.
+Run: `cargo build --workspace --tests` (or `cargo check --all-targets`) — `cargo build --workspace` alone does not compile the `tests/*.rs` targets, so this is the gate that genuinely proves the red window is compile-green.
+Expected: SUCCESS — the pre-existing integration harnesses still **compile** (they never construct `Promoted` and never call the changed private helpers). They now fail at **runtime**:
+- **`tests/vps_promote.rs`** — genuinely red: `post_promote` sends no `X-Otto-Session-Secret` header → 400; `/export` and post-promote WS reconnects present `Bearer TOKEN` (the machine secret) → 401.
+- **`tests/auth.rs`** — genuinely red: the `Machine`-mode tests (`machine_attach_with_the_promotion_secret_adopts_the_session_owner` at `:669`, `machine_attach_with_the_promotion_secret_reaches_ready` at `:978`) attach with `SECRET` and expect `Ready`; a Machine receiver now requires the session's per-session secret → 401/opaque failure.
+- **`tests/microvm.rs`** — **stays green**: `TestServeProvisioner` boots with `promotion_secret = TOKEN` and returns `token: TOKEN`, so post-Task-2 `MicrovmTarget::provision` pushes `session_secret = machine.token = TOKEN`; post-Task-3 the receiver records session→TOKEN and `/export` with bearer TOKEN returns 200. Do NOT chase phantom failures here.
+- **`tests/serve.rs`** — **stays green**: `promote_then_demote_round_trip_preserves_session` is loopback-only and untouched by Task 3 (the loopback → `SingleUser` engine ignores credentials; `authed_endpoint_request`'s `Bearer TOKEN` is ignored).
+
+**This is the stated red window, closed by Task 6.** Do NOT fix the harnesses here.
 
 - [ ] **Step 6: Format and commit**
 
@@ -361,7 +367,7 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 
 - Add a session-secret constant, e.g. `const SESSION_SECRET: &str = "session-secret";`, distinct from `TOKEN` (the machine secret) — the whole point is proving the two differ (spec success criterion 3).
 - `post_promote(base, token, body)` gains a session-secret param and sends `X-Otto-Session-Secret`; every call passes `SESSION_SECRET` (or a per-test fresh value).
-- `post_export(base, token, session)` now authenticates with the **session secret** for `/export`; calls that currently use `TOKEN` switch to `SESSION_SECRET` where the pushed session used `SESSION_SECRET`. Update every `/export` call site.
+- `post_export(base, token, session)` now authenticates with the **session secret** for `/export`; calls that currently use `TOKEN` switch to `SESSION_SECRET` where the pushed session used `SESSION_SECRET`. **Watch for status-code expectation changes, not just credential swaps:** the new `session_secret` check precedes `export_promotion`, so `export_unknown_session_is_not_found` (currently 404) becomes 401 (a never-promoted session has no recorded secret → 401, spec §3.3). Update every `/export` call site's expected status accordingly.
 - WS reconnects to the receiver: `authed_ws_request` currently sends `Bearer TOKEN`. For post-promote reconnects that must authenticate as a Machine receiver, use the session secret from the promote (the `Promoted` frame or the `handle.token`). The harness-level `start_receiver` still boots with `promotion_secret = TOKEN`; session secrets are minted/recorded per push.
 - `vps_target_provisions_against_a_receiver` / `vps_target_teardown_does_not_stop_the_receiver` / `vps_target_provision_errors_on_non_2xx`: pass a session secret to the push; assert `handle.token` is a fresh 32-hex != `TOKEN`.
 - `handover_vps_promote_points_at_receiver`: assert the `Promoted` frame's `token` is a non-empty string and != `TOKEN` (spec criterion 2).
@@ -378,11 +384,13 @@ git commit -m "engine: refuse a demotion bundle whose owner differs from the loc
 
 - [ ] **Step 3: Migrate `tests/auth.rs`**
 
-- The `Machine`-mode tests currently attach with the **machine secret** (`SECRET`) and expect `Ready` (`machine_attach_with_the_promotion_secret_adopts_the_session_owner` at `:669`, and the header path). Under slice 3 a Machine receiver requires the session's **per-session** secret. Rework: build the receiver with `accept_promotions = true`, push a bundle via `POST /promote` (with `X-Otto-Session-Secret: <secret>`) to seed `session_secrets`, then:
-  - attach with `<secret>` → `Ready`, adopts the session owner (the existing adoption assertion stays).
+- **`start_machine` (`:190-202`) must build with `accept_promotions = true`** — it currently passes `false` as the last arg to `serve_app(service, auth, test_capabilities(), None, false)`. Under slice 3 the Machine-mode tests seed `session_secrets` via `POST /promote`, which 403s unless acceptance is on. Flipping it is safe for the helper's other consumers (`machine_rejects_session_creation` and `machine_handshake_has_a_deadline` don't depend on the flag).
+- The `Machine`-mode tests that currently attach with the **machine secret** (`SECRET`) and expect `Ready` — **`machine_attach_with_the_promotion_secret_adopts_the_session_owner` (`:669`) AND `machine_attach_with_the_promotion_secret_reaches_ready` (`:978`)** — must switch to the session's **per-session** secret. Rework each: push a bundle via `POST /promote` (with `X-Otto-Session-Secret: <secret>`) to seed `session_secrets`, then:
+  - attach with `<secret>` → `Ready`, adopts the session owner (the `:669` adoption assertion stays).
   - attach with `SECRET` (the machine secret) → opaque `authentication failed` (spec criterion 3).
   - attach with a wrong `<other>` → opaque failure.
-- `machine_rejects_session_creation` (`:711`): still true — but the `Attach` without `?session=` now fails at the secret lookup; assert the opaque error + the store stays empty.
+- `machine_rejects_session_creation` (`:711`): still true — but the `Attach` without `?session=` now fails at the secret lookup (A5); assert the opaque error + the store stays empty.
+- `machine_handshake_has_a_deadline` (`:953`): its assertions still pass (no `?session=` → immediate opaque failure instead of a deadline wait), but its premise comment is now stale — update the one-line comment to note the Machine credential is the per-session secret, so a header-less `?session=`-less connection now fails at the lookup rather than the deadline.
 - Any test that pushes to a `Machine` receiver directly (`POST /promote`) gains the header.
 
 - [ ] **Step 4: Migrate `tests/serve.rs`**
