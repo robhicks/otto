@@ -19,6 +19,7 @@ members = [
     "crates/mcp-git",
     "crates/mcp-bash",
     "crates/mcp-lsp",
+    "crates/cli",
 ]
 exclude = ["ui-dioxus"]
 
