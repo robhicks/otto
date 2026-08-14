@@ -1,6 +1,6 @@
 # Handover Credentials Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Narrow the handover credential from a machine-wide secret to a per-session secret. `ServerMessage::Promoted.token` becomes a required `String` (always present); every `RemoteTarget` mints a fresh opaque per-session secret at provision time, delivered to the receiver over the provisioning channel (machine env for Fly, the restore-push for vps/microvm) and reported to the client via `Promoted.token`; a long-lived `--accept-promotions`/`--promotion-receiver` receiver keeps a session→secret map consulted by `/export`, `/workspace`, and the `Machine`-mode WS handshake; secrets are disposed when the session is demoted. Carries the slice-1a review items: an actionable `/promote` 400 for pre-ownership bundles, an owner-match check in `accept_demotion`, and a documented source/client-side-only contract for `RemoteWorkspace`.
 
