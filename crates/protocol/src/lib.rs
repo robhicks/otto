@@ -123,14 +123,15 @@ pub enum Command {
         session: SessionId,
     },
     /// Authenticate as `user` using the provided credentials. The engine replies with
-    /// `ServerMessage::LoggedIn` (or `ServerMessage::Error`). No-op in `SingleUser`/`Machine`
-    /// modes — the pre-shared token already authenticated the connection.
+    /// `ServerMessage::LoggedIn` (or `ServerMessage::Error`). Not applicable in `SingleUser` /
+    /// `Machine` modes — a `SingleUser` connection needs no credential and a `Machine` one
+    /// authenticates with the promotion secret, so `Login` is rejected with the opaque error.
     Login {
         credentials: Credentials,
     },
     /// Attach to an already-authenticated connection using `token` — a bearer minted by a prior
-    /// `LoggedIn`, or the pre-shared `--token`. No-op while the transport-level bearer is in
-    /// force; a later slice keys it to refresh-token rotation.
+    /// `LoggedIn` (in `Users` mode) or the promotion secret (in `Machine` mode). Not applicable
+    /// in `SingleUser` mode. Replied with `ServerMessage::LoggedIn`.
     Attach {
         token: String,
     },
