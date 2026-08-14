@@ -77,6 +77,15 @@ cargo build --workspace
 cargo test --workspace          # offline & deterministic — no API keys or network needed
 ```
 
+Start an interactive session in a repo:
+
+```bash
+cd /path/to/repo && otto
+```
+
+Each prompt runs a full turn (Plan → find context → code → verify) and the session remembers
+prior turns. Ctrl-C cancels a running turn; Ctrl-D exits.
+
 Run a single turn against a directory:
 
 ```bash
