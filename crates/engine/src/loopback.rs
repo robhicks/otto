@@ -82,6 +82,9 @@ impl RemoteTarget for LoopbackTarget {
             ..crate::build_capabilities()
         };
         let promotion_secret = self.auth.promotion_secret.clone().unwrap_or_default();
+        // The handle's token is a fresh per-session mint — under `SingleUser` it is a uniform
+        // invariant (the provisioned engine ignores credentials), not a functional credential.
+        let secret = crate::mint_session_secret();
         let promote = Some(PromoteConfig {
             token: promotion_secret.clone(),
             mode: PromoteMode::Loopback {
@@ -98,7 +101,7 @@ impl RemoteTarget for LoopbackTarget {
 
         Ok(RemoteHandle::with_task(
             format!("ws://127.0.0.1:{port}"),
-            promotion_secret,
+            secret,
             task,
         ))
     }
