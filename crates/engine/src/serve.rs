@@ -1631,21 +1631,16 @@ async fn handle_handover(
         Some((endpoint, tok)) => (endpoint, tok),
         None => {
             let target: Box<dyn otto_remote::RemoteTarget> = match &cfg.mode {
-                otto_remote::PromoteMode::Loopback { base_dir } => Box::new(
-                    // The provisioned engine inherits `SingleUser` regardless of the source's
-                    // mode (spec §6.5): a loopback provision is in-process, same trust domain,
-                    // and needs no cross-machine credential — `Promoted.token` stays `None`.
-                    LoopbackTarget::new(
-                        AuthConfig {
-                            mode: AuthMode::SingleUser,
-                            authenticator: None,
-                            promotion_secret: None,
-                            handshake_deadline: std::time::Duration::from_secs(10),
-                        },
-                        base_dir.clone(),
-                        to_remote,
-                    ),
-                ),
+                otto_remote::PromoteMode::Loopback { base_dir } => Box::new(LoopbackTarget::new(
+                    AuthConfig {
+                        mode: AuthMode::SingleUser,
+                        authenticator: None,
+                        promotion_secret: None,
+                        handshake_deadline: std::time::Duration::from_secs(10),
+                    },
+                    base_dir.clone(),
+                    to_remote,
+                )),
                 otto_remote::PromoteMode::Vps { endpoint } => Box::new(
                     otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
                 ),
@@ -1703,15 +1698,10 @@ async fn handle_handover(
         }
     };
     let msg = if to_remote {
-        // Deliver a token only when the remote uses a different bearer than the source (Fly mints
-        // a fresh per-session token); reuse-targets (loopback/vps/microvm) carry cfg.token, so send
-        // None. A provisioned engine with no bearer (a `SingleUser` loopback, §6.5) also sends
-        // None — an empty token is never a credential to switch to.
-        let handover_token = (!tok.is_empty() && tok != cfg.token).then(|| tok.clone());
         ServerMessage::Promoted {
             session,
             endpoint,
-            token: handover_token,
+            token: tok,
         }
     } else {
         ServerMessage::Demoted { session, endpoint }
