@@ -184,21 +184,63 @@ pub struct TurnSummary {
 pub struct SessionHistory { turns: Vec<TurnSummary> }
 ```
 
-Built by `EngineService` before each turn: read `TurnRecord`s for the session (goal, outcome),
-join against `replay_since` for `FileEdit` paths and the `VerifyResult`. **No new store table,
-no new event variant, no wire change.** Because `TurnRecord` already rides inside `SessionState`,
-history survives promote/demote with no additional work.
+**History is derived from `TurnRecord` alone — there is no event-log join.** The orchestrator
+already knows every one of these facts at the end of a turn: it produced the milestones, it
+emitted each `FileEdit`, and it emitted the `VerifyResult`. So `TurnOutcome` carries them
+(§2.2), `record_turn` persists the whole outcome, and building history is a single read of the
+session's turn records.
 
-### 2.2 Milestones need a persisted home
+This replaces an earlier design that joined `TurnRecord` against `replay_since` for the edited
+paths and verify result. Deriving both from one row is cheaper (no event-log scan per turn),
+simpler to test, and removes a class of skew where the log and the outcome could disagree.
 
-The milestone text is currently discarded. It is folded into `TurnOutcome`, which is already
-persisted as `TurnRecord.outcome: serde_json::Value`.
+**No new store table, no new event variant, no wire change.** Because `TurnRecord` already rides
+inside `SessionState`, history survives promote/demote with no additional work.
 
-This is deliberately chosen over the alternative of widening the `Log` message to carry
-milestone prose. `TurnOutcome` is structured, is already durable, is already promote-safe, and
-costs one additive field. Widening `Log` would be stringly-typed, would have to be re-parsed to
-be useful, and would put semantic content into a message that is explicitly untranslated
-passthrough on the UI boundary.
+### 2.1.1 The store needs one new read method
+
+`SessionStore` can write turn records (`record_turn`) but cannot read them back. The only
+accessor is `snapshot()`, which copies the session's entire event log — far too heavy to call
+before every turn. `SessionStore` therefore gains:
+
+```rust
+/// The session's completed turn records in ascending turn_index order. Scoped by owner:
+/// returns an empty Vec for an unknown session and, identically, for a session `owner` does
+/// not own — matching `replay_since`'s non-oracle contract.
+async fn turns(
+    &self,
+    owner: &otto_protocol::UserId,
+    session: SessionId,
+) -> anyhow::Result<Vec<TurnRecord>>;
+```
+
+Owner-scoping and the empty-on-unauthorized behavior deliberately mirror `replay_since`, so this
+method cannot become an existence oracle for another principal's sessions.
+
+### 2.2 `TurnOutcome` carries the turn's summary
+
+`TurnOutcome` is today `{ ok: bool }` (`crates/engine-core/src/orchestrator.rs:27`). It gains the
+three facts history needs, all of which the orchestrator already holds:
+
+```rust
+pub struct TurnOutcome {
+    pub ok: bool,
+    pub milestones: Vec<String>,
+    pub files_edited: Vec<PathBuf>,
+    pub verify: Option<VerifySummary>,
+}
+```
+
+`TurnOutcome` is persisted as `TurnRecord.outcome: serde_json::Value`, so this needs **no schema
+migration**. One catch the implementation must not miss: `record_turn` currently writes a
+hand-built `serde_json::json!({ "ok": outcome.ok })` (`crates/engine/src/service.rs:305`) rather
+than serializing the outcome, so that construction site must switch to serializing `TurnOutcome`
+or the new fields will be silently dropped on write.
+
+Storing milestones here is deliberately chosen over widening the `Log` message to carry milestone
+prose. `TurnOutcome` is structured, already durable, and already promote-safe. Widening `Log`
+would be stringly-typed, would have to be re-parsed to be useful, and would put semantic content
+into a message that is explicitly untranslated passthrough on the UI boundary.
 
 ### 2.3 Threading to agents
 
@@ -276,13 +318,16 @@ does not conclude the catalog is missing keys.
 - **New crate** `otto-cli` at `0.1.0`.
 - `otto-engine-core` — **breaking**: `Orchestrator::run_turn` gains a parameter; `AgentCtx` gains
   a field. Minor bump under the pre-1.0 convention the workspace already uses, flagged in the PR.
-- `otto-engine-core` — also additive: `TurnOutcome` (`crates/engine-core/src/orchestrator.rs:27`)
-  gains `milestones`.
-- `otto-persistence` — **unchanged**, and this is the point of storing milestones in
-  `TurnOutcome`. `TurnRecord.outcome` is an opaque `serde_json::Value`, so a new field inside the
-  serialized outcome is invisible to the store: no column, no migration, and **no `PRAGMA
-  user_version` bump**. A schema break would force every user to delete their session database,
-  which is far too high a price for plan text. Existing rows deserialize with the field absent.
+- `otto-engine-core` — also breaking: `TurnOutcome` gains three fields, so every construction
+  site and exhaustive match updates. Same minor bump.
+- `otto-persistence` — **breaking**: `SessionStore` gains `turns()` (§2.1.1). Any implementor
+  must add it; within the workspace that is `SqliteStore` plus test fakes. 0.1.0 → 0.2.0.
+- **No database schema change, and this is a hard constraint on the design.**
+  `TurnRecord.outcome` is an opaque `serde_json::Value`, so the new outcome fields need no
+  column, no migration, and **no `PRAGMA user_version` bump**. The store refuses to open when its
+  version does not match, so a schema break would force every existing user to delete their
+  session database — far too high a price for plan text. Turn rows written before this change
+  deserialize with the new fields absent, which `#[serde(default)]` must cover.
 - `otto-protocol` — **unchanged.** No new variants, no field changes.
 
 ---
