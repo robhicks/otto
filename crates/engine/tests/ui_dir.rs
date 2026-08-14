@@ -10,13 +10,13 @@ use std::sync::Arc;
 use otto_engine::{
     EngineService, build_default_registry, build_tool_registry, serve_app, serve_with_ui_dir,
 };
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
+use otto_protocol::AuthMode;
 use otto_providers::LocalProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
 use tower::ServiceExt; // for `oneshot`
-
-const TOKEN: &str = "test-token";
 
 /// Build the serve router (unbound), optionally with a `--ui-dir` bundle directory layered on.
 async fn build_app(ui_dir: Option<PathBuf>) -> (axum::Router, tempfile::TempDir) {
@@ -38,9 +38,17 @@ async fn build_app(ui_dir: Option<PathBuf>) -> (axum::Router, tempfile::TempDir)
         workspace,
         tools,
     );
+    // `SingleUser`: this harness only exercises the static bundle route (unauthenticated by
+    // design) and the no-ui-dir 404, never the `/ws` handshake.
+    let auth = AuthConfig {
+        mode: AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_secs(10),
+    };
     let app = serve_app(
         service,
-        TOKEN.to_string(),
+        auth,
         otto_protocol::CapabilitiesManifest {
             engine_remote: false,
             local_llm: false,

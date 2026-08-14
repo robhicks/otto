@@ -11,10 +11,11 @@ use otto_engine::{
     UnsupportedProvisioner, build_default_registry, build_tool_registry, export_bundle, serve_app,
     serve_run,
 };
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::WorkspaceSnapshot;
 use otto_persistence::{SessionState, SessionStatus, SqliteStore};
-use otto_protocol::{CapabilitiesManifest, SessionId};
+use otto_protocol::{AuthMode, CapabilitiesManifest, SessionId};
 use otto_workspace::LocalWorkspace;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -100,8 +101,15 @@ impl Provisioner for TestServeProvisioner {
             workspace,
             tools,
         );
-        // accept_promotions = true so the /promote restore RPC is live.
-        let app = serve_app(service, TOKEN.to_string(), caps(), None, true);
+        // The provisioned serve is a `--promotion-receiver` (`AuthMode::Machine`): accept
+        // promotions is true so /promote is live, and `TOKEN` doubles as the promotion secret.
+        let auth = AuthConfig {
+            mode: AuthMode::Machine,
+            authenticator: None,
+            promotion_secret: Some(TOKEN.to_string()),
+            handshake_deadline: std::time::Duration::from_secs(10),
+        };
+        let app = serve_app(service, auth, caps(), None, true);
         let listener = self
             .listener
             .lock()
@@ -250,6 +258,24 @@ fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::cl
     req
 }
 
+/// Read the `Hello` greeting (always the first frame, in every mode).
+async fn hello_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) {
+    let hello = next_json(ws).await.expect("hello frame");
+    assert_eq!(hello["type"], "hello");
+}
+
+/// Read `Hello` then `Ready`, returning the `Ready` frame.
+async fn ready_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> serde_json::Value {
+    hello_frame(ws).await;
+    let ready = next_json(ws).await.expect("ready frame");
+    assert_eq!(ready["type"], "ready");
+    ready
+}
+
 async fn next_json(
     ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
 ) -> Option<serde_json::Value> {
@@ -299,14 +325,16 @@ async fn start_source_microvm() -> (String, tempfile::TempDir, tempfile::TempDir
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("ws://127.0.0.1:{port}");
-    let app = otto_engine::serve_app_with_base(
-        service,
-        TOKEN.to_string(),
-        caps(),
-        promote,
-        false,
-        base.clone(),
-    );
+    // The source's own posture is `SingleUser` — this harness drives it only through its WS
+    // handover commands, never a credential (its handover token is the receiver's promotion
+    // secret, carried by the `PromoteConfig`).
+    let auth = AuthConfig {
+        mode: AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_secs(10),
+    };
+    let app = otto_engine::serve_app_with_base(service, auth, caps(), promote, false, base.clone());
     tokio::spawn(async move {
         serve_run(listener, app, None).await.unwrap();
     });
@@ -320,8 +348,7 @@ async fn handover_microvm_promote_is_unsupported_without_feature() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let ready = next_json(&mut ws).await.unwrap();
-    assert_eq!(ready["type"], "ready");
+    let ready = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
@@ -356,10 +383,8 @@ async fn handover_microvm_demote_without_prior_promote_errs() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let session = next_json(&mut ws).await.unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let ready = ready_frame(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
 
     let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
     ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))

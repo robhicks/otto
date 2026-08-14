@@ -7,10 +7,11 @@ use otto_engine::{
     EngineService, PromoteBundle, RemoteTarget, VpsTarget, build_default_registry,
     build_tool_registry, serve_app, serve_run,
 };
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::WorkspaceSnapshot;
-use otto_persistence::{SessionState, SessionStatus, SqliteStore};
-use otto_protocol::{CapabilitiesManifest, SessionId};
+use otto_persistence::{SessionState, SessionStatus, SessionStore, SqliteStore};
+use otto_protocol::{AuthMode, CapabilitiesManifest, SessionId};
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
@@ -53,7 +54,9 @@ fn caps() -> CapabilitiesManifest {
     }
 }
 
-/// Start a receiver `otto serve` on an ephemeral port. Returns its `http://127.0.0.1:<port>` base.
+/// Start a `--promotion-receiver` serve (`AuthMode::Machine`) on an ephemeral port. Returns its
+/// `http://127.0.0.1:<port>` base. `TOKEN` doubles as the promotion secret — the credential the
+/// `/promote`/`/export`/`/workspace` RPCs and a WS `Bearer` header all carry.
 async fn start_receiver(accept_promotions: bool) -> (String, tempfile::TempDir, tempfile::TempDir) {
     let ws_dir = tempfile::tempdir().unwrap();
     let db_dir = tempfile::tempdir().unwrap();
@@ -69,7 +72,13 @@ async fn start_receiver(accept_promotions: bool) -> (String, tempfile::TempDir, 
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), caps(), None, accept_promotions);
+    let auth = AuthConfig {
+        mode: AuthMode::Machine,
+        authenticator: None,
+        promotion_secret: Some(TOKEN.to_string()),
+        handshake_deadline: std::time::Duration::from_secs(10),
+    };
+    let app = serve_app(service, auth, caps(), None, accept_promotions);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -233,16 +242,27 @@ async fn export_malformed_session_id_is_bad_request() {
 
 #[tokio::test]
 async fn demote_without_promote_config_is_unavailable() {
-    let (recv_http, _w, _d) = start_receiver(true).await;
+    let (recv_http, _w, db_dir) = start_receiver(true).await;
     let recv_ws = recv_http.replace("http://", "ws://");
-    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{recv_ws}/ws")))
-        .await
-        .unwrap();
-    let session = next_json(&mut ws).await.unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
+    // A `Machine` receiver creates no sessions on connect, so seed the session the connection
+    // adopts (the promotion-secret header pre-resolves; `?session=` names the promoted copy).
+    let store = SqliteStore::open(db_dir.path().join("r.db")).await.unwrap();
+    let session = SessionStore::create_session(
+        &store,
+        &otto_protocol::UserId::local(),
+        "promoted",
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
+        "{recv_ws}/ws?session={}",
+        session.0
+    )))
+    .await
+    .unwrap();
+    ready_frame(&mut ws).await;
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": session.0.to_string() } });
     ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
         .await
         .unwrap();
@@ -273,10 +293,8 @@ async fn demote_with_rejected_export_surfaces_error() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let session = next_json(&mut ws).await.unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let ready = ready_frame(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
     // NOTE: session was created on the source but never promoted, so the receiver has no copy.
     let demote = serde_json::json!({ "DemoteToLocal": { "session": session } });
     ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
@@ -352,7 +370,28 @@ fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::cl
     req
 }
 
+/// Read the `Hello` greeting (always the first frame, in every mode).
+async fn hello_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) {
+    let hello = next_json(ws).await.expect("hello frame");
+    assert_eq!(hello["type"], "hello");
+}
+
+/// Read `Hello` then `Ready`, returning the `Ready` frame.
+async fn ready_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> serde_json::Value {
+    hello_frame(ws).await;
+    let ready = next_json(ws).await.expect("ready frame");
+    assert_eq!(ready["type"], "ready");
+    ready
+}
+
 /// Start a SOURCE serve configured to promote in vps mode at `vps_endpoint`. Returns its ws base.
+/// The source's own posture is `SingleUser` — this harness drives it only through its WS
+/// handover commands, never a credential, and its handover token is the receiver's promotion
+/// secret carried by the `PromoteConfig` below (spec §6.5 keeps the per-mode credentials apart).
 async fn start_source_vps(vps_endpoint: String) -> (String, tempfile::TempDir, tempfile::TempDir) {
     let ws_dir = tempfile::tempdir().unwrap();
     let db_dir = tempfile::tempdir().unwrap();
@@ -378,14 +417,13 @@ async fn start_source_vps(vps_endpoint: String) -> (String, tempfile::TempDir, t
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("ws://127.0.0.1:{port}");
-    let app = otto_engine::serve_app_with_base(
-        service,
-        TOKEN.to_string(),
-        caps(),
-        promote,
-        false,
-        base.clone(),
-    );
+    let auth = AuthConfig {
+        mode: AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_secs(10),
+    };
+    let app = otto_engine::serve_app_with_base(service, auth, caps(), promote, false, base.clone());
     tokio::spawn(async move {
         serve_run(listener, app, None).await.unwrap();
     });
@@ -403,8 +441,7 @@ async fn handover_vps_promote_points_at_receiver() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let ready = next_json(&mut ws).await.unwrap();
-    assert_eq!(ready["type"], "ready");
+    let ready = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     // Send PromoteToRemote (externally tagged) and expect a Promoted frame at the receiver.
@@ -435,7 +472,7 @@ async fn handover_vps_demote_pulls_session_back_to_source() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let ready = next_json(&mut ws).await.unwrap();
+    let ready = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     // Promote to the receiver.
@@ -495,10 +532,8 @@ async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!("{src_ws}/ws")))
         .await
         .unwrap();
-    let session = next_json(&mut ws).await.unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let ready = ready_frame(&mut ws).await;
+    let session = ready["session"].as_str().unwrap().to_string();
     let promote = serde_json::json!({ "PromoteToRemote": { "session": session } });
     ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
         .await
@@ -548,8 +583,7 @@ async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
     )))
     .await
     .unwrap();
-    let ready2 = next_json(&mut ws2).await.unwrap();
-    assert_eq!(ready2["type"], "ready");
+    let ready2 = ready_frame(&mut ws2).await;
     assert_eq!(ready2["session"].as_str().unwrap(), session);
 
     // Copy semantics: demote is non-destructive — the receiver still holds the session.
@@ -624,15 +658,15 @@ async fn vps_promote_resumes_session_and_workspace_on_receiver() {
         .unwrap();
     assert_eq!(handle.endpoint, recv_ws);
 
-    // --- Reconnect to the receiver: same session, replayed gap after seq 0. ---
+    // --- Reconnect to the receiver: same session, replayed gap after seq 0. The `Machine`
+    // receiver pre-resolves from the promotion-secret header and adopts the promoted session. ---
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
         "{recv_ws}/ws?session={}&last_seq=0",
         session.0
     )))
     .await
     .unwrap();
-    let ready = next_json(&mut ws).await.unwrap();
-    assert_eq!(ready["type"], "ready");
+    let ready = ready_frame(&mut ws).await;
     assert_eq!(ready["session"].as_str().unwrap(), session.0.to_string());
 
     let mut replayed = Vec::new();
