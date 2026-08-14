@@ -707,6 +707,25 @@ impl EngineService {
                 id.0, expected.0
             )));
         }
+        // `restore_over` overwrites the row INCLUDING its owner, so the id binding alone is not
+        // enough: a tampered bundle carrying the right id but a different owner would reassign
+        // the local row's ownership. Refuse it. `owner_of` is a reverse-existence oracle, so a
+        // demotion for an unknown local row fails closed here too — and its error is a genuine
+        // store-side failure (`Failed`), never leaked to a client, with the Refused text
+        // re-deriving both ids from the known-good `expected`.
+        let current_owner = self
+            .store
+            .owner_of(expected)
+            .await
+            .map_err(AcceptError::Failed)?;
+        if bundle.session.owner != current_owner {
+            return Err(AcceptError::Refused(format!(
+                "demotion bundle is owned by {}, but the local copy of {} is owned by {}",
+                bundle.session.owner.as_str(),
+                expected.0,
+                current_owner.as_str(),
+            )));
+        }
         let edits = self.validate_workspace_edits(bundle)?;
         // Overwrite the source's own (stale) session row, then the pre-validated workspace files.
         self.store
@@ -1407,13 +1426,18 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let service = build_test_service(ws.path(), db.path().join("s.db")).await;
 
-        let id = SessionId::new();
+        // Seed a local row: the owner check runs before the sensitive-path validation, so the
+        // demoted bundle must match a real local row for the workspace validation to be reached.
+        let id = service
+            .create_session(&local(), "seed", &serde_json::json!({}))
+            .await
+            .unwrap();
         let bundle = bundle_with(id, std::path::PathBuf::from(".env"), b"SECRET=1".to_vec());
         assert!(matches!(
             service.accept_demotion(bundle.session.id, &bundle).await,
             Err(crate::service::AcceptError::Refused(_))
         ));
-        // Fail-closed: nothing landed — neither the file nor the session.
+        // Fail-closed: nothing landed — neither the file nor a session overwrite.
         assert!(
             service
                 .workspace()
@@ -1421,7 +1445,120 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(service.store().session_status(&local(), id).await.is_err());
+        assert_eq!(
+            service.store().snapshot(&local(), id).await.unwrap().goal,
+            "seed"
+        );
+    }
+
+    /// `restore_over` overwrites the row INCLUDING its `owner`, so without this check a bundle
+    /// carrying a different owner than the local row's current owner would reassign the local
+    /// row's ownership. This is the second half of the overwrite-including-owner hole the
+    /// id-binding (#123) started on: delete the owner check in `accept_demotion` and this goes red.
+    #[tokio::test]
+    async fn accept_demotion_refuses_a_bundle_with_a_different_owner() {
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
+
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let bob = otto_protocol::UserId::parse("bob").unwrap();
+        let id = service
+            .create_session(&alice, "alice's", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Same id (the id binding passes) — but the bundle claims a different owner.
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                owner: bob,
+                goal: "bob's copy".to_string(),
+                status: otto_persistence::SessionStatus::Done,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        let err = service
+            .accept_demotion(id, &bundle)
+            .await
+            .expect_err("a bundle owned by someone other than the local row must be refused");
+        assert!(matches!(err, AcceptError::Refused(_)));
+        // The local row's owner is untouched — the overwrite never happened.
+        assert_eq!(service.store().owner_of(id).await.unwrap(), alice);
+    }
+
+    #[tokio::test]
+    async fn accept_demotion_accepts_a_bundle_with_the_same_owner() {
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
+
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        let alice = otto_protocol::UserId::parse("alice").unwrap();
+        let id = service
+            .create_session(&alice, "alice's", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Same id, same owner: a legitimate demote-pull. It overwrites and keeps the owner.
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                owner: alice.clone(),
+                goal: "advanced".to_string(),
+                status: otto_persistence::SessionStatus::Done,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        let restored = service.accept_demotion(id, &bundle).await.unwrap();
+        assert_eq!(restored, id);
+        assert_eq!(service.store().owner_of(id).await.unwrap(), alice);
+    }
+
+    /// The owner lookup (`owner_of`) is a reverse-existence oracle: a demotion for an id with no
+    /// local row must fail closed rather than restore a row that was never there. The lookup
+    /// error is a genuine store-side failure, mapped to `Failed` (never leaked to a client).
+    #[tokio::test]
+    async fn accept_demotion_refuses_an_unknown_local_row() {
+        use otto_engine_core::types::WorkspaceSnapshot;
+        use otto_persistence::SessionState;
+        use otto_remote::PromoteBundle;
+
+        let ws = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let service = build_test_service(ws.path(), db.path().join("s.db")).await;
+
+        let id = SessionId::new();
+        let bundle = PromoteBundle {
+            session: SessionState {
+                id,
+                owner: local(),
+                goal: "g".to_string(),
+                status: otto_persistence::SessionStatus::Done,
+                config: serde_json::json!({}),
+                events: vec![],
+                turns: vec![],
+            },
+            workspace: WorkspaceSnapshot { files: vec![] },
+        };
+
+        let err = service.accept_demotion(id, &bundle).await;
+        assert!(matches!(err, Err(AcceptError::Failed(_))));
     }
 
     fn scripted_router() -> Arc<dyn Router> {
