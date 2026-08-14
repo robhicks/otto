@@ -1,7 +1,9 @@
 //! The identity backend: the sqlite `AuthStore` that holds users, TOTP secrets,
 //! signing keys, refresh-token hashes, and the `jti` denylist; the RFC 6238 TOTP
-//! verifier with its replay floor and lockout; and the HS256 JWT issuer with
-//! refresh rotation.
+//! verifier with its replay floor and lockout; the HS256 JWT issuer with
+//! refresh rotation; and the [`TotpAuthenticator`] that glues them all behind
+//! the engine-core [`Authenticator`] seam. [`testing`] carries the always-compiled
+//! `FakeAuthenticator` test double the serve integration harnesses use.
 
 mod jwt;
 mod store;
@@ -13,3 +15,416 @@ pub use totp::{
     Clock, FAILURE_WINDOW, FixedClock, MAX_FAILURES, SKEW, STEP_SECS, SystemClock, TotpError,
     TotpVerifier, totp_at, truncate,
 };
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use otto_engine_core::{AuthError, Authenticator, Principal, TokenPair};
+use otto_protocol::Credentials;
+
+/// The production [`Authenticator`]: TOTP login through the verifier's replay floor and
+/// lockout, then the HS256 token lifecycle through the [`JwtIssuer`]. `serve.rs` reaches it
+/// only as `Arc<dyn Authenticator>`.
+#[derive(Clone)]
+pub struct TotpAuthenticator {
+    verifier: TotpVerifier,
+    jwt: JwtIssuer,
+}
+
+impl TotpAuthenticator {
+    /// Build the authenticator over `store` (users, signing keys, refresh hashes, denylist)
+    /// reading time from `clock` — [`SystemClock`] in production, a [`FixedClock`] in tests
+    /// so the whole suite stays deterministic.
+    pub fn new(store: Arc<dyn AuthStore>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            verifier: TotpVerifier::new(store.clone(), clock.clone()),
+            jwt: JwtIssuer::new(store, clock),
+        }
+    }
+}
+
+#[async_trait]
+impl Authenticator for TotpAuthenticator {
+    async fn authenticate(&self, creds: &Credentials) -> Result<Principal, AuthError> {
+        match creds {
+            Credentials::Totp { user, code } => {
+                self.verifier
+                    .verify(user, code)
+                    .await
+                    .map_err(totp_to_auth)?;
+                Ok(Principal { user: user.clone() })
+            }
+        }
+    }
+
+    async fn mint(&self, principal: &Principal) -> Result<TokenPair, AuthError> {
+        self.jwt
+            .mint(&principal.user)
+            .await
+            .map_err(jwt_to_auth)
+            .map(minted_pair_to_token_pair)
+    }
+
+    async fn verify_access(&self, token: &str) -> Result<Principal, AuthError> {
+        self.jwt.verify_access(token).await.map_err(jwt_to_auth)
+    }
+
+    async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
+        self.jwt
+            .rotate_refresh(refresh_token)
+            .await
+            .map_err(jwt_to_auth)
+            .map(minted_pair_to_token_pair)
+    }
+
+    async fn logout(&self, access_token: &str) -> Result<(), AuthError> {
+        self.jwt.logout(access_token).await.map_err(jwt_to_auth)
+    }
+}
+
+/// Map the verifier's verdict onto the seam's. A replayed code folds into
+/// `InvalidCredentials` — replay, an unknown user, and a wrong code are deliberately one
+/// variant (spec A11), so no caller can branch on the distinction and leak it.
+fn totp_to_auth(e: TotpError) -> AuthError {
+    match e {
+        TotpError::Invalid | TotpError::Replay => AuthError::InvalidCredentials,
+        TotpError::RateLimited { retry_after_secs } => AuthError::RateLimited { retry_after_secs },
+        TotpError::Backend(inner) => AuthError::Backend(inner),
+    }
+}
+
+/// Map the issuer's verdict onto the seam's. A bad signature, an expired token, and a
+/// denylisted `jti` are deliberately one variant (spec A11).
+fn jwt_to_auth(e: JwtError) -> AuthError {
+    match e {
+        JwtError::Unverifiable => AuthError::InvalidCredentials,
+        JwtError::Backend(inner) => AuthError::Backend(inner),
+    }
+}
+
+/// The seam's crypto-free token pair, filled from the issuer's minted pair.
+fn minted_pair_to_token_pair(pair: MintedPair) -> TokenPair {
+    TokenPair {
+        access_token: pair.access_token,
+        refresh_token: pair.refresh_token,
+        expires_at: pair.expires_at,
+    }
+}
+
+/// Test doubles for the [`Authenticator`] seam. [`FakeAuthenticator`] lives here, always
+/// compiled and behind no feature gate, because every serve integration harness — `cargo test
+/// --workspace` — constructs it unconditionally (plan-critique resolution A9). Like the
+/// `ScriptedProvider` precedent, it is a test double in an impl crate's public API: it does no
+/// I/O and no crypto, so shipping it inside the binary is harmless.
+pub mod testing {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use otto_engine_core::{AuthError, Authenticator, Principal, TokenPair};
+    use otto_protocol::{Credentials, UserId};
+
+    /// A deterministic [`Authenticator`]: every credential authenticates as the fixed
+    /// `principal`, and tokens it mints verify back to that principal until `logout` revokes
+    /// them. The whole store is an in-memory map of token → user, so two fakes built with
+    /// distinct principals are fully isolated — the cross-tenant shape the serve harnesses
+    /// need. The stored user is the principal `mint` was asked for, so a fake can also mint
+    /// for a tenant that is not its own when a test wants that.
+    pub struct FakeAuthenticator {
+        principal: UserId,
+        tokens: Mutex<HashMap<String, UserId>>,
+    }
+
+    impl FakeAuthenticator {
+        pub fn new(user: UserId) -> Self {
+            Self {
+                principal: user,
+                tokens: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Authenticator for FakeAuthenticator {
+        async fn authenticate(&self, _creds: &Credentials) -> Result<Principal, AuthError> {
+            Ok(Principal {
+                user: self.principal.clone(),
+            })
+        }
+
+        async fn mint(&self, principal: &Principal) -> Result<TokenPair, AuthError> {
+            // Numbered by the current live count, so successive mints are distinguishable and
+            // unique among the tokens still in the map. One lock hold, so concurrent mints
+            // cannot collide on a number.
+            let mut tokens = self.tokens.lock().unwrap();
+            let n = tokens.len() + 1;
+            let access_token = format!("fake-access-{n}");
+            let refresh_token = format!("fake-refresh-{n}");
+            let user = principal.user.clone();
+            tokens.insert(access_token.clone(), user.clone());
+            tokens.insert(refresh_token.clone(), user);
+            Ok(TokenPair {
+                access_token,
+                refresh_token,
+                expires_at: 0,
+            })
+        }
+
+        async fn verify_access(&self, token: &str) -> Result<Principal, AuthError> {
+            match self.tokens.lock().unwrap().get(token) {
+                Some(user) => Ok(Principal { user: user.clone() }),
+                None => Err(AuthError::InvalidCredentials),
+            }
+        }
+
+        async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
+            // Consume the old refresh token and mint a fresh pair for whoever owned it.
+            let user = self
+                .tokens
+                .lock()
+                .unwrap()
+                .remove(refresh_token)
+                .ok_or(AuthError::InvalidCredentials)?;
+            self.mint(&Principal { user }).await
+        }
+
+        async fn logout(&self, access_token: &str) -> Result<(), AuthError> {
+            self.tokens.lock().unwrap().remove(access_token);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use otto_engine_core::{AuthError, Principal};
+    use otto_protocol::{Credentials, UserId};
+
+    use super::*;
+    use crate::store::SqliteAuthStore;
+
+    /// The RFC 6238 Appendix B test secret: the ASCII bytes of "12345678901234567890".
+    const RFC_SECRET: &[u8] = b"12345678901234567890";
+    /// The fixed "now" the whole suite runs at. It must sit comfortably ahead of the wall clock,
+    /// because the JWT issuer mints `exp` from the injected clock while jsonwebtoken validates
+    /// `exp` against the **real** clock — a token minted at a 1970s-era fixed time is already
+    /// expired on arrival. The exact step is irrelevant: every TOTP assertion computes its own
+    /// expected code via `totp_at` at this step.
+    const NOW: u64 = 2_000_000_000;
+
+    fn alice() -> UserId {
+        UserId::parse("alice").unwrap()
+    }
+
+    fn bob() -> UserId {
+        UserId::parse("bob").unwrap()
+    }
+
+    /// A `TotpAuthenticator` over a fresh store with a fixed clock. The returned `TempDir`
+    /// must be kept alive for the duration of the test so the database file is not deleted.
+    async fn authenticator() -> (TotpAuthenticator, SqliteAuthStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteAuthStore::open(dir.path().join("auth.db"))
+            .await
+            .unwrap();
+        let auth = TotpAuthenticator::new(Arc::new(store.clone()), Arc::new(FixedClock(NOW)));
+        (auth, store, dir)
+    }
+
+    /// The step-`NOW` code — the correct code at [`NOW`] — computed from the RFC secret.
+    fn correct_code() -> String {
+        totp_at(RFC_SECRET, NOW / STEP_SECS)
+    }
+
+    /// A code no candidate step (T-1..T+1 around [`NOW`]) produces, so a "wrong code" assertion
+    /// cannot accidentally be satisfied by the skew window.
+    fn wrong_code() -> String {
+        let now = NOW / STEP_SECS;
+        let candidates: Vec<String> = ((now - 1)..=(now + 1))
+            .map(|s| totp_at(RFC_SECRET, s))
+            .collect();
+        (0..6u32)
+            .map(|n| format!("{n:06}"))
+            .find(|c| !candidates.contains(c))
+            .expect("three six-digit codes cannot cover 000000..000005")
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_is_invalid_credentials_never_backend() {
+        let (auth, store, _dir) = authenticator().await;
+        store.enroll_user(&alice(), RFC_SECRET).await.unwrap();
+
+        assert!(matches!(
+            auth.authenticate(&Credentials::Totp {
+                user: alice(),
+                code: wrong_code(),
+            })
+            .await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_correct_code_yields_the_principal() {
+        let (auth, store, _dir) = authenticator().await;
+        store.enroll_user(&alice(), RFC_SECRET).await.unwrap();
+
+        let principal = auth
+            .authenticate(&Credentials::Totp {
+                user: alice(),
+                code: correct_code(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(principal.user, alice());
+    }
+
+    #[tokio::test]
+    async fn a_locked_store_is_rate_limited() {
+        let (auth, store, _dir) = authenticator().await;
+        store.enroll_user(&alice(), RFC_SECRET).await.unwrap();
+
+        for _ in 0..MAX_FAILURES {
+            assert!(matches!(
+                auth.authenticate(&Credentials::Totp {
+                    user: alice(),
+                    code: wrong_code(),
+                })
+                .await,
+                Err(AuthError::InvalidCredentials)
+            ));
+        }
+        // Locked: even the correct code is rejected without being computed against.
+        assert!(matches!(
+            auth.authenticate(&Credentials::Totp {
+                user: alice(),
+                code: correct_code(),
+            })
+            .await,
+            Err(AuthError::RateLimited {
+                retry_after_secs: _
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_access_on_a_minted_token_yields_the_principal() {
+        let (auth, _store, _dir) = authenticator().await;
+        let pair = auth.mint(&Principal { user: alice() }).await.unwrap();
+
+        assert_eq!(
+            auth.verify_access(&pair.access_token).await.unwrap().user,
+            alice()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_access_on_a_logged_out_token_is_invalid_credentials() {
+        let (auth, _store, _dir) = authenticator().await;
+        let pair = auth.mint(&Principal { user: alice() }).await.unwrap();
+        auth.logout(&pair.access_token).await.unwrap();
+
+        assert!(matches!(
+            auth.verify_access(&pair.access_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rotate_refresh_consumes_the_old_token_and_mints_a_fresh_pair() {
+        let (auth, _store, _dir) = authenticator().await;
+        let pair = auth.mint(&Principal { user: alice() }).await.unwrap();
+
+        let rotated = auth.rotate_refresh(&pair.refresh_token).await.unwrap();
+        assert_ne!(rotated.access_token, pair.access_token);
+        assert_ne!(rotated.refresh_token, pair.refresh_token);
+        assert_eq!(
+            auth.verify_access(&rotated.access_token)
+                .await
+                .unwrap()
+                .user,
+            alice()
+        );
+
+        // The old refresh token is single-use: a second rotation is refused. The old access
+        // token, by contrast, is still valid — rotation mints a new pair, it does not log out.
+        assert!(matches!(
+            auth.rotate_refresh(&pair.refresh_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(auth.verify_access(&pair.access_token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_fake_returns_its_fixed_principal_for_any_input() {
+        let fake = testing::FakeAuthenticator::new(alice());
+
+        let principal = fake
+            .authenticate(&Credentials::Totp {
+                user: bob(),
+                code: "000000".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(principal.user, alice());
+    }
+
+    #[tokio::test]
+    async fn the_fake_verifies_only_the_tokens_it_minted() {
+        let alice_fake = testing::FakeAuthenticator::new(alice());
+        let bob_fake = testing::FakeAuthenticator::new(bob());
+        let pair = alice_fake.mint(&Principal { user: alice() }).await.unwrap();
+
+        assert_eq!(
+            alice_fake
+                .verify_access(&pair.access_token)
+                .await
+                .unwrap()
+                .user,
+            alice()
+        );
+        // A token minted by alice's fake is unknown to bob's fake.
+        assert!(matches!(
+            bob_fake.verify_access(&pair.access_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            alice_fake.verify_access("never-minted").await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_fake_logout_denylists_a_minted_token() {
+        let fake = testing::FakeAuthenticator::new(alice());
+        let pair = fake.mint(&Principal { user: alice() }).await.unwrap();
+
+        fake.logout(&pair.access_token).await.unwrap();
+        assert!(matches!(
+            fake.verify_access(&pair.access_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_fake_rotate_consumes_the_old_refresh_token() {
+        let fake = testing::FakeAuthenticator::new(alice());
+        let pair = fake.mint(&Principal { user: alice() }).await.unwrap();
+
+        let rotated = fake.rotate_refresh(&pair.refresh_token).await.unwrap();
+        assert_ne!(rotated.refresh_token, pair.refresh_token);
+        assert_eq!(
+            fake.verify_access(&rotated.access_token)
+                .await
+                .unwrap()
+                .user,
+            alice()
+        );
+        assert!(matches!(
+            fake.rotate_refresh(&pair.refresh_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+}
