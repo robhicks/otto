@@ -81,7 +81,21 @@ impl RemoteTarget for LoopbackTarget {
                 base_dir: dir.join("promote"),
             },
         });
-        let app = crate::serve::app(service, self.token.clone(), capabilities, promote, false);
+        let app = crate::serve::app(
+            service,
+            otto_engine_core::auth::AuthConfig {
+                mode: otto_protocol::AuthMode::SingleUser,
+                authenticator: None,
+                // The provisioned engine keeps the source's token as its machine credential for
+                // `/promote`/`/export` (the loopback demote/re-promote round trip); its `/ws`
+                // accepts any connection as the local principal, per `SingleUser`.
+                promotion_secret: Some(self.token.clone()),
+                handshake_deadline: std::time::Duration::from_secs(10),
+            },
+            capabilities,
+            promote,
+            false,
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();

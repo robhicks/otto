@@ -53,11 +53,14 @@ otto-persistence = { path = "../persistence" }
 otto-remote = { path = "../remote" }
 otto-retrieval = { path = "../retrieval" }
 otto-extensions = { path = "../extensions" }
+otto-auth = { path = "../auth" }
 dirs = "5"
+# Constant-time comparison of the promotion secret on `/ws`, `/workspace`, `/promote`, `/export`.
+subtle = "2"
 rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 anyhow.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "net", "time"] }
 async-trait.workspace = true
 serde = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
@@ -83,3 +86,6 @@ rcgen = "0.13"
 rustls = "0.23"
 # Used only by tests/vps_promote.rs (VpsTarget moved to the otto-remote crate).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Used only by tests/auth.rs: inspecting the server's store after a failed handshake
+# ("asserted by a test that inspects the store afterwards", spec §9 success criterion 2).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

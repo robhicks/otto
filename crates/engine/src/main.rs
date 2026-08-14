@@ -796,9 +796,19 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 
     let scheme = if tls.is_some() { "wss" } else { "ws" };
     let public_ws_base = format!("{scheme}://127.0.0.1:{port}");
+    // Interim wiring between the auth slice's serve rework (Task 6) and the CLI modes (Task 7):
+    // the pre-slice `OTTO_TOKEN` maps to the promotion secret, served in `SingleUser` mode so the
+    // engine stays functional on its default loopback bind. Task 7 replaces this with
+    // `--single-user` / `--promotion-receiver` / `Users` and the `OTTO_PROMOTION_SECRET` rename.
+    let auth = otto_engine_core::auth::AuthConfig {
+        mode: otto_protocol::AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: Some(token),
+        handshake_deadline: std::time::Duration::from_secs(10),
+    };
     let app = serve_app_with_base(
         service,
-        token,
+        auth,
         capabilities,
         promote,
         accept_promotions,

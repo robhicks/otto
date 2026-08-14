@@ -1,5 +1,7 @@
 //! WebSocket transport for the engine. Maps WS frames to `Command`/event frames over an
-//! `EngineService`: bearer-token auth on upgrade, a `Ready { session }` frame on connect,
+//! `EngineService`: a `Hello { auth_mode }` greeting on upgrade, then per-mode authentication
+//! (the `Login`/`Attach` handshake under a deadline in `Users`, nothing in `SingleUser`, the
+//! promotion secret in `Machine`), a `Ready { session }` frame once a principal owns a session,
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
 //! Binds loopback (plaintext `ws://` or, with `serve::run` + a `RustlsConfig`, `wss://`); concurrent sessions are out of scope (see the design spec).
 
@@ -20,12 +22,15 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use otto_engine_core::TurnOutcome;
+use otto_engine_core::auth::{AuthConfig, Authenticator};
 use otto_engine_core::tool::Approver;
 use otto_engine_core::tool::PauseController;
 use otto_protocol::{
-    CapabilitiesManifest, Command, Event, ServerMessage, SessionId, WorkspaceRequest,
+    AuthMode, CapabilitiesManifest, Command, Event, ServerMessage, SessionId, UserId,
+    WorkspaceRequest,
 };
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tower_http::cors::{Any, CorsLayer};
@@ -40,19 +45,18 @@ use otto_remote::{PromoteConfig, RemoteHandle, RemoteTarget, promote};
 struct ConnectParams {
     session: Option<String>,
     last_seq: Option<u64>,
-    /// Bearer token carried in the query string. A browser `WebSocket` can't set an
-    /// `Authorization` header, so the `/ws` upgrade accepts the token here as well.
-    /// Security: tokens in URLs can leak into server logs and browser history — acceptable
-    /// for the loopback/dev posture of sub-project A; the header path stays the recommended
-    /// one for non-browser clients. A later sub-project may move this to a WS subprotocol
-    /// carrier or route through Tauri's Rust-side WS client (which can set headers).
-    token: Option<String>,
 }
 
-/// Shared server state: the engine service and the required bearer token.
+/// The single opaque string every failed authentication presents to the client (A11): the real
+/// cause — wrong code, unknown user, replayed step, expired/denylisted token, a non-auth command
+/// before authentication, a missed deadline — is logged server-side only.
+const AUTH_FAILED: &str = "authentication failed";
+
+/// Shared server state: the engine service and the auth posture (`AuthConfig`), plus the
+/// handover plumbing.
 struct ServeState {
     service: EngineService,
-    token: String,
+    auth: AuthConfig,
     capabilities: CapabilitiesManifest,
     /// `Some` when `--promote-loopback`/`--promote-vps` is set; enables the handover commands.
     promote: Option<PromoteConfig>,
@@ -69,19 +73,40 @@ struct ServeState {
     remotes: Mutex<HashMap<(SessionId, bool), RemoteHandle>>,
 }
 
-/// True if `headers` carry `Authorization: Bearer <token>` matching `token`.
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
+impl ServeState {
+    /// The configured authenticator — present exactly when the mode is `Users`.
+    fn authenticator(&self) -> Option<&Arc<dyn Authenticator>> {
+        self.auth.authenticator.as_ref()
+    }
+}
+
+/// True if `headers` carry `Authorization: Bearer <secret>` — compared constant-time via
+/// `subtle`, so a wrong-length or wrong-value secret leaks neither its prefix nor its length
+/// through a timing side channel.
+fn authorized(headers: &HeaderMap, secret: Option<&str>) -> bool {
+    match (secret, bearer_token(headers)) {
+        (Some(secret), Some(provided)) => bool::from(secret.as_bytes().ct_eq(provided.as_bytes())),
+        _ => false,
+    }
+}
+
+/// The bearer token from an `Authorization: Bearer` header, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        == Some(token)
+        .map(|t| t.to_string())
 }
 
-/// True if the `/ws` upgrade is authorized: a matching `Authorization: Bearer` header
-/// (preferred) or a matching `?token=` query param (the browser path).
-fn authorized_ws(headers: &HeaderMap, token: &str, params: &ConnectParams) -> bool {
-    authorized(headers, token) || params.token.as_deref() == Some(token)
+/// Constant-time compare of a frame-carried credential (an `Attach` token) against the promotion
+/// secret. The header path is `authorized`; this is the post-upgrade sibling for the `Machine`
+/// mode's one frame.
+fn secret_matches(secret: Option<&str>, provided: &str) -> bool {
+    match secret {
+        Some(secret) => bool::from(secret.as_bytes().ct_eq(provided.as_bytes())),
+        None => false,
+    }
 }
 
 /// Resolve the TLS flag pair: both present -> `Some((cert, key))`; neither -> `None`;
@@ -100,14 +125,14 @@ pub fn resolve_tls_paths(
 /// Build the axum app. Exposed for tests so they can serve it on an ephemeral port.
 pub fn app(
     service: EngineService,
-    token: String,
+    auth: AuthConfig,
     capabilities: CapabilitiesManifest,
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
 ) -> AxumRouter {
     app_inner(
         service,
-        token,
+        auth,
         capabilities,
         promote,
         accept_promotions,
@@ -119,7 +144,7 @@ pub fn app(
 /// target). `app` is the same with no base, for servers that are never demoted-from.
 pub fn app_with_base(
     service: EngineService,
-    token: String,
+    auth: AuthConfig,
     capabilities: CapabilitiesManifest,
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
@@ -127,7 +152,7 @@ pub fn app_with_base(
 ) -> AxumRouter {
     app_inner(
         service,
-        token,
+        auth,
         capabilities,
         promote,
         accept_promotions,
@@ -171,16 +196,15 @@ pub fn with_ui_dir(app: AxumRouter, dir: PathBuf) -> AxumRouter {
 
 fn app_inner(
     service: EngineService,
-    token: String,
+    auth: AuthConfig,
     capabilities: CapabilitiesManifest,
     promote: Option<PromoteConfig>,
     accept_promotions: bool,
     public_ws_base: Option<String>,
 ) -> AxumRouter {
-    assert!(!token.is_empty(), "serve token must not be empty");
     let state = Arc::new(ServeState {
         service,
-        token,
+        auth,
         capabilities,
         promote,
         accept_promotions,
@@ -190,9 +214,9 @@ fn app_inner(
     // CORS for the browser UI: it is served from a different origin (dx dev server or
     // otto serve --ui-dir) and its POST /workspace carries an `Authorization` header,
     // so the browser sends a preflight.
-    // `allow_origin(Any)` matches the loopback/dev posture already accepted for the `?token=`
-    // query param on /ws; auth rides the Authorization header (not cookies), so wildcard origin
-    // without credentials mode is correct and exposes nothing extra.
+    // `allow_origin(Any)` matches the loopback/dev posture already accepted for the post-upgrade
+    // `Login`/`Attach` handshake on /ws; auth rides the Authorization header or a WS frame (not
+    // cookies), so wildcard origin without credentials mode is correct and exposes nothing extra.
     // SECURITY: never add `.allow_credentials(true)` here — with `allow_origin(Any)` that is
     // both a tower-http startup panic and a real cross-origin credential leak.
     let cors = CorsLayer::new()
@@ -231,25 +255,51 @@ pub async fn run(
     Ok(())
 }
 
+/// The `/ws` upgrade itself is not the auth boundary (spec §7.2): the socket is accepted and the
+/// `Hello` greeting + `Login`/`Attach` handshake run inside `handle_socket`, per the mode. The
+/// `Authorization` header is passed through so a non-browser client can pre-resolve a principal.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     Query(params): Query<ConnectParams>,
     State(state): State<Arc<ServeState>>,
 ) -> Response {
-    if !authorized_ws(&headers, &state.token, &params) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
-    }
-    ws.on_upgrade(move |socket| handle_socket(socket, params, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, headers, params, state))
 }
 
+/// `POST /workspace` — the per-mode credential table (spec §7.3): `SingleUser` ignores the header
+/// entirely (the route is loopback-bound, single-principal, mints nothing); `Users` requires a
+/// valid access token, verified exactly like the WS path; `Machine` requires the promotion
+/// secret, constant-time. The workspace itself is *not* per-tenant isolated (one process-global
+/// root) — authentication only, per the design spec.
 async fn workspace_handler(
     headers: HeaderMap,
     State(state): State<Arc<ServeState>>,
     body: axum::body::Bytes,
 ) -> Response {
-    if !authorized(&headers, &state.token) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    match state.auth.mode {
+        AuthMode::SingleUser => {}
+        AuthMode::Users => {
+            let Some(token) = bearer_token(&headers) else {
+                return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+                    .into_response();
+            };
+            let Some(authenticator) = state.authenticator() else {
+                return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+                    .into_response();
+            };
+            if let Err(e) = authenticator.verify_access(&token).await {
+                eprintln!("serve: /workspace rejected: {e:?}");
+                return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+                    .into_response();
+            }
+        }
+        AuthMode::Machine => {
+            if !authorized(&headers, state.auth.promotion_secret.as_deref()) {
+                return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+                    .into_response();
+            }
+        }
     }
     let req: WorkspaceRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
@@ -260,7 +310,8 @@ async fn workspace_handler(
 }
 
 /// Inbound restore RPC (receiver role). Fail-closed: `403` unless `--accept-promotions`, `401`
-/// without a valid bearer. Restores the bundle into this engine's store + workspace (gated).
+/// without the promotion secret (constant-time). Restores the bundle into this engine's store +
+/// workspace (gated).
 async fn promote_handler(
     headers: HeaderMap,
     State(state): State<Arc<ServeState>>,
@@ -269,7 +320,7 @@ async fn promote_handler(
     if !state.accept_promotions {
         return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
     }
-    if !authorized(&headers, &state.token) {
+    if !authorized(&headers, state.auth.promotion_secret.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
     let bundle: otto_remote::PromoteBundle = match serde_json::from_slice(&body) {
@@ -294,8 +345,9 @@ async fn promote_handler(
 }
 
 /// Outbound export RPC (receiver role): returns a session's `PromoteBundle` so a demoting source
-/// can pull it back. Same gate as `/promote`: `403` unless `--accept-promotions`, `401` without a
-/// valid bearer. The bundle's workspace snapshot is gate-filtered (secrets never leave here).
+/// can pull it back. Same gate as `/promote`: `403` unless `--accept-promotions`, `401` without
+/// the promotion secret (constant-time). The bundle's workspace snapshot is gate-filtered (secrets
+/// never leave here).
 async fn export_handler(
     headers: HeaderMap,
     State(state): State<Arc<ServeState>>,
@@ -304,7 +356,7 @@ async fn export_handler(
     if !state.accept_promotions {
         return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
     }
-    if !authorized(&headers, &state.token) {
+    if !authorized(&headers, state.auth.promotion_secret.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
     #[derive(serde::Deserialize)]
@@ -483,7 +535,8 @@ async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) ->
 
 /// Drive `turn` to completion while concurrently reading inbound frames for
 /// `ApproveDiff`/`Pause`/`Resume`/`Abort`. Shared by every command that starts a turn
-/// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart.
+/// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart. `owner` is
+/// the connection-scoped principal (A9): the in-flight `Abort` acts for it.
 async fn run_turn_loop(
     turn: impl std::future::Future<Output = anyhow::Result<TurnOutcome>>,
     reader: &mut WsReader,
@@ -491,6 +544,7 @@ async fn run_turn_loop(
     pause_state: &PauseState,
     state: &ServeState,
     session: SessionId,
+    owner: &UserId,
 ) -> TurnLoopOutcome {
     tokio::pin!(turn);
     loop {
@@ -516,7 +570,7 @@ async fn run_turn_loop(
                             pause_state.resume_all();
                         }
                         Ok(Command::Abort { .. }) => {
-                            let _ = state.service.abort(&otto_protocol::UserId::local(), session).await;
+                            let _ = state.service.abort(owner, session).await;
                             approvals.clear();
                             pause_state.resume_all();
                             return TurnLoopOutcome::StopOuterLoop;
@@ -537,12 +591,275 @@ async fn run_turn_loop(
     }
 }
 
-async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<ServeState>) {
+/// The identity established by the handshake, threaded through the command loop so no command
+/// re-constructs `UserId::local()` at its call site (A9's resolution).
+struct ConnIdentity {
+    owner: UserId,
+    /// The access token this connection authenticated with (header, `Login`, or `Attach`);
+    /// `None` in `SingleUser`/`Machine` modes, which have no per-user token to re-verify.
+    access_token: Option<String>,
+}
+
+/// Whether the first-frame wait is bounded. `Users` waits under `AuthConfig.handshake_deadline`;
+/// `Machine` skips the deadline entirely (§7.2).
+enum HandshakeDeadline {
+    Yes,
+    None,
+}
+
+/// Resolve the connection's principal after `Hello`. On failure — a bad credential, a non-auth
+/// command, a malformed frame, or a missed deadline — sends the single opaque
+/// `Error { "authentication failed" }` and returns `None`; the caller closes the socket.
+async fn authenticate_connection(
+    reader: &mut WsReader,
+    writer: &mut WsWriter,
+    headers: &HeaderMap,
+    state: &ServeState,
+) -> Option<ConnIdentity> {
+    match state.auth.mode {
+        AuthMode::SingleUser => Some(ConnIdentity {
+            owner: UserId::local(),
+            access_token: None,
+        }),
+        AuthMode::Users => {
+            // A valid `Authorization: Bearer` header pre-resolves a principal — skipping the
+            // *deadline*, not the greeting (§7.2). A present-but-invalid header falls through to
+            // the frame handshake rather than failing the connection.
+            if let Some(token) = bearer_token(headers) {
+                if let Some(authenticator) = state.authenticator() {
+                    if let Ok(principal) = authenticator.verify_access(&token).await {
+                        return Some(ConnIdentity {
+                            owner: principal.user,
+                            access_token: Some(token),
+                        });
+                    }
+                }
+            }
+            handshake_frame(reader, writer, state, HandshakeDeadline::Yes).await
+        }
+        AuthMode::Machine => {
+            // The promotion secret via the header (constant-time) — or the post-upgrade `Attach`
+            // frame. `Machine` skips the deadline; the owner is the attached session's own, adopted
+            // in `resolve_session` (§6.5 / §7.2).
+            if authorized(headers, state.auth.promotion_secret.as_deref()) {
+                return Some(ConnIdentity {
+                    owner: UserId::local(),
+                    access_token: None,
+                });
+            }
+            handshake_frame(reader, writer, state, HandshakeDeadline::None).await
+        }
+    }
+}
+
+/// Await and verify the first post-upgrade frame. It must be `Login` (identity credentials →
+/// `authenticate` + `mint` → `LoggedIn`) or `Attach` (an access token, or on `Machine` the
+/// promotion secret). Anything else is the same opaque failure. Returns the established identity.
+async fn handshake_frame(
+    reader: &mut WsReader,
+    writer: &mut WsWriter,
+    state: &ServeState,
+    deadline: HandshakeDeadline,
+) -> Option<ConnIdentity> {
+    let frame = match deadline {
+        HandshakeDeadline::Yes => {
+            match tokio::time::timeout(state.auth.handshake_deadline, reader.next()).await {
+                Err(_) => {
+                    eprintln!("serve: handshake deadline exceeded; closing");
+                    send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    return None;
+                }
+                Ok(frame) => frame,
+            }
+        }
+        HandshakeDeadline::None => reader.next().await,
+    };
+    let text = match frame {
+        Some(Ok(Message::Text(t))) => t,
+        // Disconnect or a non-text frame: close silently (nothing to tell the client).
+        _ => return None,
+    };
+    let command = match serde_json::from_str::<Command>(text.as_str()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("serve: malformed handshake frame: {e}");
+            send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: AUTH_FAILED.to_string(),
+                },
+            )
+            .await
+            .ok();
+            return None;
+        }
+    };
+    match command {
+        Command::Login { credentials } => {
+            let Some(authenticator) = state.authenticator() else {
+                // A `Users`-mode server must not exist without one; fail closed.
+                send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: AUTH_FAILED.to_string(),
+                    },
+                )
+                .await
+                .ok();
+                return None;
+            };
+            let principal = match authenticator.authenticate(&credentials).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("serve: login failed: {e:?}");
+                    send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    return None;
+                }
+            };
+            let pair = match authenticator.mint(&principal).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("serve: token mint failed: {e:?}");
+                    send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    return None;
+                }
+            };
+            let logged_in = ServerMessage::LoggedIn {
+                user: principal.user.clone(),
+                access_token: pair.access_token.clone(),
+                expires_at: pair.expires_at,
+                refresh_token: pair.refresh_token,
+            };
+            if send_msg(writer, &logged_in).await.is_err() {
+                return None;
+            }
+            Some(ConnIdentity {
+                owner: principal.user,
+                access_token: Some(pair.access_token),
+            })
+        }
+        Command::Attach { token } => {
+            if state.auth.mode == AuthMode::Machine {
+                // The one credential Machine accepts in a frame: the promotion secret, constant-time.
+                if secret_matches(state.auth.promotion_secret.as_deref(), &token) {
+                    Some(ConnIdentity {
+                        owner: UserId::local(),
+                        access_token: None,
+                    })
+                } else {
+                    eprintln!("serve: machine attach rejected");
+                    send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    None
+                }
+            } else {
+                let Some(authenticator) = state.authenticator() else {
+                    send_msg(
+                        writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    return None;
+                };
+                match authenticator.verify_access(&token).await {
+                    Ok(principal) => Some(ConnIdentity {
+                        owner: principal.user,
+                        access_token: Some(token),
+                    }),
+                    Err(e) => {
+                        eprintln!("serve: attach failed: {e:?}");
+                        send_msg(
+                            writer,
+                            &ServerMessage::Error {
+                                message: AUTH_FAILED.to_string(),
+                            },
+                        )
+                        .await
+                        .ok();
+                        None
+                    }
+                }
+            }
+        }
+        // Any non-auth command before authentication — including `CreateSession` — is the same
+        // failure (§7.2 step 3).
+        _ => {
+            eprintln!("serve: non-auth command before authentication");
+            send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: AUTH_FAILED.to_string(),
+                },
+            )
+            .await
+            .ok();
+            None
+        }
+    }
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    headers: HeaderMap,
+    params: ConnectParams,
+    state: Arc<ServeState>,
+) {
     // Split up-front so the turn (writer) and inbound approvals (reader) can run concurrently.
     let (mut writer, mut reader) = socket.split();
 
-    let session = match resolve_session(&params, &state).await {
-        Ok(s) => s,
+    // `Hello` is always the first frame, in every mode — even when the upgrade header already
+    // pre-resolved a principal (that skips the *deadline*, not the greeting, §7.2).
+    if send_msg(
+        &mut writer,
+        &ServerMessage::Hello {
+            auth_mode: state.auth.mode.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    // Establish the connection's identity (or close on the opaque auth failure).
+    let mut identity =
+        match authenticate_connection(&mut reader, &mut writer, &headers, &state).await {
+            Some(i) => i,
+            None => return,
+        };
+
+    let (session, owner) = match resolve_session(&params, &state, &identity.owner).await {
+        Ok((s, o)) => (s, o),
         Err(e) => {
             let _ = send_msg(
                 &mut writer,
@@ -573,7 +890,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
         match state
             .service
             .store()
-            .replay_since(&otto_protocol::UserId::local(), session, Some(after))
+            .replay_since(&owner, session, Some(after))
             .await
         {
             Ok(events) => {
@@ -621,6 +938,37 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 continue;
             }
         };
+        // A `Users` connection re-verifies its access token on every non-auth command: a
+        // long-lived socket must not outlive the token's expiry or its denylisting (§7.2).
+        // `Refresh` rides ahead (it needs no access token) and `Logout` revokes the one we hold.
+        if state.auth.mode == AuthMode::Users
+            && let Some(token) = &identity.access_token
+            && !matches!(
+                &command,
+                Command::Login { .. }
+                    | Command::Attach { .. }
+                    | Command::Refresh { .. }
+                    | Command::Logout
+            )
+        {
+            let re_ok = match state.authenticator() {
+                Some(authenticator) => authenticator.verify_access(token).await.is_ok(),
+                None => false,
+            };
+            if !re_ok {
+                eprintln!("serve: per-command access-token re-verification failed");
+                let _ = send_msg(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: AUTH_FAILED.to_string(),
+                    },
+                )
+                .await;
+                // The connection stays open so the client can `Refresh` (§8); the command is not
+                // dispatched.
+                continue;
+            }
+        }
         match command {
             Command::SendPrompt { text, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
@@ -634,7 +982,6 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 // Drive the turn while concurrently reading inbound approvals. The turn borrows
                 // `writer` (via the sink); `run_turn_loop` borrows `reader` — disjoint, so it can
                 // poll both.
-                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
@@ -642,8 +989,16 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     let turn = state
                         .service
                         .run_prompt_with_controls(&owner, session, &text, &mut sink, controls);
-                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
-                        .await
+                    run_turn_loop(
+                        turn,
+                        &mut reader,
+                        &approvals,
+                        &pause_state,
+                        &state,
+                        session,
+                        &owner,
+                    )
+                    .await
                 }; // `sink` dropped here → `writer` is free again
 
                 if report_turn_outcome(outcome, &mut writer).await {
@@ -651,10 +1006,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                 }
             }
             Command::Abort { .. } => {
-                let _ = state
-                    .service
-                    .abort(&otto_protocol::UserId::local(), session)
-                    .await;
+                let _ = state.service.abort(&owner, session).await;
                 break;
             }
             Command::ApproveDiff { .. } => {
@@ -671,13 +1023,11 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             }
             // Handover is the one client-facing command that does not route through an
             // `EngineService` method — `handle_handover` reaches `otto_remote::promote` via the
-            // `store()` accessor — so it authorizes explicitly here. Trivially passing today
-            // (one principal), but promote ships a session's whole event log off-machine and
-            // demote overwrites the local row including its owner, so this is the wrong check
-            // to leave for later.
+            // `store()` accessor — so it authorizes explicitly here, for the connection's owner.
+            // Promote ships a session's whole event log off-machine and demote overwrites the
+            // local row including its owner; the check must never be silently droppable.
             Command::PromoteToRemote { .. } | Command::DemoteToLocal { .. } => {
                 let to_remote = matches!(command, Command::PromoteToRemote { .. });
-                let owner = otto_protocol::UserId::local();
                 if let Err(e) = state.service.authorize_session(&owner, session).await {
                     let _ = send_msg(
                         &mut writer,
@@ -693,7 +1043,6 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
             Command::RunCommand { name, args, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
                 let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
-                let owner = otto_protocol::UserId::local();
                 let outcome = {
                     let mut sink = WsSink {
                         writer: &mut writer,
@@ -701,8 +1050,16 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     let turn = state.service.run_command_with_controls(
                         &owner, session, &name, &args, &mut sink, approver, pauser,
                     );
-                    run_turn_loop(turn, &mut reader, &approvals, &pause_state, &state, session)
-                        .await
+                    run_turn_loop(
+                        turn,
+                        &mut reader,
+                        &approvals,
+                        &pause_state,
+                        &state,
+                        session,
+                        &owner,
+                    )
+                    .await
                 }; // `sink` dropped here → `writer` is free again
 
                 if report_turn_outcome(outcome, &mut writer).await {
@@ -718,13 +1075,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     };
                     state
                         .service
-                        .run_agent_with_controls(
-                            &otto_protocol::UserId::local(),
-                            session,
-                            &name,
-                            &prompt,
-                            &mut sink,
-                        )
+                        .run_agent_with_controls(&owner, session, &name, &prompt, &mut sink)
                         .await
                 }; // `sink` dropped here → `writer` is free again
 
@@ -733,19 +1084,75 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     break 'outer;
                 }
             }
-            // Identity commands are inert until the auth slice lands; treat them as
-            // unauthenticated (the pre-identity `SingleUser` posture) — reply and close.
-            Command::Login { .. }
-            | Command::Attach { .. }
-            | Command::Refresh { .. }
-            | Command::Logout => {
+            // Identity commands are only valid during the handshake on a `Users` connection; a
+            // re-`Login`/re-`Attach` mid-connection must not rebind the principal (and the modes
+            // where they are not-applicable were announced by `Hello`). Opaque failure + close.
+            Command::Login { .. } | Command::Attach { .. } => {
                 let _ = send_msg(
                     &mut writer,
                     &ServerMessage::Error {
-                        message: "authentication not enabled".to_string(),
+                        message: AUTH_FAILED.to_string(),
                     },
                 )
                 .await;
+                break;
+            }
+            Command::Refresh { refresh_token } => {
+                // Not-applicable outside `Users` (the mode was announced by `Hello`); inside it,
+                // rotate the refresh token and reply with a fresh `LoggedIn`, re-binding the
+                // connection's access token so the next command re-verifies against it.
+                let Some(authenticator) = state.authenticator() else {
+                    let _ = send_msg(
+                        &mut writer,
+                        &ServerMessage::Error {
+                            message: AUTH_FAILED.to_string(),
+                        },
+                    )
+                    .await;
+                    break;
+                };
+                match authenticator.rotate_refresh(&refresh_token).await {
+                    Ok(pair) => {
+                        let logged_in = ServerMessage::LoggedIn {
+                            user: identity.owner.clone(),
+                            access_token: pair.access_token.clone(),
+                            expires_at: pair.expires_at,
+                            refresh_token: pair.refresh_token,
+                        };
+                        identity.access_token = Some(pair.access_token);
+                        if send_msg(&mut writer, &logged_in).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("serve: refresh rotation failed: {e:?}");
+                        let _ = send_msg(
+                            &mut writer,
+                            &ServerMessage::Error {
+                                message: AUTH_FAILED.to_string(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+            Command::Logout => {
+                // Not-applicable outside `Users`. Inside it: denylist the connection's access
+                // token's `jti` and revoke its refresh token, abort the principal's in-flight
+                // turn, send `LoggedOut`, and close — the connection does not continue
+                // unauthenticated (§7.2).
+                if let (Some(authenticator), Some(token)) =
+                    (state.authenticator(), &identity.access_token)
+                {
+                    if let Err(e) = authenticator.logout(token).await {
+                        eprintln!("serve: logout revocation failed: {e:?}");
+                    }
+                }
+                let _ = state.service.abort(&owner, session).await;
+                approvals.clear();
+                pause_state.resume_all();
+                let _ = send_msg(&mut writer, &ServerMessage::LoggedOut).await;
                 break;
             }
         }
@@ -1093,28 +1500,52 @@ async fn handle_handover(
     let _ = send_msg(writer, &msg).await;
 }
 
-async fn resolve_session(params: &ConnectParams, state: &ServeState) -> anyhow::Result<SessionId> {
+/// Resolve the session for this connection and return `(session, owner)` — the connection-scoped
+/// principal threaded through the whole loop (A9's resolution). The explicit `?session=` arm is
+/// ownership-checked: attaching to a session the principal does not own fails byte-for-byte
+/// identically to a nonexistent id, so the API is not an existence oracle. On a `Machine`
+/// receiver the promotion secret is authority over every session promoted onto it, so the check
+/// is existence and the connection adopts the session's own owner (§6.5). The `None` arm creates
+/// a session owned by the principal — rejected on `Machine`, which hosts only promoted sessions.
+async fn resolve_session(
+    params: &ConnectParams,
+    state: &ServeState,
+    owner: &UserId,
+) -> anyhow::Result<(SessionId, UserId)> {
     match &params.session {
         Some(s) => {
             let uuid = uuid::Uuid::parse_str(s)?;
-            Ok(SessionId(uuid))
+            let session = SessionId(uuid);
+            let actual = match state.auth.mode {
+                AuthMode::Machine => {
+                    // Existence only — the machine credential already authenticated the holder;
+                    // the attached session's owner is adopted, whatever it is.
+                    state
+                        .service
+                        .store()
+                        .owner_of(session)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("no session {}", session.0))?
+                }
+                _ => {
+                    // Same shared message for "not yours" and "not there".
+                    state.service.authorize_session(owner, session).await?;
+                    owner.clone()
+                }
+            };
+            Ok((session, actual))
         }
         None => {
-            // One principal exists until slice 1b adds identity, so every served session is owned
-            // by `local` — the same principal every command handler in this file passes.
-            // Enforcement lives in `EngineService::authorize`, which every command routes through;
-            // the store's reads are owner-scoped too, so a replay for the wrong owner is empty.
-            //
-            // Deliberately *not* checked in the `Some(s)` arm above: attaching to an explicit
-            // `?session=` stays blind, because rejecting an unowned id would close a socket that
-            // today receives `Ready`, and `ui-dioxus` appends `&session=` on reconnect. Nothing
-            // leaks — the first command on such a connection hits `authorize` and fails. The
-            // attach-time check lands in slice 1b alongside real principals.
-            let owner = otto_protocol::UserId::local();
-            state
+            // A Machine receiver creates no sessions; an `Attach` without `?session=` has no owner
+            // to adopt (§7.2 step 4).
+            if state.auth.mode == AuthMode::Machine {
+                anyhow::bail!("machine receivers do not create sessions; pass ?session=");
+            }
+            let session = state
                 .service
-                .create_session(&owner, "(serve/ws)", &serde_json::json!({}))
-                .await
+                .create_session(owner, "(serve/ws)", &serde_json::json!({}))
+                .await?;
+            Ok((session, owner.clone()))
         }
     }
 }
