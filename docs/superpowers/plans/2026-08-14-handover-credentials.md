@@ -50,7 +50,16 @@
 
 ## Task Order & Rationale
 
-Forced by the inward dependency rule and compile-green discipline: `protocol` (Task 1) → `remote` (Task 2) → `engine` serve/loopback/service (Tasks 3–5) → integration harnesses (Task 6) → workspace doc (Task 7) → `ui-dioxus` (Task 8) → docs (Task 9). Tasks 1–2 are independent of each other but both must precede Task 3 (serve.rs consumes `Promoted.token: String` and `mint_session_secret`). Task 1 edits `serve.rs`'s `Promoted` construction (the type change forces it) but no other engine code; Task 2 edits the vps demote arm (the `VpsTarget::export` removal forces it) but no other engine code. **One deliberate red window is stated, not hidden:** Task 3 changes the *behavior* of `/promote`, `/export`, `/workspace`, and the `Machine` WS handshake, so the pre-existing integration harnesses (`vps_promote.rs`, `microvm.rs`, `auth.rs`, `serve.rs`) fail at **runtime** — they still compile — until Task 6 migrates them. Task 3's own gate is `cargo test -p otto-engine --lib` (library tests) plus `cargo build --workspace`; Task 6 closes the window with `cargo test --workspace`.
+Forced by the inward dependency rule and compile-green discipline: `protocol` (Task 1) → `remote` (Task 2) → `engine` serve/loopback/service (Tasks 3–5) → integration harnesses (Task 6) → workspace doc (Task 7) → `ui-dioxus` (Task 8) → docs (Task 9). Tasks 1–2 are independent of each other but both must precede Task 3 (serve.rs consumes `Promoted.token: String` and `mint_session_secret`). Task 1 edits `serve.rs`'s `Promoted` construction (the type change forces it) but no other engine code; Task 2 edits the vps demote arm (the `VpsTarget::export` removal forces it) but no other engine code. **One deliberate red window is stated, not hidden:** the window opens **at Task 2's commit**, not
+Task 3's. Task 2's serve.rs edit makes the vps demote pull present the per-session secret as the
+`/export` bearer, but the receiver's `/export` handler still validates the machine-wide secret until
+Task 3 lands — so `handover_vps_demote_pulls_session_back_to_source` and
+`vps_demote_round_trip_brings_advanced_state_back_to_source` 401 from that commit onward. Task 3
+then adds the *other* runtime breaks (`/promote` header-missing 400, `/export`/WS/`/workspace`
+machine-secret 401, `Machine` attach opaque-failure). All are behavioral — the harnesses still
+compile — until Task 6 migrates them. Task 3's own gate is `cargo test -p otto-engine --lib`
+(library tests) plus `cargo build --workspace --tests`; Task 6 closes the window with
+`cargo test --workspace`.
 
 ---
 
@@ -249,10 +258,10 @@ Expected: PASS.
 
 Run: `cargo build --workspace --tests` (or `cargo check --all-targets`) — `cargo build --workspace` alone does not compile the `tests/*.rs` targets, so this is the gate that genuinely proves the red window is compile-green.
 Expected: SUCCESS — the pre-existing integration harnesses still **compile** (they never construct `Promoted` and never call the changed private helpers). They now fail at **runtime**:
-- **`tests/vps_promote.rs`** — genuinely red: `post_promote` sends no `X-Otto-Session-Secret` header → 400; `/export` and post-promote WS reconnects present `Bearer TOKEN` (the machine secret) → 401.
-- **`tests/auth.rs`** — genuinely red: the `Machine`-mode tests (`machine_attach_with_the_promotion_secret_adopts_the_session_owner` at `:669`, `machine_attach_with_the_promotion_secret_reaches_ready` at `:978`) attach with `SECRET` and expect `Ready`; a Machine receiver now requires the session's per-session secret → 401/opaque failure.
+- **`tests/vps_promote.rs`** — genuinely red. The two demote pulls (`handover_vps_demote_pulls_session_back_to_source`, `vps_demote_round_trip_brings_advanced_state_back_to_source`) have been red since **Task 2's** commit (the source presents the session secret as the `/export` bearer but the receiver still validates the machine secret until Task 3's `export_handler` change); Task 3 adds `post_promote`'s missing-header 400 and the `/export`/WS machine-secret 401s.
+- **`tests/auth.rs`** — genuinely red (from Task 3): the `Machine`-mode tests (`machine_attach_with_the_promotion_secret_adopts_the_session_owner` at `:669`, `machine_attach_with_the_promotion_secret_reaches_ready` at `:978`) attach with `SECRET` and expect `Ready`; a Machine receiver now requires the session's per-session secret → 401/opaque failure.
 - **`tests/microvm.rs`** — **stays green**: `TestServeProvisioner` boots with `promotion_secret = TOKEN` and returns `token: TOKEN`, so post-Task-2 `MicrovmTarget::provision` pushes `session_secret = machine.token = TOKEN`; post-Task-3 the receiver records session→TOKEN and `/export` with bearer TOKEN returns 200. Do NOT chase phantom failures here.
-- **`tests/serve.rs`** — **stays green**: `promote_then_demote_round_trip_preserves_session` is loopback-only and untouched by Task 3 (the loopback → `SingleUser` engine ignores credentials; `authed_endpoint_request`'s `Bearer TOKEN` is ignored).
+- **`tests/serve.rs`** — **stays green**: `promote_then_demote_round_trip_preserves_session` is loopback-only and untouched (the loopback → `SingleUser` engine ignores credentials; `authed_endpoint_request`'s `Bearer TOKEN` is ignored).
 
 **This is the stated red window, closed by Task 6.** Do NOT fix the harnesses here.
 
