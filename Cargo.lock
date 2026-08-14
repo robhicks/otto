@@ -2656,6 +2656,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "otto-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "data-encoding",
+ "otto-engine-core",
+ "otto-protocol",
+ "serde",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "otto-engine"
 version = "0.3.0"
 dependencies = [
