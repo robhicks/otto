@@ -2355,4 +2355,34 @@ mod tests {
     fn promotion_receiver_is_ok_with_accept_and_zero_principals() {
         assert!(promotion_receiver_preconditions(true, 0).is_ok());
     }
+
+    #[tokio::test]
+    async fn enroll_force_reprovisions_and_invalidates_the_old_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = otto_auth::SqliteAuthStore::open(dir.path().join("auth.db"))
+            .await
+            .unwrap();
+        let user = otto_protocol::UserId::parse("alice").unwrap();
+
+        // First enrollment provisions a secret.
+        store.enroll_user(&user, &[0u8; 20]).await.unwrap();
+        let first = store.totp_secret(&user).await.unwrap().expect("enrolled");
+
+        // Enrolling again without --force is refused (a typo cannot silently re-provision).
+        let err = enroll_user(&store, &user, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("--force"),
+            "unexpected error: {err}"
+        );
+
+        // With --force the secret is re-provisioned to a different value, so a stale
+        // authenticator code from the old secret can no longer match (spec §7.4).
+        enroll_user(&store, &user, true).await.unwrap();
+        let second = store
+            .totp_secret(&user)
+            .await
+            .unwrap()
+            .expect("re-enrolled");
+        assert_ne!(first, second, "re-provision must rotate the secret");
+    }
 }
