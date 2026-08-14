@@ -12,7 +12,7 @@ use otto_engine_core::tool::{
     Approver, Decision, DenyApprover, NeverPause, PauseController, Tool, ToolRegistry,
 };
 use otto_engine_core::traits::{Workspace, WorkspaceRead};
-use otto_engine_core::types::Edit;
+use otto_engine_core::types::{Edit, SessionHistory, TurnSummary};
 use otto_engine_core::{AgentRegistry, Orchestrator, Retriever, Router, TokenMeter, TurnOutcome};
 use otto_extensions::{Extensions, MarkdownAgent, TaskTool, expand_args, resolve_injections};
 use otto_persistence::{SessionStatus, SessionStore, TurnRecord};
@@ -875,6 +875,34 @@ impl EngineService {
             workspace: self.filtered_workspace_snapshot().await?,
         })
     }
+}
+
+/// Fold persisted turn records into the bounded history the spine hands to agents.
+///
+/// A record whose `outcome` will not deserialize as a `TurnOutcome` is **skipped**, not fatal:
+/// history is an optimization, and one unreadable row from an older or corrupted store must
+/// never stop a turn from running.
+///
+/// Not yet called from production code: `run_prompt_with_controls` starts passing real history
+/// to `Orchestrator::run_turn` once that call gains a `history` parameter (a later task in this
+/// plan). Until then this is exercised only by the test below.
+#[allow(dead_code)]
+pub(crate) fn history_from_records(records: Vec<TurnRecord>) -> SessionHistory {
+    let summaries = records
+        .into_iter()
+        .filter_map(|r| {
+            let outcome: TurnOutcome = serde_json::from_value(r.outcome).ok()?;
+            Some(TurnSummary {
+                turn_index: r.turn_index,
+                goal: r.goal,
+                milestones: outcome.milestones,
+                files_edited: outcome.files_edited,
+                verify: outcome.verify,
+                ok: outcome.ok,
+            })
+        })
+        .collect();
+    SessionHistory::new(summaries)
 }
 
 #[cfg(test)]
@@ -2529,5 +2557,43 @@ mod tests {
             service.store().session_status(&local(), id).await.unwrap(),
             SessionStatus::Failed
         );
+    }
+
+    #[test]
+    fn history_from_records_parses_outcomes_and_skips_unparseable_ones() {
+        use std::path::PathBuf;
+
+        let records = vec![
+            TurnRecord {
+                turn_index: 0,
+                goal: "first".to_string(),
+                outcome: serde_json::json!({
+                    "ok": true,
+                    "milestones": ["m1"],
+                    "files_edited": ["a.rs"],
+                    "verify": { "ok": true, "detail": "passed" }
+                }),
+            },
+            // A row written before TurnOutcome grew: must still load, with defaults.
+            TurnRecord {
+                turn_index: 1,
+                goal: "legacy".to_string(),
+                outcome: serde_json::json!({ "ok": false }),
+            },
+            // Corrupt: must be skipped, never panic.
+            TurnRecord {
+                turn_index: 2,
+                goal: "bad".to_string(),
+                outcome: serde_json::json!("not an object"),
+            },
+        ];
+
+        let h = history_from_records(records);
+        assert_eq!(h.turns().len(), 2);
+        assert_eq!(h.turns()[0].milestones, vec!["m1".to_string()]);
+        assert_eq!(h.turns()[0].files_edited, vec![PathBuf::from("a.rs")]);
+        assert_eq!(h.turns()[1].goal, "legacy");
+        assert!(h.turns()[1].milestones.is_empty());
+        assert!(!h.turns()[1].ok);
     }
 }
