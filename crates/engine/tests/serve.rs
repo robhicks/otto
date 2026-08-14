@@ -1137,8 +1137,8 @@ fn authed_endpoint_request(
 /// including its owner, so the check must not be quietly droppable.
 ///
 /// With one principal a connection cannot normally reach another owner's session, so the test
-/// seeds one directly in the store under a different owner and then attaches to it by id. Since
-/// the identity slice the refusal happens at attach time (`resolve_session` — the same shared
+/// seeds one directly in the store under a different owner and then attaches to it by id. With the
+/// identity slice, the refusal happens at attach time (`resolve_session` — the same shared
 /// not-found message), so the handover command is never reachable for a foreign session; the
 /// vacuity guard below proves an *owned* session still gets past authorization and fails later,
 /// on the absent promote configuration, with a different message.
