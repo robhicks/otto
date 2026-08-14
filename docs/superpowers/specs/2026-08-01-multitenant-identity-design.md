@@ -344,10 +344,12 @@ Logout,                                 // denylist this connection's jti, revok
 ```
 
 `Attach` exists because a browser `WebSocket` cannot set an `Authorization` header and the access
-token must not go in the query string. Keeping it separate from `Login` keeps the `Authenticator`
-seam honest: the seam verifies *identity credentials*, never session tokens. `Logout` is
-field-free — it acts on the connection's own bound token, so a client cannot revoke a token it does
-not hold.
+token must not go in the query string. Keeping it separate from `Login` keeps the two commands'
+seam calls distinct: `Login` exercises `authenticate` (identity credentials), while `Attach` — and
+every subsequent command — exercises `verify_access` (a session token). A session token is never
+re-run through identity verification, and identity credentials are never presented to the token
+path. `Logout` is field-free — it acts on the connection's own bound token, so a client cannot
+revoke a token it does not hold.
 
 Both `Attach` and `Refresh` carry secrets, so `Command`'s derived `Debug` is replaced with a
 hand-written one that redacts those two fields as well.
@@ -501,12 +503,44 @@ pub enum AuthError {
 pub trait Authenticator: Send + Sync {
     /// Verify presented credentials and return the authenticated principal.
     async fn authenticate(&self, creds: &Credentials) -> Result<Principal, AuthError>;
+
+    /// Mint an access + refresh token pair for an already-authenticated principal.
+    /// Called by the `Login` command after `authenticate` succeeds.
+    async fn mint(&self, principal: &Principal) -> Result<TokenPair, AuthError>;
+
+    /// Verify an access token (signature, `exp`, denylist) and return its principal.
+    /// Called by `Attach` and by the per-command re-verification in §7.2.
+    async fn verify_access(&self, token: &str) -> Result<Principal, AuthError>;
+
+    /// Rotate a refresh token: consume it, issue a fresh pair. Called by `Refresh`.
+    async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError>;
+
+    /// Denylist an access token's `jti` and revoke its refresh token. Called by `Logout`.
+    async fn logout(&self, access_token: &str) -> Result<(), AuthError>;
+}
+
+/// A minted access/refresh pair, expressed in plain wire types so the seam stays crypto-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenPair {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// Unix seconds; the access token's `exp`.
+    pub expires_at: u64,
 }
 ```
 
-This is the one place the issue's sketch is tightened: it returns `anyhow::Result<Principal>`, which
-cannot express "rate limited" without string-matching and risks an internal error message reaching
-the client verbatim. A three-variant enum costs nothing and makes A11 enforceable by the type.
+The seam carries the **token lifecycle, not just identity verification**. This is the resolution of
+a plan-review finding: `serve.rs` reaches the authenticator only as `Arc<dyn Authenticator>`, and it
+must mint (`Login`), verify (`Attach` + per-command re-check), rotate (`Refresh`), and revoke
+(`Logout`) through that object — a concrete `TotpAuthenticator`'s extra methods would be unreachable
+through the trait object, and future OIDC/device-flow backends implement the same lifecycle anyway.
+All of it is expressed in `String`/`u64`/plain records, so the no-crypto-in-engine-core rule (§1)
+holds unchanged: the seam is still "a trait plus plain types".
+
+This is the one place the issue's sketch is tightened: `authenticate` returns
+`anyhow::Result<Principal>` in the sketch, which cannot express "rate limited" without
+string-matching and risks an internal error message reaching the client verbatim. A three-variant
+enum costs nothing and makes A11 enforceable by the type.
 
 ---
 
@@ -893,12 +927,19 @@ each of which builds `serve_app`/`ServeState` directly rather than going through
 Two consequences the plan must budget for rather than discover:
 
 1. **Those harnesses need an `Authenticator`.** They get a `FakeAuthenticator` — a test double in
-   `otto-auth` behind `#[cfg(feature = "testing")]` (forwarded as `otto-engine`'s own `testing`
-   feature, the `firecracker`-forwarding precedent) that accepts a fixed credential and returns a
-   fixed `Principal`. Not `SqliteAuthStore`: the suite must stay hermetic and fast, and — critically
-   — **A5's `OTTO_AUTH_DB` default must never be consulted by a test.** Every constructor takes an
-   explicit path or an explicit authenticator, so a developer's real auth database can never be
-   opened, written, or depended on by `cargo test`.
+   `otto-auth` under a plain `pub mod testing` that implements the **full** seam (§5): it accepts a
+   fixed credential and returns a fixed `Principal`, mints a deterministic token pair, accepts any
+   non-empty access token it minted on `verify_access`, rotates to a fresh pair, and records
+   `logout` (no crypto, no store). It is **always compiled — no `#[cfg(feature = "testing")]` gate
+   and no `testing` feature at all** — following the `ScriptedProvider` precedent (a test double that
+   lives in an impl crate's public API and ships in the binary harmlessly, since it does no I/O).
+   This is what keeps `cargo test --workspace` compiling the seven harnesses with **no feature
+   flags**, and what keeps `cargo test -p otto-auth` (Task 5's own gate) compiling the fake's own
+   tests — a default-off feature would break both, because integration harnesses build the crate
+   without `--features`. Not `SqliteAuthStore`: the suite must stay hermetic and fast, and —
+   critically — **A5's `OTTO_AUTH_DB` default must never be consulted by a test.** Every constructor
+   takes an explicit path or an explicit authenticator, so a developer's real auth database can
+   never be opened, written, or depended on by `cargo test`.
 2. **§7.4's zero-principal startup refusal, §6.5's loopback/`--promotion-receiver` enforcement, and
    the `--single-user` mode resolution live in `cmd_serve`, which no test exercises.** They must
    therefore be extracted as pure, unit-testable functions (in the shape of the existing
