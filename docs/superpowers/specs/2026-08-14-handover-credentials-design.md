@@ -120,12 +120,16 @@ reused from the client — and that secret is disposed when the session is demot
 1. `cargo test --workspace` is green with no network access and no environment variables set;
    `cargo clippy --workspace --all-targets` and `cargo fmt --all --check` are clean. The only
    pre-existing failure, `otto-mcp-lsp`'s rust-analyzer round-trip, is unaffected.
-2. Every `Promoted` frame the server sends carries a non-empty `token` (a fresh 32-hex mint), for
-   **all four** targets — loopback, vps, microvm, and fly — asserted by tests that read the frame
-   off the socket. A `Promoted` frame with a `null`/missing token no longer deserializes.
-3. A `--promotion-receiver` receiver that has accepted a session refuses a WS attach, an `/export`,
-   and a `/workspace` call that present the machine-wide promotion secret, and accepts them with the
-   session's own secret — asserted with distinct values so the two cannot coincide by accident.
+2. Every `Promoted` frame the server sends carries a non-empty `token` (a fresh 32-hex mint) — for
+   loopback and vps asserted by tests that read the frame off the socket (`tests/promote.rs`,
+   `tests/vps_promote.rs`), and for fly/microvm at the mint+push layer (their `RemoteTarget`s are
+   exercised at the `remote`-crate wiremock/unit level, with no engine socket harness). A `Promoted`
+   frame with a `null` token — or a frame that omits `token` entirely — no longer deserializes (§2).
+3. A `--promotion-receiver` receiver that has accepted a session refuses a WS attach and an
+   `/export` that present the machine-wide promotion secret, and accepts them with the session's own
+   secret — asserted with distinct values so the two cannot coincide by accident. (`/workspace` is
+   exempt by design — A6 — since it is machine-scoped and accepts any live session secret or the
+   machine secret.)
 4. A successful `/export` (the demote pull) disposes the session's secret on the receiver: a second
    `/export` or a WS attach with the same secret fails afterwards. The receiver's retained copy of
    the session still exists (copy semantics preserved — asserted against the store).
@@ -196,9 +200,15 @@ by the machine secret) plus `X-Otto-Session-Secret: <session_secret>`. Callers:
 - **`VpsTarget::provision`** — mints `let secret = mint_session_secret();`, pushes with
   `bearer = self.token` (the receiver's machine secret, the pusher's admission credential) and
   `session_secret = secret`, returns `RemoteHandle::new(endpoint, secret)`.
-- **`MicrovmTarget::provision`** — the provisioner returns `ProvisionedMachine { token }` (the
-  freshly-minted secret booted into the machine); pushes with `bearer = machine.token` and
-  `session_secret = machine.token` (A3); handle token = `machine.token`.
+- **`MicrovmTarget::provision`** — the mint happens at the **handover construction site**, exactly
+  where `cfg.token` is threaded today: `serve.rs`'s microvm arm (`:1652-1658`) builds
+  `FirecrackerProvisioner::new(config, mint_session_secret())` (fresh per handover, since the
+  provisioner is constructed per call). The provisioner boots the machine with that secret as its
+  promotion secret (cmdline/env) and returns it in `ProvisionedMachine.token`; `MicrovmTarget`
+  pushes with `bearer = machine.token` and `session_secret = machine.token` (A3); handle token =
+  `machine.token`. The in-process `TestServeProvisioner` in `tests/microvm.rs` mirrors this: it
+  mints a fresh secret per `provision()`, boots the serve with it as `promotion_secret`, and returns
+  it in the machine.
 
 ### 1.3 `VpsTarget` changes
 
@@ -218,6 +228,26 @@ secret is a uniform invariant, not a functional credential. The loopback engine'
 Signature unchanged (`export_bundle(endpoint, token, session)`); callers now pass the **session
 secret** (from the stored handle) instead of the machine-wide token.
 
+### 1.6 Source-side `handle_handover` — the `Promoted` frame
+
+`serve.rs`'s `handle_handover` (the reuse branch at `serve.rs:1621-1719`) currently computes
+`handover_token = (!tok.is_empty() && tok != cfg.token).then(|| tok.clone())` and sends `None` for
+loopback/vps/microvm (with stale "stays `None`" comments at `:1637` and `:1706-1708`). Under this
+slice every target returns a freshly-minted handle token, so that filter is deleted and the frame is
+built unconditionally:
+
+```rust
+ServerMessage::Promoted { session, endpoint, token: tok }
+```
+
+The vps demote arm (`:1394-1445`) stops reconstructing a `VpsTarget` from `cfg.token` and instead —
+like the microvm (`:1446-1527`) and fly (`:1528-1618`) arms — reads the stored handle's
+endpoint+secret from `state.remotes[(session, true)]`, calls `export_bundle(&endpoint, &secret,
+session)`, and on success removes the handle. **Behavior tightening to state:** vps demote now
+depends on the in-memory handle, so a *source* restart after a vps promote strands the demote
+(identical posture to microvm/fly today; see Risk 2). The `Promoted`/`Demoted` reply shapes are
+otherwise unchanged.
+
 ---
 
 ## 2. `protocol` — `Promoted.token` is a required `String`
@@ -230,13 +260,14 @@ Promoted {
 }
 ```
 
-- The `#[serde(default)]` attribute stays (an absent token — from a hypothetical pre-slice peer —
-  defaults to the empty string, which fails every check), but a serialized `null` no longer
-  deserializes: `"token": null` → serde type error. This is the deliberate break.
+- **`#[serde(default)]` is removed from `token`.** A `Promoted` frame that omits the field *or*
+  serializes `null` fails to deserialize — the break is complete, matching success criterion 2 and
+  §9's tests. The empty-string "fails every check" safety net a default would provide is redundant:
+  the client never emits an absent token, and a frame without one is a peer running pre-slice code.
 - `Debug` redacts `token` (already does).
 - Tests: `handover_server_messages_round_trip` / `promoted_with_token_round_trips` /
-  `server_message_debug_redacts_promoted_token` construct `token: String` now; a new test asserts a
-  `null` token fails to deserialize.
+  `server_message_debug_redacts_promoted_token` construct `token: String` now; new tests assert that
+  both a `null` token and a *missing* token fail to deserialize.
 - Version bump `protocol` 0.1.0 → 0.2.0 (Rule 6, flagged to the architect reviewer). `ui-dioxus`
   depends on `protocol` — its `Cargo.toml` dependency follows the bump (workspace-excluded, so the
   workspace build is unaffected by the version change, but the desktop suite pins it).
@@ -267,10 +298,11 @@ against **any** live session secret in the map (A6).
 
 1. `403` unless `--accept-promotions`; `401` unless the machine secret matches (unchanged).
 2. Deserialize `PromoteBundle`. On failure, **special-case the pre-ownership shape**: parse the raw
-   body as `serde_json::Value`, and if `session.owner` is absent, return `400` with the actionable
-   message (mirroring slice 1a's §4.1, adapted for the wire): *"promote bundle predates session
-   ownership (issue #115): its session carries no owner. otto has no installed base, so there is no
-   migration — re-promote from a current otto."* Any other deserialize failure keeps the existing
+   body as `serde_json::Value`, and if `session` is a present JSON object that lacks the `owner` key,
+   return `400` with the actionable message (mirroring slice 1a's §4.1, adapted for the wire):
+   *"promote bundle predates session ownership (issue #115): its session carries no owner. otto has
+   no installed base, so there is no migration — re-promote from a current otto."* Any other
+   deserialize failure (including a body with no `session` object at all) keeps the existing
    `bad request: {e}` 400 (premise correction 1 / success criterion 6).
 3. Require the `X-Otto-Session-Secret` header (`400` if absent — A2).
 4. `accept_promotion` as today; on `Ok(session)`, `record_session_secret(session, header_secret)`.
@@ -281,7 +313,10 @@ against **any** live session secret in the map (A6).
 2. Parse `{ session }`; look up `session_secret(session)`; `401` if absent (never promoted here, or
    already disposed) or if the bearer does not match it (constant-time). **The machine-wide secret
    no longer authorizes an export** (success criterion 3).
-3. `export_promotion(session)` as today (`404` on unknown).
+3. `export_promotion(session)` as today. Its `404` on an unknown session is now near-unreachable —
+   a session with no recorded secret 401s at step 2 (never-promoted and disposed are
+   indistinguishable by design), and disposed rows are retained — but it stays as the fail-closed
+   backstop for a store row that vanishes between the check and the read.
 4. On success, `dispose_session_secret(session)` **before** returning the bundle (A4) — demote
    consumes the credential.
 
@@ -312,8 +347,10 @@ AuthMode::Machine => {
 }
 ```
 
-`handshake_frame` gains the expected Machine secret (an `Option<&str>`, `None` on the `Users` path,
-which is unchanged); its `Attach` arm for `Machine` compares against that secret
+`authenticate_connection`'s signature changes to take `params: &ConnectParams` (its current call site
+at `serve.rs:1038` passes only `(reader, writer, headers, state)`); `handshake_frame` gains the
+expected Machine secret (`Option<&str>`, `None` on the `Users` path, which is unchanged); its
+`Attach` arm for `Machine` compares against that secret
 (`secret_matches(Some(&secret), &token)`), not the promotion secret. `ConnIdentity.owner` stays the
 `UserId::local()` placeholder and `resolve_session` adopts the attached session's owner as before —
 unchanged.
@@ -370,12 +407,13 @@ SocketEvent::Message(Ok(ServerMessage::Promoted { endpoint, token, .. })) => {
 }
 ```
 
-The reconnect (`do_connect`) and the `/workspace` RPCs (`load_files`/`open_path`) read the `token`
-signal, so adopting it here is what lets a post-promote client present the per-session secret to the
-remote. Under the desktop sidecar (loopback → `SingleUser` engine) the token is minted but ignored,
-so behavior there is unchanged. `Demoted` reconnects to the source, whose credential is the
-connection's own — slice 2 owns the full credential lifecycle; this slice only stops discarding the
-handover secret.
+The `/workspace` RPCs (`load_files`/`open_path` at `app.rs:371-423`) read the `token` signal, so
+adopting it here is what lets a post-promote client present the per-session secret to the remote's
+`/workspace`. (The WS *handshake* presentation of the session secret — the transport carries no
+bearer; auth is post-upgrade frames — is slice 2's login flow, not this slice's.) Under the desktop
+sidecar (loopback → `SingleUser` engine) the token is minted but ignored, so behavior there is
+unchanged. `Demoted` reconnects to the source, whose credential is the connection's own — slice 2
+owns the full credential lifecycle; this slice only stops discarding the handover secret.
 
 ---
 
@@ -417,8 +455,9 @@ The `ui-dioxus` `protocol` dependency follows the bump.
 
 ## 9. Testing
 
-- **`protocol`** — `Promoted { token: String }` round-trips; a `null`/missing `token` fails to
-  deserialize; `Debug` redacts it. Existing `Promoted` tests updated to the `String` shape.
+- **`protocol`** — `Promoted { token: String }` round-trips; a `null` token **and** a missing `token`
+  field both fail to deserialize; `Debug` redacts it. Existing `Promoted` tests updated to the
+  `String` shape.
 - **`remote`** — `mint_session_secret` is 32-hex and unique; `push_promote_bundle` sends the
   `X-Otto-Session-Secret` header (wiremock `header` matcher); `VpsTarget::provision` mints a fresh
   secret distinct from the machine secret and pushes with bearer=cfg.token +
@@ -429,7 +468,8 @@ The `ui-dioxus` `protocol` dependency follows the bump.
   the store); `/workspace` `Machine` accepts a live session secret and the machine secret; WS
   `Machine` attach requires the session's secret (`?session=` present, wrong secret → opaque
   failure, machine secret → 401); `Promoted.token` is non-empty for loopback (via
-  `tests/serve.rs`'s promote test) and vps (via `tests/vps_promote.rs`).
+  `tests/promote.rs`, which currently asserts `None` at `:98` and must flip) and vps (via
+  `tests/vps_promote.rs`).
 - **`engine` (service)** — `accept_demotion` refuses an owner-mismatched bundle and accepts a
   matching one; the refusal is `AcceptError::Refused`.
 - **`engine` (integration)** — `tests/vps_promote.rs`, `tests/microvm.rs`, `tests/promote.rs` updated
@@ -444,8 +484,10 @@ The `ui-dioxus` `protocol` dependency follows the bump.
 All four test harnesses build `serve_app` directly. The push-side harnesses (`vps_promote.rs`,
 `microvm.rs`) gain a session-secret constant distinct from `TOKEN` where the test must prove the two
 credentials differ, or reuse `TOKEN` where the machine secret and session secret coincide (the
-single-session microVM case). The `post_promote`/`post_export` helpers send/require the header and
-the session-secret bearer respectively.
+single-session microVM case). `tests/microvm.rs`'s `TestServeProvisioner` mints a fresh per-session
+secret per `provision()` (mirroring the §1.2 construction-site mint) so the `microvm_target_seam_round_trip`
+and `microvm_demote_pull_then_dispose` tests drive the mint layer. The `post_promote`/`post_export`
+helpers send/require the header and the session-secret bearer respectively.
 
 ---
 
@@ -455,9 +497,12 @@ the session-secret bearer respectively.
    edge case; the operator remedy (clear the receiver's stale row) is documented but adds an
    operational step. A follow-up could add a source-confirmed release step (a demote-complete RPC)
    if the flow ever needs to be retry-proof.
-2. **The in-memory session→secret map does not survive a receiver restart.** Fly/microVM die with
-   their machine; a long-lived VPS receiver that restarts orphans its promoted sessions' credentials.
-   Persisting the map (or keying it off a durable secret column) is the natural follow-up.
+2. **The in-memory session→secret map does not survive a receiver restart, and the vps demote now
+   depends on the source's in-memory handle.** Fly/microVM die with their machine; a long-lived VPS
+   receiver that restarts orphans its promoted sessions' credentials, and a *source* restart after a
+   vps promote strands the demote pull (the handle — and its session secret — is gone). Both are the
+   same posture microvm/fly already had. Persisting the map (or keying it off a durable secret
+   column) is the natural follow-up.
 3. **`Promoted.token` as a required `String` breaks any peer that still serializes `None`.** There is
    no such peer (lockstep, no installed base), and the break is explicit + version-bumped. Any
    future out-of-band client must be rebuilt against `protocol` 0.2.0.
