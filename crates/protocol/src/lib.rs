@@ -289,10 +289,9 @@ pub enum ServerMessage {
     },
     /// Handover framing: the session has been provisioned onto a remote engine reachable at
     /// `endpoint` (a `ws://host:port` base). The client reconnects there, session and last_seq
-    /// unchanged. `token` is the bearer the remote requires — the client must switch to it before
-    /// reconnecting. When the remote uses the same trust domain as the source (loopback/vps/
-    /// microvm) the token is the source's own bearer, repeated verbatim; a provisioned engine
-    /// with no bearer (a `SingleUser` loopback, §6.5) sends an empty string. Always present: a
+    /// unchanged. `token` is a fresh opaque per-session secret the target minted at provision
+    /// time and delivered to the remote over the provisioning channel — never the client's own
+    /// source credential. The client must switch to it before reconnecting. Always present: a
     /// frame with a `null` or missing `token` fails to deserialize. Not a sequenced `Event` —
     /// never persisted/replayed from the store.
     Promoted {
