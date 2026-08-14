@@ -1,6 +1,6 @@
 # Multitenant identity — the `Authenticator` seam, TOTP + JWT, and session ownership
 
-> **Status:** DRAFT — being implemented as slice 1b (issue #125); open issues below are resolved.
+> **Status:** IMPLEMENTED — shipped as slice 1b (issue #125) in [#137](https://github.com/robhicks/otto/pull/137).
 > **Implements:** the identity half of the "Suggested first slice" of
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a —
