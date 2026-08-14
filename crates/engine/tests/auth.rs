@@ -229,7 +229,7 @@ async fn start_machine() -> (u16, tempfile::TempDir) {
     };
     // Acceptance is on so the tests can seed `session_secrets` via `POST /promote` (the Machine
     // receiver's only path to a recorded per-session secret). `machine_rejects_session_creation`
-    // and `machine_handshake_has_a_deadline` do not depend on the flag.
+    // does not depend on the flag.
     let app = serve_app(service, auth, test_capabilities(), None, true);
     let port = serve(app).await;
     (port, dir)
@@ -968,12 +968,19 @@ async fn refresh_with_another_users_token_is_rejected_and_closes() {
     ));
 }
 
-/// A wrong promotion secret on a `Machine` receiver is the single opaque error (A11), then the
-/// connection closes — no cause-specific detail leaks.
+/// A wrong session secret on a `Machine` receiver is the single opaque error (A11), then the
+/// connection closes — no cause-specific detail leaks. The credential compared is the promoted
+/// session's own per-session secret (`X-Otto-Session-Secret` at `/promote`); anything else —
+/// the machine-wide `SECRET` included — is indistinguishable (spec criterion 3).
 #[tokio::test]
 async fn machine_wrong_secret_is_the_opaque_error() {
     let (port, _dir) = start_machine().await;
-    let mut ws = connect(request(port, "")).await;
+    // Seed the session + its per-session secret via /promote so the `?session=` lookup (A5)
+    // succeeds and it is the wrong `Attach` token that is actually compared.
+    let id = otto_protocol::SessionId::new();
+    assert_eq!(promote_to(port, "the-real-secret", id).await.status(), 200);
+
+    let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
     let hello = hello(&mut ws).await;
     assert_eq!(hello["auth_mode"], "machine");
 
@@ -994,19 +1001,33 @@ async fn machine_wrong_secret_is_the_opaque_error() {
 }
 
 /// The `Machine` credential is the attached session's per-session secret (spec §3.5), so a
-/// header-less, `?session=`-less connection has no secret to look up (A5): it now fails
-/// immediately at the lookup — same opaque error, no session created — rather than waiting out
-/// the injectable handshake deadline. (The deadline still guards a `?session=` connection that
-/// presents no credential and never sends an `Attach`.)
+/// `?session=` connection that presents no credential and never sends an `Attach` is held
+/// under the injectable handshake deadline (finding 4): the deadline must fire with the single
+/// opaque error and close — a Machine receiver cannot hold an idle socket past the deadline.
+/// (A `?session=`-less connection fails earlier at the A5 secret lookup, never reaching the
+/// deadline; `machine_rejects_session_creation` covers that path.)
 #[tokio::test]
 async fn machine_handshake_has_a_deadline() {
     let (port, dir) = start_machine().await;
-    let mut ws = connect(request(port, "")).await;
+    // Seed the session + its per-session secret via /promote so the `?session=` lookup (A5)
+    // succeeds and the connection reaches the handshake deadline.
+    let id = otto_protocol::SessionId::new();
+    assert_eq!(
+        promote_to(port, "never-sent-secret", id).await.status(),
+        200
+    );
+
+    let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
     let hello = hello(&mut ws).await;
     assert_eq!(hello["auth_mode"], "machine");
 
-    // Send nothing: the opaque Error arrives, the server closes, and no session is created.
-    let frame = next_json(&mut ws).await;
+    // Send nothing: the opaque Error must arrive promptly — bounded to twice the injectable
+    // `HANDSHAKE_DEADLINE` `start_machine` configures (the nominal arrival is at the deadline
+    // itself; the slack is scheduler tolerance). A regression that held the idle socket past
+    // the deadline would expire the timeout here and fail the test instead of hanging.
+    let frame = tokio::time::timeout(HANDSHAKE_DEADLINE * 2, next_json(&mut ws))
+        .await
+        .expect("the handshake deadline must deliver the opaque error");
     assert_eq!(frame["type"], "error");
     assert_eq!(frame["message"], "authentication failed");
     assert!(
@@ -1015,8 +1036,8 @@ async fn machine_handshake_has_a_deadline() {
     );
     assert_eq!(
         session_count(&dir).await,
-        0,
-        "a timed-out machine handshake must create no session"
+        1,
+        "a timed-out machine handshake must not create a session"
     );
 }
 
