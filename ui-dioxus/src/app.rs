@@ -197,9 +197,19 @@ pub fn App() -> Element {
                                 turn_running.set(false);
                             }
                             SocketEvent::Message(Ok(ServerMessage::Promoted {
-                                endpoint, ..
-                            }))
-                            | SocketEvent::Message(Ok(ServerMessage::Demoted {
+                                endpoint,
+                                token: handover_token,
+                                ..
+                            })) => {
+                                // The promoted remote requires this per-session bearer for its
+                                // `/workspace` RPCs (load_files/open_path). Switch the credential
+                                // BEFORE the reconnect effect fires `do_connect`, exactly as the
+                                // `LoggedIn` arm stores an access token — the /workspace RPCs read
+                                // the signal once `Connected`, so ordering here is load-bearing.
+                                token.set(handover_token);
+                                reconnect_to.set(Some(endpoint));
+                            }
+                            SocketEvent::Message(Ok(ServerMessage::Demoted {
                                 endpoint, ..
                             })) => {
                                 // Reconnect to the handed-back engine, reusing token + session +

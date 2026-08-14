@@ -102,11 +102,14 @@ impl Provisioner for TestServeProvisioner {
             tools,
         );
         // The provisioned serve is a `--promotion-receiver` (`AuthMode::Machine`): accept
-        // promotions is true so /promote is live, and `TOKEN` doubles as the promotion secret.
+        // promotions is true so /promote is live. A fresh per-session secret is minted per
+        // provision (spec §1.2) and doubles as the machine's promotion secret — one session per
+        // machine, so the machine secret IS the session secret (spec A3).
+        let secret = otto_engine::mint_session_secret();
         let auth = AuthConfig {
             mode: AuthMode::Machine,
             authenticator: None,
-            promotion_secret: Some(TOKEN.to_string()),
+            promotion_secret: Some(secret.clone()),
             handshake_deadline: std::time::Duration::from_secs(10),
         };
         let app = serve_app(service, auth, caps(), None, true);
@@ -121,7 +124,7 @@ impl Provisioner for TestServeProvisioner {
         });
         Ok(ProvisionedMachine {
             endpoint: self.endpoint.clone(),
-            token: TOKEN.to_string(),
+            token: secret,
             task,
         })
     }
@@ -137,11 +140,21 @@ async fn microvm_target_seam_round_trip() {
     let bundle = sample_bundle(id, vec![("out.txt", b"HELLO")]);
     let handle = target.provision(&bundle).await.unwrap();
     assert_eq!(handle.endpoint, provisioner.endpoint);
+    assert!(
+        handle.token.len() == 32 && handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the microvm handle token must be a fresh 32-hex mint, got {:?}",
+        handle.token
+    );
+    assert_ne!(
+        handle.token, TOKEN,
+        "the machine's session secret must not be the shared TOKEN constant"
+    );
 
-    // Prove the restore landed: export the session back off the provisioned serve and check the file.
+    // Prove the restore landed: export the session back off the provisioned serve (authorized by
+    // the machine's session secret — its own token — never TOKEN) and check the file.
     let resp = reqwest::Client::new()
         .post(format!("{http_base}/export"))
-        .bearer_auth(TOKEN)
+        .bearer_auth(&handle.token)
         .json(&serde_json::json!({ "session": id.0.to_string() }))
         .send()
         .await
@@ -176,6 +189,15 @@ async fn microvm_demote_pull_then_dispose() {
     let bundle = sample_bundle(id, vec![("pulled.txt", b"FROM_VM")]);
     let handle = target.provision(&bundle).await.unwrap();
     assert_eq!(handle.endpoint, endpoint);
+    assert!(
+        handle.token.len() == 32 && handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the microvm handle token must be a fresh 32-hex mint, got {:?}",
+        handle.token
+    );
+    assert_ne!(
+        handle.token, TOKEN,
+        "the handle's secret must be the fresh mint, not the shared TOKEN constant"
+    );
 
     // Pull the session back off the provisioned serve using the handle's endpoint + token.
     let pulled = export_bundle(&handle.endpoint, &handle.token, id)
@@ -193,6 +215,7 @@ async fn microvm_demote_pull_then_dispose() {
     );
 
     // Dispose: dropping the handle aborts the serve task → the endpoint stops listening.
+    let handle_token = handle.token.clone();
     drop(handle);
     tokio::task::yield_now().await;
     let result = reqwest::Client::builder()
@@ -200,7 +223,7 @@ async fn microvm_demote_pull_then_dispose() {
         .build()
         .unwrap()
         .post(format!("{http_base}/export"))
-        .bearer_auth(TOKEN)
+        .bearer_auth(&handle_token)
         .json(&serde_json::json!({ "session": id.0.to_string() }))
         .send()
         .await;
@@ -218,6 +241,7 @@ async fn microvm_target_teardown_stops_the_machine() {
 
     let bundle = sample_bundle(SessionId::new(), vec![]);
     let handle = target.provision(&bundle).await.unwrap();
+    let handle_token = handle.token.clone();
 
     // Teardown aborts the serve task → the endpoint stops listening.
     target.teardown(handle).await.unwrap();
@@ -229,7 +253,7 @@ async fn microvm_target_teardown_stops_the_machine() {
         .build()
         .unwrap()
         .post(format!("{http_base}/promote"))
-        .bearer_auth(TOKEN)
+        .bearer_auth(&handle_token)
         .json(&sample_bundle(SessionId::new(), vec![]))
         .send()
         .await;

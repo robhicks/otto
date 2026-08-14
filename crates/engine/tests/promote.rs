@@ -95,7 +95,8 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     let last_seq = src_events.last().unwrap().seq;
 
     // --- Promote to a loopback remote. The provisioned engine inherits SingleUser (spec §6.5):
-    // same trust domain, no cross-machine credential, `Promoted.token` stays `None`. ---
+    // same trust domain, no cross-machine credential — yet the handle token is a fresh mint (spec
+    // success criterion 2): a uniform invariant, not a functional credential. ---
     let target = LoopbackTarget::new(
         AuthConfig {
             mode: AuthMode::SingleUser,
@@ -109,6 +110,11 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     let handle = promote(&*store, &*workspace, session, &target)
         .await
         .unwrap();
+    assert!(
+        handle.token.len() == 32 && handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the loopback handle token must be a fresh 32-hex mint, got {:?}",
+        handle.token
+    );
 
     // --- Reconnect to the remote: same session, replayed gap after seq 0. ---
     let url = format!("{}/ws?session={}&last_seq=0", handle.endpoint, session.0);

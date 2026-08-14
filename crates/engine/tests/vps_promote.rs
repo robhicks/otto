@@ -22,6 +22,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "vps-token";
+/// A distinct per-session secret the harness pushes with, proving it differs from the machine
+/// secret `TOKEN` (spec success criterion 3). Real pushes mint a fresh value per session; the
+/// constant stands in where the test only needs the two credentials to differ.
+const SESSION_SECRET: &str = "session-secret";
 
 /// Build a `PromoteBundle` with the given session id and workspace files (typed → serialized,
 /// so the wire shape always matches the real serde derives).
@@ -55,8 +59,9 @@ fn caps() -> CapabilitiesManifest {
 }
 
 /// Start a `--promotion-receiver` serve (`AuthMode::Machine`) on an ephemeral port. Returns its
-/// `http://127.0.0.1:<port>` base. `TOKEN` doubles as the promotion secret — the credential the
-/// `/promote`/`/export`/`/workspace` RPCs and a WS `Bearer` header all carry.
+/// `http://127.0.0.1:<port>` base. `TOKEN` is the machine-wide admission secret `/promote`
+/// authenticates with; per-session secrets are minted/recorded per push and authorize
+/// `/export`, `/workspace`, and WS attach (spec §3).
 async fn start_receiver(accept_promotions: bool) -> (String, tempfile::TempDir, tempfile::TempDir) {
     let ws_dir = tempfile::tempdir().unwrap();
     let db_dir = tempfile::tempdir().unwrap();
@@ -88,16 +93,25 @@ async fn start_receiver(accept_promotions: bool) -> (String, tempfile::TempDir, 
     (format!("http://127.0.0.1:{port}"), ws_dir, db_dir)
 }
 
-async fn post_promote(base: &str, token: Option<&str>, body: &PromoteBundle) -> reqwest::Response {
+async fn post_promote(
+    base: &str,
+    token: Option<&str>,
+    session_secret: Option<&str>,
+    body: &PromoteBundle,
+) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("{base}/promote"))
         .json(body);
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
+    if let Some(s) = session_secret {
+        req = req.header("X-Otto-Session-Secret", s);
+    }
     req.send().await.unwrap()
 }
 
+/// `/export` authenticates with the **session's** per-session secret (never the machine secret).
 async fn post_export(base: &str, token: Option<&str>, session: &str) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("{base}/export"))
@@ -123,23 +137,28 @@ async fn export_without_bearer_is_unauthorized() {
 }
 
 #[tokio::test]
-async fn export_unknown_session_is_not_found() {
+async fn export_never_promoted_session_is_unauthorized() {
+    // A session never promoted here has no recorded per-session secret → 401 (spec §3.3), never
+    // a 404 — never-promoted and already-disposed are indistinguishable by design.
     let (base, _w, _d) = start_receiver(true).await;
-    let resp = post_export(&base, Some(TOKEN), &SessionId::new().0.to_string()).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let resp = post_export(&base, Some(SESSION_SECRET), &SessionId::new().0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn export_existing_session_returns_a_bundle() {
-    // Promote a session onto the receiver, then export it back out.
+    // Promote a session onto the receiver (recording SESSION_SECRET for it), then export it back
+    // out authenticated with the session's per-session secret.
     let (base, _w, _d) = start_receiver(true).await;
     let id = SessionId::new();
     let body = sample_bundle(id, vec![("out.txt", b"HI")]);
     assert_eq!(
-        post_promote(&base, Some(TOKEN), &body).await.status(),
+        post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
         reqwest::StatusCode::OK
     );
-    let resp = post_export(&base, Some(TOKEN), &id.0.to_string()).await;
+    let resp = post_export(&base, Some(SESSION_SECRET), &id.0.to_string()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let bundle: PromoteBundle = resp.json().await.unwrap();
     assert_eq!(bundle.session.id, id);
@@ -149,7 +168,7 @@ async fn export_existing_session_returns_a_bundle() {
 async fn promote_without_accept_flag_is_forbidden() {
     let (base, _w, _d) = start_receiver(false).await;
     let body = sample_bundle(SessionId::new(), vec![]);
-    let resp = post_promote(&base, Some(TOKEN), &body).await;
+    let resp = post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
@@ -157,7 +176,7 @@ async fn promote_without_accept_flag_is_forbidden() {
 async fn promote_without_bearer_is_unauthorized() {
     let (base, _w, _d) = start_receiver(true).await;
     let body = sample_bundle(SessionId::new(), vec![]);
-    let resp = post_promote(&base, None, &body).await;
+    let resp = post_promote(&base, None, Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
@@ -165,7 +184,7 @@ async fn promote_without_bearer_is_unauthorized() {
 async fn promote_with_wrong_bearer_is_unauthorized() {
     let (base, _w, _d) = start_receiver(true).await;
     let body = sample_bundle(SessionId::new(), vec![]);
-    let resp = post_promote(&base, Some("nope"), &body).await;
+    let resp = post_promote(&base, Some("nope"), Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
@@ -174,7 +193,7 @@ async fn promote_valid_bundle_is_ok_and_restores() {
     let (base, _w, _d) = start_receiver(true).await;
     let id = SessionId::new();
     let body = sample_bundle(id, vec![("out.txt", b"HELLO")]);
-    let resp = post_promote(&base, Some(TOKEN), &body).await;
+    let resp = post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["session"].as_str().unwrap(), id.0.to_string());
@@ -185,7 +204,7 @@ async fn promote_sensitive_entry_is_refused() {
     // A hostile/malformed bundle is a client fault → 400, not a receiver error (500).
     let (base, _w, _d) = start_receiver(true).await;
     let body = sample_bundle(SessionId::new(), vec![(".env", b"SECRET=1")]);
-    let resp = post_promote(&base, Some(TOKEN), &body).await;
+    let resp = post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
@@ -194,9 +213,9 @@ async fn promote_duplicate_session_is_conflict() {
     let (base, _w, _d) = start_receiver(true).await;
     let id = SessionId::new();
     let body = sample_bundle(id, vec![]);
-    let first = post_promote(&base, Some(TOKEN), &body).await;
+    let first = post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    let second = post_promote(&base, Some(TOKEN), &body).await;
+    let second = post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
 }
 
@@ -206,6 +225,7 @@ async fn promote_malformed_body_is_bad_request() {
     let resp = reqwest::Client::new()
         .post(format!("{base}/promote"))
         .bearer_auth(TOKEN)
+        .header("X-Otto-Session-Secret", SESSION_SECRET)
         .body("{ not json")
         .send()
         .await
@@ -214,9 +234,19 @@ async fn promote_malformed_body_is_bad_request() {
 }
 
 #[tokio::test]
-async fn export_with_wrong_bearer_is_unauthorized() {
+async fn export_with_wrong_secret_is_unauthorized() {
+    // A promoted session exported with a wrong (or the machine-wide) secret is refused — the
+    // per-session secret is the only `/export` credential (spec criterion 3).
     let (base, _w, _d) = start_receiver(true).await;
-    let resp = post_export(&base, Some("nope"), &SessionId::new().0.to_string()).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let resp = post_export(&base, Some("nope"), &id.0.to_string()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
@@ -242,27 +272,27 @@ async fn export_malformed_session_id_is_bad_request() {
 
 #[tokio::test]
 async fn demote_without_promote_config_is_unavailable() {
-    let (recv_http, _w, db_dir) = start_receiver(true).await;
+    let (recv_http, _w, _db) = start_receiver(true).await;
     let recv_ws = recv_http.replace("http://", "ws://");
-    // A `Machine` receiver creates no sessions on connect, so seed the session the connection
-    // adopts (the promotion-secret header pre-resolves; `?session=` names the promoted copy).
-    let store = SqliteStore::open(db_dir.path().join("r.db")).await.unwrap();
-    let session = SessionStore::create_session(
-        &store,
-        &otto_protocol::UserId::local(),
-        "promoted",
-        &serde_json::json!({}),
-    )
-    .await
-    .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
-        "{recv_ws}/ws?session={}",
-        session.0
-    )))
+    // Seed the session + its per-session secret via /promote — the Machine receiver's only path
+    // to a recorded session secret (a row created directly in the store has no secret and is
+    // unreachable by design, spec §3.5).
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![]);
+    assert_eq!(
+        post_promote(&recv_http, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request_with(
+        &format!("{recv_ws}/ws?session={}", id.0),
+        SESSION_SECRET,
+    ))
     .await
     .unwrap();
     ready_frame(&mut ws).await;
-    let demote = serde_json::json!({ "DemoteToLocal": { "session": session.0.to_string() } });
+    let demote = serde_json::json!({ "DemoteToLocal": { "session": id.0.to_string() } });
     ws.send(Message::Text(serde_json::to_string(&demote).unwrap()))
         .await
         .unwrap();
@@ -322,6 +352,16 @@ async fn vps_target_provisions_against_a_receiver() {
     let handle = target.provision(&bundle).await.unwrap();
     // The handle points back at the ws endpoint the client reconnects to.
     assert_eq!(handle.endpoint, ws_endpoint);
+    // The handle's token is a fresh per-session mint, distinct from the machine secret.
+    assert!(
+        handle.token.len() == 32 && handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the vps handle token must be a fresh 32-hex mint, got {:?}",
+        handle.token
+    );
+    assert_ne!(
+        handle.token, TOKEN,
+        "the session secret must differ from the machine secret"
+    );
 }
 
 #[tokio::test]
@@ -332,11 +372,15 @@ async fn vps_target_teardown_does_not_stop_the_receiver() {
     let bundle = sample_bundle(SessionId::new(), vec![]);
     let target = VpsTarget::new(ws_endpoint, TOKEN);
     let handle = target.provision(&bundle).await.unwrap();
+    assert_ne!(
+        handle.token, TOKEN,
+        "the session secret must differ from the machine secret"
+    );
     target.teardown(handle).await.unwrap();
 
     // The receiver is still up: a second valid POST /promote (new session id) succeeds.
     let body = sample_bundle(SessionId::new(), vec![]);
-    let resp = post_promote(&http_base, Some(TOKEN), &body).await;
+    let resp = post_promote(&http_base, Some(TOKEN), Some(SESSION_SECRET), &body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
@@ -363,11 +407,20 @@ async fn next_json(
     }
 }
 
-fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+fn authed_ws_request_with(
+    url: &str,
+    token: &str,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let mut req = url.to_string().into_client_request().unwrap();
     req.headers_mut()
-        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
     req
+}
+
+/// The source-side default: `Bearer TOKEN`. A `SingleUser` source ignores the credential, so this
+/// is only a uniform convention.
+fn authed_ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    authed_ws_request_with(url, TOKEN)
 }
 
 /// Read the `Hello` greeting (always the first frame, in every mode).
@@ -453,6 +506,17 @@ async fn handover_vps_promote_points_at_receiver() {
         let frame = next_json(&mut ws).await.expect("a frame");
         if frame["type"] == "promoted" {
             assert_eq!(frame["endpoint"].as_str().unwrap(), recv_ws);
+            // Spec criterion 2: every Promoted frame carries a fresh 32-hex token — never the
+            // machine-wide secret (the whole point of the per-session model).
+            let token = frame["token"].as_str().expect("promoted token");
+            assert!(
+                token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit()),
+                "the promoted token must be a fresh 32-hex mint, got {token:?}"
+            );
+            assert_ne!(
+                token, TOKEN,
+                "the promoted token must differ from the machine secret"
+            );
             break;
         }
         assert_ne!(frame["type"], "error", "promote must not error: {frame:?}");
@@ -480,16 +544,19 @@ async fn handover_vps_demote_pulls_session_back_to_source() {
     ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
         .await
         .unwrap();
+    let session_secret;
     loop {
         let frame = next_json(&mut ws).await.expect("a frame");
         if frame["type"] == "promoted" {
+            session_secret = frame["token"].as_str().unwrap().to_string();
             break;
         }
         assert_ne!(frame["type"], "error", "promote must not error: {frame:?}");
     }
 
-    // Advance the session on the RECEIVER: write a file via its /workspace RPC.
-    let recv_remote_ws = RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    // Advance the session on the RECEIVER: write a file via its /workspace RPC, authenticated
+    // with the per-session secret the promote delivered.
+    let recv_remote_ws = RemoteWorkspace::new(recv_http.clone(), session_secret);
     recv_remote_ws
         .apply_edit(&otto_engine_core::types::Edit {
             path: std::path::PathBuf::from("remote_only.txt"),
@@ -538,16 +605,19 @@ async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
     ws.send(Message::Text(serde_json::to_string(&promote).unwrap()))
         .await
         .unwrap();
+    let session_secret;
     loop {
         let f = next_json(&mut ws).await.expect("frame");
         if f["type"] == "promoted" {
+            session_secret = f["token"].as_str().unwrap().to_string();
             break;
         }
         assert_ne!(f["type"], "error", "{f:?}");
     }
 
-    // Advance the session ON THE RECEIVER: write a file via its /workspace RPC.
-    let recv_remote_ws = otto_workspace::RemoteWorkspace::new(recv_http.clone(), TOKEN);
+    // Advance the session ON THE RECEIVER: write a file via its /workspace RPC, authenticated
+    // with the per-session secret the promote delivered.
+    let recv_remote_ws = otto_workspace::RemoteWorkspace::new(recv_http.clone(), session_secret);
     recv_remote_ws
         .apply_edit(&otto_engine_core::types::Edit {
             path: std::path::PathBuf::from("advanced.txt"),
@@ -586,9 +656,20 @@ async fn vps_demote_round_trip_brings_advanced_state_back_to_source() {
     let ready2 = ready_frame(&mut ws2).await;
     assert_eq!(ready2["session"].as_str().unwrap(), session);
 
-    // Copy semantics: demote is non-destructive — the receiver still holds the session.
-    let resp = post_export(&recv_http, Some(TOKEN), &session).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // Copy semantics: demote is non-destructive — the receiver still holds the session. Its
+    // per-session secret was consumed by the demote pull (spec A4), so the retained copy is
+    // unreachable via a second /export; assert against the store, not the wire.
+    let recv_store = SqliteStore::open(_rd.path().join("r.db")).await.unwrap();
+    assert!(
+        SessionStore::session_status(
+            &recv_store,
+            &otto_protocol::UserId::local(),
+            otto_protocol::SessionId(uuid::Uuid::parse_str(&session).unwrap()),
+        )
+        .await
+        .is_ok(),
+        "the receiver must retain the session after the demote pull (copy semantics)"
+    );
 }
 
 #[tokio::test]
@@ -657,13 +738,23 @@ async fn vps_promote_resumes_session_and_workspace_on_receiver() {
         .await
         .unwrap();
     assert_eq!(handle.endpoint, recv_ws);
+    assert!(
+        handle.token.len() == 32 && handle.token.chars().all(|c| c.is_ascii_hexdigit()),
+        "the vps handle token must be a fresh 32-hex mint, got {:?}",
+        handle.token
+    );
+    assert_ne!(
+        handle.token, TOKEN,
+        "the session secret must differ from the machine secret"
+    );
 
-    // --- Reconnect to the receiver: same session, replayed gap after seq 0. The `Machine`
-    // receiver pre-resolves from the promotion-secret header and adopts the promoted session. ---
-    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request(&format!(
-        "{recv_ws}/ws?session={}&last_seq=0",
-        session.0
-    )))
+    // --- Reconnect to the receiver with the session's per-session secret (spec §3.5): same
+    // session, replayed gap after seq 0. The Machine receiver looks the secret up for the session
+    // named in ?session=. ---
+    let (mut ws, _) = tokio_tungstenite::connect_async(authed_ws_request_with(
+        &format!("{recv_ws}/ws?session={}&last_seq=0", session.0),
+        &handle.token,
+    ))
     .await
     .unwrap();
     let ready = ready_frame(&mut ws).await;
@@ -687,13 +778,150 @@ async fn vps_promote_resumes_session_and_workspace_on_receiver() {
     assert_eq!(replayed, expected);
     drop(ws);
 
-    // --- The workspace transferred: read out.txt via the receiver's /workspace RPC. ---
-    let remote_ws = RemoteWorkspace::new(recv_http, TOKEN);
+    // --- The workspace transferred: read out.txt via the receiver's /workspace RPC, authenticated
+    // with the session secret (A6). ---
+    let remote_ws = RemoteWorkspace::new(recv_http, handle.token.clone());
     assert_eq!(
         remote_ws
             .read(std::path::Path::new("out.txt"))
             .await
             .unwrap(),
         b"PROMOTED"
+    );
+}
+
+async fn post_workspace(base: &str, token: Option<&str>, glob: &str) -> reqwest::Response {
+    let mut req = reqwest::Client::new()
+        .post(format!("{base}/workspace"))
+        .json(&otto_protocol::WorkspaceRequest::List {
+            glob: glob.to_string(),
+        });
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    req.send().await.unwrap()
+}
+
+/// Spec criterion 3: the machine-wide promotion secret is admission-only — it does not authorize
+/// an `/export` for a session pushed with a distinct per-session secret.
+#[tokio::test]
+async fn export_with_the_machine_secret_is_unauthorized() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    let resp = post_export(&base, Some(TOKEN), &id.0.to_string()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+/// Spec criterion 4: a successful `/export` disposes the session's secret — a second export with
+/// the same secret is refused (401), while the receiver's retained copy of the session still
+/// exists (copy semantics, asserted against the store).
+#[tokio::test]
+async fn export_disposes_the_session_secret_but_keeps_the_session() {
+    let (base, _w, db_dir) = start_receiver(true).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let first = post_export(&base, Some(SESSION_SECRET), &id.0.to_string()).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let second = post_export(&base, Some(SESSION_SECRET), &id.0.to_string()).await;
+    assert_eq!(second.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Copy semantics: the demote pull consumed the credential, not the session — the receiver's
+    // store still holds the session.
+    let store = SqliteStore::open(db_dir.path().join("r.db")).await.unwrap();
+    let status = SessionStore::session_status(
+        &store,
+        &otto_protocol::UserId::local(),
+        otto_protocol::SessionId(uuid::Uuid::parse_str(&id.0.to_string()).unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, SessionStatus::Active);
+}
+
+/// A6: `/workspace` on a `Machine` receiver accepts the machine secret OR any live session
+/// secret, and refuses anything else.
+#[tokio::test]
+async fn workspace_accepts_machine_and_live_session_secrets() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let id = SessionId::new();
+    let body = sample_bundle(id, vec![]);
+    assert_eq!(
+        post_promote(&base, Some(TOKEN), Some(SESSION_SECRET), &body)
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    assert_eq!(
+        post_workspace(&base, Some(TOKEN), "*").await.status(),
+        reqwest::StatusCode::OK,
+        "the machine secret must reach /workspace (A6)"
+    );
+    assert_eq!(
+        post_workspace(&base, Some(SESSION_SECRET), "*")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "a live session secret must reach /workspace (A6)"
+    );
+    assert_eq!(
+        post_workspace(&base, Some("wrong-secret"), "*")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A2: `/promote` without the `X-Otto-Session-Secret` header is refused — a session restored
+/// without a recorded secret would be unreachable yet exist.
+#[tokio::test]
+async fn promote_without_session_secret_header_is_bad_request() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let body = sample_bundle(SessionId::new(), vec![]);
+    let resp = post_promote(&base, Some(TOKEN), None, &body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// Spec criterion 6: a pre-ownership bundle (a `session` object lacking `owner`) gets the
+/// operator-actionable message byte-for-byte, never a bare `missing field 'owner'`.
+#[tokio::test]
+async fn promote_pre_ownership_bundle_returns_the_actionable_message() {
+    let (base, _w, _d) = start_receiver(true).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/promote"))
+        .bearer_auth(TOKEN)
+        .header("X-Otto-Session-Secret", SESSION_SECRET)
+        .json(&serde_json::json!({
+            "session": { "id": SessionId::new().0.to_string(), "goal": "g" },
+            "workspace": { "files": [] },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        body,
+        "promote bundle predates session ownership (issue #115): its session carries no owner. \
+         otto has no installed base, so there is no migration — re-promote from a current otto.",
+        "the pre-ownership message must be the actionable one, byte-for-byte"
+    );
+    assert!(
+        !body.contains("missing field 'owner'"),
+        "the bare serde message must not leak, got: {body}"
     );
 }

@@ -43,7 +43,7 @@ pub use mcp::{
 pub use otto_remote::{
     FlyConfig, FlyTarget, MicrovmConfig, MicrovmTarget, PromoteBundle, PromoteConfig, PromoteMode,
     ProvisionedMachine, Provisioner, RemoteHandle, RemoteTarget, UnsupportedProvisioner, VpsTarget,
-    export_bundle, promote,
+    export_bundle, mint_session_secret, promote,
 };
 pub use policy_gate::PolicyGate;
 pub use serve::{

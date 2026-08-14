@@ -71,12 +71,55 @@ struct ServeState {
     /// cache hit always corresponds to the same direction and the reply label cannot be mislabelled
     /// by a malformed client sequence that flips the direction on a repeat call.
     remotes: Mutex<HashMap<(SessionId, bool), RemoteHandle>>,
+    /// The receiver's session→secret map (spec §3.1): the per-session secret recorded on a
+    /// successful `/promote` push, consulted by `/export`, the `Machine`-mode WS handshake, and
+    /// `/workspace` (membership, A6), and disposed when the session is demoted. Transient
+    /// transport state, never persisted and never logged; no `Debug` impl formats it.
+    session_secrets: Mutex<HashMap<SessionId, String>>,
 }
 
 impl ServeState {
     /// The configured authenticator — present exactly when the mode is `Users`.
     fn authenticator(&self) -> Option<&Arc<dyn Authenticator>> {
         self.auth.authenticator.as_ref()
+    }
+
+    /// Record the per-session secret carried on a successful `/promote` push.
+    fn record_session_secret(&self, session: SessionId, secret: String) {
+        self.session_secrets.lock().unwrap().insert(session, secret);
+    }
+
+    /// The recorded per-session secret for `session`, if any. Cloned out under the lock so the
+    /// guard is released before any await by the caller.
+    fn session_secret(&self, session: SessionId) -> Option<String> {
+        self.session_secrets.lock().unwrap().get(&session).cloned()
+    }
+
+    /// Consume a session's secret after a successful `/export`: demote consumes the credential,
+    /// so a disposed secret is indistinguishable from one never recorded (both `None`).
+    fn dispose_session_secret(&self, session: SessionId) {
+        self.session_secrets.lock().unwrap().remove(&session);
+    }
+
+    /// `/workspace` authorization on a `Machine` receiver (A6): the machine secret (the
+    /// operator/back-compat path) OR membership in the session→secret map — each entry compared
+    /// constant-time. The RPC is machine-scoped with no session id in the request, so checking
+    /// against every live session secret is the session-side credential check.
+    fn machine_workspace_authorized(&self, headers: &HeaderMap) -> bool {
+        if authorized(headers, self.auth.promotion_secret.as_deref()) {
+            return true;
+        }
+        let Some(provided) = bearer_token(headers) else {
+            return false;
+        };
+        let secrets = self.session_secrets.lock().unwrap();
+        // `.any()` short-circuits on the first match, leaking the matching position through
+        // timing — acceptable: the map holds at most one entry per live promoted session (tiny),
+        // every value is the same 32-hex shape, and the position reveals nothing about the secret
+        // to a caller who already holds some credential (the failure is a single opaque error).
+        secrets
+            .values()
+            .any(|s| bool::from(s.as_bytes().ct_eq(provided.as_bytes())))
     }
 }
 
@@ -210,6 +253,7 @@ fn app_inner(
         accept_promotions,
         public_ws_base,
         remotes: Mutex::new(HashMap::new()),
+        session_secrets: Mutex::new(HashMap::new()),
     });
     // CORS for the browser UI: it is served from a different origin (dx dev server or
     // otto serve --ui-dir) and its POST /workspace carries an `Authorization` header,
@@ -295,7 +339,9 @@ async fn workspace_handler(
             }
         }
         AuthMode::Machine => {
-            if !authorized(&headers, state.auth.promotion_secret.as_deref()) {
+            // A6: the machine secret (operator path) OR any live session secret (a promoted
+            // client reconnects with its per-session secret and drives /workspace with it).
+            if !state.machine_workspace_authorized(&headers) {
                 return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
                     .into_response();
             }
@@ -309,9 +355,25 @@ async fn workspace_handler(
     axum::Json(resp).into_response()
 }
 
+/// Detect the pre-ownership bundle shape that `/promote` special-cases (spec §3.2 / premise
+/// correction 1): a `PromoteBundle` whose top-level `session` object is present but lacks the
+/// `owner` key — a bundle serialized before slice 1a's session ownership. Returns `true` only for
+/// that exact shape. A body that is not JSON, has no `session` object, or whose `session` is not an
+/// object keeps the ordinary `bad request: {e}` 400.
+fn is_pre_ownership_bundle(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    match value.get("session") {
+        Some(serde_json::Value::Object(session)) => !session.contains_key("owner"),
+        _ => false,
+    }
+}
+
 /// Inbound restore RPC (receiver role). Fail-closed: `403` unless `--accept-promotions`, `401`
 /// without the promotion secret (constant-time). Restores the bundle into this engine's store +
-/// workspace (gated).
+/// workspace (gated). A pre-ownership bundle (a `session` lacking `owner`) gets the actionable
+/// 400; the `X-Otto-Session-Secret` header is required (A2) and recorded for `/export`/WS attach.
 async fn promote_handler(
     headers: HeaderMap,
     State(state): State<Arc<ServeState>>,
@@ -325,10 +387,39 @@ async fn promote_handler(
     }
     let bundle: otto_remote::PromoteBundle = match serde_json::from_slice(&body) {
         Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response(),
+        Err(e) => {
+            if is_pre_ownership_bundle(&body) {
+                // The legacy break inside `SessionState`'s deserialization (missing `owner`),
+                // with the operator-actionable message (slice 1a's §4.1, adapted to the wire).
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "promote bundle predates session ownership (issue #115): its session carries \
+                     no owner. otto has no installed base, so there is no migration — re-promote \
+                     from a current otto.",
+                )
+                    .into_response();
+            }
+            return (StatusCode::BAD_REQUEST, format!("bad request: {e}")).into_response();
+        }
+    };
+    // The per-session secret the pusher minted for this session (A2): required — a session
+    // restored without a recorded secret would be unreachable yet exist.
+    let header_secret = match headers
+        .get(otto_remote::SESSION_SECRET_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing or empty X-Otto-Session-Secret header",
+            )
+                .into_response();
+        }
     };
     match state.service.accept_promotion(&bundle).await {
         Ok(session) => {
+            state.record_session_secret(session, header_secret);
             axum::Json(serde_json::json!({ "session": session.0.to_string() })).into_response()
         }
         Err(crate::service::AcceptError::AlreadyExists) => {
@@ -345,9 +436,10 @@ async fn promote_handler(
 }
 
 /// Outbound export RPC (receiver role): returns a session's `PromoteBundle` so a demoting source
-/// can pull it back. Same gate as `/promote`: `403` unless `--accept-promotions`, `401` without
-/// the promotion secret (constant-time). The bundle's workspace snapshot is gate-filtered (secrets
-/// never leave here).
+/// can pull it back. `403` unless `--accept-promotions`. Authorized by the **session's** per-session
+/// secret (recorded at `/promote`), never the machine-wide secret; a successful export disposes the
+/// secret (demote consumes the credential). The bundle's workspace snapshot is gate-filtered
+/// (secrets never leave here).
 async fn export_handler(
     headers: HeaderMap,
     State(state): State<Arc<ServeState>>,
@@ -355,9 +447,6 @@ async fn export_handler(
 ) -> Response {
     if !state.accept_promotions {
         return (StatusCode::FORBIDDEN, "promotion acceptance disabled").into_response();
-    }
-    if !authorized(&headers, state.auth.promotion_secret.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
     }
     #[derive(serde::Deserialize)]
     struct ExportRequest {
@@ -371,8 +460,22 @@ async fn export_handler(
         Ok(u) => SessionId(u),
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad session id: {e}")).into_response(),
     };
+    // The session's per-session secret authorizes its export — `None` means never-promoted-here
+    // or already-disposed (indistinguishable by design, and both `401`). The machine secret is
+    // admission-only and no longer authorizes an export.
+    let Some(secret) = state.session_secret(session) else {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    };
+    if !authorized(&headers, Some(&secret)) {
+        return (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+    }
     match state.service.export_promotion(session).await {
-        Ok(bundle) => axum::Json(bundle).into_response(),
+        Ok(bundle) => {
+            // Demote consumes the credential: dispose BEFORE returning the bundle. A store row
+            // that vanishes between the check above and this read keeps its fail-closed 404.
+            state.dispose_session_secret(session);
+            axum::Json(bundle).into_response()
+        }
         // Unknown session (snapshot errors when the row is absent) → 404, not a 500.
         Err(_) => (StatusCode::NOT_FOUND, "unknown session").into_response(),
     }
@@ -798,6 +901,7 @@ async fn authenticate_connection(
     reader: &mut WsReader,
     writer: &mut WsWriter,
     headers: &HeaderMap,
+    params: &ConnectParams,
     state: &ServeState,
 ) -> Option<ConnIdentity> {
     match state.auth.mode {
@@ -819,21 +923,50 @@ async fn authenticate_connection(
                     }
                 }
             }
-            handshake_frame(reader, writer, state).await
+            handshake_frame(reader, writer, state, None).await
         }
         AuthMode::Machine => {
-            // The promotion secret via the header (constant-time) — or the post-upgrade `Attach`
-            // frame. `Machine` waits under the same handshake deadline as `Users`: a receiver
-            // that sends neither a header nor an `Attach` frame must not hold an idle socket
-            // indefinitely (finding 4). The owner is the attached session's own, adopted in
-            // `resolve_session` (§6.5 / §7.2).
-            if authorized(headers, state.auth.promotion_secret.as_deref()) {
+            // The credential is the per-session secret for the session named in ?session= (A5): a
+            // receiver creates no sessions, so a Machine connection without a ?session= has no
+            // secret to check — the single opaque failure. Header or `Attach` frame, both against
+            // the session's secret; the owner is the attached session's own, adopted in
+            // `resolve_session` (§6.5 / §7.2). `Machine` waits under the same handshake deadline
+            // as `Users` (finding 4).
+            let Some(session) = params
+                .session
+                .as_ref()
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            else {
+                eprintln!("serve: machine attach without a session id");
+                send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: AUTH_FAILED.to_string(),
+                    },
+                )
+                .await
+                .ok();
+                return None;
+            };
+            let Some(secret) = state.session_secret(SessionId(session)) else {
+                eprintln!("serve: machine attach for an unknown/disposed session");
+                send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: AUTH_FAILED.to_string(),
+                    },
+                )
+                .await
+                .ok();
+                return None;
+            };
+            if authorized(headers, Some(&secret)) {
                 return Some(ConnIdentity {
                     owner: UserId::local(),
                     access_token: None,
                 });
             }
-            handshake_frame(reader, writer, state).await
+            handshake_frame(reader, writer, state, Some(&secret)).await
         }
     }
 }
@@ -841,12 +974,14 @@ async fn authenticate_connection(
 /// Await and verify the first post-upgrade frame under `AuthConfig.handshake_deadline` (both
 /// `Users` and `Machine` wait; `SingleUser` never reaches this — it expects no frame). It must
 /// be `Login` (identity credentials → `authenticate` + `mint` → `LoggedIn`) or `Attach` (an
-/// access token, or on `Machine` the promotion secret). Anything else is the same opaque
-/// failure. Returns the established identity.
+/// access token, or on `Machine` the session's per-session secret). `expected_machine_secret` is
+/// the secret the `Machine` `Attach` arm verifies against (`None` on the `Users` path, which is
+/// unchanged). Anything else is the same opaque failure. Returns the established identity.
 async fn handshake_frame(
     reader: &mut WsReader,
     writer: &mut WsWriter,
     state: &ServeState,
+    expected_machine_secret: Option<&str>,
 ) -> Option<ConnIdentity> {
     let frame = match tokio::time::timeout(state.auth.handshake_deadline, reader.next()).await {
         Err(_) => {
@@ -943,8 +1078,9 @@ async fn handshake_frame(
         }
         Command::Attach { token } => {
             if state.auth.mode == AuthMode::Machine {
-                // The one credential Machine accepts in a frame: the promotion secret, constant-time.
-                if secret_matches(state.auth.promotion_secret.as_deref(), &token) {
+                // The one credential Machine accepts in a frame: the attached session's
+                // per-session secret, constant-time.
+                if secret_matches(expected_machine_secret, &token) {
                     Some(ConnIdentity {
                         owner: UserId::local(),
                         access_token: None,
@@ -1035,7 +1171,7 @@ async fn handle_socket(
 
     // Establish the connection's identity (or close on the opaque auth failure).
     let mut identity =
-        match authenticate_connection(&mut reader, &mut writer, &headers, &state).await {
+        match authenticate_connection(&mut reader, &mut writer, &headers, &params, &state).await {
             Some(i) => i,
             None => return,
         };
@@ -1391,10 +1527,34 @@ async fn handle_handover(
     // Vps demote: pull the session's current bundle back off the receiver and restore it into THIS
     // (source) engine, overwriting our own stale copy. Symmetric inverse of the promote push. The
     // client reconnects to us (the session is local again), so we report our own public ws base.
+    // The pull is authorized by the session's per-session secret, which lives in the stored handle
+    // (spec §1.3): the machine-wide pusher token is not a session credential and cannot export.
     if !to_remote {
-        if let otto_remote::PromoteMode::Vps { endpoint } = &cfg.mode {
-            let target = otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone());
-            let bundle = match target.export(session).await {
+        if let otto_remote::PromoteMode::Vps { .. } = &cfg.mode {
+            // Source the live endpoint+secret from the handle a prior promote stored under
+            // (session, true). No handle ⟹ nothing to pull from. Take the lock only to clone the
+            // endpoint/secret, releasing it at the `;` before any await.
+            let live = state
+                .remotes
+                .lock()
+                .unwrap()
+                .get(&(session, true))
+                .map(|h| (h.endpoint.clone(), h.token.clone()));
+            let Some((endpoint, secret)) = live else {
+                let _ = send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: "no active vps handover for this session; promote first"
+                            .to_string(),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Pull the current bundle off the receiver with the stored session secret. On failure,
+            // leave the remote session in place (a transient pull error must not lose it).
+            let bundle = match otto_remote::export_bundle(&endpoint, &secret, session).await {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = send_msg(
@@ -1419,6 +1579,7 @@ async fn handle_handover(
                 let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
                 return;
             }
+            state.remotes.lock().unwrap().remove(&(session, true));
             match &state.public_ws_base {
                 Some(base) => {
                     let _ = send_msg(
@@ -1631,21 +1792,16 @@ async fn handle_handover(
         Some((endpoint, tok)) => (endpoint, tok),
         None => {
             let target: Box<dyn otto_remote::RemoteTarget> = match &cfg.mode {
-                otto_remote::PromoteMode::Loopback { base_dir } => Box::new(
-                    // The provisioned engine inherits `SingleUser` regardless of the source's
-                    // mode (spec §6.5): a loopback provision is in-process, same trust domain,
-                    // and needs no cross-machine credential — `Promoted.token` stays `None`.
-                    LoopbackTarget::new(
-                        AuthConfig {
-                            mode: AuthMode::SingleUser,
-                            authenticator: None,
-                            promotion_secret: None,
-                            handshake_deadline: std::time::Duration::from_secs(10),
-                        },
-                        base_dir.clone(),
-                        to_remote,
-                    ),
-                ),
+                otto_remote::PromoteMode::Loopback { base_dir } => Box::new(LoopbackTarget::new(
+                    AuthConfig {
+                        mode: AuthMode::SingleUser,
+                        authenticator: None,
+                        promotion_secret: None,
+                        handshake_deadline: std::time::Duration::from_secs(10),
+                    },
+                    base_dir.clone(),
+                    to_remote,
+                )),
                 otto_remote::PromoteMode::Vps { endpoint } => Box::new(
                     otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
                 ),
@@ -1655,7 +1811,7 @@ async fn handle_handover(
                         dyn otto_remote::Provisioner,
                     > = std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
                         config.clone(),
-                        cfg.token.clone(),
+                        crate::mint_session_secret(),
                     ));
                     #[cfg(not(feature = "firecracker"))]
                     let provisioner: std::sync::Arc<
@@ -1703,15 +1859,10 @@ async fn handle_handover(
         }
     };
     let msg = if to_remote {
-        // Deliver a token only when the remote uses a different bearer than the source (Fly mints
-        // a fresh per-session token); reuse-targets (loopback/vps/microvm) carry cfg.token, so send
-        // None. A provisioned engine with no bearer (a `SingleUser` loopback, §6.5) also sends
-        // None — an empty token is never a credential to switch to.
-        let handover_token = (!tok.is_empty() && tok != cfg.token).then(|| tok.clone());
         ServerMessage::Promoted {
             session,
             endpoint,
-            token: handover_token,
+            token: tok,
         }
     } else {
         ServerMessage::Demoted { session, endpoint }
@@ -1772,7 +1923,14 @@ async fn resolve_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use otto_engine_core::Router;
+    use otto_engine_core::traits::Workspace;
+    use otto_persistence::SessionStore;
+    use otto_providers::LocalProvider;
+    use otto_router::SingleProviderRouter;
+    use otto_workspace::LocalWorkspace;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn tls_paths_both_present_is_some() {
@@ -1790,5 +1948,111 @@ mod tests {
     fn tls_paths_only_one_is_error() {
         assert!(resolve_tls_paths(Some(PathBuf::from("c.pem")), None).is_err());
         assert!(resolve_tls_paths(None, Some(PathBuf::from("k.pem"))).is_err());
+    }
+
+    /// An `Authorization: Bearer` header carrying `token`.
+    fn bearer_headers(token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    /// A `ServeState` in `Machine` mode over a real (offline, deterministic) `EngineService`.
+    /// The test module shares `serve.rs`, so the private fields are constructible directly — the
+    /// fixture is the smallest honest way to exercise `machine_workspace_authorized`.
+    async fn machine_state_fixture(
+        dir: &tempfile::TempDir,
+        promotion_secret: Option<&str>,
+    ) -> ServeState {
+        let router: Arc<dyn Router> =
+            Arc::new(SingleProviderRouter::new(Arc::new(LocalProvider::new())));
+        let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+        let tools = Arc::new(crate::build_tool_registry(
+            tools_ws,
+            dir.path().to_path_buf(),
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(
+            otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+                .await
+                .unwrap(),
+        );
+        let service = EngineService::new(
+            store,
+            Arc::new(crate::build_default_registry()),
+            router,
+            workspace,
+            tools,
+        );
+        ServeState {
+            service,
+            auth: AuthConfig {
+                mode: AuthMode::Machine,
+                authenticator: None,
+                promotion_secret: promotion_secret.map(String::from),
+                handshake_deadline: std::time::Duration::from_secs(10),
+            },
+            capabilities: crate::build_capabilities(),
+            promote: None,
+            accept_promotions: true,
+            public_ws_base: None,
+            remotes: Mutex::new(HashMap::new()),
+            session_secrets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_workspace_authorized_accepts_machine_and_session_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = machine_state_fixture(&dir, Some("machine-secret")).await;
+        let session = SessionId(uuid::Uuid::new_v4());
+        state.record_session_secret(session, "session-secret".to_string());
+
+        // A6: the machine secret (operator path) and any live session secret both authorize.
+        assert!(state.machine_workspace_authorized(&bearer_headers("machine-secret")));
+        assert!(state.machine_workspace_authorized(&bearer_headers("session-secret")));
+        // A wrong secret — and no header at all — are rejected.
+        assert!(!state.machine_workspace_authorized(&bearer_headers("wrong-secret")));
+        assert!(!state.machine_workspace_authorized(&HeaderMap::new()));
+        // Demote consumes the credential: the disposed secret no longer authorizes /workspace.
+        state.dispose_session_secret(session);
+        assert!(!state.machine_workspace_authorized(&bearer_headers("session-secret")));
+    }
+
+    #[tokio::test]
+    async fn machine_workspace_authorized_without_machine_secret_uses_session_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = machine_state_fixture(&dir, None).await;
+        let session = SessionId(uuid::Uuid::new_v4());
+        state.record_session_secret(session, "session-secret".to_string());
+
+        assert!(state.machine_workspace_authorized(&bearer_headers("session-secret")));
+        assert!(!state.machine_workspace_authorized(&bearer_headers("wrong-secret")));
+    }
+
+    #[test]
+    fn pre_ownership_bundle_detected_when_session_lacks_owner() {
+        // The pre-ownership shape: a bundle whose `session` object carries no `owner` key.
+        let legacy = br#"{"session":{"id":"00000000-0000-0000-0000-000000000000","goal":"g","status":"active","config":{},"events":[],"turns":[]},"workspace":{}}"#;
+        assert!(is_pre_ownership_bundle(legacy));
+    }
+
+    #[test]
+    fn pre_ownership_bundle_false_for_a_valid_bundle() {
+        // A current bundle's `session` carries `owner` — not a legacy shape.
+        let valid = br#"{"session":{"id":"00000000-0000-0000-0000-000000000000","owner":"local","goal":"g","status":"active","config":{},"events":[],"turns":[]},"workspace":{}}"#;
+        assert!(!is_pre_ownership_bundle(valid));
+    }
+
+    #[test]
+    fn pre_ownership_bundle_false_for_garbage_and_non_bundle_bodies() {
+        assert!(!is_pre_ownership_bundle(b"not json"));
+        assert!(!is_pre_ownership_bundle(b"{}"));
+        assert!(!is_pre_ownership_bundle(br#"{"other": 1}"#));
+        // A `session` that is present but not an object keeps the ordinary bad-request path.
+        assert!(!is_pre_ownership_bundle(br#"{"session": 42}"#));
     }
 }

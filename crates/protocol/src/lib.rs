@@ -116,8 +116,8 @@ pub enum Command {
         session: SessionId,
     },
     /// Hand this session off to a freshly-provisioned remote engine. The engine replies with
-    /// `ServerMessage::Promoted { endpoint, token }`; the client reconnects there (using `token`
-    /// when present, else the same token, plus session + last_seq). Handled only between turns.
+    /// `ServerMessage::Promoted { endpoint, token }`; the client reconnects there (using `token`,
+    /// plus session + last_seq). Handled only between turns.
     PromoteToRemote {
         session: SessionId,
     },
@@ -289,15 +289,15 @@ pub enum ServerMessage {
     },
     /// Handover framing: the session has been provisioned onto a remote engine reachable at
     /// `endpoint` (a `ws://host:port` base). The client reconnects there, session and last_seq
-    /// unchanged. `token` is `Some` when the remote requires a DIFFERENT bearer than the source
-    /// (e.g. a Fly-minted per-session token): the client must switch to it before reconnecting.
-    /// `None` means reuse the current token (same trust domain — loopback/vps/microvm). Not a
-    /// sequenced `Event` — never persisted/replayed from the store.
+    /// unchanged. `token` is a fresh opaque per-session secret the target minted at provision
+    /// time and delivered to the remote over the provisioning channel — never the client's own
+    /// source credential. The client must switch to it before reconnecting. Always present: a
+    /// frame with a `null` or missing `token` fails to deserialize. Not a sequenced `Event` —
+    /// never persisted/replayed from the store.
     Promoted {
         session: SessionId,
         endpoint: String,
-        #[serde(default)]
-        token: Option<String>,
+        token: String,
     },
     /// Handover framing for the reverse trip: the session is now on a local engine at `endpoint`.
     Demoted {
@@ -340,12 +340,12 @@ impl std::fmt::Debug for ServerMessage {
             ServerMessage::Promoted {
                 session,
                 endpoint,
-                token,
+                token: _,
             } => f
                 .debug_struct("Promoted")
                 .field("session", session)
                 .field("endpoint", endpoint)
-                .field("token", &token.as_deref().map(|_| "<redacted>"))
+                .field("token", &"<redacted>")
                 .finish(),
             ServerMessage::Demoted { session, endpoint } => f
                 .debug_struct("Demoted")
@@ -620,7 +620,7 @@ mod tests {
             ServerMessage::Promoted {
                 session: s,
                 endpoint: "ws://127.0.0.1:9000".into(),
-                token: None,
+                token: "".into(),
             },
             ServerMessage::Demoted {
                 session: s,
@@ -634,7 +634,7 @@ mod tests {
         let json = serde_json::to_string(&ServerMessage::Promoted {
             session: s,
             endpoint: "x".into(),
-            token: None,
+            token: "".into(),
         })
         .unwrap();
         assert!(json.contains("\"type\":\"promoted\""));
@@ -646,15 +646,33 @@ mod tests {
         let msg = ServerMessage::Promoted {
             session: s,
             endpoint: "ws://127.0.0.1:9000".into(),
-            token: Some("abc".into()),
+            token: "abc".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: ServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msg);
         match back {
-            ServerMessage::Promoted { token, .. } => assert_eq!(token.as_deref(), Some("abc")),
+            ServerMessage::Promoted { token, .. } => assert_eq!(&token, "abc"),
             _ => panic!("expected Promoted"),
         }
+    }
+
+    #[test]
+    fn promoted_with_null_token_fails_to_deserialize() {
+        let json = r#"{"type":"promoted","session":"00000000-0000-0000-0000-000000000001","endpoint":"ws://x","token":null}"#;
+        assert!(
+            serde_json::from_str::<ServerMessage>(json).is_err(),
+            "a null `token` must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn promoted_with_missing_token_fails_to_deserialize() {
+        let json = r#"{"type":"promoted","session":"00000000-0000-0000-0000-000000000001","endpoint":"ws://x"}"#;
+        assert!(
+            serde_json::from_str::<ServerMessage>(json).is_err(),
+            "a missing `token` field must fail to deserialize"
+        );
     }
 
     #[test]
@@ -746,7 +764,7 @@ mod tests {
         let promoted = ServerMessage::Promoted {
             session: SessionId::new(),
             endpoint: "ws://x".into(),
-            token: Some("fly-secret".into()),
+            token: "fly-secret".into(),
         };
         let dbg = format!("{promoted:?}");
         assert!(

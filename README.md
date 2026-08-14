@@ -61,9 +61,11 @@ cargo build --release -p otto-engine
 
 Runtime requirements: the sandbox behind `otto run` needs `bwrap` on Linux (`sandbox-exec` on
 macOS); `otto serve` defaults to `AuthMode::Users`, so enroll a principal with
-`otto auth enroll <user>` before serving. The `OTTO_PROMOTION_SECRET` promotion secret is needed
-only when a `--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set. See "How it
-works" below.
+`otto auth enroll <user>` before serving. The `OTTO_PROMOTION_SECRET` promotion secret is the
+*admission* credential for the `/promote` push, needed only when a
+`--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set. Each promoted session is
+then guarded by a fresh per-session secret minted by the target and reported to the client as
+`Promoted.token` (always present). See "How it works" below.
 
 ## Quick start
 
@@ -133,7 +135,11 @@ The same protocol runs embedded (the `run` command above) or served. `otto serve
 `Command`/`Event` protocol over an authenticated WebSocket. Three auth modes: the default
 `Users` (TOTP principals via `otto auth enroll <user>`), `--single-user` (loopback-only, no
 credential — the desktop sidecar), and `--promotion-receiver` (machine-to-machine, for promote
-receivers). The promotion secret `OTTO_PROMOTION_SECRET` is required only when a
+receivers). On promote, the target mints a fresh per-session secret, delivers it to the receiver
+over the provisioning channel, and reports it to the client as `Promoted.token` (always present);
+`--promotion-receiver` servers keep a session→secret map that authorizes `/export`, `/workspace`,
+and the machine-mode WebSocket handshake. The promotion secret `OTTO_PROMOTION_SECRET` is the
+admission credential for the `/promote` push, required only when a
 `--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set; a default `Users` serve
 needs at least one enrolled principal instead:
 
