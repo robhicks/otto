@@ -733,6 +733,21 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, state: Arc<Serv
                     break 'outer;
                 }
             }
+            // Identity commands are inert until the auth slice lands; treat them as
+            // unauthenticated (the pre-identity `SingleUser` posture) — reply and close.
+            Command::Login { .. }
+            | Command::Attach { .. }
+            | Command::Refresh { .. }
+            | Command::Logout => {
+                let _ = send_msg(
+                    &mut writer,
+                    &ServerMessage::Error {
+                        message: "authentication not enabled".to_string(),
+                    },
+                )
+                .await;
+                break;
+            }
         }
     }
 }
