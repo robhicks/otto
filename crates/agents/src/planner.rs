@@ -107,6 +107,19 @@ mod tests {
         assert_eq!(milestones[1].description, "step two");
     }
 
+    #[test]
+    fn plan_prompt_is_pinned_for_the_no_history_case() {
+        // Regression rail for threading conversation history into the Planner: the offline
+        // suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
+        // "helpfully" update this string when the history change makes it fail — that means
+        // the no-history path changed, which the history task is required to leave alone.
+        let expected = "You are otto's planner. Decompose the goal into an ordered list of concrete milestones.\n\
+                        Goal: add a hello function\n\
+                        Respond ONLY with valid JSON matching this schema:\n\
+                        milestones: array of objects, each with a string field named description.";
+        assert_eq!(plan_prompt("add a hello function"), expected);
+    }
+
     #[tokio::test]
     async fn falls_back_to_goal_when_unparseable() {
         // LocalProvider echoes the prompt — not JSON — so the planner falls back.

@@ -530,6 +530,26 @@ mod tests {
     }
 
     #[test]
+    fn select_prompt_is_pinned_for_the_no_history_case() {
+        // Regression rail for threading conversation history into the ContextFinder: the
+        // offline suite asserts on LocalProvider output, which echoes this exact prompt. Do
+        // NOT "helpfully" update this string when the history change makes it fail — that
+        // means the no-history path changed, which the history task is required to leave
+        // alone. Candidate list is fixed/deterministic so the pinned string is reproducible.
+        let cands = vec![
+            ("src/login.rs".to_string(), 10u64),
+            ("README.md".to_string(), 3u64),
+        ];
+        let mut syms = std::collections::HashMap::new();
+        syms.insert("src/login.rs".to_string(), vec!["login".to_string()]);
+        let expected = "You are otto's context finder. From the candidate files below, choose up to 8 files most relevant to the goal, most relevant first.\nGoal: add a hello function\nCandidates:\n- src/login.rs (score 10) [symbols: login]\n- README.md (score 3)\nEach candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; the path is only the part before ` (score`.\nRespond ONLY with valid JSON: an object with a string-array field named files, each the exact path (without the score or symbols) copied from a candidate line.";
+        assert_eq!(
+            select_prompt("add a hello function", &cands, &syms),
+            expected
+        );
+    }
+
+    #[test]
     fn select_prompt_lists_symbols_only_when_present() {
         let cands = vec![("a.rs".to_string(), 10u64), ("b.rs".to_string(), 5u64)];
         let mut syms = std::collections::HashMap::new();
