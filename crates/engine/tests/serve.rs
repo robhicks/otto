@@ -1270,6 +1270,11 @@ async fn promote_then_demote_round_trip_preserves_session() {
     while let Some(frame) = next_json_opt(&mut ws).await {
         if frame["type"] == "promoted" {
             remote_endpoint = frame["endpoint"].as_str().unwrap().to_string();
+            // Spec criterion 2: every Promoted frame carries a non-empty token — a fresh mint,
+            // even on loopback, where the SingleUser engine ignores the credential (it is a
+            // uniform invariant, not a functional one).
+            let token = frame["token"].as_str().expect("promoted token");
+            assert!(!token.is_empty(), "promoted token must be non-empty");
             break;
         }
     }

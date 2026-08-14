@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use otto_auth::testing::FakeAuthenticator;
 use otto_engine::{
-    EngineService, build_default_registry, build_tool_registry, build_tool_registry_approving,
-    serve_app, serve_run,
+    EngineService, PromoteBundle, build_default_registry, build_tool_registry,
+    build_tool_registry_approving, serve_app, serve_run,
 };
 use otto_engine_core::auth::{AuthConfig, AuthError, Authenticator, Principal, TokenPair};
 use otto_engine_core::traits::Workspace;
+use otto_engine_core::types::WorkspaceSnapshot;
+use otto_persistence::{SessionState, SessionStatus};
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
@@ -28,6 +30,35 @@ const SECRET: &str = "test-promotion-secret";
 /// Short enough that the timeout tests are fast, long enough that a legitimate handshake never
 /// races it.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(500);
+
+/// A bundle owned by alice, so a `Machine` receiver that restores it has an owner to adopt.
+fn sample_bundle(id: otto_protocol::SessionId) -> PromoteBundle {
+    PromoteBundle {
+        session: SessionState {
+            id,
+            owner: alice(),
+            goal: "promoted".to_string(),
+            status: SessionStatus::Active,
+            config: json!({}),
+            events: vec![],
+            turns: vec![],
+        },
+        workspace: WorkspaceSnapshot { files: vec![] },
+    }
+}
+
+/// Push a bundle to a `Machine` receiver's `/promote` with `secret` as its per-session secret
+/// (`X-Otto-Session-Secret`); the machine-wide `SECRET` is the bearer. Seeds `session_secrets`.
+async fn promote_to(port: u16, secret: &str, id: otto_protocol::SessionId) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/promote"))
+        .bearer_auth(SECRET)
+        .header("X-Otto-Session-Secret", secret)
+        .json(&sample_bundle(id))
+        .send()
+        .await
+        .unwrap()
+}
 
 fn alice() -> otto_protocol::UserId {
     otto_protocol::UserId::parse("alice").unwrap()
@@ -196,7 +227,10 @@ async fn start_machine() -> (u16, tempfile::TempDir) {
         promotion_secret: Some(SECRET.to_string()),
         handshake_deadline: HANDSHAKE_DEADLINE,
     };
-    let app = serve_app(service, auth, test_capabilities(), None, false);
+    // Acceptance is on so the tests can seed `session_secrets` via `POST /promote` (the Machine
+    // receiver's only path to a recorded per-session secret). `machine_rejects_session_creation`
+    // and `machine_handshake_has_a_deadline` do not depend on the flag.
+    let app = serve_app(service, auth, test_capabilities(), None, true);
     let port = serve(app).await;
     (port, dir)
 }
@@ -663,38 +697,37 @@ async fn single_user_goes_straight_to_ready() {
     assert_eq!(ready["type"], "ready");
 }
 
-/// `Machine`: the promotion secret via `Attach`, then `Ready` — and the connection adopts the
-/// attached session's owner (alice's), so handover authorization passes.
+/// `Machine`: the session's per-session secret via `Attach`, then `Ready` — and the connection
+/// adopts the attached session's owner (alice's), so handover authorization passes. The machine
+/// secret `SECRET` and any other wrong secret are the single opaque failure (spec criterion 3).
 #[tokio::test]
-async fn machine_attach_with_the_promotion_secret_adopts_the_session_owner() {
-    let (port, dir) = start_machine().await;
-    let store = otto_persistence::SqliteStore::open(store_path(&dir))
-        .await
-        .unwrap();
-    let session =
-        otto_persistence::SessionStore::create_session(&store, &alice(), "promoted", &json!({}))
-            .await
-            .unwrap();
+async fn machine_attach_with_the_session_secret_adopts_the_session_owner() {
+    let (port, _dir) = start_machine().await;
+    // Seed the session + its per-session secret via /promote (the Machine receiver's only path to
+    // a recorded session secret; a row created directly in the store is unreachable by design).
+    let id = otto_protocol::SessionId::new();
+    let per_session = "per-session-secret".to_string();
+    assert_eq!(promote_to(port, &per_session, id).await.status(), 200);
 
-    let mut ws = connect(request(port, &format!("?session={}", session.0))).await;
-    let hello = hello(&mut ws).await;
-    assert_eq!(hello["auth_mode"], "machine");
+    let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
+    let hello_frame = hello(&mut ws).await;
+    assert_eq!(hello_frame["auth_mode"], "machine");
     send_cmd(
         &mut ws,
         &otto_protocol::Command::Attach {
-            token: SECRET.into(),
+            token: per_session.clone(),
         },
     )
     .await;
     let ready = next_json(&mut ws).await;
     assert_eq!(ready["type"], "ready");
-    assert_eq!(ready["session"].as_str().unwrap(), session.0.to_string());
+    assert_eq!(ready["session"].as_str().unwrap(), id.0.to_string());
 
     // The connection adopted alice's ownership: handover authorization clears (the failure below
     // is the absent promote config, never a "no session" refusal).
     send_cmd(
         &mut ws,
-        &otto_protocol::Command::PromoteToRemote { session },
+        &otto_protocol::Command::PromoteToRemote { session: id },
     )
     .await;
     let frame = next_json(&mut ws).await;
@@ -703,31 +736,46 @@ async fn machine_attach_with_the_promotion_secret_adopts_the_session_owner() {
         !frame["message"].as_str().unwrap().contains("no session"),
         "the adopted owner must clear authorization: {frame}"
     );
+    drop(ws);
+
+    // The machine secret is admission-only (spec criterion 3): it no longer authenticates a WS
+    // attach — the same opaque failure as any wrong secret.
+    for wrong in [SECRET, "another-secret"] {
+        let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
+        let hello_frame = hello(&mut ws).await;
+        assert_eq!(hello_frame["auth_mode"], "machine");
+        send_cmd(
+            &mut ws,
+            &otto_protocol::Command::Attach {
+                token: wrong.into(),
+            },
+        )
+        .await;
+        let frame = next_json(&mut ws).await;
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["message"], "authentication failed");
+        assert!(
+            next_json_opt(&mut ws).await.is_none(),
+            "connection must close after a failed machine attach"
+        );
+    }
 }
 
-/// `Machine` creates no sessions: an `Attach` without `?session=` has no owner to adopt and is
-/// rejected, leaving the store empty.
+/// `Machine` creates no sessions: a connection without `?session=` has no session whose
+/// per-session secret to check (A5) — the immediate opaque failure, and the store stays empty.
 #[tokio::test]
 async fn machine_rejects_session_creation() {
     let (port, dir) = start_machine().await;
     let mut ws = connect(request(port, "")).await;
     let hello = hello(&mut ws).await;
     assert_eq!(hello["auth_mode"], "machine");
-    send_cmd(
-        &mut ws,
-        &otto_protocol::Command::Attach {
-            token: SECRET.into(),
-        },
-    )
-    .await;
+    // No Attach frame is even consumed: the secret lookup fails first and the connection closes.
     let frame = next_json(&mut ws).await;
     assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
     assert!(
-        frame["message"]
-            .as_str()
-            .unwrap()
-            .contains("machine receivers do not create sessions"),
-        "unexpected: {frame}"
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the failed machine handshake"
     );
     assert_eq!(
         session_count(&dir).await,
@@ -945,10 +993,11 @@ async fn machine_wrong_secret_is_the_opaque_error() {
     );
 }
 
-/// Finding 4: a `Machine` receiver waits under the same injectable handshake deadline as
-/// `Users`. A connection that sends neither a promotion-secret header nor an `Attach` frame
-/// gets the opaque error and is closed — it cannot hold an idle socket open forever on a
-/// network-reachable receiver.
+/// The `Machine` credential is the attached session's per-session secret (spec §3.5), so a
+/// header-less, `?session=`-less connection has no secret to look up (A5): it now fails
+/// immediately at the lookup — same opaque error, no session created — rather than waiting out
+/// the injectable handshake deadline. (The deadline still guards a `?session=` connection that
+/// presents no credential and never sends an `Attach`.)
 #[tokio::test]
 async fn machine_handshake_has_a_deadline() {
     let (port, dir) = start_machine().await;
@@ -956,8 +1005,7 @@ async fn machine_handshake_has_a_deadline() {
     let hello = hello(&mut ws).await;
     assert_eq!(hello["auth_mode"], "machine");
 
-    // Send nothing: the deadline expires, the opaque Error arrives, the server closes, and no
-    // session is created.
+    // Send nothing: the opaque Error arrives, the server closes, and no session is created.
     let frame = next_json(&mut ws).await;
     assert_eq!(frame["type"], "error");
     assert_eq!(frame["message"], "authentication failed");
@@ -972,38 +1020,59 @@ async fn machine_handshake_has_a_deadline() {
     );
 }
 
-/// The promotion secret via the frame `Attach` reaches `Ready` on a `Machine` receiver — the
-/// header-less path (§7.2). The receiver adopts an existing session (it creates none).
+/// The session's per-session secret via the frame `Attach` reaches `Ready` on a `Machine`
+/// receiver — the header-less path (§7.2). The receiver adopts the promoted session (it creates
+/// none); the machine secret and any other wrong secret are the single opaque failure.
 #[tokio::test]
-async fn machine_attach_with_the_promotion_secret_reaches_ready() {
+async fn machine_attach_with_the_session_secret_reaches_ready() {
     let (port, dir) = start_machine().await;
-    let store = otto_persistence::SqliteStore::open(store_path(&dir))
-        .await
-        .unwrap();
-    let session =
-        otto_persistence::SessionStore::create_session(&store, &alice(), "promoted", &json!({}))
-            .await
-            .unwrap();
+    // Seed the session + its per-session secret via /promote.
+    let id = otto_protocol::SessionId::new();
+    let per_session = "ready-per-session-secret".to_string();
+    assert_eq!(promote_to(port, &per_session, id).await.status(), 200);
 
-    let mut ws = connect(request(port, &format!("?session={}", session.0))).await;
-    let hello = hello(&mut ws).await;
-    assert_eq!(hello["auth_mode"], "machine");
+    let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
+    let hello_frame = hello(&mut ws).await;
+    assert_eq!(hello_frame["auth_mode"], "machine");
     send_cmd(
         &mut ws,
         &otto_protocol::Command::Attach {
-            token: SECRET.into(),
+            token: per_session.clone(),
         },
     )
     .await;
     // Attach sends no LoggedIn on Machine; the next frame is Ready.
     let ready = next_json(&mut ws).await;
     assert_eq!(ready["type"], "ready");
-    assert_eq!(ready["session"].as_str().unwrap(), session.0.to_string());
+    assert_eq!(ready["session"].as_str().unwrap(), id.0.to_string());
     assert_eq!(
         session_count(&dir).await,
         1,
         "a machine attach must not create a session"
     );
+    drop(ws);
+
+    // The machine secret is admission-only — a WS attach with it is refused (spec criterion 3),
+    // indistinguishably from any other wrong secret.
+    for wrong in [SECRET, "some-other-secret"] {
+        let mut ws = connect(request(port, &format!("?session={}", id.0))).await;
+        let hello_frame = hello(&mut ws).await;
+        assert_eq!(hello_frame["auth_mode"], "machine");
+        send_cmd(
+            &mut ws,
+            &otto_protocol::Command::Attach {
+                token: wrong.into(),
+            },
+        )
+        .await;
+        let frame = next_json(&mut ws).await;
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["message"], "authentication failed");
+        assert!(
+            next_json_opt(&mut ws).await.is_none(),
+            "connection must close after a failed machine attach"
+        );
+    }
 }
 
 /// §7.2's re-verification covers the frames `run_turn_loop` consumes mid-turn, not just the main
