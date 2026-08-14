@@ -487,15 +487,18 @@ async fn send_msg(writer: &mut WsWriter, msg: &ServerMessage) -> anyhow::Result<
 }
 
 /// A sink that writes each event to the socket's writer half as a `ServerMessage::Event` frame.
+/// The writer is shared through a mutex so the in-turn reader loop (`run_turn_loop`) can also
+/// write (a mid-turn `Refresh` replies `LoggedIn`) while the turn's sink is alive.
 struct WsSink<'a> {
-    writer: &'a mut WsWriter,
+    writer: &'a tokio::sync::Mutex<WsWriter>,
 }
 
 #[async_trait::async_trait]
 impl EventSink for WsSink<'_> {
     async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().await;
         send_msg(
-            self.writer,
+            &mut writer,
             &ServerMessage::Event {
                 event: event.clone(),
             },
@@ -568,10 +571,15 @@ async fn re_verify_access_token(state: &ServeState, access_token: Option<&str>) 
 /// Drive `turn` to completion while concurrently reading inbound frames for
 /// `ApproveDiff`/`Pause`/`Resume`/`Abort`. Shared by every command that starts a turn
 /// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart. `owner` is
-/// the connection-scoped principal (A9): the in-flight `Abort` acts for it. `access_token` is
-/// the connection's bearer (`None` outside `Users`); it is re-verified on every in-turn command
-/// (§7.2), so a revoked/expired token can neither approve a gated edit nor issue in-turn
-/// controls until the turn ends — a failure aborts the turn and returns `AuthFailed`.
+/// the connection-scoped principal (A9): the in-flight `Abort` acts for it. `writer` is the
+/// socket's shared writer (the turn's own sink writes events through the same mutex), which a
+/// mid-turn `Refresh` uses to reply `LoggedIn`. `access_token` is the connection's bearer
+/// (`None` outside `Users`); it is re-verified on every in-turn command (§7.2), so a
+/// revoked/expired token can neither approve a gated edit nor issue in-turn controls until the
+/// turn ends — a failure aborts the turn and returns `AuthFailed`. Identity commands ride ahead
+/// of that re-verify, matching the main loop: a mid-turn `Refresh` rotates the pair (reply
+/// `LoggedIn`, rebinding `*access_token`) even when the access token is revoked/expired — the
+/// §8 recovery path — while `Login`/`Attach`/`Logout` are exempted but otherwise ignored here.
 // The per-command re-verification (Finding I2) pushed this past clippy's 7-argument threshold.
 // Folding `owner`+`access_token` into a struct would split the connection's `ConnIdentity` from
 // the resolved (Machine-adopted) session owner — a worse signature than a long one.
@@ -579,12 +587,13 @@ async fn re_verify_access_token(state: &ServeState, access_token: Option<&str>) 
 async fn run_turn_loop(
     turn: impl std::future::Future<Output = anyhow::Result<TurnOutcome>>,
     reader: &mut WsReader,
+    writer: &tokio::sync::Mutex<WsWriter>,
     approvals: &ApprovalRegistry,
     pause_state: &PauseState,
     state: &ServeState,
     session: SessionId,
     owner: &UserId,
-    access_token: Option<&str>,
+    access_token: &mut Option<String>,
 ) -> TurnLoopOutcome {
     tokio::pin!(turn);
     loop {
@@ -605,8 +614,18 @@ async fn run_turn_loop(
                     };
                     // §7.2: the access token is re-verified on every in-turn command, not only
                     // at the main loop's dispatch — a revoked/expired token must not approve a
-                    // gated edit or issue in-turn controls while a turn is in flight.
-                    if !re_verify_access_token(state, access_token).await {
+                    // gated edit or issue in-turn controls while a turn is in flight. Identity
+                    // commands ride ahead, as in the main loop (§8): a mid-turn `Refresh` is the
+                    // recovery path for exactly the revoked/expired-token case this check guards
+                    // against, and `Login`/`Attach`/`Logout` are lifecycle frames, not commands.
+                    if !matches!(
+                        &command,
+                        Command::Login { .. }
+                            | Command::Attach { .. }
+                            | Command::Refresh { .. }
+                            | Command::Logout
+                    ) && !re_verify_access_token(state, access_token.as_deref()).await
+                    {
                         eprintln!("serve: per-command access-token re-verification failed mid-turn");
                         let _ = state.service.abort(owner, session).await;
                         approvals.clear();
@@ -614,6 +633,68 @@ async fn run_turn_loop(
                         return TurnLoopOutcome::AuthFailed;
                     }
                     match command {
+                        Command::Refresh { refresh_token } => {
+                            // §8: service the mid-turn `Refresh` instead of dropping it. Rotate
+                            // the refresh token, reply `LoggedIn`, and rebind the connection's
+                            // access token (the caller's `ConnIdentity.access_token`, passed by
+                            // `&mut`) so the next command — in-turn or after — re-verifies
+                            // against the fresh pair. Mirrors the main loop's `Refresh` arm.
+                            let Some(authenticator) = state.authenticator() else {
+                                eprintln!("serve: mid-turn refresh on a non-Users connection");
+                                let mut guard = writer.lock().await;
+                                let _ = send_msg(
+                                    &mut guard,
+                                    &ServerMessage::Error {
+                                        message: AUTH_FAILED.to_string(),
+                                    },
+                                )
+                                .await;
+                                drop(guard);
+                                approvals.clear();
+                                pause_state.resume_all();
+                                return TurnLoopOutcome::StopOuterLoop;
+                            };
+                            match authenticator.rotate_refresh(&refresh_token).await {
+                                Ok(pair) => {
+                                    let logged_in = ServerMessage::LoggedIn {
+                                        user: owner.clone(),
+                                        access_token: pair.access_token.clone(),
+                                        expires_at: pair.expires_at,
+                                        refresh_token: pair.refresh_token,
+                                    };
+                                    *access_token = Some(pair.access_token);
+                                    let mut guard = writer.lock().await;
+                                    let ok =
+                                        send_msg(&mut guard, &logged_in).await.is_ok();
+                                    drop(guard);
+                                    if !ok {
+                                        approvals.clear();
+                                        pause_state.resume_all();
+                                        return TurnLoopOutcome::StopOuterLoop;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("serve: mid-turn refresh rotation failed: {e:?}");
+                                    let mut guard = writer.lock().await;
+                                    let _ = send_msg(
+                                        &mut guard,
+                                        &ServerMessage::Error {
+                                            message: AUTH_FAILED.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    drop(guard);
+                                    approvals.clear();
+                                    pause_state.resume_all();
+                                    return TurnLoopOutcome::StopOuterLoop;
+                                }
+                            }
+                        }
+                        // Exempted from the re-verify above but otherwise not serviced mid-turn:
+                        // a re-`Login`/re-`Attach` cannot rebind the principal here (the main
+                        // loop rejects them with the opaque error + close), and `Logout`'s
+                        // revocation is the main loop's job. They are ignored (the turn goes on).
+                        Command::Login { .. } | Command::Attach { .. } | Command::Logout => {}
                         Command::ApproveDiff { id, approved, .. } => {
                             approvals.resolve(id, approved);
                         }
@@ -1025,12 +1106,15 @@ async fn handle_socket(
                     tools: None,
                     router: None,
                 };
-                // Drive the turn while concurrently reading inbound approvals. The turn borrows
-                // `writer` (via the sink); `run_turn_loop` borrows `reader` — disjoint, so it can
-                // poll both.
+                // Drive the turn while concurrently reading inbound approvals. The turn's sink
+                // and `run_turn_loop` share `writer` through a mutex — the turn writes events
+                // through the sink, and the reader loop replies to a mid-turn `Refresh` with
+                // `LoggedIn` — while `run_turn_loop` borrows `reader` to poll both. The token
+                // slot is passed `&mut` so a mid-turn `Refresh` can rebind it in place.
+                let shared_writer = tokio::sync::Mutex::new(writer);
                 let outcome = {
                     let mut sink = WsSink {
-                        writer: &mut writer,
+                        writer: &shared_writer,
                     };
                     let turn = state
                         .service
@@ -1038,16 +1122,18 @@ async fn handle_socket(
                     run_turn_loop(
                         turn,
                         &mut reader,
+                        &shared_writer,
                         &approvals,
                         &pause_state,
                         &state,
                         session,
                         &owner,
-                        identity.access_token.as_deref(),
+                        &mut identity.access_token,
                     )
                     .await
-                }; // `sink` dropped here → `writer` is free again
+                }; // `sink` dropped here → the mutex is unguarded again
 
+                writer = shared_writer.into_inner();
                 if report_turn_outcome(outcome, &mut writer).await {
                     break 'outer;
                 }
@@ -1090,9 +1176,10 @@ async fn handle_socket(
             Command::RunCommand { name, args, .. } => {
                 let approver = Arc::new(InteractiveApprover::new(approvals.clone()));
                 let pauser = Arc::new(InteractivePauser(Arc::clone(&pause_state)));
+                let shared_writer = tokio::sync::Mutex::new(writer);
                 let outcome = {
                     let mut sink = WsSink {
-                        writer: &mut writer,
+                        writer: &shared_writer,
                     };
                     let turn = state.service.run_command_with_controls(
                         &owner, session, &name, &args, &mut sink, approver, pauser,
@@ -1100,16 +1187,18 @@ async fn handle_socket(
                     run_turn_loop(
                         turn,
                         &mut reader,
+                        &shared_writer,
                         &approvals,
                         &pause_state,
                         &state,
                         session,
                         &owner,
-                        identity.access_token.as_deref(),
+                        &mut identity.access_token,
                     )
                     .await
-                }; // `sink` dropped here → `writer` is free again
+                }; // `sink` dropped here → the mutex is unguarded again
 
+                writer = shared_writer.into_inner();
                 if report_turn_outcome(outcome, &mut writer).await {
                     break 'outer;
                 }
@@ -1117,15 +1206,17 @@ async fn handle_socket(
             Command::RunAgent { name, prompt, .. } => {
                 // No `run_turn_loop`: a single TaskTool dispatch has no fs.write gate check to
                 // approve and no multi-step turn to pause between steps of (see the design spec).
+                let shared_writer = tokio::sync::Mutex::new(writer);
                 let outcome = {
                     let mut sink = WsSink {
-                        writer: &mut writer,
+                        writer: &shared_writer,
                     };
                     state
                         .service
                         .run_agent_with_controls(&owner, session, &name, &prompt, &mut sink)
                         .await
-                }; // `sink` dropped here → `writer` is free again
+                }; // `sink` dropped here → the mutex is unguarded again
+                writer = shared_writer.into_inner();
 
                 if report_turn_outcome(TurnLoopOutcome::Finished(outcome.err()), &mut writer).await
                 {

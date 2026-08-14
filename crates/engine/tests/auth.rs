@@ -991,3 +991,144 @@ async fn revoked_token_cannot_approve_mid_turn() {
         "the connection must close after the mid-turn auth failure (aborting the turn)"
     );
 }
+
+/// §8 recovery through the turn loop: a `Refresh` sent mid-connection (while a turn is parked on
+/// the approving gate) with a revoked access token must NOT close the connection — the turn loop
+/// rotates to a fresh pair (`LoggedIn` with a new token), keeps the turn alive, and re-binds the
+/// connection so a subsequent command re-verifies against the new token. The inverse of
+/// `revoked_token_cannot_approve_mid_turn`: there the client does not `Refresh`, so the mid-turn
+/// command fails closed; here the client does, so the connection recovers instead.
+#[tokio::test]
+async fn mid_turn_refresh_recovers_a_revoked_connection() {
+    let server = start_users_approving().await;
+    let mut ws = connect(request(server.port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let logged_in = login(&mut ws).await;
+    let access_token = logged_in["access_token"].as_str().unwrap().to_string();
+    let refresh_token = logged_in["refresh_token"].as_str().unwrap().to_string();
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = otto_protocol::SessionId(
+        uuid::Uuid::parse_str(ready["session"].as_str().unwrap()).unwrap(),
+    );
+
+    // Park a turn on the gated `fs.write` (the approving gate): the Coder proposes an edit and
+    // the turn waits for an `ApproveDiff`. The `ApprovalRequest` event proves the turn is in
+    // flight and the socket reader is consuming in-turn frames.
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::SendPrompt {
+            session,
+            text: "add a greeting".into(),
+        },
+    )
+    .await;
+    let approval_id = loop {
+        let frame = next_json(&mut ws).await;
+        if frame["type"] == "event" {
+            if let Some(req) = frame["event"]["kind"].get("ApprovalRequest") {
+                break req["id"].as_str().unwrap().to_string();
+            }
+        }
+    };
+
+    // Revoke the access token mid-turn, then `Refresh`: the turn loop must service it (rotate +
+    // reply `LoggedIn`) rather than tripping the re-verify and closing the connection.
+    server.fake.logout(&access_token).await.unwrap();
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Refresh {
+            refresh_token: refresh_token.clone(),
+        },
+    )
+    .await;
+    let refreshed = next_json(&mut ws).await;
+    assert_eq!(refreshed["type"], "logged_in");
+    let new_access = refreshed["access_token"].as_str().unwrap().to_string();
+    assert_ne!(
+        new_access, access_token,
+        "a mid-turn refresh must rotate the access token"
+    );
+
+    // The connection survived with its token re-bound: approving the parked edit now re-verifies
+    // against the NEW token and lets the turn run to completion. Approve every `ApprovalRequest`
+    // until `TurnComplete` (the repair loop may re-propose).
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::ApproveDiff {
+            session,
+            id: uuid::Uuid::parse_str(&approval_id).unwrap(),
+            approved: true,
+        },
+    )
+    .await;
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        assert_ne!(
+            frame["type"], "error",
+            "the connection must not error after a mid-turn refresh: {frame}"
+        );
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(req) = kind.get("ApprovalRequest") {
+                let id = req["id"].as_str().unwrap().to_string();
+                send_cmd(
+                    &mut ws,
+                    &otto_protocol::Command::ApproveDiff {
+                        session,
+                        id: uuid::Uuid::parse_str(&id).unwrap(),
+                        approved: true,
+                    },
+                )
+                .await;
+            } else if kind.get("TurnComplete").is_some() {
+                saw_turn_complete = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_turn_complete,
+        "the parked turn must run to TurnComplete after a mid-turn refresh"
+    );
+
+    // A subsequent command succeeds against the new token (the main loop re-verifies it).
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::SendPrompt {
+            session,
+            text: "add a greeting".into(),
+        },
+    )
+    .await;
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        assert_ne!(
+            frame["type"], "error",
+            "a command on the rotated token must be accepted: {frame}"
+        );
+        if frame["type"] == "event" {
+            let kind = &frame["event"]["kind"];
+            if let Some(req) = kind.get("ApprovalRequest") {
+                let id = req["id"].as_str().unwrap().to_string();
+                send_cmd(
+                    &mut ws,
+                    &otto_protocol::Command::ApproveDiff {
+                        session,
+                        id: uuid::Uuid::parse_str(&id).unwrap(),
+                        approved: true,
+                    },
+                )
+                .await;
+            } else if kind.get("TurnComplete").is_some() {
+                saw_turn_complete = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_turn_complete,
+        "a SendPrompt on the rotated token must run to TurnComplete"
+    );
+}
