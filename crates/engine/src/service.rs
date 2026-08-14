@@ -227,6 +227,14 @@ impl EngineService {
         let start_seq = self.store.next_seq(session).await?;
         let turn_index = self.store.next_turn(session).await?;
 
+        // Bounded conversation history from this session's prior turns, folded from the
+        // persisted records. A store read failure degrades to no history (a first-turn view)
+        // rather than failing the turn outright.
+        let history = {
+            let records = self.store.turns(owner, session).await.unwrap_or_default();
+            history_from_records(records)
+        };
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
         // Spawn the turn. Its sync sink assigns seqs and pushes events into the channel; the
@@ -267,7 +275,9 @@ impl EngineService {
                     meter: &meter,
                     pauser: &*pauser,
                 };
-                orchestrator.run_turn(session, &goal, &sink_fn).await
+                orchestrator
+                    .run_turn(session, &goal, &history, &sink_fn)
+                    .await
             })
         };
 
@@ -883,10 +893,8 @@ impl EngineService {
 /// history is an optimization, and one unreadable row from an older or corrupted store must
 /// never stop a turn from running.
 ///
-/// Not yet called from production code: `run_prompt_with_controls` starts passing real history
-/// to `Orchestrator::run_turn` once that call gains a `history` parameter (a later task in this
-/// plan). Until then this is exercised only by the test below.
-#[allow(dead_code)]
+/// Called from `run_prompt_with_controls`, which loads the session's prior turn records and
+/// folds them into the `SessionHistory` handed to `Orchestrator::run_turn`.
 pub(crate) fn history_from_records(records: Vec<TurnRecord>) -> SessionHistory {
     let summaries = records
         .into_iter()

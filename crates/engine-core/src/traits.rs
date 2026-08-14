@@ -63,6 +63,7 @@ pub struct AgentCtx<'a> {
     workspace: &'a dyn WorkspaceRead,
     tools: &'a ToolRegistry,
     retriever: Option<&'a dyn crate::retrieval::Retriever>,
+    history: Option<&'a crate::types::SessionHistory>,
 }
 
 impl<'a> AgentCtx<'a> {
@@ -76,6 +77,7 @@ impl<'a> AgentCtx<'a> {
             workspace,
             tools,
             retriever: None,
+            history: None,
         }
     }
 
@@ -105,6 +107,19 @@ impl<'a> AgentCtx<'a> {
     pub fn retriever(&self) -> Option<&dyn crate::retrieval::Retriever> {
         self.retriever
     }
+
+    /// Attach the session's bounded conversation history.
+    pub fn with_history(mut self, history: &'a crate::types::SessionHistory) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// The session's prior turns. Returns an empty history when none is attached, so agents
+    /// never branch on an `Option` — an absent history and a first turn are the same thing.
+    pub fn history(&self) -> &crate::types::SessionHistory {
+        const EMPTY: &crate::types::SessionHistory = &crate::types::SessionHistory::EMPTY;
+        self.history.unwrap_or(EMPTY)
+    }
 }
 
 #[cfg(test)]
@@ -118,7 +133,7 @@ mod tests {
     use crate::retrieval::Candidate;
     use crate::router::{RouteHints, Router};
     use crate::tool::{Decision, DenyAsk, PermissionGate, ToolRegistry};
-    use crate::types::{CompleteRequest, CompleteResponse};
+    use crate::types::{CompleteRequest, CompleteResponse, SessionHistory, TurnSummary};
 
     struct StubRouter;
     #[async_trait]
@@ -182,5 +197,29 @@ mod tests {
         let noop = NoopRetriever;
         let ctx = AgentCtx::new(&router, &ws, &tools).with_retriever(&noop);
         assert!(ctx.retriever().is_some());
+    }
+
+    #[test]
+    fn agent_ctx_history_defaults_to_empty_and_round_trips() {
+        let router = StubRouter;
+        let ws = StubWorkspace;
+        let tools = stub_tools();
+
+        let ctx = AgentCtx::new(&router, &ws, &tools);
+        assert!(
+            ctx.history().is_empty(),
+            "absent history reads as empty, never as an Option"
+        );
+
+        let history = SessionHistory::new(vec![TurnSummary {
+            turn_index: 0,
+            goal: "first goal".to_string(),
+            milestones: vec!["m".to_string()],
+            files_edited: vec![],
+            verify: None,
+            ok: true,
+        }]);
+        let ctx = AgentCtx::new(&router, &ws, &tools).with_history(&history);
+        assert_eq!(ctx.history().turns()[0].goal, "first goal");
     }
 }

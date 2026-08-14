@@ -93,10 +93,11 @@ impl<'a> Orchestrator<'a> {
         &self,
         _session: SessionId,
         goal: &str,
+        history: &crate::types::SessionHistory,
         emit: &dyn Emitter,
     ) -> anyhow::Result<TurnOutcome> {
         let ctx = {
-            let base = AgentCtx::new(self.router, self.workspace, self.tools);
+            let base = AgentCtx::new(self.router, self.workspace, self.tools).with_history(history);
             match self.retriever {
                 Some(r) => base.with_retriever(r),
                 None => base,
@@ -297,7 +298,8 @@ mod tests {
     };
     use crate::traits::{Agent, Workspace, WorkspaceRead};
     use crate::types::{
-        CompleteRequest, CompleteResponse, Edit, Milestone, Usage, WorkspaceSnapshot,
+        CompleteRequest, CompleteResponse, Edit, Milestone, SessionHistory, Usage,
+        WorkspaceSnapshot,
     };
     use async_trait::async_trait;
     use serde_json::Value;
@@ -485,7 +487,12 @@ mod tests {
         };
 
         let outcome = orch
-            .run_turn(SessionId::new(), "do the thing", &sink)
+            .run_turn(
+                SessionId::new(),
+                "do the thing",
+                &SessionHistory::empty(),
+                &sink,
+            )
             .await
             .unwrap();
 
@@ -563,7 +570,12 @@ mod tests {
         };
 
         let outcome = orch
-            .run_turn(SessionId::new(), "do the thing", &(|_k: EventKind| {}))
+            .run_turn(
+                SessionId::new(),
+                "do the thing",
+                &SessionHistory::empty(),
+                &(|_k: EventKind| {}),
+            )
             .await
             .unwrap();
 
@@ -604,7 +616,12 @@ mod tests {
         };
 
         let err = orch
-            .run_turn(SessionId::new(), "x", &(|_k: EventKind| {}))
+            .run_turn(
+                SessionId::new(),
+                "x",
+                &SessionHistory::empty(),
+                &(|_k: EventKind| {}),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no agent registered"));
@@ -635,7 +652,10 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
 
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -683,7 +703,12 @@ mod tests {
         };
 
         let outcome = orch
-            .run_turn(SessionId::new(), "x", &(|_k: EventKind| {}))
+            .run_turn(
+                SessionId::new(),
+                "x",
+                &SessionHistory::empty(),
+                &(|_k: EventKind| {}),
+            )
             .await
             .unwrap();
 
@@ -773,7 +798,10 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
 
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             TurnOutcome {
@@ -830,7 +858,10 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
 
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             TurnOutcome {
@@ -914,7 +945,10 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
 
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             TurnOutcome {
@@ -975,7 +1009,10 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
 
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             TurnOutcome {
@@ -1030,7 +1067,9 @@ mod tests {
             let events = Arc::clone(&events);
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
-        orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        orch.run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         let recorded = events.lock().unwrap().clone();
         assert!(recorded.iter().any(|e| matches!(
             e,
@@ -1064,7 +1103,9 @@ mod tests {
             let events = Arc::clone(&events);
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
-        orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        orch.run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         let recorded = events.lock().unwrap().clone();
         assert!(
             !recorded
@@ -1112,7 +1153,10 @@ mod tests {
             let events = Arc::clone(&events);
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
-        let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
+        let outcome = orch
+            .run_turn(SessionId::new(), "x", &SessionHistory::empty(), &sink)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
             TurnOutcome {
