@@ -132,14 +132,27 @@ pub mod testing {
     /// for a tenant that is not its own when a test wants that.
     pub struct FakeAuthenticator {
         principal: UserId,
-        tokens: Mutex<HashMap<String, UserId>>,
+        state: Mutex<FakeState>,
+    }
+
+    /// The live token map plus a monotonic mint counter. The counter is deliberately
+    /// independent of the map's live size, so a `logout`/`rotate_refresh` that shrinks the
+    /// map can never make a later `mint` reuse a token string — a byte-identical token
+    /// that maps to the wrong principal is the worst failure a cross-tenant test double
+    /// could produce.
+    struct FakeState {
+        tokens: HashMap<String, UserId>,
+        next: u64,
     }
 
     impl FakeAuthenticator {
         pub fn new(user: UserId) -> Self {
             Self {
                 principal: user,
-                tokens: Mutex::new(HashMap::new()),
+                state: Mutex::new(FakeState {
+                    tokens: HashMap::new(),
+                    next: 1,
+                }),
             }
         }
     }
@@ -153,16 +166,18 @@ pub mod testing {
         }
 
         async fn mint(&self, principal: &Principal) -> Result<TokenPair, AuthError> {
-            // Numbered by the current live count, so successive mints are distinguishable and
-            // unique among the tokens still in the map. One lock hold, so concurrent mints
-            // cannot collide on a number.
-            let mut tokens = self.tokens.lock().unwrap();
-            let n = tokens.len() + 1;
+            // Numbered by a monotonic per-fake counter, never by the map's live size, so
+            // every token string is unique across the fake's whole lifetime even after a
+            // `logout`/`rotate_refresh` shrinks the map. One lock hold keeps the counter
+            // increment and the insert atomic under concurrent mints.
+            let mut state = self.state.lock().unwrap();
+            let n = state.next;
+            state.next += 1;
             let access_token = format!("fake-access-{n}");
             let refresh_token = format!("fake-refresh-{n}");
             let user = principal.user.clone();
-            tokens.insert(access_token.clone(), user.clone());
-            tokens.insert(refresh_token.clone(), user);
+            state.tokens.insert(access_token.clone(), user.clone());
+            state.tokens.insert(refresh_token.clone(), user);
             Ok(TokenPair {
                 access_token,
                 refresh_token,
@@ -171,7 +186,7 @@ pub mod testing {
         }
 
         async fn verify_access(&self, token: &str) -> Result<Principal, AuthError> {
-            match self.tokens.lock().unwrap().get(token) {
+            match self.state.lock().unwrap().tokens.get(token) {
                 Some(user) => Ok(Principal { user: user.clone() }),
                 None => Err(AuthError::InvalidCredentials),
             }
@@ -180,16 +195,17 @@ pub mod testing {
         async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
             // Consume the old refresh token and mint a fresh pair for whoever owned it.
             let user = self
-                .tokens
+                .state
                 .lock()
                 .unwrap()
+                .tokens
                 .remove(refresh_token)
                 .ok_or(AuthError::InvalidCredentials)?;
             self.mint(&Principal { user }).await
         }
 
         async fn logout(&self, access_token: &str) -> Result<(), AuthError> {
-            self.tokens.lock().unwrap().remove(access_token);
+            self.state.lock().unwrap().tokens.remove(access_token);
             Ok(())
         }
     }
@@ -426,5 +442,38 @@ mod tests {
             fake.rotate_refresh(&pair.refresh_token).await,
             Err(AuthError::InvalidCredentials)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_fake_mint_counter_is_monotonic_across_logout() {
+        let fake = testing::FakeAuthenticator::new(alice());
+
+        // Two mints, then evict everything alice's first pair minted. Under the old
+        // map-size-derived numbering (`len + 1`, which skips to odd numbers 1, 3, ...), the
+        // third mint would reuse `fake-access-3` — byte-identical to bob's still-live token —
+        // and remint it for alice, misattributing bob's live token.
+        let alice1 = fake.mint(&Principal { user: alice() }).await.unwrap();
+        let bob1 = fake.mint(&Principal { user: bob() }).await.unwrap();
+        assert_eq!(bob1.access_token, "fake-access-2");
+        fake.logout(&alice1.access_token).await.unwrap();
+        // The fake's `logout` removes by key, so revoking the refresh-token entry too is what
+        // a test of the counter needs; the seam only ever passes access tokens in real use.
+        fake.logout(&alice1.refresh_token).await.unwrap();
+
+        // The fresh mint must NOT reuse any token string ever issued, and must verify as the
+        // principal it was minted for.
+        let alice2 = fake.mint(&Principal { user: alice() }).await.unwrap();
+        assert_ne!(alice2.access_token, bob1.access_token);
+        assert_ne!(alice2.access_token, alice1.access_token);
+        assert_ne!(alice2.refresh_token, bob1.refresh_token);
+        assert_eq!(
+            fake.verify_access(&alice2.access_token).await.unwrap().user,
+            alice()
+        );
+        // Bob's still-live token is untouched: no cross-principal misattribution.
+        assert_eq!(
+            fake.verify_access(&bob1.access_token).await.unwrap().user,
+            bob()
+        );
     }
 }
