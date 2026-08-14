@@ -12,6 +12,41 @@ pub use sensitive::{SENSITIVE_MARKERS, is_sensitive};
 mod user;
 pub use user::{InvalidUserId, UserId};
 
+/// The credentials a client presents to authenticate. Hand-`Debug`ged to redact the secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Credentials {
+    Totp { user: UserId, code: String },
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Totp { user, code: _ } => f
+                .debug_struct("Totp")
+                .field("user", user)
+                .field("code", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+/// The server's authentication posture, announced in `ServerMessage::Hello` on connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Loopback-only serve with **no credential**: every connection is the reserved `local`
+    /// principal, so there is no authentication frame and no session ownership to resolve. The
+    /// desktop sidecar's mode (`otto serve --single-user`). Not the default.
+    SingleUser,
+    /// Enrolled principals authenticate with TOTP; sessions are owned per-user. The default
+    /// `otto serve` posture.
+    Users,
+    /// A promotion receiver (`otto serve --promotion-receiver`): the promotion secret
+    /// authenticates the connection and it adopts the attached session's owner. No enrolled
+    /// principals.
+    Machine,
+}
+
 /// Identifies a single agent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -39,7 +74,7 @@ pub enum Role {
 }
 
 /// Commands sent from a frontend to the engine (request/response channel).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     CreateSession,
     SendPrompt {
@@ -91,6 +126,99 @@ pub enum Command {
     DemoteToLocal {
         session: SessionId,
     },
+    /// Authenticate as `user` using the provided credentials. The engine replies with
+    /// `ServerMessage::LoggedIn` (or `ServerMessage::Error`). Not applicable in `SingleUser` /
+    /// `Machine` modes — a `SingleUser` connection needs no credential and a `Machine` one
+    /// authenticates with the promotion secret, so `Login` is rejected with the opaque error.
+    Login {
+        credentials: Credentials,
+    },
+    /// Attach to an already-authenticated connection using `token` — a bearer minted by a prior
+    /// `LoggedIn` (in `Users` mode) or the promotion secret (in `Machine` mode). Not applicable
+    /// in `SingleUser` mode. Replied with `ServerMessage::LoggedIn`.
+    Attach {
+        token: String,
+    },
+    /// Exchange `refresh_token` for a fresh `LoggedIn` (rotating the access token). Replied with
+    /// `ServerMessage::LoggedIn` (or `ServerMessage::Error`).
+    Refresh {
+        refresh_token: String,
+    },
+    /// Revoke the current session's tokens. The engine replies with `ServerMessage::LoggedOut`.
+    Logout,
+}
+
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::CreateSession => f.write_str("CreateSession"),
+            Command::SendPrompt { session, text } => f
+                .debug_struct("SendPrompt")
+                .field("session", session)
+                .field("text", text)
+                .finish(),
+            Command::RunCommand {
+                session,
+                name,
+                args,
+            } => f
+                .debug_struct("RunCommand")
+                .field("session", session)
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Command::RunAgent {
+                session,
+                name,
+                prompt,
+            } => f
+                .debug_struct("RunAgent")
+                .field("session", session)
+                .field("name", name)
+                .field("prompt", prompt)
+                .finish(),
+            Command::Abort { session } => {
+                f.debug_struct("Abort").field("session", session).finish()
+            }
+            Command::ApproveDiff {
+                session,
+                id,
+                approved,
+            } => f
+                .debug_struct("ApproveDiff")
+                .field("session", session)
+                .field("id", id)
+                .field("approved", approved)
+                .finish(),
+            Command::Pause { session } => {
+                f.debug_struct("Pause").field("session", session).finish()
+            }
+            Command::Resume { session } => {
+                f.debug_struct("Resume").field("session", session).finish()
+            }
+            Command::PromoteToRemote { session } => f
+                .debug_struct("PromoteToRemote")
+                .field("session", session)
+                .finish(),
+            Command::DemoteToLocal { session } => f
+                .debug_struct("DemoteToLocal")
+                .field("session", session)
+                .finish(),
+            Command::Login { credentials } => f
+                .debug_struct("Login")
+                .field("credentials", credentials)
+                .finish(),
+            Command::Attach { token: _ } => f
+                .debug_struct("Attach")
+                .field("token", &"<redacted>")
+                .finish(),
+            Command::Refresh { refresh_token: _ } => f
+                .debug_struct("Refresh")
+                .field("refresh_token", &"<redacted>")
+                .finish(),
+            Command::Logout => f.write_str("Logout"),
+        }
+    }
 }
 
 /// The body of an event emitted by the engine.
@@ -145,7 +273,7 @@ pub struct Event {
 
 /// Outbound WS framing for the engine→frontend stream. Reuses the core `Event`;
 /// `Ready`/`Error` are transport framing. Shared so browser clients can deserialize it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Ready {
@@ -176,6 +304,73 @@ pub enum ServerMessage {
         session: SessionId,
         endpoint: String,
     },
+    /// Transport framing announcing the server's auth posture on connect.
+    Hello {
+        auth_mode: AuthMode,
+    },
+    /// Sent in reply to `Command::Login`/`Command::Refresh` once the client is authenticated, and
+    /// on `Command::Attach` when the provided token is accepted.
+    LoggedIn {
+        user: UserId,
+        access_token: String,
+        expires_at: u64,
+        refresh_token: String,
+    },
+    /// Sent in reply to `Command::Logout`: the session's tokens are revoked.
+    LoggedOut,
+}
+
+impl std::fmt::Debug for ServerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerMessage::Ready {
+                session,
+                capabilities,
+            } => f
+                .debug_struct("Ready")
+                .field("session", session)
+                .field("capabilities", capabilities)
+                .finish(),
+            ServerMessage::Event { event } => {
+                f.debug_struct("Event").field("event", event).finish()
+            }
+            ServerMessage::Error { message } => {
+                f.debug_struct("Error").field("message", message).finish()
+            }
+            ServerMessage::Promoted {
+                session,
+                endpoint,
+                token,
+            } => f
+                .debug_struct("Promoted")
+                .field("session", session)
+                .field("endpoint", endpoint)
+                .field("token", &token.as_deref().map(|_| "<redacted>"))
+                .finish(),
+            ServerMessage::Demoted { session, endpoint } => f
+                .debug_struct("Demoted")
+                .field("session", session)
+                .field("endpoint", endpoint)
+                .finish(),
+            ServerMessage::Hello { auth_mode } => f
+                .debug_struct("Hello")
+                .field("auth_mode", auth_mode)
+                .finish(),
+            ServerMessage::LoggedIn {
+                user,
+                access_token: _,
+                expires_at,
+                refresh_token: _,
+            } => f
+                .debug_struct("LoggedIn")
+                .field("user", user)
+                .field("expires_at", expires_at)
+                .field("access_token", &"<redacted>")
+                .field("refresh_token", &"<redacted>")
+                .finish(),
+            ServerMessage::LoggedOut => f.write_str("LoggedOut"),
+        }
+    }
 }
 
 /// A unary workspace operation, sent to a remote engine's `POST /workspace`.
@@ -478,5 +673,95 @@ mod tests {
         let back: WorkspaceResponse =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(resp, back);
+    }
+
+    #[test]
+    fn login_command_round_trips_externally_tagged() {
+        let cmd = Command::Login {
+            credentials: Credentials::Totp {
+                user: UserId::parse("alice").unwrap(),
+                code: "123456".into(),
+            },
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.starts_with(
+                r#"{"Login":{"credentials":{"Totp":{"user":"alice","code":"123456"}}}}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+    }
+
+    #[test]
+    fn logged_in_frame_is_internally_tagged_and_redacts_debug() {
+        let frame = ServerMessage::LoggedIn {
+            user: UserId::parse("alice").unwrap(),
+            access_token: "access-secret-token".into(),
+            expires_at: 1_700_000_000,
+            refresh_token: "refresh-secret-token".into(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.starts_with(r#"{"type":"logged_in","user":"alice""#));
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), frame);
+
+        let dbg = format!("{frame:?}");
+        assert!(
+            !dbg.contains("access-secret-token") && !dbg.contains("refresh-secret-token"),
+            "tokens leaked in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn command_debug_redacts_attach_and_refresh() {
+        let attach = format!(
+            "{:?}",
+            Command::Attach {
+                token: "secret-token".into()
+            }
+        );
+        assert!(!attach.contains("secret-token"));
+        let refresh = format!(
+            "{:?}",
+            Command::Refresh {
+                refresh_token: "secret-refresh".into()
+            }
+        );
+        assert!(!refresh.contains("secret-refresh"));
+        let login = format!(
+            "{:?}",
+            Command::Login {
+                credentials: Credentials::Totp {
+                    user: UserId::parse("alice").unwrap(),
+                    code: "654321".into()
+                }
+            }
+        );
+        assert!(!login.contains("654321"));
+    }
+
+    #[test]
+    fn server_message_debug_redacts_promoted_token() {
+        // The hand-written `Debug` for the whole enum must also close the pre-existing
+        // `Promoted.token` leak in the derived impl it replaces.
+        let promoted = ServerMessage::Promoted {
+            session: SessionId::new(),
+            endpoint: "ws://x".into(),
+            token: Some("fly-secret".into()),
+        };
+        let dbg = format!("{promoted:?}");
+        assert!(
+            !dbg.contains("fly-secret"),
+            "Promoted.token leaked in Debug: {dbg}"
+        );
+    }
+
+    #[test]
+    fn hello_frame_carries_the_mode_snake_cased() {
+        let hello = ServerMessage::Hello {
+            auth_mode: AuthMode::SingleUser,
+        };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(json, r#"{"type":"hello","auth_mode":"single_user"}"#);
+        assert_eq!(serde_json::from_str::<ServerMessage>(&json).unwrap(), hello);
     }
 }

@@ -5,13 +5,24 @@
 use std::sync::Arc;
 
 use otto_engine::{EngineService, build_default_registry, build_tool_registry, serve_app};
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
+use otto_protocol::AuthMode;
 use otto_providers::LocalProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
 use tower::ServiceExt; // for `oneshot`
 
-const TOKEN: &str = "test-token";
+/// A `SingleUser`-mode serve: no credential, and the `/workspace` Authorization header is
+/// ignored — the mode the CORS preflight probes exercise.
+fn single_user() -> AuthConfig {
+    AuthConfig {
+        mode: AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_secs(10),
+    }
+}
 
 /// Build the serve router (unbound) over a temp workspace.
 async fn build_app() -> (axum::Router, tempfile::TempDir) {
@@ -35,7 +46,7 @@ async fn build_app() -> (axum::Router, tempfile::TempDir) {
     );
     let app = serve_app(
         service,
-        TOKEN.to_string(),
+        single_user(),
         otto_protocol::CapabilitiesManifest {
             engine_remote: false,
             local_llm: false,
@@ -107,7 +118,10 @@ async fn workspace_post_response_carries_cors_origin() {
     let req = axum::http::Request::builder()
         .method(axum::http::Method::POST)
         .uri("/workspace")
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ignored-in-single-user",
+        )
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .header(axum::http::header::ORIGIN, "http://127.0.0.1:8080")
         .body(axum::body::Body::from(body))

@@ -60,7 +60,10 @@ cargo build --release -p otto-engine
 ```
 
 Runtime requirements: the sandbox behind `otto run` needs `bwrap` on Linux (`sandbox-exec` on
-macOS); `otto serve` requires `OTTO_TOKEN`. See "How it works" below.
+macOS); `otto serve` defaults to `AuthMode::Users`, so enroll a principal with
+`otto auth enroll <user>` before serving. The `OTTO_PROMOTION_SECRET` promotion secret is needed
+only when a `--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set. See "How it
+works" below.
 
 ## Quick start
 
@@ -127,10 +130,15 @@ touching the spine.
 ## Serving the engine + the browser UI
 
 The same protocol runs embedded (the `run` command above) or served. `otto serve` exposes the
-`Command`/`Event` protocol over a bearer-authed WebSocket; the bearer token is mandatory:
+`Command`/`Event` protocol over an authenticated WebSocket. Three auth modes: the default
+`Users` (TOTP principals via `otto auth enroll <user>`), `--single-user` (loopback-only, no
+credential — the desktop sidecar), and `--promotion-receiver` (machine-to-machine, for promote
+receivers). The promotion secret `OTTO_PROMOTION_SECRET` is required only when a
+`--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set; a default `Users` serve
+needs at least one enrolled principal instead:
 
 ```bash
-OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787   # prints ws://127.0.0.1:8787/ws
+cargo run -p otto-engine -- serve --port 8787   # prints ws://127.0.0.1:8787/ws
 ```
 
 The UI is a single Dioxus CSR crate in [`ui-dioxus/`](ui-dioxus/). It compiles to WASM for the
@@ -155,7 +163,7 @@ For the served web UI, pass the bundle to `otto serve --ui-dir <path>` after bui
 
 ```bash
 cd ui-dioxus && ./scripts/build-web.sh      # produces the web release bundle
-OTTO_TOKEN=devtoken cargo run -p otto-engine -- serve --port 8787 --ui-dir target/dx/otto-desktop/release/web/public
+cargo run -p otto-engine -- serve --port 8787 --ui-dir target/dx/otto-desktop/release/web/public
 ```
 
 ## Developing

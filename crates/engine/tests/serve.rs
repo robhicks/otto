@@ -6,12 +6,15 @@ use std::sync::Arc;
 
 use axum_server::tls_rustls::RustlsConfig;
 use futures_util::{SinkExt, StreamExt};
+use otto_auth::testing::FakeAuthenticator;
 use otto_engine::{
     EngineService, build_default_registry, build_tool_registry, build_tool_registry_approving,
     serve_app, serve_run,
 };
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
 use otto_extensions::{CustomAgentDef, CustomCommandDef, Extensions};
+use otto_protocol::AuthMode;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::LocalWorkspace;
@@ -20,6 +23,17 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TOKEN: &str = "test-token";
+
+/// The `SingleUser` auth posture every plain command-flow server in this file serves: no
+/// credential (the `Authorization` header is ignored), no authenticator, no promotion secret.
+fn single_user() -> AuthConfig {
+    AuthConfig {
+        mode: AuthMode::SingleUser,
+        authenticator: None,
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_secs(10),
+    }
+}
 
 /// A fixed manifest the test server reports, so the assertion below is deterministic and
 /// also proves non-default values are threaded through (not hardcoded false).
@@ -59,7 +73,7 @@ async fn start_server() -> (u16, tempfile::TempDir) {
         tools,
     );
 
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -111,7 +125,7 @@ async fn start_server_with_command() -> (u16, tempfile::TempDir) {
     )
     .with_extensions(Arc::new(extensions));
 
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -162,7 +176,7 @@ async fn start_server_with_agent() -> (u16, tempfile::TempDir) {
     )
     .with_extensions(Arc::new(extensions));
 
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -202,7 +216,7 @@ async fn start_approval_server() -> (u16, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -240,7 +254,7 @@ async fn start_metering_server() -> (u16, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -256,7 +270,7 @@ async fn streams_token_cost_meter_events() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
@@ -286,7 +300,7 @@ async fn pause_before_prompt_parks_turn_until_resume() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     // Pause BEFORE prompting → the turn's first checkpoint parks deterministically.
@@ -351,7 +365,7 @@ async fn disconnect_while_paused_does_not_hang() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let pause = serde_json::json!({ "Pause": { "session": session } });
@@ -381,7 +395,7 @@ async fn disconnect_while_paused_does_not_hang() {
     let (mut ws2, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("server still accepts connections after a paused-disconnect");
-    let ready2: Value = next_json(&mut ws2).await;
+    let ready2: Value = ready_frame(&mut ws2).await;
     let session2 = ready2["session"].as_str().unwrap().to_string();
     let cmd2 =
         serde_json::json!({ "SendPrompt": { "session": session2, "text": "add a greeting" } });
@@ -427,7 +441,7 @@ async fn approved_edit_is_written() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
@@ -470,7 +484,7 @@ async fn rejected_edit_is_not_written() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
@@ -508,7 +522,7 @@ async fn disconnect_mid_approval_fails_closed() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({ "SendPrompt": { "session": session, "text": "add a greeting" } });
@@ -540,6 +554,85 @@ fn authed_request(
     req
 }
 
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A ws request with no credential — the auth-posture tests connect bare so the server must
+/// reach its own verdict (deadline on `Users`, `Ready` on `SingleUser`).
+fn request(port: u16, query: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    let url = format!("ws://127.0.0.1:{port}/ws{query}");
+    url.into_client_request().unwrap()
+}
+
+async fn connect(req: tokio_tungstenite::tungstenite::handshake::client::Request) -> Ws {
+    let (ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("connect");
+    ws
+}
+
+/// Assert the first frame is `Hello` (the greeting that precedes every handshake, in every mode),
+/// returning it.
+async fn hello(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Value {
+    let hello = next_json(ws).await;
+    assert_eq!(hello["type"], "hello");
+    hello
+}
+
+/// Read `Hello` then `Ready`, returning the `Ready` frame.
+async fn ready_frame(
+    ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Value {
+    hello(ws).await;
+    let ready = next_json(ws).await;
+    assert_eq!(ready["type"], "ready");
+    ready
+}
+
+/// A `Users`-mode server over the `FakeAuthenticator` (every `Login` authenticates as `alice`)
+/// with a short handshake deadline — the posture where a socket presenting only `?token=` (no
+/// header, no auth frame) must hit the deadline and get the opaque Error.
+async fn start_users_server() -> (u16, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("{}");
+    let router: Arc<dyn otto_engine_core::Router> =
+        Arc::new(SingleProviderRouter::new(Arc::new(provider)));
+    let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
+    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
+        otto_persistence::SqliteStore::open(dir.path().join("s.db"))
+            .await
+            .unwrap(),
+    );
+    let service = EngineService::new(
+        store,
+        Arc::new(build_default_registry()),
+        router,
+        workspace,
+        tools,
+    );
+    let fake = Arc::new(FakeAuthenticator::new(
+        otto_protocol::UserId::parse("alice").unwrap(),
+    ));
+    let auth = AuthConfig {
+        mode: AuthMode::Users,
+        authenticator: Some(fake as Arc<dyn otto_engine_core::Authenticator>),
+        promotion_secret: None,
+        handshake_deadline: std::time::Duration::from_millis(500),
+    };
+    let app = serve_app(service, auth, test_capabilities(), None, false);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        serve_run(listener, app, None).await.unwrap();
+    });
+    (port, dir)
+}
+
 #[tokio::test]
 async fn streams_a_turn_then_reconnects_with_replay() {
     let (port, _dir) = start_server().await;
@@ -550,7 +643,7 @@ async fn streams_a_turn_then_reconnects_with_replay() {
         .expect("connect");
 
     // First frame is Ready { session }.
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     let session = ready["session"].as_str().unwrap().to_string();
 
@@ -585,7 +678,7 @@ async fn streams_a_turn_then_reconnects_with_replay() {
     ))
     .await
     .expect("reconnect");
-    let ready2: Value = next_json(&mut ws2).await;
+    let ready2: Value = ready_frame(&mut ws2).await;
     assert_eq!(ready2["type"], "ready");
     assert_eq!(ready2["session"].as_str().unwrap(), session);
 
@@ -610,7 +703,7 @@ async fn run_command_expands_and_narrows_tools() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({
@@ -644,7 +737,7 @@ async fn run_command_unknown_name_reports_error_and_keeps_connection_open() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({
@@ -686,7 +779,7 @@ async fn run_agent_dispatches_and_reports_turn_complete() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({
@@ -739,7 +832,7 @@ async fn run_agent_unknown_name_reports_error_and_keeps_connection_open() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({
@@ -782,7 +875,7 @@ async fn ready_frame_carries_capabilities() {
         .await
         .expect("connect");
 
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     let caps = &ready["capabilities"];
     assert!(caps.is_object(), "Ready must carry a capabilities object");
@@ -792,55 +885,88 @@ async fn ready_frame_carries_capabilities() {
     assert_eq!(caps["sandbox"], true);
 }
 
+/// `?token=` is gone (spec §9): a `Users`-mode socket with no credential of any kind — no header,
+/// no query token, no auth frame — is not authenticated. It hits the handshake deadline and gets
+/// the single opaque Error.
 #[tokio::test]
 async fn rejects_missing_token() {
-    let (port, _dir) = start_server().await;
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    // No Authorization header → upgrade rejected (401), connect_async errors.
-    let result = tokio_tungstenite::connect_async(url).await;
+    let (port, _dir) = start_users_server().await;
+    let mut ws = connect(request(port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
     assert!(
-        result.is_err(),
-        "unauthenticated connection must be rejected"
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the failed handshake"
     );
 }
 
+/// A wrong bearer header is not a credential on a `Users` app: it falls through to the frame
+/// handshake, and a socket that sends no `Login`/`Attach` hits the deadline (opaque Error).
 #[tokio::test]
 async fn rejects_wrong_token() {
-    let (port, _dir) = start_server().await;
-    let url = format!("ws://127.0.0.1:{port}/ws");
-    let mut req = url.into_client_request().unwrap();
+    let (port, _dir) = start_users_server().await;
+    let mut req = request(port, "");
     req.headers_mut()
         .insert("Authorization", "Bearer wrong-token".parse().unwrap());
-    let result = tokio_tungstenite::connect_async(req).await;
-    assert!(result.is_err(), "a wrong token must be rejected");
+    let mut ws = connect(req).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the failed handshake"
+    );
 }
 
+/// The query token is inert, not authorizing: a `SingleUser` app ignores `?token=` entirely and
+/// reaches `Ready` with no credential (the old browser path neither grants nor interferes).
 #[tokio::test]
 async fn authorizes_via_query_token() {
     let (port, _dir) = start_server().await;
-    // No Authorization header — token rides in the query string (browser path).
-    let url = format!("ws://127.0.0.1:{port}/ws?token={TOKEN}");
-    let (mut ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .expect("query-token connection must be accepted");
+    let mut ws = connect(request(port, &format!("?token={TOKEN}"))).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "single_user");
     let ready = next_json(&mut ws).await;
     assert_eq!(ready["type"], "ready");
 }
 
+/// `?token=` is inert on a `Users` app too: a socket presenting only a wrong query token (no
+/// header, no auth frame) hits the handshake deadline and gets the opaque Error.
 #[tokio::test]
 async fn rejects_wrong_query_token() {
-    let (port, _dir) = start_server().await;
-    let url = format!("ws://127.0.0.1:{port}/ws?token=wrong-token");
-    let result = tokio_tungstenite::connect_async(url).await;
-    assert!(result.is_err(), "a wrong query token must be rejected");
+    let (port, _dir) = start_users_server().await;
+    let mut ws = connect(request(port, "?token=wrong-token")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the failed handshake"
+    );
 }
 
+/// An empty `?token=` is as inert as any other query value: no header, no auth frame → the
+/// handshake deadline fires and the connection is closed.
 #[tokio::test]
 async fn rejects_empty_query_token() {
-    let (port, _dir) = start_server().await;
-    let url = format!("ws://127.0.0.1:{port}/ws?token=");
-    let result = tokio_tungstenite::connect_async(url).await;
-    assert!(result.is_err(), "an empty query token must be rejected");
+    let (port, _dir) = start_users_server().await;
+    let mut ws = connect(request(port, "?token=")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the failed handshake"
+    );
 }
 
 /// Start the serve app over TLS on 127.0.0.1:0 with a self-signed cert for "localhost".
@@ -873,7 +999,7 @@ async fn start_tls_server() -> (u16, Vec<u8>, tempfile::TempDir) {
         workspace,
         tools,
     );
-    let app = serve_app(service, TOKEN.to_string(), test_capabilities(), None, false);
+    let app = serve_app(service, single_user(), test_capabilities(), None, false);
 
     // Self-signed cert for "localhost" (connect via wss://localhost so the SAN matches).
     // rcgen 0.13 uses CertifiedKey { cert, key_pair }.
@@ -927,7 +1053,7 @@ async fn streams_a_turn_over_wss() {
             .await
             .expect("wss connect");
 
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     let session = ready["session"].as_str().unwrap().to_string();
 
@@ -982,13 +1108,7 @@ async fn start_promote_server() -> (u16, tempfile::TempDir) {
             base_dir: dir.path().join("remotes"),
         },
     });
-    let app = serve_app(
-        service,
-        TOKEN.to_string(),
-        test_capabilities(),
-        promote,
-        false,
-    );
+    let app = serve_app(service, single_user(), test_capabilities(), promote, false);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1017,9 +1137,11 @@ fn authed_endpoint_request(
 /// including its owner, so the check must not be quietly droppable.
 ///
 /// With one principal a connection cannot normally reach another owner's session, so the test
-/// seeds one directly in the store under a different owner and then attaches to it by id —
-/// which `resolve_session` still permits, deliberately (attach-time checking is the identity
-/// slice's, because it would change behavior a reconnecting client depends on).
+/// seeds one directly in the store under a different owner and then attaches to it by id. With the
+/// identity slice, the refusal happens at attach time (`resolve_session` — the same shared
+/// not-found message), so the handover command is never reachable for a foreign session; the
+/// vacuity guard below proves an *owned* session still gets past authorization and fails later,
+/// on the absent promote configuration, with a different message.
 #[tokio::test]
 async fn handover_refuses_a_session_the_connection_does_not_own() {
     let (port, dir) = start_server().await;
@@ -1044,20 +1166,19 @@ async fn handover_refuses_a_session_the_connection_does_not_own() {
         ))
         .await
         .expect("connect");
-        let ready: Value = next_json(&mut ws).await;
-        assert_eq!(ready["type"], "ready");
-
-        let msg = serde_json::json!({ cmd: { "session": victim.0.to_string() } });
-        ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
-            .await
-            .unwrap();
-
+        // Hello arrives (the greeting precedes every handshake), then the attach-time refusal —
+        // never a Ready, so the handover command cannot run against a foreign session.
+        hello(&mut ws).await;
         let frame: Value = next_json(&mut ws).await;
         assert_eq!(frame["type"], "error", "{cmd} should be refused");
         // The shared not-found message — never "not yours", which would be an existence oracle.
         assert!(
             frame["message"].as_str().unwrap().contains("no session"),
             "{cmd}: unexpected {frame}"
+        );
+        assert!(
+            next_json_opt(&mut ws).await.is_none(),
+            "no Ready and no further frames may follow the attach-time refusal"
         );
     }
 
@@ -1070,7 +1191,7 @@ async fn handover_refuses_a_session_the_connection_does_not_own() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let owned = ready["session"].as_str().unwrap().to_string();
     let msg = serde_json::json!({ "PromoteToRemote": { "session": owned } });
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -1090,7 +1211,7 @@ async fn promote_without_flag_replies_error() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     let cmd = serde_json::json!({ "PromoteToRemote": { "session": session } });
@@ -1117,7 +1238,7 @@ async fn promote_then_demote_round_trip_preserves_session() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .expect("connect local");
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     let session = ready["session"].as_str().unwrap().to_string();
 
     // Run a turn on the local engine; track the highest seq seen.
@@ -1165,7 +1286,7 @@ async fn promote_then_demote_round_trip_preserves_session() {
     ))
     .await
     .expect("connect remote");
-    let ready_r: Value = next_json(&mut ws_r).await;
+    let ready_r: Value = ready_frame(&mut ws_r).await;
     assert_eq!(ready_r["type"], "ready");
     assert_eq!(ready_r["capabilities"]["engine_remote"], true);
 
@@ -1191,7 +1312,7 @@ async fn promote_then_demote_round_trip_preserves_session() {
         tokio_tungstenite::connect_async(authed_endpoint_request(&local_endpoint, &session, 0))
             .await
             .expect("connect demoted-local");
-    let ready_l: Value = next_json(&mut ws_l).await;
+    let ready_l: Value = ready_frame(&mut ws_l).await;
     assert_eq!(ready_l["capabilities"]["engine_remote"], false);
     // Continuity: replaying from seq 0 yields the original session's events.
     let mut saw_event = false;
@@ -1237,7 +1358,7 @@ async fn served_sessions_are_owned_by_the_local_principal() {
     let (mut ws, _) = tokio_tungstenite::connect_async(authed_request(port, ""))
         .await
         .unwrap();
-    let ready: Value = next_json(&mut ws).await;
+    let ready: Value = ready_frame(&mut ws).await;
     assert_eq!(ready["type"], "ready");
     let session = ready["session"].as_str().unwrap().to_string();
 

@@ -85,9 +85,10 @@ fn percent_encoded_query(autoconnect: &str) -> String {
 }
 
 /// The `/ws` target `build_ws_url` must produce from those params on a fresh (no session, no
-/// last_seq) connection.
+/// last_seq) connection. No `token=` — the credential no longer rides in the URL (spec §6.4);
+/// the query's token is consumed by `parse_launch_params` and carried on the RPC header instead.
 fn expected_target() -> String {
-    format!("{TEST_WS_BASE}/ws?token={TEST_TOKEN}")
+    format!("{TEST_WS_BASE}/ws")
 }
 
 /// Overwrite the page's query string in place (no navigation, no reload) so the mounted `App`
@@ -153,7 +154,7 @@ async fn mount_app_and_drive() -> Vec<String> {
 
 /// THE regression test. A launch URL carrying `ws`/`token`/`autoconnect=1` — in the exact form the
 /// desktop wrapper writes — must make the mounted app actually call `transport::connect`, with the
-/// fully built `/ws?token=…` target, which proves the parsed params flowed all the way through
+/// fully built `/ws` target, which proves the parsed params flowed all the way through
 /// `build_ws_url` into the connect call rather than being parsed and dropped.
 #[wasm_bindgen_test]
 async fn autoconnects_from_launch_params_on_mount() {

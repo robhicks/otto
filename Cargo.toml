@@ -8,6 +8,7 @@ members = [
     "crates/router",
     "crates/tools",
     "crates/agents",
+    "crates/auth",
     "crates/engine",
     "crates/remote",
     "crates/persistence",

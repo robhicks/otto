@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use otto_engine_core::Router;
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::Workspace;
 use otto_persistence::{SessionStore, SqliteStore};
 use otto_remote::{PromoteBundle, PromoteConfig, PromoteMode, RemoteHandle, RemoteTarget};
@@ -18,7 +19,10 @@ use crate::{build_default_registry, build_router, build_tool_registry};
 /// Provisions a real second engine in-process: restores the bundle into a fresh sqlite store +
 /// workspace under `base_dir` (one subdir per session id) and serves it on `127.0.0.1:0`.
 pub struct LoopbackTarget {
-    token: String,
+    /// The auth posture the provisioned engine serves with. Per spec §6.5 the loopback provision
+    /// inherits `SingleUser` (same trust domain, no cross-machine credential): the caller threads
+    /// the source's posture when it is `SingleUser`, or a fresh `SingleUser` config otherwise.
+    auth: AuthConfig,
     base_dir: PathBuf,
     /// The `engine_remote` capability the provisioned engine reports: `true` for promote
     /// (it's now "remote"), `false` for demote (back to "local").
@@ -26,11 +30,11 @@ pub struct LoopbackTarget {
 }
 
 impl LoopbackTarget {
-    /// `token` is the bearer the provisioned remote requires; `base_dir` is where the restored
+    /// `auth` is the posture the provisioned remote serves with; `base_dir` is where the restored
     /// store + workspace are written; `engine_remote` is the capability flag it reports.
-    pub fn new(token: impl Into<String>, base_dir: PathBuf, engine_remote: bool) -> Self {
+    pub fn new(auth: AuthConfig, base_dir: PathBuf, engine_remote: bool) -> Self {
         Self {
-            token: token.into(),
+            auth,
             base_dir,
             engine_remote,
         }
@@ -70,18 +74,21 @@ impl RemoteTarget for LoopbackTarget {
         .with_retriever(crate::build_retriever(&ws_dir).await);
 
         // This provisioned engine reports the configured capability and is itself promote-capable
-        // (so the round-trip — demote, re-promote — works), rooted at a nested base dir.
+        // (so the round-trip — demote, re-promote — works), rooted at a nested base dir. Its bearer
+        // for `/promote`/`/export` is the threaded promotion secret (empty for a `SingleUser`
+        // provision, whose `/ws`/`/workspace` accept any connection as the local principal).
         let capabilities = otto_protocol::CapabilitiesManifest {
             engine_remote: self.engine_remote,
             ..crate::build_capabilities()
         };
+        let promotion_secret = self.auth.promotion_secret.clone().unwrap_or_default();
         let promote = Some(PromoteConfig {
-            token: self.token.clone(),
+            token: promotion_secret.clone(),
             mode: PromoteMode::Loopback {
                 base_dir: dir.join("promote"),
             },
         });
-        let app = crate::serve::app(service, self.token.clone(), capabilities, promote, false);
+        let app = crate::serve::app(service, self.auth.clone(), capabilities, promote, false);
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -91,7 +98,7 @@ impl RemoteTarget for LoopbackTarget {
 
         Ok(RemoteHandle::with_task(
             format!("ws://127.0.0.1:{port}"),
-            self.token.clone(),
+            promotion_secret,
             task,
         ))
     }

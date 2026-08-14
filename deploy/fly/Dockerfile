@@ -49,9 +49,9 @@ COPY --from=webbuild /src/ui-dioxus/target/dx/otto-desktop/release/web/public /u
 # The session workspace root. create_machine injects OTTO_ROOT=/workspace.
 RUN mkdir -p /workspace
 # OTTO_HOST=0.0.0.0 is load-bearing: Fly's proxy reaches the machine over its network interface,
-# not loopback, so otto serve must NOT bind 127.0.0.1 here (its safe local default). OTTO_TOKEN is
-# injected per-machine by the provisioner.
+# not loopback, so otto serve must NOT bind 127.0.0.1 here (its safe local default).
+# OTTO_PROMOTION_SECRET is injected per-machine by the provisioner.
 ENV OTTO_PORT=8787 OTTO_ROOT=/workspace OTTO_HOST=0.0.0.0 OTTO_UI_DIR=/usr/local/share/otto/ui
 # No OS sandbox backend (bwrap) is installed, so `bash`/sandboxed tools stay unregistered on the
 # guest (fail-closed) — a deliberate posture consistent with otto's "no backend -> no bash" rule.
-CMD ["sh", "-c", "otto serve --accept-promotions --port \"$OTTO_PORT\" --root \"$OTTO_ROOT\" --ui-dir \"$OTTO_UI_DIR\""]
+CMD ["sh", "-c", "otto serve --accept-promotions --promotion-receiver --port \"$OTTO_PORT\" --root \"$OTTO_ROOT\" --ui-dir \"$OTTO_UI_DIR\""]

@@ -40,13 +40,15 @@ use crate::net::url::redact_token;
 ///
 /// # Why the redaction lives in the constructor
 ///
-/// `build_ws_url` puts the bearer token in a query parameter, and a rejected URL comes back from
-/// the browser quoting the URL in full. Redacting at each call site made "did this one remember?"
-/// a per-site review question that a source-scanning test could only approximate — and it left the
-/// desktop transport uncovered entirely. Because `new` is the only constructor, it is the one
-/// place that makes the property structural: **no diagnostic can leave this seam carrying a
-/// `token=` query parameter, whatever a future call site formats.** `redact_token` is idempotent,
-/// so a call site that also redacts is harmless.
+/// The leak it was built to close: `build_ws_url` put the bearer token in a query parameter, and a
+/// rejected URL comes back from the browser quoting the URL in full. That URL is gone now (spec
+/// §6.4 — slice 2 moves credentials to post-upgrade frames), but the structural guarantee is what
+/// stays worth keeping: redacting at each call site made "did this one remember?" a per-site
+/// review question that a source-scanning test could only approximate — and it left the desktop
+/// transport uncovered entirely. Because `new` is the only constructor, it is the one place that
+/// makes the property structural: **no diagnostic can leave this seam carrying a `token=` query
+/// parameter, whatever a future call site formats.** `redact_token` is idempotent, so a call site
+/// that also redacts is harmless.
 ///
 /// Scope, stated exactly: `redact_token` recognizes the `token=<value>` *query* form. The same
 /// secret also travels as an `Authorization: Bearer …` header on the workspace RPC. No diagnostic

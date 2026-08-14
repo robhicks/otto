@@ -1,5 +1,6 @@
 //! otto engine core: the orchestrator state machine and the trait seams it drives.
 
+pub mod auth;
 pub mod meter;
 pub mod orchestrator;
 pub mod registry;
@@ -9,6 +10,7 @@ pub mod tool;
 pub mod traits;
 pub mod types;
 
+pub use auth::{AuthConfig, AuthError, Authenticator, Principal, TokenPair};
 pub use meter::TokenMeter;
 pub use orchestrator::{Emitter, Orchestrator, TurnOutcome};
 pub use registry::AgentRegistry;

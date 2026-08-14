@@ -1,9 +1,12 @@
 //! `otto run "<goal>" [--root <path>] [--agent <name>]` — run a single turn (or a named custom agent) and print output.
-//! `otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket (needs OTTO_TOKEN).
+//! `otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--single-user | --promotion-receiver] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]` — serve over WebSocket. Three auth modes (spec §6.5): the default `Users` (TOTP via `otto auth`), `--single-user` (loopback-only, no credential — the desktop sidecar), and `--promotion-receiver` (machine-to-machine, requires `--accept-promotions`). The promotion secret is `OTTO_PROMOTION_SECRET` (renamed from `OTTO_TOKEN`), required only when a `--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set.
+//! `otto auth enroll <user>` / `otto auth list` / `otto auth revoke <user>` — provision/remove TOTP principals against the `OTTO_AUTH_DB` store (the out-of-band bootstrap, spec §7.4).
 //! `otto plugin marketplace add|remove|update|list` / `otto plugin install|uninstall|list` — manage Claude Code plugin marketplaces under `~/.claude/plugins/marketplaces/`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use rand::RngCore;
 
 use otto_engine::{
     McpConnection, build_router, build_tool_registry, mcp_connect_bash, mcp_connect_fs,
@@ -14,6 +17,8 @@ use otto_engine_core::tool::ToolRegistry;
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
+use otto_auth::AuthStore;
+
 mod plugin_cli;
 mod plugin_tui;
 
@@ -21,7 +26,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage:
   otto run \"<goal>\" [--root <path>] [--agent <name>]
-  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
+  otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--single-user | --promotion-receiver] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
+  otto auth enroll <user> [--force]
+  otto auth list
+  otto auth revoke <user>
   otto plugin                                  interactive TUI (default)
   otto plugin marketplace add|remove|update|list
   otto plugin install|uninstall|list
@@ -37,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
     match command.as_str() {
         "run" => cmd_run(rest).await,
         "serve" => cmd_serve(rest).await,
+        "auth" => cmd_auth(rest).await,
         "plugin" => plugin_cli::cmd_plugin(rest, home_dir()).await,
         "version" | "--version" | "-V" => {
             println!("otto {VERSION}");
@@ -181,6 +190,98 @@ fn home_dir() -> PathBuf {
 
 fn open_db_path() -> String {
     std::env::var("OTTO_DB").unwrap_or_else(|_| "otto-sessions.db".to_string())
+}
+
+/// The auth database path: `OTTO_AUTH_DB` if set, else the OS data dir + `otto/auth.db` (spec A5).
+/// Auth state — TOTP secrets, the HS256 signing key, refresh-token hashes — is a credential and
+/// lives outside the workspace so the sensitive-path floor is untouched (the session store's
+/// `otto-sessions.db` default is inside the workspace by contrast). `otto auth` and `otto serve`
+/// share this path.
+///
+/// **Fails closed (spec A5)** when neither the variable nor the OS data dir is available: there
+/// is deliberately no CWD fallback. Writing the credentials into an arbitrary directory — e.g. a
+/// workspace root a serve was started inside — would place them where the sensitive-path floor
+/// does not cover them, so `otto auth`/`otto serve` refuse to run instead.
+fn auth_db_path() -> anyhow::Result<String> {
+    auth_db_path_from(std::env::var("OTTO_AUTH_DB").ok(), dirs::data_dir())
+}
+
+/// The pure core of [`auth_db_path`]: an explicit `OTTO_AUTH_DB` wins; otherwise the OS data
+/// dir is required, or the caller fails closed with an actionable error. Tested directly so the
+/// no-CWD-fallback invariant is provable without manipulating process-global env/dirs.
+fn auth_db_path_from(env: Option<String>, data_dir: Option<PathBuf>) -> anyhow::Result<String> {
+    if let Some(path) = env {
+        return Ok(path);
+    }
+    let dir = data_dir.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine the OS data directory for the auth database and OTTO_AUTH_DB is \
+             unset: set OTTO_AUTH_DB to an explicit path outside any workspace, or the auth \
+             state (TOTP secrets, signing key, refresh hashes) cannot be placed safely"
+        )
+    })?;
+    Ok(dir
+        .join("otto")
+        .join("auth.db")
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// Parse `host` as an `IpAddr` and require `is_loopback()`. The `--single-user` bind guard (spec
+/// §6.5): "loopback" is a predicate, not a string match. A value that does not parse as an IP is
+/// rejected — so `localhost` is refused (it resolves, but not necessarily to a loopback address),
+/// `::1` and `127.0.0.2` are accepted, and `0.0.0.0` is refused. Pure, per §9.1.
+fn resolve_bind_host_is_loopback(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Whether a `--single-user` serve's promote posture is legal (spec §6.5): the only promote mode
+/// permitted is `--promote-loopback` — it provisions a second in-process engine in the same trust
+/// domain and needs no cross-machine credential — and a plain serve (no promote flags at all) is
+/// equally valid. `--promote-vps`/`--promote-microvm`/`--promote-fly` and `--accept-promotions`/
+/// `--promotion-receiver` are startup errors. `loopback` is the one permitted mode, so it needs no
+/// explicit test; the predicate is false exactly when a disallowed mode is present.
+fn single_user_promote_modes_ok(
+    _loopback: bool,
+    vps: bool,
+    microvm: bool,
+    fly: bool,
+    accept_promotions: bool,
+) -> bool {
+    !vps && !microvm && !fly && !accept_promotions
+}
+
+/// Refuse to start a `Users`-mode serve with zero enrolled principals, naming `otto auth enroll`
+/// (spec §7.4): a server nobody can log into is always a misconfiguration, and failing at startup
+/// beats failing at first connection. Scoped to `AuthMode::Users` by the caller — `SingleUser` and
+/// `Machine` have no enrolled principals by design (§6.5).
+async fn users_mode_has_enrolled_principals(store: &dyn AuthStore) -> anyhow::Result<()> {
+    if store.enrolled_count().await? == 0 {
+        anyhow::bail!(
+            "no enrolled principals: run `otto auth enroll <user>` to provision the first \
+             principal before starting a multi-user server"
+        );
+    }
+    Ok(())
+}
+
+/// The `--promotion-receiver` startup preconditions (spec §6.5): `--accept-promotions` must be set,
+/// and no principal may be enrolled — a machine-credential host cannot double as a multi-user
+/// server, or the machine secret would be a backdoor into it. `enrolled` is passed in so the guard
+/// stays pure (the caller opens the store).
+fn promotion_receiver_preconditions(accept_promotions: bool, enrolled: u64) -> anyhow::Result<()> {
+    if !accept_promotions {
+        anyhow::bail!("--promotion-receiver requires --accept-promotions");
+    }
+    if enrolled > 0 {
+        anyhow::bail!(
+            "--promotion-receiver refuses to start with {enrolled} enrolled principal(s): a \
+             machine-credential host cannot double as a multi-user server"
+        );
+    }
+    Ok(())
 }
 
 /// Read Firecracker microVM parameters from `OTTO_FC_*` env vars. Defaults match common Firecracker
@@ -638,6 +739,136 @@ async fn run_command_in(
     Ok(())
 }
 
+/// Parse a `UserId` from a CLI argument, exiting with an error on an invalid id (never echoing the
+/// rejected value — it is operator input, but `InvalidUserId`'s message already omits it).
+fn parse_user(s: &str) -> otto_protocol::UserId {
+    match otto_protocol::UserId::parse(s) {
+        Ok(user) => user,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Parse a `UserId`, refusing the reserved `local` principal (spec §7.4). All three `otto auth`
+/// subcommands refuse it — `enroll local` cannot create it, `revoke local` cannot delete it, and
+/// `list` never shows it as though it were an enrolled principal — so the reserved built-in can
+/// never become half-real.
+fn refuse_local(s: &str) -> otto_protocol::UserId {
+    if s == otto_protocol::UserId::local().as_str() {
+        eprintln!(
+            "error: 'local' is the reserved built-in principal and cannot be enrolled or revoked"
+        );
+        std::process::exit(2);
+    }
+    parse_user(s)
+}
+
+/// Enroll `user`: generate a 20-byte TOTP secret (spec §6.1), persist it, and print the
+/// `otpauth://` URI plus a terminal QR (spec §7.4). Enrolling an already-enrolled user re-provisions
+/// them — invalidating the old secret — and requires `--force` so a typo cannot silently lock
+/// someone out.
+async fn enroll_user(
+    store: &otto_auth::SqliteAuthStore,
+    user: &otto_protocol::UserId,
+    force: bool,
+) -> anyhow::Result<()> {
+    if store.totp_secret(user).await?.is_some() {
+        if !force {
+            anyhow::bail!(
+                "{user} is already enrolled; pass --force to re-provision (this invalidates the \
+                 existing secret)"
+            );
+        }
+        // Re-provision: drop the user and their refresh tokens first — `enroll_user` refuses a
+        // duplicate, and this also resets the replay floor and the failure counter.
+        store.revoke_user(user).await?;
+    }
+    let mut secret = [0u8; 20];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    store.enroll_user(user, &secret).await?;
+    let b32 = data_encoding::BASE32_NOPAD.encode(&secret);
+    let uri = format!(
+        "otpauth://totp/otto:{user}?secret={b32}&issuer=otto&algorithm=SHA1&digits=6&period=30"
+    );
+    println!("Enrolled {user}. Add the account to your authenticator app (or scan the QR):");
+    println!("{uri}");
+    let code = qrcode::QrCode::new(&uri)?;
+    let qr = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .module_dimensions(1, 1)
+        .build();
+    println!("{qr}");
+    Ok(())
+}
+
+/// `otto auth enroll <user> [--force]` / `otto auth list` / `otto auth revoke <user>` — the
+/// out-of-band bootstrap that provisions the first principal (spec §7.4). Runs on the host against
+/// the `OTTO_AUTH_DB` store directly; it needs no server and no credential, which is precisely why
+/// it is the bootstrap.
+async fn cmd_auth(args: Vec<String>) -> anyhow::Result<()> {
+    let mut it = args.into_iter();
+    let sub = it.next().unwrap_or_default();
+    match sub.as_str() {
+        "enroll" => {
+            let mut user: Option<String> = None;
+            let mut force = false;
+            for a in it {
+                if a == "--force" {
+                    force = true;
+                } else if user.is_none() {
+                    user = Some(a);
+                } else {
+                    eprintln!(
+                        "error: otto auth enroll takes exactly one user (plus optional --force)"
+                    );
+                    std::process::exit(2);
+                }
+            }
+            let Some(user) = user else {
+                eprintln!("error: otto auth enroll requires a user");
+                std::process::exit(2);
+            };
+            let user = refuse_local(&user);
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
+            enroll_user(&store, &user, force).await
+        }
+        "list" => {
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
+            let users = store.list_users().await?;
+            if users.is_empty() {
+                println!("no enrolled principals");
+            } else {
+                // `list_users` is ordered by id; `local` is never stored, so no filter needed.
+                for user in users {
+                    println!("{user}");
+                }
+            }
+            Ok(())
+        }
+        "revoke" => {
+            let user = match it.next() {
+                Some(user) => refuse_local(&user),
+                None => {
+                    eprintln!("error: otto auth revoke requires a user");
+                    std::process::exit(2);
+                }
+            };
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
+            store.revoke_user(&user).await?;
+            println!("revoked {user}");
+            Ok(())
+        }
+        _ => {
+            eprintln!(
+                "usage: otto auth enroll <user> [--force] | otto auth list | otto auth revoke <user>"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     // Fail fast on a bad *_BASE_URL. This matters most on serve: the offline fallback keeps
     // answering, so connected clients would receive canned output indefinitely with nothing but a
@@ -666,6 +897,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut approve_edits = false;
     let mut promote_loopback = false;
     let mut accept_promotions = false;
+    let mut single_user = false;
+    let mut promotion_receiver = false;
     let mut promote_vps: Option<String> = None;
     let mut promote_microvm = false;
     let mut promote_fly = false;
@@ -694,6 +927,8 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
                 }
             },
             "--approve-edits" => approve_edits = true,
+            "--single-user" => single_user = true,
+            "--promotion-receiver" => promotion_receiver = true,
             "--promote-loopback" => promote_loopback = true,
             "--accept-promotions" => accept_promotions = true,
             "--promote-vps" => match it.next() {
@@ -709,12 +944,106 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         }
     }
 
-    // Auth is mandatory and fail-closed: refuse to start without a token.
-    let token = match std::env::var("OTTO_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!("error: OTTO_TOKEN must be set to run `otto serve`");
+    // ---- Auth posture (spec §6.5): three explicit modes, resolved before any server setup so a
+    // misconfiguration is a hard, fail-closed startup error rather than a server that starts and
+    // accepts or refuses the wrong connections.
+    //
+    //   --single-user        → SingleUser: loopback bind enforced, no authenticator, no auth
+    //                          database; only --promote-loopback is allowed.
+    //   --promotion-receiver → Machine: requires --accept-promotions and refuses to start with any
+    //                          principal enrolled (the machine secret must never be a backdoor
+    //                          into a multi-user server).
+    //   default              → Users: a real TotpAuthenticator over the OTTO_AUTH_DB store, and the
+    //                          zero-principal refusal (spec §7.4).
+    //
+    // The promotion secret (OTTO_PROMOTION_SECRET, renamed from OTTO_TOKEN) is required only when a
+    // --promote-* / --accept-promotions / --promotion-receiver flag is set — a serve with neither
+    // needs no shared secret. --single-user never reads it: its only allowed promote (loopback)
+    // provisions an in-process engine in the same trust domain, which needs no cross-machine
+    // credential, and the desktop sidecar runs without any secret env.
+    let needs_secret = (promote_loopback
+        || promote_vps.is_some()
+        || promote_microvm
+        || promote_fly
+        || accept_promotions
+        || promotion_receiver)
+        && !single_user;
+    let promotion_secret = if needs_secret {
+        match std::env::var("OTTO_PROMOTION_SECRET") {
+            Ok(t) if !t.is_empty() => t,
+            _ => {
+                eprintln!(
+                    "error: OTTO_PROMOTION_SECRET must be set when using --promote-*, \
+                     --accept-promotions, or --promotion-receiver"
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let auth = if single_user {
+        let bind_host = std::env::var("OTTO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        if !resolve_bind_host_is_loopback(&bind_host) {
+            eprintln!(
+                "error: --single-user requires a loopback bind host, but OTTO_HOST={bind_host:?} \
+                 is not a loopback address (localhost is refused because it resolves, but not \
+                 necessarily to a loopback address)"
+            );
             std::process::exit(2);
+        }
+        // `--promotion-receiver` implies `--accept-promotions`; fold it in so the flag is refused
+        // under --single-user even when its own `--accept-promotions` requirement is unmet.
+        if !single_user_promote_modes_ok(
+            promote_loopback,
+            promote_vps.is_some(),
+            promote_microvm,
+            promote_fly,
+            accept_promotions || promotion_receiver,
+        ) {
+            eprintln!(
+                "error: --single-user allows only --promote-loopback; --promote-vps, \
+                 --promote-microvm, --promote-fly, --accept-promotions, and --promotion-receiver \
+                 are refused"
+            );
+            std::process::exit(2);
+        }
+        otto_engine_core::auth::AuthConfig {
+            mode: otto_protocol::AuthMode::SingleUser,
+            authenticator: None,
+            promotion_secret: None,
+            handshake_deadline: std::time::Duration::from_secs(10),
+        }
+    } else if promotion_receiver {
+        let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
+        let enrolled = store.enrolled_count().await?;
+        if let Err(e) = promotion_receiver_preconditions(accept_promotions, enrolled) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        otto_engine_core::auth::AuthConfig {
+            mode: otto_protocol::AuthMode::Machine,
+            authenticator: None,
+            promotion_secret: Some(promotion_secret.clone()),
+            handshake_deadline: std::time::Duration::from_secs(10),
+        }
+    } else {
+        // Users (the default): TOTP-authenticated, ≥1 enrolled principal required (§7.4).
+        let store = Arc::new(otto_auth::SqliteAuthStore::open(auth_db_path()?).await?);
+        if let Err(e) = users_mode_has_enrolled_principals(store.as_ref()).await {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        let authenticator = Arc::new(otto_auth::TotpAuthenticator::new(
+            store.clone(),
+            Arc::new(otto_auth::SystemClock),
+        ));
+        otto_engine_core::auth::AuthConfig {
+            mode: otto_protocol::AuthMode::Users,
+            authenticator: Some(authenticator),
+            promotion_secret: needs_secret.then(|| promotion_secret.clone()),
+            handshake_deadline: std::time::Duration::from_secs(10),
         }
     };
 
@@ -753,7 +1082,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             std::process::exit(2);
         }
         (true, _, _, _) => Some(otto_engine::PromoteConfig {
-            token: token.clone(),
+            token: promotion_secret.clone(),
             // The dot-prefix is load-bearing: `LocalWorkspace::list` skips dot-directories, so a
             // provisioned engine's restored store/workspace under here is never recursively
             // captured by a later `workspace.snapshot()`. Do not rename without that guarantee.
@@ -762,17 +1091,17 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             },
         }),
         (_, Some(endpoint), _, _) => Some(otto_engine::PromoteConfig {
-            token: token.clone(),
+            token: promotion_secret.clone(),
             mode: otto_engine::PromoteMode::Vps { endpoint },
         }),
         (_, _, true, _) => Some(otto_engine::PromoteConfig {
-            token: token.clone(),
+            token: promotion_secret.clone(),
             mode: otto_engine::PromoteMode::Microvm {
                 config: microvm_config_from_env(),
             },
         }),
         (_, _, _, true) => Some(otto_engine::PromoteConfig {
-            token: token.clone(),
+            token: promotion_secret.clone(),
             mode: otto_engine::PromoteMode::Fly {
                 config: fly_config_from_env(),
             },
@@ -798,7 +1127,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
     let public_ws_base = format!("{scheme}://127.0.0.1:{port}");
     let app = serve_app_with_base(
         service,
-        token,
+        auth,
         capabilities,
         promote,
         accept_promotions,
@@ -1945,5 +2274,161 @@ mod tests {
             blocked.to_string().contains("blocked by PreToolUse hook"),
             "expected the plugin tool to be blocked by the mcp__ matcher, got: {blocked}"
         );
+    }
+
+    // ---- Auth-mode guards (spec §6.5 / §7.4). Pure functions in the `validate_ui_dir` shape so
+    // the security-relevant startup refusals ship with unit coverage. ----
+
+    /// Finding 5: the auth DB must never fall back to the CWD. An explicit `OTTO_AUTH_DB` wins;
+    /// the OS data dir is the default; neither available → fail closed with an actionable error
+    /// (spec A5), so `otto serve`/`otto auth` refuse to run rather than write TOTP secrets and
+    /// the signing key somewhere the sensitive-path floor does not cover.
+    #[test]
+    fn auth_db_path_fails_closed_without_a_data_dir() {
+        // OTTO_AUTH_DB wins, even with a data dir present.
+        assert_eq!(
+            auth_db_path_from(Some("x.db".to_string()), Some(PathBuf::from("/data"))).unwrap(),
+            "x.db"
+        );
+        // Absent env → the OS data dir + otto/auth.db (spec A5).
+        assert_eq!(
+            auth_db_path_from(None, Some(PathBuf::from("/data"))).unwrap(),
+            "/data/otto/auth.db"
+        );
+        // Absent env AND no data dir → a hard, actionable error, never "otto-auth.db" in the CWD.
+        let err = auth_db_path_from(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OTTO_AUTH_DB"),
+            "the error must name the escape hatch: {err}"
+        );
+        assert!(
+            !msg.contains("otto-auth.db"),
+            "the error must not suggest the CWD fallback: {err}"
+        );
+    }
+
+    #[test]
+    fn loopback_predicate_accepts_loopback_addresses() {
+        assert!(resolve_bind_host_is_loopback("127.0.0.1"));
+        assert!(resolve_bind_host_is_loopback("127.0.0.2"));
+        assert!(resolve_bind_host_is_loopback("::1"));
+    }
+
+    #[test]
+    fn loopback_predicate_rejects_non_loopback_and_non_ips() {
+        assert!(!resolve_bind_host_is_loopback("0.0.0.0"));
+        // `localhost` resolves, but not necessarily to a loopback address — refused per §6.5.
+        assert!(!resolve_bind_host_is_loopback("localhost"));
+        assert!(!resolve_bind_host_is_loopback("garbage"));
+        assert!(!resolve_bind_host_is_loopback(""));
+    }
+
+    #[test]
+    fn single_user_allows_only_loopback_promote() {
+        // A plain --single-user serve, and the desktop sidecar's exact shape
+        // (--single-user --promote-loopback), are both fine.
+        assert!(single_user_promote_modes_ok(
+            false, false, false, false, false
+        ));
+        assert!(single_user_promote_modes_ok(
+            true, false, false, false, false
+        ));
+        // Every other promote mode is a startup error.
+        assert!(!single_user_promote_modes_ok(
+            false, true, false, false, false
+        ));
+        assert!(!single_user_promote_modes_ok(
+            false, false, true, false, false
+        ));
+        assert!(!single_user_promote_modes_ok(
+            false, false, false, true, false
+        ));
+        // --accept-promotions / --promotion-receiver are refused too.
+        assert!(!single_user_promote_modes_ok(
+            true, false, false, false, true
+        ));
+    }
+
+    #[tokio::test]
+    async fn users_mode_refuses_zero_enrolled_principals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = otto_auth::SqliteAuthStore::open(dir.path().join("auth.db"))
+            .await
+            .unwrap();
+        let err = users_mode_has_enrolled_principals(&store)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("otto auth enroll"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn users_mode_passes_with_an_enrolled_principal() {
+        use otto_auth::AuthStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store = otto_auth::SqliteAuthStore::open(dir.path().join("auth.db"))
+            .await
+            .unwrap();
+        store
+            .enroll_user(&otto_protocol::UserId::parse("alice").unwrap(), &[1u8; 20])
+            .await
+            .unwrap();
+        assert!(users_mode_has_enrolled_principals(&store).await.is_ok());
+    }
+
+    #[test]
+    fn promotion_receiver_requires_accept_promotions() {
+        let err = promotion_receiver_preconditions(false, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("--accept-promotions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn promotion_receiver_refuses_enrolled_principals() {
+        let err = promotion_receiver_preconditions(true, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("enrolled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn promotion_receiver_is_ok_with_accept_and_zero_principals() {
+        assert!(promotion_receiver_preconditions(true, 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn enroll_force_reprovisions_and_invalidates_the_old_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = otto_auth::SqliteAuthStore::open(dir.path().join("auth.db"))
+            .await
+            .unwrap();
+        let user = otto_protocol::UserId::parse("alice").unwrap();
+
+        // First enrollment provisions a secret.
+        store.enroll_user(&user, &[0u8; 20]).await.unwrap();
+        let first = store.totp_secret(&user).await.unwrap().expect("enrolled");
+
+        // Enrolling again without --force is refused (a typo cannot silently re-provision).
+        let err = enroll_user(&store, &user, false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("--force"),
+            "unexpected error: {err}"
+        );
+
+        // With --force the secret is re-provisioned to a different value, so a stale
+        // authenticator code from the old secret can no longer match (spec §7.4).
+        enroll_user(&store, &user, true).await.unwrap();
+        let second = store
+            .totp_secret(&user)
+            .await
+            .unwrap()
+            .expect("re-enrolled");
+        assert_ne!(first, second, "re-provision must rotate the secret");
     }
 }

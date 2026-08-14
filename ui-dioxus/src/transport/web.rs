@@ -41,10 +41,13 @@ pub fn connect_impl(
     ws_url: &str,
 ) -> Result<(Box<dyn Sink>, UnboundedReceiver<SocketEvent>), SeamError> {
     let (tx, rx) = unbounded::<SocketEvent>();
-    // `ws_url` carries the bearer token as a query parameter (`build_ws_url`), and a rejected URL
-    // comes back as a `SyntaxError` that QUOTES THE URL IN FULL. This `SeamError` is a transport
-    // diagnostic, so `app.rs` routes it to `client_error_row(ClientText::Passthrough(..))` and it
-    // renders in the event log — the surface most likely to be copied into a bug report.
+    // `ws_url` no longer carries the bearer token (`build_ws_url` emits none; spec §6.4, slice 2
+    // moves credentials to post-upgrade frames), but the redaction stays on the seam regardless:
+    // a rejected URL still comes back as a `SyntaxError` that QUOTES THE URL IN FULL, and any
+    // future call site or browser API echo can hand this constructor a credential-bearing string.
+    // This `SeamError` is a transport diagnostic, so `app.rs` routes it to
+    // `client_error_row(ClientText::Passthrough(..))` and it renders in the event log — the
+    // surface most likely to be copied into a bug report.
     //
     // The redaction is NOT applied here: `SeamError::new` does it for every diagnostic on the
     // seam, so this site cannot forget and neither can the next one. Host/path/session/last_seq

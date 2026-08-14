@@ -3,37 +3,50 @@
 
 /// Build the `/ws` connection URL. `session`/`last_seq` are appended only when reconnecting.
 ///
-/// **The bearer token rides in the query string.** Anything that derives a user-visible diagnostic
-/// from this URL — or from a browser API that echoes it back in an error — must route the text
-/// through [`redact_token`] first. See its doc for the concrete leak that motivated it.
-pub fn build_ws_url(
-    base: &str,
-    token: &str,
-    session: Option<&str>,
-    last_seq: Option<u64>,
-) -> String {
+/// No credential rides here: the serve protocol no longer reads a `?token=` query parameter
+/// (spec §6.4) — the desktop sidecar serves `--single-user` (nothing to send), and browser
+/// authentication happens post-upgrade via `Login`/`Attach` frames in slice 2. So the URL is just
+/// the endpoint plus optional `session`/`last_seq` replay markers.
+///
+/// [`redact_token`] still exists and still guards every transport diagnostic (`SeamError::new`):
+/// redaction is defense-in-depth for any credential-bearing text a future call site or a browser
+/// API echo may surface, even though this function no longer produces any.
+pub fn build_ws_url(base: &str, session: Option<&str>, last_seq: Option<u64>) -> String {
     // Normalize the base: tolerate a trailing slash and a base that already ends in
     // `/ws` (e.g. the endpoint URL `otto serve` prints), so we never produce `/ws/ws`.
     let base = base.trim_end_matches('/');
     let base = base.strip_suffix("/ws").unwrap_or(base);
-    let mut url = format!("{base}/ws?token={}", urlencoding::encode(token));
+    let mut url = format!("{base}/ws");
+    let mut query: Vec<String> = Vec::new();
     if let Some(s) = session {
-        url.push_str(&format!("&session={}", urlencoding::encode(s)));
+        query.push(format!("session={}", urlencoding::encode(s)));
     }
     if let Some(seq) = last_seq {
-        url.push_str(&format!("&last_seq={seq}"));
+        query.push(format!("last_seq={seq}"));
+    }
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query.join("&"));
     }
     url
 }
 
 /// Replace the value of every `token=` query parameter in a diagnostic string with `<redacted>`.
 ///
-/// The leak this closes: `build_ws_url` puts the bearer token in the query string, and the
-/// browser's `WebSocket::new` rejects a malformed URL with a `SyntaxError` whose text **quotes the
-/// offending URL in full**. That string becomes a `transport::SeamError`, so it flows straight
-/// into `client_error_row(ClientText::Passthrough(..))` and renders in the event log — a surface
+/// The leak this closed originally: `build_ws_url` put the bearer token in the query string, and
+/// the browser's `WebSocket::new` rejects a malformed URL with a `SyntaxError` whose text **quotes
+/// the offending URL in full**. That string became a `transport::SeamError`, so it flowed straight
+/// into `client_error_row(ClientText::Passthrough(..))` and rendered in the event log — a surface
 /// this crate's own docs describe as "their audience is a bug report", i.e. exactly the text a
 /// user is most likely to copy into an issue.
+///
+/// `build_ws_url` no longer emits a `token=` (spec §6.4; slice 2 moves credentials to post-upgrade
+/// frames), so the specific URL leak is gone — but the function stays, guarding the whole seam by
+/// construction: `transport::SeamError::new` redacts every diagnostic on both targets, so whatever
+/// *future* call site hands it a credential-bearing URL (a `Login`/`Refresh` endpoint, a browser
+/// API echo of a connect attempt, an RPC URL) cannot leak through the event log by accident. The
+/// scan is cheap and value-scoped, so keeping it on the seam costs nothing while the credential
+/// stays anywhere in this crate's vocabulary.
 ///
 /// Redaction rather than a fixed authored message, deliberately: the host, port, path, `session`,
 /// and `last_seq` are what make "the URL was rejected" actionable, and replacing the whole
@@ -103,10 +116,14 @@ pub fn ws_to_http_base(ws_url: &str) -> String {
     }
 }
 
-/// The Tauri desktop wrapper's auto-connect bootstrap (sub-project G): the local sidecar's
-/// WS base URL and a freshly-generated bearer token, carried as query params on the webview's
-/// initial navigation (`desktop/src-tauri/src/launch.rs`'s `build_launch_url` is the writer
-/// side of this contract).
+/// The desktop wrapper's auto-connect bootstrap (sub-project G): the local sidecar's WS base URL
+/// and a connect credential, carried as query params on the webview's initial navigation
+/// (`desktop/src-tauri/src/launch.rs`'s `build_launch_url` is the writer side of this contract).
+///
+/// `token` is **empty on the desktop path** — the sidecar serves `--single-user`, so the webview
+/// connects bare (see `desktop_boot::boot`). The field stays because the *web* target's
+/// `parse_launch_params` still reads a token from an external bootstrap URL; slice 2 replaces
+/// both with the post-upgrade login flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchParams {
     pub ws: String,
@@ -151,27 +168,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_without_reconnect_has_only_token() {
-        let u = build_ws_url("ws://127.0.0.1:8787", "tok", None, None);
-        assert_eq!(u, "ws://127.0.0.1:8787/ws?token=tok");
+    fn url_without_reconnect_has_no_credential() {
+        let u = build_ws_url("ws://127.0.0.1:8787", None, None);
+        assert_eq!(u, "ws://127.0.0.1:8787/ws");
     }
 
     #[test]
-    fn url_trims_trailing_slash_and_encodes_token() {
-        let u = build_ws_url("ws://host/", "a b&c", None, None);
-        assert_eq!(u, "ws://host/ws?token=a%20b%26c");
+    fn url_trims_trailing_slash_and_appends_no_token() {
+        let u = build_ws_url("ws://host/", None, None);
+        assert_eq!(u, "ws://host/ws");
     }
 
     #[test]
     fn url_with_reconnect_appends_session_and_seq() {
-        let u = build_ws_url("ws://h", "t", Some("sess-1"), Some(12));
-        assert_eq!(u, "ws://h/ws?token=t&session=sess-1&last_seq=12");
+        let u = build_ws_url("ws://h", Some("sess-1"), Some(12));
+        assert_eq!(u, "ws://h/ws?session=sess-1&last_seq=12");
     }
 
     #[test]
     fn redact_token_removes_the_secret_and_keeps_the_diagnostic_useful() {
         // The exact shape a browser `SyntaxError` carries: the whole URL, quoted, inside prose.
-        let raw = build_ws_url("ws://h", "s3cr3t-bearer", Some("sess-1"), Some(12));
+        // `build_ws_url` no longer emits `token=` (spec §6.4), so the URL is hand-assembled to
+        // exercise the defensive scan against a future credential-bearing call site.
+        let raw = "ws://h/ws?token=s3cr3t-bearer&session=sess-1&last_seq=12";
         let err = format!(
             "JsValue(SyntaxError: Failed to construct 'WebSocket': The URL '{raw}' is invalid.)"
         );
@@ -247,14 +266,11 @@ mod tests {
     #[test]
     fn url_tolerates_base_already_ending_in_ws() {
         assert_eq!(
-            build_ws_url("ws://127.0.0.1:8787/ws", "tok", None, None),
-            "ws://127.0.0.1:8787/ws?token=tok"
+            build_ws_url("ws://127.0.0.1:8787/ws", None, None),
+            "ws://127.0.0.1:8787/ws"
         );
         // trailing slash + /ws both handled
-        assert_eq!(
-            build_ws_url("ws://h/ws/", "t", None, None),
-            "ws://h/ws?token=t"
-        );
+        assert_eq!(build_ws_url("ws://h/ws/", None, None), "ws://h/ws");
     }
 
     #[test]

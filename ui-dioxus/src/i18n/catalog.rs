@@ -178,7 +178,9 @@ messages! {
     DiffTrailingNewlineRemoved { en: "(trailing newline removed)", de: "(abschließender Zeilenumbruch entfernt)", es: "(salto de línea final eliminado)", hi: "(अंत की नई पंक्ति हटाई गई)", zh: "（已移除行尾换行符）" }
 
     // ---- Client-authored, actionable ------------------------------------------------------
-    UrlAndTokenRequired { en: "URL and token are required", de: "URL und Token sind erforderlich", es: "se requieren URL y token", hi: "URL और टोकन आवश्यक हैं", zh: "需要 URL 和令牌" }
+    // A token is deliberately NOT mentioned: the desktop sidecar serves `--single-user` and
+    // connects with no credential, so an empty token must never block connecting (spec §6.6).
+    UrlRequired { en: "A server URL is required", de: "Eine Server-URL ist erforderlich", es: "se requiere una URL de servidor", hi: "सर्वर URL आवश्यक है", zh: "需要服务器 URL" }
 
     // ---- Desktop shell -------------------------------------------------------------------
     ChooseWorkspaceFolder { en: "Choose a workspace folder", de: "Arbeitsbereichsordner auswählen", es: "Elegir una carpeta de espacio de trabajo", hi: "कार्यस्थान फ़ोल्डर चुनें", zh: "选择工作区文件夹" }
