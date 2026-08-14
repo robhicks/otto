@@ -156,7 +156,15 @@ impl JwtIssuer {
         }
     }
 
-    /// Denylist an access token's `jti` until its own `exp`, pruning expired rows along the way.
+    /// Denylist an access token's `jti` until its own `exp`, revoke its principal's whole
+    /// outstanding refresh set, and prune expired denylist rows along the way.
+    ///
+    /// The store offers only whole-set revocation, so logout revokes **every** outstanding
+    /// refresh token of the token's principal — including refresh tokens minted to other
+    /// concurrent connections of that user. That is the spec-consistent semantics (§9: "both
+    /// die"): a second connection holding another refresh token of the same user is signed
+    /// out too, and no refresh token can silently re-authenticate the logged-out principal
+    /// without TOTP.
     pub async fn logout(&self, access_token: &str) -> Result<(), JwtError> {
         let now = self.clock.now();
         self.logout_at(access_token, now).await
@@ -165,9 +173,17 @@ impl JwtIssuer {
     /// Denylist at an explicit `now` (unix seconds) — deterministic for tests.
     pub async fn logout_at(&self, access_token: &str, now: u64) -> Result<(), JwtError> {
         let claims = self.decode(access_token).await?;
+        let user = UserId::parse(&claims.sub)
+            .map_err(|e| anyhow::anyhow!("access token carries an invalid sub: {e}"))?;
         self.store
             .denylist_insert(&claims.jti, claims.exp as i64)
             .await?;
+        // Revoke the user's whole outstanding refresh set (the store only offers whole-set
+        // revocation). Without this, a refresh token minted alongside the access token would
+        // stay live for its 30-day TTL and silently re-authenticate the user after logout —
+        // `Refresh` is exempt from per-command re-verification, so the denylist alone would
+        // not stop it. This signs every concurrent session of the user out (spec §9).
+        self.store.revoke_user_refresh(&user).await?;
         // Opportunistic prune on this write keeps the table bounded by logouts within one
         // access TTL rather than growing without limit (spec §6.2).
         self.store.prune_denylist(now as i64).await?;
@@ -446,6 +462,34 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_the_users_refresh_set_and_denylists_the_jti() {
+        let (issuer, _store, _dir) = issuer_with_key().await;
+        let pair = issuer.mint(&alice()).await.unwrap();
+        // A second outstanding pair for alice — the whole-set semantics: logout must kill it
+        // too, not just the refresh token the logged-out access token was minted with.
+        let second = issuer.mint(&alice()).await.unwrap();
+
+        issuer.logout(&pair.access_token).await.unwrap();
+
+        // The access token is denylisted (and so rejected)...
+        assert!(matches!(
+            issuer.verify_access(&pair.access_token).await,
+            Err(JwtError::Unverifiable)
+        ));
+        // ...and the user's whole refresh set is revoked: neither the pair's own refresh
+        // token nor the other outstanding one can rotate — no silent re-authentication
+        // without TOTP after a logout.
+        assert!(matches!(
+            issuer.rotate_refresh(&pair.refresh_token).await,
+            Err(JwtError::Unverifiable)
+        ));
+        assert!(matches!(
+            issuer.rotate_refresh(&second.refresh_token).await,
+            Err(JwtError::Unverifiable)
+        ));
     }
 
     #[tokio::test]

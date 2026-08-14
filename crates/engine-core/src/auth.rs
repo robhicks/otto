@@ -101,7 +101,9 @@ pub trait Authenticator: Send + Sync {
     /// Rotate a refresh token: consume it, issue a fresh pair. Called by `Refresh`; single-use.
     async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError>;
 
-    /// Denylist an access token's `jti` and revoke its refresh token. Called by `Logout`.
+    /// Denylist an access token's `jti` and revoke its principal's whole outstanding refresh
+    /// set (the store offers only whole-set revocation, so every concurrent session of the
+    /// user is signed out — spec §9). Called by `Logout`.
     async fn logout(&self, access_token: &str) -> Result<(), AuthError>;
 }
 

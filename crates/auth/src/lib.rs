@@ -130,6 +130,13 @@ pub mod testing {
     /// distinct principals are fully isolated — the cross-tenant shape the serve harnesses
     /// need. The stored user is the principal `mint` was asked for, so a fake can also mint
     /// for a tenant that is not its own when a test wants that.
+    ///
+    /// `logout` models the real backend's whole-set semantics (spec §9): denylisting the
+    /// presented access token also revokes that user's **entire** outstanding token set — the
+    /// store offers only whole-set refresh revocation, so every concurrent session of the
+    /// user is signed out. A test that needs only the access token dead while the refresh set
+    /// stays live (the one real way that state arises — the access token's own `exp`
+    /// passing) uses [`FakeAuthenticator::expire_access`] instead.
     pub struct FakeAuthenticator {
         principal: UserId,
         state: Mutex<FakeState>,
@@ -154,6 +161,15 @@ pub mod testing {
                     next: 1,
                 }),
             }
+        }
+
+        /// Mark a single access token dead **without** touching the user's refresh set —
+        /// models the access token's own 15-minute `exp` passing (spec A7), the one real way
+        /// a live refresh token outlives its access token now that `logout` revokes the whole
+        /// refresh set. The serve recovery tests (§8) use this to prove a `Refresh` restores
+        /// a connection whose access token can no longer re-verify.
+        pub async fn expire_access(&self, access_token: &str) {
+            self.state.lock().unwrap().tokens.remove(access_token);
         }
     }
 
@@ -205,7 +221,15 @@ pub mod testing {
         }
 
         async fn logout(&self, access_token: &str) -> Result<(), AuthError> {
-            self.state.lock().unwrap().tokens.remove(access_token);
+            // Whole-set revocation, mirroring the real backend (spec §9): the store offers
+            // only whole-set refresh revocation, so denylisting the access token also signs
+            // out every concurrent session of the same principal. Looking the user up first
+            // means an unknown token is a no-op (idempotent, like `denylist_insert`).
+            let mut state = self.state.lock().unwrap();
+            let Some(user) = state.tokens.get(access_token).cloned() else {
+                return Ok(());
+            };
+            state.tokens.retain(|_, owner| *owner != user);
             Ok(())
         }
     }
@@ -424,6 +448,38 @@ mod tests {
         ));
     }
 
+    /// Finding 1's fake-side model: `logout` revokes the user's whole outstanding token set,
+    /// not just the presented access token — a refresh token minted to another concurrent
+    /// session of the same user must not survive it.
+    #[tokio::test]
+    async fn the_fake_logout_revokes_the_whole_refresh_set() {
+        let fake = testing::FakeAuthenticator::new(alice());
+        let first = fake.mint(&Principal { user: alice() }).await.unwrap();
+        let second = fake.mint(&Principal { user: alice() }).await.unwrap();
+
+        fake.logout(&first.access_token).await.unwrap();
+
+        // The denylisted access token is rejected...
+        assert!(matches!(
+            fake.verify_access(&first.access_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        // ...and neither outstanding refresh token of the user can rotate — logout signs
+        // every concurrent session out, matching the real backend's whole-set revocation.
+        assert!(matches!(
+            fake.rotate_refresh(&first.refresh_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            fake.rotate_refresh(&second.refresh_token).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+
+        // Another principal's tokens are untouched by alice's logout.
+        let bob_pair = fake.mint(&Principal { user: bob() }).await.unwrap();
+        assert!(fake.verify_access(&bob_pair.access_token).await.is_ok());
+    }
+
     #[tokio::test]
     async fn the_fake_rotate_consumes_the_old_refresh_token() {
         let fake = testing::FakeAuthenticator::new(alice());
@@ -448,17 +504,15 @@ mod tests {
     async fn the_fake_mint_counter_is_monotonic_across_logout() {
         let fake = testing::FakeAuthenticator::new(alice());
 
-        // Two mints, then evict everything alice's first pair minted. Under the old
-        // map-size-derived numbering (`len + 1`, which skips to odd numbers 1, 3, ...), the
-        // third mint would reuse `fake-access-3` — byte-identical to bob's still-live token —
-        // and remint it for alice, misattributing bob's live token.
+        // Two mints, then log out alice's first pair. Under the old map-size-derived numbering
+        // (`len + 1`, which skips to odd numbers 1, 3, ...), the third mint would reuse
+        // `fake-access-3` — byte-identical to bob's still-live token — and remint it for alice,
+        // misattributing bob's live token. The fake's `logout` revokes alice's whole set (both
+        // tokens of the pair), which is exactly what a test of the counter needs.
         let alice1 = fake.mint(&Principal { user: alice() }).await.unwrap();
         let bob1 = fake.mint(&Principal { user: bob() }).await.unwrap();
         assert_eq!(bob1.access_token, "fake-access-2");
         fake.logout(&alice1.access_token).await.unwrap();
-        // The fake's `logout` removes by key, so revoking the refresh-token entry too is what
-        // a test of the counter needs; the seam only ever passes access tokens in real use.
-        fake.logout(&alice1.refresh_token).await.unwrap();
 
         // The fresh mint must NOT reuse any token string ever issued, and must verify as the
         // principal it was minted for.

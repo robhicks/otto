@@ -754,8 +754,11 @@ async fn per_command_reverification_rejects_a_revoked_token() {
         uuid::Uuid::parse_str(ready["session"].as_str().unwrap()).unwrap(),
     );
 
-    // Revoke the token while the connection is live, then try to run a turn.
-    server.fake.logout(&access_token).await.unwrap();
+    // Make the access token unable to re-verify while the turn is live, then try to run a
+    // turn. This models the access token's `exp` passing (its 15-minute TTL) — not a
+    // `Logout`, which would revoke the user's whole refresh set and leave nothing to recover
+    // with. The §8 recovery path exists precisely for the expired-access-token case.
+    server.fake.expire_access(&access_token).await;
     send_cmd(
         &mut ws,
         &otto_protocol::Command::SendPrompt {
@@ -1033,9 +1036,12 @@ async fn mid_turn_refresh_recovers_a_revoked_connection() {
         }
     };
 
-    // Revoke the access token mid-turn, then `Refresh`: the turn loop must service it (rotate +
-    // reply `LoggedIn`) rather than tripping the re-verify and closing the connection.
-    server.fake.logout(&access_token).await.unwrap();
+    // Make the access token unable to re-verify mid-turn, then `Refresh`: the turn loop must
+    // service it (rotate + reply `LoggedIn`) rather than tripping the re-verify and closing
+    // the connection. `expire_access` (the access token's 15-minute TTL passing) rather than
+    // `logout` — a real logout revokes the user's whole refresh set, so there would be no
+    // refresh token left to recover with.
+    server.fake.expire_access(&access_token).await;
     send_cmd(
         &mut ws,
         &otto_protocol::Command::Refresh {
