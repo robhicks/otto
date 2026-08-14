@@ -52,18 +52,22 @@ fn busy_somewhere(e: &anyhow::Error) -> bool {
 /// Bumped whenever the on-disk schema changes shape. Stamped into `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 1;
 
-/// What consuming one refresh token found and did, so the caller can react to reuse.
+/// What consuming one refresh token found and did, so the caller can react to reuse — and, for
+/// the winner, to the token's own expiry.
 ///
 /// `consume_refresh` performs the single-use consume atomically (`UPDATE ... WHERE
 /// consumed_at IS NULL`), so exactly one caller ever observes [`ConsumeRefresh::Consumed`]
 /// for a given token. The reuse-detection matters: a token presented twice is the classic
-/// theft signal, and the caller revokes the reported user's whole outstanding set.
+/// theft signal, and the caller revokes the reported user's whole outstanding set. The
+/// `expires_at` the winner receives lets the caller reject a token presented past its TTL the
+/// same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsumeRefresh {
     /// No such token — never issued (or revoked since).
     Unknown,
-    /// This call atomically consumed the token; the pair can now be re-issued.
-    Consumed { user: UserId },
+    /// This call atomically consumed the token; the pair can now be re-issued. `expires_at`
+    /// is the consumed row's TTL, so the caller can enforce expiry as a policy decision.
+    Consumed { user: UserId, expires_at: i64 },
     /// The token existed but was already consumed — a reuse. The caller should treat it as
     /// a theft signal and revoke `user`'s whole outstanding refresh set.
     Reused { user: UserId },
@@ -466,25 +470,25 @@ impl AuthStore for SqliteAuthStore {
 
     async fn consume_refresh(&self, token: &str, now: i64) -> anyhow::Result<ConsumeRefresh> {
         let hash = hash_refresh(token);
-        // The atomic single-use consume AND the user lookup happen in one statement:
-        // `UPDATE ... WHERE consumed_at IS NULL RETURNING user` yields the user's row only if
-        // THIS call won the single-use race (sqlite 3.35+ RETURNING, supported by sqlx 0.8).
-        // There is no window between the claim and the read, so a concurrent
+        // The atomic single-use consume AND the user/expiry lookup happen in one statement:
+        // `UPDATE ... WHERE consumed_at IS NULL RETURNING user, expires_at` yields the user's
+        // row only if THIS call won the single-use race (sqlite 3.35+ RETURNING, supported by
+        // sqlx 0.8). There is no window between the claim and the read, so a concurrent
         // `revoke_user_refresh`/`revoke_user` deleting the just-claimed row can no longer make
         // a follow-up lookup come up empty — the old two-statement version panicked there.
-        let user: Option<(String,)> = sqlx::query_as(
+        let row: Option<(String, i64)> = sqlx::query_as(
             "UPDATE refresh_tokens SET consumed_at = ?1
              WHERE hash = ?2 AND consumed_at IS NULL
-             RETURNING user",
+             RETURNING user, expires_at",
         )
         .bind(now)
         .bind(&hash)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((user,)) = user {
+        if let Some((user, expires_at)) = row {
             let user = UserId::parse(&user)
                 .map_err(|e| anyhow::anyhow!("refresh_tokens: stored user is invalid: {e}"))?;
-            return Ok(ConsumeRefresh::Consumed { user });
+            return Ok(ConsumeRefresh::Consumed { user, expires_at });
         }
         // The row is absent (never issued) or already consumed — tell them apart so a reuse
         // can revoke the user's whole set. The lookup tolerates the row having vanished since
@@ -813,7 +817,10 @@ mod tests {
 
         assert_eq!(
             store.consume_refresh("rt-1", NOW).await.unwrap(),
-            ConsumeRefresh::Consumed { user: alice() }
+            ConsumeRefresh::Consumed {
+                user: alice(),
+                expires_at: NOW + 3600
+            }
         );
         // A second consume of the same token is a reuse, and reports the user so the
         // caller can revoke their whole outstanding set.
@@ -861,7 +868,10 @@ mod tests {
         );
         assert_eq!(
             store.consume_refresh("bob-1", NOW).await.unwrap(),
-            ConsumeRefresh::Consumed { user: bob() }
+            ConsumeRefresh::Consumed {
+                user: bob(),
+                expires_at: NOW + 3600
+            }
         );
     }
 
@@ -881,7 +891,10 @@ mod tests {
 
         assert_eq!(
             store.consume_refresh("alice-1", NOW).await.unwrap(),
-            ConsumeRefresh::Consumed { user: alice() }
+            ConsumeRefresh::Consumed {
+                user: alice(),
+                expires_at: NOW + 3600
+            }
         );
         store.revoke_user_refresh(&alice()).await.unwrap();
         assert_eq!(

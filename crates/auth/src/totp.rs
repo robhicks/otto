@@ -3,9 +3,12 @@
 //! The crypto is two small functions — HMAC-SHA1 over the 8-byte big-endian step and the RFC 4226
 //! 31-bit dynamic truncation — verified against the RFC 6238 Appendix B test vectors. The
 //! [`TotpVerifier`] layers the security decisions on top of the [`AuthStore`]: a ±1 step skew
-//! window, a replay floor (`step <= last_step` is rejected before the code is ever compared), a
-//! conditional `set_last_step` write so concurrent same-step logins have exactly one winner, and
-//! a per-user lockout (5 failures within 15 minutes) that short-circuits before computing a code.
+//! window, a replay floor (`step <= last_step` can never be accepted), a conditional
+//! `set_last_step` write so concurrent same-step logins have exactly one winner, and a per-user
+//! lockout (5 failures within 15 minutes) that short-circuits before computing a code. A replay —
+//! a code that belongs to an already-consumed step, or presented when every candidate is behind
+//! the floor — is rejected without counting toward the lockout, so a client's own retry of a lost
+//! response can never lock it out.
 //!
 //! Everything is a pure function of `(secret, last_step, now)`, so a [`Clock`] trait — the
 //! [`SystemClock`] in production, a [`FixedClock`] in tests — keeps the RFC vectors and the whole
@@ -133,13 +136,23 @@ impl TotpVerifier {
         let last_step = self.store.last_step(user).await?;
         let t = now.div_euclid(STEP_SECS as i64) as u64;
         let mut accepted = None;
+        // `saw_in_window` records that at least one candidate escaped the replay floor, and
+        // `replay` records that the presented code belongs to a floor-rejected (already-consumed)
+        // step. Together they decide whether a rejection is a genuine failure to count toward the
+        // lockout, or a replay that must not be counted.
+        let mut saw_in_window = false;
+        let mut replay = false;
         for candidate in (t.saturating_sub(SKEW as u64))..=(t.saturating_add(SKEW as u64)) {
             // The replay floor: any candidate step at or below the accepted one is rejected
-            // BEFORE the code is compared. Without it the ±1 window would make an observed code
-            // replayable for 90 seconds (spec §6.1).
+            // BEFORE it can be accepted — without it the ±1 window would make an observed code
+            // replayable for 90 seconds (spec §6.1). The code is still compared against a
+            // floor-rejected candidate, but only to recognize a replay for the failure counter:
+            // it can never be accepted from one.
             if candidate <= last_step {
+                replay |= codes_equal(&secret, code, candidate);
                 continue;
             }
+            saw_in_window = true;
             if codes_equal(&secret, code, candidate) {
                 accepted = Some(candidate);
                 break;
@@ -160,7 +173,13 @@ impl TotpVerifier {
                 }
             }
             None => {
-                self.store.record_failure(user, now, FAILURE_WINDOW).await?;
+                // A rejection is a failed login only when the code was genuinely wrong at an
+                // in-window step. A replay — the presented code belongs to an already-consumed
+                // step, or every candidate is behind the floor — is not: counting it would let a
+                // client's own retry of a lost response lock it out.
+                if saw_in_window && !replay {
+                    self.store.record_failure(user, now, FAILURE_WINDOW).await?;
+                }
                 Err(TotpError::Invalid)
             }
         }
@@ -418,6 +437,42 @@ mod tests {
         assert!(matches!(
             verifier.verify_at(&alice(), "000000", 59 * 30).await,
             Err(TotpError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replaying_a_consumed_step_does_not_count_toward_lockout() {
+        let (verifier, store, _dir) = verifier_with_fixed_clock(59 * 30).await;
+        store.enroll_user(&alice(), rfc_secret()).await.unwrap();
+
+        let now = 59 * 30;
+        let code = totp_at(rfc_secret(), 59);
+        // Consume step 59.
+        assert!(verifier.verify_at(&alice(), &code, now).await.is_ok());
+        assert_eq!(store.last_step(&alice()).await.unwrap(), 59);
+
+        // A client retrying the same code — a lost response, not a failed login — is rejected,
+        // but the rejection is a replay, not a failure: it must never accumulate toward the
+        // lockout threshold no matter how many times the already-consumed code is replayed.
+        for _ in 0..(MAX_FAILURES * 2) {
+            assert!(matches!(
+                verifier.verify_at(&alice(), &code, now).await,
+                Err(TotpError::Invalid)
+            ));
+        }
+        assert_eq!(
+            store
+                .failures_within(&alice(), now as i64, FAILURE_WINDOW)
+                .await
+                .unwrap(),
+            0
+        );
+        // A fresh step is still accepted — no lockout, and the failure counter is clean.
+        assert!(matches!(
+            verifier
+                .verify_at(&alice(), &totp_at(rfc_secret(), 60), 60 * 30)
+                .await,
+            Ok(())
         ));
     }
 }

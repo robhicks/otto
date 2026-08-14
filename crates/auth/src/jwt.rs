@@ -1,8 +1,9 @@
 //! HS256 JWTs with refresh rotation and a `jti` denylist, over the [`AuthStore`].
 //!
 //! The [`JwtIssuer`] mints access tokens with `sub`/`iat`/`exp`/`jti` claims and a `kid` header
-//! (no `aud` — it is reserved but not emitted, spec §6.2), looks the 32-byte signing key up by
-//! `kid` so a second key can be introduced before the first is retired, and verifies in the spec's
+//! (no `aud` — it is reserved but not emitted, spec §6.2), and verification looks the 32-byte
+//! signing key up by the **presented** `kid` — so a second key can be introduced before the first
+//! is retired, and an unknown or missing `kid` fails closed. Verification runs in the spec's
 //! order: **signature → `exp` → denylist**. Refresh tokens are 32 random bytes, stored only as
 //! SHA-256 hashes by the store, and rotated single-use: presenting an already-consumed token is
 //! the classic theft signal, so it revokes the user's whole outstanding refresh set.
@@ -15,7 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
 use otto_engine_core::Principal;
 use otto_protocol::UserId;
 use serde::{Deserialize, Serialize};
@@ -113,7 +116,9 @@ impl JwtIssuer {
     }
 
     /// Rotate a refresh token: consume it atomically and issue a fresh pair. A token already
-    /// consumed is a reuse — the theft signal — and revokes the user's whole outstanding set.
+    /// consumed is a reuse — the theft signal — and revokes the user's whole outstanding set;
+    /// so does a token presented past its own `expires_at` (a stale pair must never be rotated
+    /// indefinitely).
     pub async fn rotate_refresh(&self, refresh_token: &str) -> Result<MintedPair, JwtError> {
         let now = self.clock.now();
         self.rotate_refresh_at(refresh_token, now).await
@@ -130,7 +135,17 @@ impl JwtIssuer {
             .consume_refresh(refresh_token, now as i64)
             .await?
         {
-            ConsumeRefresh::Consumed { user } => self.mint_at(&user, now).await,
+            ConsumeRefresh::Consumed { user, expires_at } => {
+                // An expired token must never rotate: the row's TTL has passed, so the stored
+                // `expires_at` is enforced here (spec A7's 30-day refresh life). Presenting one
+                // past its expiry is treated like a reuse — the theft signal — and revokes the
+                // user's whole outstanding set, so no stale pair can be rotated forever.
+                if expires_at <= now as i64 {
+                    self.store.revoke_user_refresh(&user).await?;
+                    return Err(JwtError::Unverifiable);
+                }
+                self.mint_at(&user, now).await
+            }
             ConsumeRefresh::Unknown => Err(JwtError::Unverifiable),
             ConsumeRefresh::Reused { user } => {
                 // Presenting an already-consumed token is the classic theft signal: revoke the
@@ -163,7 +178,17 @@ impl JwtIssuer {
     /// (jsonwebtoken's `Validation::new(HS256)` against the wall clock), so this is both the
     /// verify path and the logout claim-extraction path.
     async fn decode(&self, token: &str) -> Result<Claims, JwtError> {
-        let key = self.signing_key().await?;
+        // Verification looks the key up by the presented `kid` (spec §6.2), so a rolled key
+        // verifies tokens minted under it — and an unknown or missing kid fails closed rather
+        // than silently falling back to the current key. This never auto-creates a key: minting
+        // is the only path that does.
+        let header = decode_header(token).map_err(|_| JwtError::Unverifiable)?;
+        let kid = header.kid.as_deref().ok_or(JwtError::Unverifiable)?;
+        let key = self
+            .store
+            .signing_key(kid)
+            .await?
+            .ok_or(JwtError::Unverifiable)?;
         decode::<Claims>(
             token,
             &DecodingKey::from_secret(&key),
@@ -324,7 +349,10 @@ mod tests {
             jti: uuid::Uuid::new_v4().to_string(),
         };
         let token = jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &jsonwebtoken::Header {
+                kid: Some(KID.to_owned()),
+                ..Default::default()
+            },
             &expired,
             &jsonwebtoken::EncodingKey::from_secret(&KEY),
         )
@@ -334,6 +362,63 @@ mod tests {
             issuer.verify_access(&token).await,
             Err(JwtError::Unverifiable)
         ));
+    }
+
+    #[tokio::test]
+    async fn verification_looks_the_key_up_by_the_presented_kid() {
+        let (issuer, store, _dir) = issuer_with_key().await;
+        let pair = issuer.mint(&alice()).await.unwrap();
+        // The minted token's kid is intact, so it verifies under the current key.
+        assert!(issuer.verify_access(&pair.access_token).await.is_ok());
+
+        let claims = decode_claims(&pair.access_token);
+
+        // A token signed with the right key but bearing an unknown kid is rejected: the key is
+        // looked up by the *presented* kid, so an unknown one fails closed instead of silently
+        // falling back to the current key.
+        let forged_unknown_kid = jsonwebtoken::encode(
+            &jsonwebtoken::Header {
+                kid: Some("otto-nope".to_owned()),
+                ..Default::default()
+            },
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&KEY),
+        )
+        .unwrap();
+        assert!(matches!(
+            issuer.verify_access(&forged_unknown_kid).await,
+            Err(JwtError::Unverifiable)
+        ));
+
+        // A token with no kid header is likewise rejected.
+        let no_kid = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&KEY),
+        )
+        .unwrap();
+        assert!(matches!(
+            issuer.verify_access(&no_kid).await,
+            Err(JwtError::Unverifiable)
+        ));
+
+        // The intended roll works end to end: a second key introduced under a fresh kid before
+        // the first is retired verifies tokens minted with it.
+        let second_key = [9u8; 32];
+        store
+            .insert_signing_key("otto-2", &second_key)
+            .await
+            .unwrap();
+        let rolled = jsonwebtoken::encode(
+            &jsonwebtoken::Header {
+                kid: Some("otto-2".to_owned()),
+                ..Default::default()
+            },
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(&second_key),
+        )
+        .unwrap();
+        assert!(issuer.verify_access(&rolled).await.is_ok());
     }
 
     #[tokio::test]
@@ -449,5 +534,37 @@ mod tests {
                 .unwrap(),
             crate::store::ConsumeRefresh::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn an_expired_refresh_token_cannot_rotate_and_revokes_the_set() {
+        let (issuer, _store, _dir) = issuer_with_key().await;
+        let now = 1_700_000_000u64;
+        let fresh = issuer.mint_at(&alice(), now).await.unwrap();
+        let stale = issuer.mint_at(&alice(), now).await.unwrap();
+
+        // Before the TTL elapses, rotation works and consumes the old token.
+        let rotated = issuer
+            .rotate_refresh_at(&fresh.refresh_token, now + 1)
+            .await
+            .unwrap();
+
+        // Once the token's expires_at has passed, presenting it must NOT rotate.
+        let after_ttl = now + REFRESH_TTL.as_secs() + 1;
+        assert!(matches!(
+            issuer
+                .rotate_refresh_at(&stale.refresh_token, after_ttl)
+                .await,
+            Err(JwtError::Unverifiable)
+        ));
+
+        // Per the theft-signal convention, the expired presentation revokes the user's whole
+        // outstanding set — including the freshly rotated, still-valid token.
+        assert!(matches!(
+            issuer
+                .rotate_refresh_at(&rotated.refresh_token, now + 1)
+                .await,
+            Err(JwtError::Unverifiable)
+        ));
     }
 }
