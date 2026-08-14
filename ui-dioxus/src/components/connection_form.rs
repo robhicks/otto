@@ -23,6 +23,13 @@ pub fn ConnectionForm(
                 oninput: move |e| url.set(e.value()),
             }
             input {
+                // The token field (and its `redact_token` twin in `net/url.rs`) stays, unused, for
+                // the REMOTE-SERVER path until slice 2 of the identity rollout replaces it with the
+                // post-upgrade login flow. The desktop sidecar serves `--single-user` and connects
+                // with no credential, so this input is dead on that path today — do not delete it:
+                // the field is how a browser session against a credential-bearing serve (auth mode
+                // `Users`/`Machine`) currently supplies its bearer. Its `Msg::TokenPlaceholder`
+                // copy is still catalogued for the same reason.
                 class: "token-input",
                 value: "{token}",
                 r#type: "password",

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use otto_protocol::{CapabilitiesManifest, Command, EventKind, ServerMessage, SessionId};
+use otto_protocol::{AuthMode, CapabilitiesManifest, Command, EventKind, ServerMessage, SessionId};
 use uuid::Uuid;
 
 use crate::components::{
@@ -43,10 +43,16 @@ pub fn App() -> Element {
     let locale = use_locale();
 
     let mut url = use_signal(|| "ws://127.0.0.1:8787".to_string());
-    // `mut`: the desktop-only auto-connect mount block below calls `token.set(..)` with the
-    // sidecar-generated bearer token (`Signal::set` requires `&mut self`, so this binding must
-    // be mutable even though the web target never writes it — only reads it via `token.read()`).
+    // `mut`: the desktop auto-connect block, the web autoconnect block, and the `LoggedIn`/
+    // `LoggedOut` frames all call `token.set(..)` (`Signal::set` requires `&mut self`, so the
+    // binding must be mutable even though most of the app only reads it via `token.read()`). The
+    // desktop path writes an *empty* token — the sidecar serves `--single-user`, so no credential
+    // is needed — while the web path and a slice-2 `Login` write a real one.
     let mut token = use_signal(String::new);
+    // The server's auth posture (`Hello { auth_mode }`), announced on every connect. None until
+    // the first Hello frame arrives; slice 2's login UI reads this to decide whether a credential
+    // is even needed.
+    let mut auth_mode = use_signal(|| None::<AuthMode>);
     let mut conn = use_signal(|| ConnState::Disconnected);
     let mut rows = use_signal(Vec::<RowMsg>::new);
     let mut last_seq = use_signal(|| None::<u64>);
@@ -89,14 +95,14 @@ pub fn App() -> Element {
 
     let mut do_connect = move || {
         let base = url.read().clone();
-        let tok = token.read().clone();
-        if base.trim().is_empty() || tok.trim().is_empty() {
-            rows.write().push(client_error_row(ClientText::authored(
-                Msg::UrlAndTokenRequired,
-            )));
+        // A URL is the one thing a connection cannot do without; a token is not — the desktop
+        // sidecar serves `--single-user` and connects bare (empty token by design).
+        if base.trim().is_empty() {
+            rows.write()
+                .push(client_error_row(ClientText::authored(Msg::UrlRequired)));
             return;
         }
-        let target = build_ws_url(&base, &tok, session.read().as_deref(), *last_seq.read());
+        let target = build_ws_url(&base, session.read().as_deref(), *last_seq.read());
 
         // Invalidate any live drain task and tear down the previous socket BEFORE installing the
         // new one: bump the generation (so the old task bails), then `close()` the old sink (so the
@@ -127,6 +133,12 @@ pub fn App() -> Element {
                             break;
                         }
                         match ev {
+                            SocketEvent::Message(Ok(ServerMessage::Hello { auth_mode: mode })) => {
+                                // Records the server's auth posture. Under `--single-user` this is
+                                // `AuthMode::SingleUser` and no credential is ever needed; slice 2's
+                                // login UI reads this signal to decide whether to show a login form.
+                                auth_mode.set(Some(mode));
+                            }
                             SocketEvent::Message(Ok(ServerMessage::Ready {
                                 session: s,
                                 capabilities: caps,
@@ -195,6 +207,21 @@ pub fn App() -> Element {
                                 // local<->remote. Deferred to an Effect (this task can't call
                                 // `do_connect` itself — it's defined outside the `spawn`).
                                 reconnect_to.set(Some(endpoint));
+                            }
+                            SocketEvent::Message(Ok(ServerMessage::LoggedIn {
+                                access_token,
+                                ..
+                            })) => {
+                                // `Command::Login`/`Attach`/`Refresh` succeeded: store the access
+                                // token (the transport sends it as a bearer header). Slice 2 wires
+                                // the rest of the login flow; here it is enough that the token
+                                // signal carries the credential the RPCs already use.
+                                token.set(access_token);
+                            }
+                            SocketEvent::Message(Ok(ServerMessage::LoggedOut)) => {
+                                // The server revoked this connection's tokens and will close the
+                                // socket; clear the stored credential so nothing reuses it.
+                                token.set(String::new());
                             }
                             SocketEvent::Message(Err(detail)) => {
                                 rows.write().push(client_error_row(ClientText::Passthrough(
@@ -335,15 +362,17 @@ pub fn App() -> Element {
         }
     };
 
-    // Fetch the file list over the /workspace RPC and rebuild the tree. No-op without url+token
-    // (the form gates Connect on both, so by Connected they are present). Spawned the same way
+    // Fetch the file list over the /workspace RPC and rebuild the tree. Only reachable while
+    // Connected — the auto-load effect below fires only on `ConnState::Connected`, and the refresh
+    // button is disabled otherwise. Under `--single-user` the token is empty by design, so no
+    // token gate guards this (the serve ignores the header in that mode). Spawned the same way
     // the drain task is — an ordinary Dioxus `spawn`, not a `use_future` (this is an action
     // triggered by an event/effect, not a standing background task).
     let load_files = move || {
         let base = url.read().clone();
         let http_base = ws_to_http_base(&base);
         let tok = token.read().clone();
-        if http_base.is_empty() || tok.is_empty() {
+        if http_base.is_empty() {
             return;
         }
         spawn(async move {
@@ -365,7 +394,7 @@ pub fn App() -> Element {
         let base = url.read().clone();
         let http_base = ws_to_http_base(&base);
         let tok = token.read().clone();
-        if http_base.is_empty() || tok.is_empty() {
+        if http_base.is_empty() {
             return;
         }
         spawn(async move {

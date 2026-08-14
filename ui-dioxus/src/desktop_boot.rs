@@ -1,6 +1,7 @@
 //! Desktop bootstrap: fold the Tauri `desktop/` wrapper's job (pick workspace → launch a local
 //! `otto serve` sidecar → wait for it to bind → auto-connect) into the one Dioxus crate. Fixed
-//! port (`SIDECAR_PORT`), generated token. This whole module is desktop-only — it is `mod`-gated behind
+//! port (`SIDECAR_PORT`), served `--single-user` (loopback-only, no shared credential). This whole
+//! module is desktop-only — it is `mod`-gated behind
 //! `#[cfg(feature = "desktop")]` in `main.rs`, so it never compiles into (or is referenced by)
 //! the web build.
 use std::path::Path;
@@ -148,11 +149,10 @@ pub async fn boot() -> BootOutcome {
         return BootOutcome::Cancelled;
     };
     let root = handle.path().to_path_buf();
-    let token = uuid::Uuid::new_v4().to_string();
     // The sidecar binary is resolved by `resolve_otto_bin`: OTTO_BIN, else a binary staged
     // beside this executable by `dx bundle`, else `otto` on PATH. See that function for why.
-    // The argv itself (port, root, and the two capability flags) is built by `serve_command`,
-    // which documents why each flag is there and is unit-tested.
+    // The argv itself (port, root, the two capability flags, and `--single-user`) is built by
+    // `serve_command`, which documents why each flag is there and is unit-tested.
     //
     // `kill_on_drop(true)` (set there) kills the sidecar when the stored `Child` is dropped — but
     // Drop only runs if the app *unwinds* on close.
@@ -161,7 +161,7 @@ pub async fn boot() -> BootOutcome {
     // kernel-level guard that does not depend on Drop running. The two are complementary:
     // `kill_on_drop` handles the graceful in-app disconnect, `PR_SET_PDEATHSIG` handles hard exits.
     let bin = resolve_otto_bin();
-    let mut command = serve_command(&bin, &root, &token);
+    let mut command = serve_command(&bin, &root);
     let mut child = match spawn_guarded(&mut command) {
         Ok(child) => child,
         Err(e) => {
@@ -181,21 +181,25 @@ pub async fn boot() -> BootOutcome {
         child,
         LaunchParams {
             ws: format!("ws://127.0.0.1:{SIDECAR_PORT}"),
-            token,
+            // No credential: the sidecar serves `--single-user`, so the webview connects bare and
+            // the `token` field stays empty. It remains on `LaunchParams` (rather than being
+            // dropped) because the web target's `parse_launch_params` still carries a token from
+            // an external bootstrap — see `net/url.rs`.
+            token: String::new(),
         },
     )
 }
 
-/// Build the `otto serve` sidecar command for a workspace at `root`, authenticated with `token`.
+/// Build the `otto serve` sidecar command for a workspace at `root`.
 ///
 /// Split out of `boot()` so the argv is assertable without spawning a process or opening the folder
 /// picker `boot()` starts with (see the tests at the bottom of this file). `boot()` is the only
 /// caller; the split exists for testability, not reuse.
 ///
-/// ## Why the two capability flags
+/// ## Why the capability flags and auth mode
 ///
-/// `otto serve` defaults both of these **off**, and a sidecar launched without them silently
-/// disables two already-shipped UI surfaces on desktop:
+/// `otto serve` defaults `--approve-edits`, `--promote-loopback`, and `--single-user` all **off**,
+/// and a sidecar launched without them silently mis-serves the desktop app:
 ///
 /// - `--approve-edits` installs the `ApprovalModeGate`, which upgrades ordinary (non-sensitive)
 ///   `fs.write` from `Allow` to an interactive `Ask`. That `Ask` is what makes the orchestrator emit
@@ -204,10 +208,17 @@ pub async fn boot() -> BootOutcome {
 ///   feature.
 /// - `--promote-loopback` installs the `PromoteConfig`/`LoopbackTarget` that `Command::PromoteToRemote`
 ///   needs. Without it the shipped Promote/Demote buttons have no target.
+/// - `--single-user` is the loopback-only auth mode (spec §6.5): no authenticator, no `Login`
+///   handshake, no shared secret. The sidecar serves exactly one webview over loopback, so this is
+///   the mode that requires none — and the post-promote reconnect keeps working because the
+///   provisioned loopback engine inherits the same posture. (It is also the only promote posture
+///   that allows `--promote-loopback`, so the two flags compose by design; without it the serve
+///   defaults to `Users`, whose TOTP `Login` handshake the bare webview can never pass.)
 ///
-/// The two compose: `cmd_serve` parses them independently, and its mutual-exclusivity check covers
+/// The three compose: `cmd_serve` parses them independently, and its mutual-exclusivity check covers
 /// only the four *promote modes* (`--promote-loopback`/`--promote-vps`/`--promote-microvm`/
-/// `--promote-fly`), of which this names exactly one.
+/// `--promote-fly`), of which this names exactly one. `--single-user` allows only loopback promote
+/// (`crates/engine/src/main.rs`: `single_user_promote_modes_ok`), which is what we pass.
 ///
 /// Deliberately **not** passed: `--accept-promotions`. That opens the inbound `POST /promote` and
 /// `POST /export` endpoints so *other* machines can push sessions onto this one, which the desktop
@@ -228,7 +239,7 @@ pub async fn boot() -> BootOutcome {
 /// `PR_SET_PDEATHSIG` guard covers process death, so what is left uncovered is a `Child` dropped
 /// while the app keeps running, which would leave a sidecar holding the port until the next launch
 /// fails to bind.
-fn serve_command(bin: &str, root: &Path, token: &str) -> Command {
+fn serve_command(bin: &str, root: &Path) -> Command {
     let mut command = Command::new(bin);
     command
         .arg("serve")
@@ -238,7 +249,7 @@ fn serve_command(bin: &str, root: &Path, token: &str) -> Command {
         .arg(root)
         .arg("--approve-edits")
         .arg("--promote-loopback")
-        .env("OTTO_TOKEN", token)
+        .arg("--single-user")
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
@@ -471,18 +482,24 @@ mod tests {
         );
     }
 
-    /// THE test for this change: the desktop sidecar must be launched with both capability flags.
+    /// THE test for this change: the desktop sidecar must be launched with both capability flags
+    /// and the `--single-user` auth mode.
     ///
-    /// Without them `otto serve` runs with diff-approval and promote/demote *off*, which silently
-    /// disables two shipped UI surfaces on desktop — the `ApprovalPanel` never receives an
-    /// `ApprovalRequest`, and the Promote/Demote buttons have no target. The Phase 0 runtime gate
-    /// only reached those paths through an external shim script
+    /// Without the capability flags `otto serve` runs with diff-approval and promote/demote *off*,
+    /// which silently disables two shipped UI surfaces on desktop — the `ApprovalPanel` never
+    /// receives an `ApprovalRequest`, and the Promote/Demote buttons have no target. The Phase 0
+    /// runtime gate only reached those paths through an external shim script
     /// (`docs/superpowers/spikes/2026-07-21-ui-runtime/otto-shim.sh`); this pins the capability set
     /// into the app itself so it cannot regress to the shim-dependent state.
+    ///
+    /// `--single-user` is the loopback-only auth mode (spec §6.5): the desktop sidecar serves a
+    /// local webview and needs no shared credential, so it must declare the mode that requires
+    /// none. Without it `serve` defaults to `Users` (TOTP) and the webview, having no token, can
+    /// never pass the `Login` handshake — the app would reach no `Ready` at all.
     #[test]
     fn serve_command_passes_both_desktop_capability_flags() {
-        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
-        for flag in ["--approve-edits", "--promote-loopback"] {
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws")));
+        for flag in ["--approve-edits", "--promote-loopback", "--single-user"] {
             assert!(
                 argv.iter().any(|a| a == flag),
                 "desktop sidecar argv is missing `{flag}` — the matching UI surface is unreachable \
@@ -496,7 +513,7 @@ mod tests {
     /// `--root --approve-edits`), which a `contains` check alone would happily accept.
     #[test]
     fn serve_command_argv_is_the_expected_serve_invocation() {
-        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws")));
         assert_eq!(
             argv,
             vec![
@@ -507,6 +524,7 @@ mod tests {
                 "/tmp/ws",
                 "--approve-edits",
                 "--promote-loopback",
+                "--single-user",
             ]
         );
     }
@@ -515,7 +533,7 @@ mod tests {
     /// with a dead connection and no diagnostic beyond a failed connect. Fails loudly here instead.
     #[test]
     fn serve_command_names_exactly_one_promote_mode() {
-        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws"), "tok"));
+        let argv = argv_of(&serve_command("otto", Path::new("/tmp/ws")));
         let modes: Vec<_> = argv
             .iter()
             .filter(|a| PROMOTE_MODE_FLAGS.contains(&a.as_str()))
@@ -527,11 +545,14 @@ mod tests {
         );
     }
 
-    /// The sidecar's program, workspace root, and token are the caller's, not hardcoded — the token
-    /// especially, since it is the bearer credential the webview then authenticates with.
+    /// The sidecar's program and workspace root are the caller's, not hardcoded — and the env it
+    /// spawns with must carry **no** `OTTO_TOKEN`. The credential is gone by design: the sidecar
+    /// runs `--single-user`, which authenticates nothing, and the webview connects with no token;
+    /// an `OTTO_TOKEN` env var would authenticate nothing, cost nothing to read, and be a secret
+    /// minted and stored in a place with no reader.
     #[test]
-    fn serve_command_carries_the_given_binary_root_and_token() {
-        let command = serve_command("/custom/otto", Path::new("/tmp/other-ws"), "s3cret");
+    fn serve_command_carries_the_given_binary_and_root_and_never_a_token() {
+        let command = serve_command("/custom/otto", Path::new("/tmp/other-ws"));
         assert_eq!(command.as_std().get_program(), OsStr::new("/custom/otto"));
         assert!(argv_of(&command).contains(&"/tmp/other-ws".to_string()));
         let token = command
@@ -539,7 +560,12 @@ mod tests {
             .get_envs()
             .find(|(k, _)| *k == OsStr::new("OTTO_TOKEN"))
             .and_then(|(_, v)| v);
-        assert_eq!(token, Some(OsStr::new("s3cret")));
+        assert_eq!(
+            token, None,
+            "the desktop sidecar no longer authenticates via OTTO_TOKEN — the serve runs \
+             --single-user and the webview connects with no credential; a token env var would be \
+             dead weight at best and a leaked secret at worst"
+        );
     }
 
     /// Guards the same gap `boot_spawns_through_the_guarded_path` guards for the spawn choke point:
@@ -607,7 +633,9 @@ mod tests {
     /// `/bin/echo` specifically, not `/bin/sh`: `serve_command` hardcodes `serve` as argv[1], so
     /// `sh` would try to *execute a script named `serve`* relative to the test's working directory.
     /// None exists today (so `sh` exits 127 and the test is correct either way), but if one ever
-    /// appeared it would be run with `OTTO_TOKEN` set. `echo` never interprets an argument as a path.
+    /// appeared it would be run with the sidecar's env — and the sidecar's env is now free of any
+    /// secret, by design (`--single-user`), so the risk of such a script being picked up is gone.
+    /// `echo` never interprets an argument as a path.
     /// Unix-gated for the absolute binary path.
     #[test]
     #[cfg(unix)]
@@ -618,7 +646,7 @@ mod tests {
             .build()
             .expect("build test runtime");
         rt.block_on(async {
-            let mut command = serve_command("/bin/echo", Path::new("/tmp"), "tok");
+            let mut command = serve_command("/bin/echo", Path::new("/tmp"));
             let mut child = spawn_guarded(&mut command).expect("spawn /bin/echo stand-in");
             assert!(
                 child.stderr.is_some(),

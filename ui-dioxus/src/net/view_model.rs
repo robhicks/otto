@@ -101,7 +101,7 @@ impl ClientText {
 ///   authored word "ok" (including when `ok` is false), so `render_row` substitutes the translated
 ///   `Msg::VerifyOk` there — client-authored copy, not a passed-through server payload.
 /// - `ClientError(ClientText)` carries both kinds: the `Authored { msg, args }` arm IS translated
-///   (it is this crate's own copy, e.g. `Msg::UrlAndTokenRequired`, or a localized frame around an
+///   (it is this crate's own copy, e.g. `Msg::UrlRequired`, or a localized frame around an
 ///   untranslatable payload, e.g. `Msg::SidecarSpawnFailed`); only `Passthrough` is verbatim.
 /// - The numeric fields (`bytes`, `input`, `output`) render as Western digits in every locale —
 ///   `u64::to_string()`, with no locale-aware numeral system or digit grouping (spec §8).
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn client_error_rows_carry_authored_or_passthrough_text() {
         // Authored copy retranslates…
-        let authored = client_error_row(ClientText::authored(Msg::UrlAndTokenRequired));
+        let authored = client_error_row(ClientText::authored(Msg::UrlRequired));
         assert_ne!(
             render_row(Locale::En, &authored),
             render_row(Locale::De, &authored)
@@ -696,7 +696,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "has no placeholders")]
     fn authored_with_rejects_a_placeholder_free_key() {
-        let _ = ClientText::authored_with(Msg::UrlAndTokenRequired, vec![("x", "y".to_string())]);
+        let _ = ClientText::authored_with(Msg::UrlRequired, vec![("x", "y".to_string())]);
     }
 
     #[test]
@@ -705,11 +705,11 @@ mod tests {
         // would ship the literal `{bin}` to a user. `Msg::has_placeholders` is derived from the
         // catalog at macro-expansion time, so this cannot drift from the templates.
         assert!(Msg::SidecarSpawnFailed.has_placeholders());
-        assert!(!Msg::UrlAndTokenRequired.has_placeholders());
+        assert!(!Msg::UrlRequired.has_placeholders());
 
         // The one no-arg construction in the crate must name a placeholder-free key, and must
         // render without leaving a brace behind.
-        let no_args = Msg::UrlAndTokenRequired;
+        let no_args = Msg::UrlRequired;
         assert!(
             !no_args.has_placeholders(),
             "{no_args:?} needs authored_with"
@@ -1011,7 +1011,7 @@ mod tests {
                 "row-error",
             ),
             (
-                RowMsg::ClientError(ClientText::authored(Msg::UrlAndTokenRequired)),
+                RowMsg::ClientError(ClientText::authored(Msg::UrlRequired)),
                 "row-error",
             ),
         ];
