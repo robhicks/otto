@@ -12,6 +12,7 @@
 //! depends on `otto-cli` is a genuine Cargo package cycle — see `embedded.rs`'s module doc for the
 //! full explanation.
 
+use std::future::Future;
 use std::io::Write;
 
 use otto_cli::ClientTransport;
@@ -59,12 +60,76 @@ async fn run_one<T: ClientTransport>(
             }
             // Server-originated text, reproduced verbatim. A failed turn returns to the prompt;
             // it never ends the session.
+            //
+            // Known, narrower residual risk, left open by this fix round: if
+            // `record_turn`/`set_terminal_status` fails *after* a turn's own `TurnComplete` has
+            // already streamed (`EngineService::run_prompt_with_controls` drains the orchestrator's
+            // events — including `TurnComplete` — into the sink *before* persisting the turn
+            // record; a persist failure after that point still turns into a `ServerMessage::Error`
+            // on the wire), the resulting stray `Error` is queued and gets read by whichever
+            // `recv()` happens next — the same failure mode `run_one_interruptible`'s drain fixes
+            // for `Abort`. It cannot be fixed the same way here: unlike after `Abort`, an ordinary
+            // `Error` is not always followed by a `TurnComplete` (a mid-turn failure never produces
+            // one at all — see `loop_reports_a_server_error_and_keeps_going`), so draining
+            // unconditionally after this arm would sometimes swallow a *different*, later turn's
+            // real terminal frame instead of fixing anything. Closing this needs either reordering
+            // `run_prompt_with_controls` so persistence can fail before the client ever sees
+            // `TurnComplete`, or a non-blocking peek on `ClientTransport` — both out of scope for
+            // this round (no `recv()` timeout/peek is being added here either).
             Some(ServerMessage::Error { message }) => {
                 writeln!(out, "error: {message}")?;
                 return Ok(());
             }
             Some(_) => continue,
             None => return Ok(()),
+        }
+    }
+}
+
+/// `run_one`, interruptible by `interrupt`: if `interrupt` resolves before the turn completes,
+/// send `Command::Abort` and drain the transport up to (and including) the terminal frame the
+/// abort is guaranteed to produce, before returning.
+///
+/// The drain is why this exists separately from an inline `tokio::select!` in `repl()`: when
+/// `interrupt` wins the race, `run_one`'s future is dropped mid-`recv()`, and whatever the
+/// still-running turn had already queued — plus the `Abort`-synthesized terminal `TurnComplete`
+/// (`EmbeddedTransport::send`'s `Abort` arm always produces one, turn or no turn) — is left
+/// sitting unread. `ClientTransport::recv()` never yields `None` on its own for a live transport,
+/// so without draining here, the *next* `run_one` call's first `recv()` would silently consume one
+/// of these stale frames instead of its own turn's first frame, permanently shifting every
+/// subsequent turn's output by one prompt. Generic and transport-agnostic like `run_one`, so it is
+/// testable against `FakeTransport` with no terminal and no real signal handler.
+async fn run_one_interruptible<T: ClientTransport>(
+    transport: &mut T,
+    session: SessionId,
+    text: String,
+    out: &mut impl Write,
+    interrupt: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    tokio::select! {
+        result = run_one(transport, session, text, out) => result,
+        _ = interrupt => {
+            let _ = transport.send(Command::Abort { session }).await;
+            drain_to_terminal(transport).await;
+            Ok(())
+        }
+    }
+}
+
+/// Discard frames until (and including) a `TurnComplete` event, or the transport closes.
+///
+/// Only safe to call where a terminal frame is *guaranteed* to eventually arrive — exactly the
+/// case right after `Command::Abort` (see `run_one_interruptible`'s doc). Draining unconditionally
+/// after an ordinary `ServerMessage::Error` would be wrong: some real failures never produce a
+/// following `TurnComplete` at all, and draining there would swallow a *later* turn's own terminal
+/// frame instead — see the residual-risk note on `run_one`'s `Error` arm.
+async fn drain_to_terminal<T: ClientTransport>(transport: &mut T) {
+    while let Some(msg) = transport.recv().await {
+        if matches!(
+            &msg,
+            ServerMessage::Event { event } if matches!(event.kind, EventKind::TurnComplete { .. })
+        ) {
+            break;
         }
     }
 }
@@ -105,9 +170,10 @@ pub async fn repl(root: std::path::PathBuf) -> anyhow::Result<()> {
         return run_loop(&mut transport, lines.into_iter(), &mut stdout).await;
     }
 
-    // One session for the whole interactive lifetime — `run_loop`'s per-call `CreateSession`
-    // would mint a fresh session per input line, which is right for the piped path (one shot)
-    // but wrong here.
+    // The piped path above runs `run_loop` once, which creates and owns its own session for that
+    // one call. The interactive path instead needs a single session to outlive many `run_one`
+    // calls — one per readline iteration — so it is created here rather than by delegating to
+    // `run_loop`.
     let session = create_session(&mut transport).await?;
 
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -119,19 +185,16 @@ pub async fn repl(root: std::path::PathBuf) -> anyhow::Result<()> {
                 if line.is_empty() {
                     continue;
                 }
-                tokio::select! {
-                    result = run_one(&mut transport, session, line, &mut stdout) => {
-                        result?;
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        // Ctrl-C mid-turn: abort and return to the prompt. The abort is
-                        // best-effort — the turn is silenced, not cancelled (see
-                        // `EmbeddedTransport::send`'s `Abort` arm), so it keeps running to
-                        // completion holding the engine's turn lock; that is a known limitation
-                        // of this slice, not something to work around here.
-                        let _ = transport.send(Command::Abort { session }).await;
-                    }
-                }
+                // Ctrl-C mid-turn: abort and return to the prompt. The abort is best-effort — the
+                // turn is silenced, not cancelled (see `EmbeddedTransport::send`'s `Abort` arm),
+                // so it keeps running to completion holding the engine's turn lock; that is a
+                // known limitation of this slice, not something to work around here.
+                // `run_one_interruptible` drains to the abort's terminal frame before returning,
+                // so the *next* prompt does not inherit a stale frame from this one.
+                run_one_interruptible(&mut transport, session, line, &mut stdout, async {
+                    let _ = tokio::signal::ctrl_c().await;
+                })
+                .await?;
             }
             // Ctrl-C at the prompt, or Ctrl-D: exit cleanly.
             Err(rustyline::error::ReadlineError::Interrupted)
@@ -145,7 +208,7 @@ pub async fn repl(root: std::path::PathBuf) -> anyhow::Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use otto_cli::FakeTransport;
+    use otto_cli::{ClientTransport, FakeTransport};
     use otto_protocol::{Command, Event, EventKind, ServerMessage, SessionId};
 
     use super::run_loop;
@@ -398,5 +461,145 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("engine closed"));
+    }
+
+    /// A transport that yields to the executor at least once per `recv`, wrapping a
+    /// `FakeTransport`.
+    ///
+    /// `FakeTransport::recv` resolves synchronously (a plain `VecDeque::pop_front`, no real
+    /// suspension), so racing it inside `tokio::select!` against an already-ready `interrupt`
+    /// future is not a fair race at all: `run_one`'s whole call chain would run to completion on
+    /// `select!`'s very first poll, before `interrupt` is ever consulted, so the interrupt branch
+    /// could never win. A real transport's `recv()` always has a genuine await point (it is
+    /// reading off a channel/socket), so this wrapper is what makes the interrupt race realistic
+    /// and, by forcing `run_one` to yield at its very first `recv`, deterministic: `interrupt`
+    /// (immediately ready) is guaranteed to be the only branch ready on `select!`'s first poll.
+    struct YieldingTransport {
+        inner: FakeTransport,
+    }
+
+    #[async_trait::async_trait]
+    impl ClientTransport for YieldingTransport {
+        async fn send(&mut self, cmd: Command) -> anyhow::Result<()> {
+            self.inner.send(cmd).await
+        }
+
+        async fn recv(&mut self) -> Option<ServerMessage> {
+            tokio::task::yield_now().await;
+            self.inner.recv().await
+        }
+    }
+
+    /// The regression test for the Critical fix: after an interrupt, the *next* `SendPrompt` must
+    /// start from a clean queue rather than immediately consuming a frame left over from the
+    /// interrupted turn.
+    ///
+    /// Without `run_one_interruptible`'s drain, this test fails: the interrupted call's dropped
+    /// `run_one` future never reads the stray `AgentStarted` event or the `Abort`-synthesized
+    /// `TurnComplete { ok: false }`, so the *next* `run_one` call reads that stale
+    /// `TurnComplete { ok: false }` as if it were its own first frame and reports "turn failed"
+    /// instead of ever seeing its real `TurnComplete { ok: true }`.
+    #[tokio::test]
+    async fn interrupt_drains_the_aborted_turns_frames_before_the_next_prompt() {
+        let session = SessionId::new();
+        let mut t = YieldingTransport {
+            inner: FakeTransport::new(vec![
+                ServerMessage::Ready {
+                    session,
+                    capabilities: Default::default(),
+                },
+                // The interrupted turn: one real event already in flight, then the terminal
+                // frame `EmbeddedTransport::send`'s `Abort` arm always synthesizes.
+                ServerMessage::Event {
+                    event: Event {
+                        seq: 0,
+                        session,
+                        kind: EventKind::AgentStarted {
+                            role: otto_protocol::Role::Planner,
+                        },
+                    },
+                },
+                ServerMessage::Event {
+                    event: Event {
+                        seq: 1,
+                        session,
+                        kind: EventKind::TurnComplete { ok: false },
+                    },
+                },
+                // The *next* prompt's own, real frame.
+                ServerMessage::Event {
+                    event: Event {
+                        seq: 2,
+                        session,
+                        kind: EventKind::TurnComplete { ok: true },
+                    },
+                },
+            ]),
+        };
+
+        let session = super::create_session(&mut t).await.unwrap();
+        let mut interrupted_out = Vec::new();
+
+        // `interrupt` is already resolved, so it is guaranteed to win the race against
+        // `YieldingTransport`'s forced-yield `run_one` (see `YieldingTransport`'s doc).
+        super::run_one_interruptible(
+            &mut t,
+            session,
+            "interrupted".to_string(),
+            &mut interrupted_out,
+            std::future::ready(()),
+        )
+        .await
+        .unwrap();
+
+        let mut next_out = Vec::new();
+        super::run_one(&mut t, session, "next".to_string(), &mut next_out)
+            .await
+            .unwrap();
+        let next_text = String::from_utf8(next_out).unwrap();
+        assert!(
+            next_text.contains("done"),
+            "the next prompt must see its own TurnComplete, not a stale one left over from the \
+             interrupted turn: {next_text}"
+        );
+    }
+
+    /// The non-interrupted path of `run_one_interruptible` behaves exactly like `run_one`: when
+    /// `interrupt` never resolves, the turn's own frames are rendered and no `Abort` is sent.
+    #[tokio::test]
+    async fn run_one_interruptible_delegates_to_run_one_when_not_interrupted() {
+        let session = SessionId::new();
+        let mut t = FakeTransport::new(vec![
+            ServerMessage::Ready {
+                session,
+                capabilities: Default::default(),
+            },
+            ServerMessage::Event {
+                event: Event {
+                    seq: 0,
+                    session,
+                    kind: EventKind::TurnComplete { ok: true },
+                },
+            },
+        ]);
+        let session = super::create_session(&mut t).await.unwrap();
+        let mut out = Vec::new();
+
+        // `std::future::pending` never resolves, so this exercises only the `run_one` branch.
+        super::run_one_interruptible(
+            &mut t,
+            session,
+            "go".to_string(),
+            &mut out,
+            std::future::pending(),
+        )
+        .await
+        .unwrap();
+
+        assert!(String::from_utf8(out).unwrap().contains("done"));
+        assert!(
+            !t.sent().iter().any(|c| matches!(c, Command::Abort { .. })),
+            "no interrupt fired, so no Abort should have been sent"
+        );
     }
 }
