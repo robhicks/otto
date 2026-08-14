@@ -199,6 +199,25 @@ impl EmbeddedTransport {
             .await?
             .len())
     }
+
+    /// The session's persisted status, after letting the in-flight turn finish.
+    ///
+    /// The wait is the point: an aborted turn is silenced, not cancelled, so it runs on to its own
+    /// terminal status write. Reading before that write would pass whether or not the write
+    /// respects the abort.
+    #[cfg(test)]
+    pub(crate) async fn session_status(
+        &mut self,
+        session: SessionId,
+    ) -> anyhow::Result<otto_persistence::SessionStatus> {
+        if let Some(turn) = self.current.take() {
+            let _ = turn.handle.await;
+        }
+        self.service
+            .store()
+            .session_status(&self.owner, session)
+            .await
+    }
 }
 
 /// Where this root's session database lives: `OTTO_DB` when the operator names one (matching
@@ -494,6 +513,42 @@ mod tests {
                 other => panic!("expected events then a TurnComplete, got {other:?}"),
             }
         }
+    }
+
+    /// An abort must still read back as `Aborted` once the silenced turn has run to completion.
+    ///
+    /// This is the half `abort_during_a_turn_yields_a_terminal_frame` does not cover: that test
+    /// asserts on the *frame*, so it stayed green while the turn's own terminal `set_status`
+    /// overwrote the abort with `Done`/`Failed` in the store. Nothing in today's REPL reads the
+    /// status, but `--continue`/`--resume` will.
+    ///
+    /// Race-free in both directions: if the abort lands first the engine's guard skips the turn's
+    /// terminal write; if it lands after, the abort is simply the last writer. `Aborted` either way.
+    #[tokio::test]
+    async fn abort_survives_the_silenced_turn_running_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
+
+        t.send(Command::CreateSession).await.unwrap();
+        let session = match t.recv().await {
+            Some(ServerMessage::Ready { session, .. }) => session,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        t.send(Command::SendPrompt {
+            session,
+            text: "a goal to abandon".to_string(),
+        })
+        .await
+        .unwrap();
+        t.send(Command::Abort { session }).await.unwrap();
+
+        assert_eq!(
+            t.session_status(session).await.unwrap(),
+            otto_persistence::SessionStatus::Aborted,
+            "the completing turn must not overwrite the abort"
+        );
     }
 
     /// An unsupported command must be answered, not fatal. `RunAgent` stands in for the whole

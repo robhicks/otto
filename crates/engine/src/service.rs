@@ -298,13 +298,17 @@ impl EngineService {
         let turn_result = handle.await?; // JoinError propagates
 
         if let Some(e) = stream_err {
-            let _ = self.store.set_status(session, SessionStatus::Failed).await;
+            let _ = self
+                .set_terminal_status(owner, session, SessionStatus::Failed)
+                .await;
             return Err(e);
         }
         let outcome = match turn_result {
             Ok(outcome) => outcome,
             Err(e) => {
-                let _ = self.store.set_status(session, SessionStatus::Failed).await;
+                let _ = self
+                    .set_terminal_status(owner, session, SessionStatus::Failed)
+                    .await;
                 return Err(e);
             }
         };
@@ -328,9 +332,40 @@ impl EngineService {
         } else {
             SessionStatus::Failed
         };
-        self.store.set_status(session, status).await?;
+        self.set_terminal_status(owner, session, status).await?;
 
         Ok(outcome)
+    }
+
+    /// Write a turn's terminal status — unless the session was aborted while the turn ran.
+    ///
+    /// A turn is not cancellable. `abort` records `SessionStatus::Aborted`, but it does not signal
+    /// the running turn, which goes on to completion and reaches the terminal writes above; those
+    /// would otherwise clobber `Aborted` with `Done`/`Failed`, and a later resume/history read
+    /// would see a session that was never aborted. Both the embedded transport and `otto serve`
+    /// abort this way, which is why the guard lives here, at the offending write, instead of at
+    /// any one abort site — a new caller cannot reintroduce the bug.
+    ///
+    /// No locking, because both interleavings are already correct: an `Abort` landing before this
+    /// read is seen and skipped, and one landing after is simply the last writer, so `Aborted`
+    /// wins either way.
+    ///
+    /// A failed status read falls through to the write. That is the pre-existing behavior, and it
+    /// is the safer default: leaving a finished session stuck in `Running` because a read
+    /// hiccuped would be a worse outcome than a rare clobber.
+    async fn set_terminal_status(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+        status: SessionStatus,
+    ) -> anyhow::Result<()> {
+        if matches!(
+            self.store.session_status(owner, session).await,
+            Ok(SessionStatus::Aborted)
+        ) {
+            return Ok(());
+        }
+        self.store.set_status(session, status).await
     }
 
     /// Look up `name` in the discovered custom commands (set via `with_extensions`), expand its
@@ -1042,6 +1077,45 @@ mod tests {
             service.store.session_status(&alice, session).await.unwrap(),
             otto_persistence::SessionStatus::Active,
             "a rejected turn must not change the session's status"
+        );
+    }
+
+    /// An aborted session must still read back as `Aborted` after the turn finishes.
+    ///
+    /// A turn is not cancellable: `abort` records `Aborted` but the orchestrator runs on and
+    /// reaches `run_prompt_with_controls`'s terminal `set_status`, which used to overwrite it with
+    /// `Done`/`Failed`. Aborting *before* the turn is the deterministic way to put `Aborted` in the
+    /// store while that write happens — no timing, no sleep — and it exercises exactly the guard
+    /// that the mid-turn case relies on. Both the embedded transport and `otto serve` abort this
+    /// way, so this covers both.
+    #[tokio::test]
+    async fn a_turns_terminal_status_does_not_clobber_an_abort() {
+        let (service, _tmp) = build_service_for_test().await;
+        let owner = otto_protocol::UserId::local();
+        let session = service
+            .create_session(&owner, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        service.abort(&owner, session).await.unwrap();
+
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt(&owner, session, "go", &mut sink)
+            .await
+            .unwrap();
+
+        // The turn ran to completion — this is the terminal write that used to clobber.
+        assert!(
+            sink.events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::TurnComplete { .. })),
+            "the turn must actually have completed for this to test anything"
+        );
+        assert_eq!(
+            service.store.session_status(&owner, session).await.unwrap(),
+            SessionStatus::Aborted,
+            "a completing turn must not overwrite an abort"
         );
     }
 
