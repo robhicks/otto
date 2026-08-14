@@ -1,7 +1,6 @@
 # Handover credentials — per-session secrets, `Promoted.token` always `Some`
 
-> **Status:** DRAFT — per-session promotion secrets for every `RemoteTarget`, the receiver's
-> session→secret map, and the carried-over slice-1a review items. Not yet implemented.
+> **Status:** IMPLEMENTED — shipped as slice 3 (issue #126) in [#139](https://github.com/robhicks/otto/pull/139).
 > **Implements:** slice 3 of the multitenancy spine (issue #126) — the handover-credentials half of
 > "Suggested first slice" in [#115](https://github.com/robhicks/otto/issues/115).
 > **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a, shipped
