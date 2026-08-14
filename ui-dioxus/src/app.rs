@@ -209,7 +209,9 @@ pub fn App() -> Element {
                                 token.set(handover_token);
                                 reconnect_to.set(Some(endpoint));
                             }
-                            SocketEvent::Message(Ok(ServerMessage::Demoted { endpoint, .. })) => {
+                            SocketEvent::Message(Ok(ServerMessage::Demoted {
+                                endpoint, ..
+                            })) => {
                                 // Reconnect to the handed-back engine, reusing token + session +
                                 // last_seq. The new engine's manifest flips the status strip
                                 // local<->remote. Deferred to an Effect (this task can't call
