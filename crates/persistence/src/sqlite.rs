@@ -405,6 +405,32 @@ impl crate::SessionStore for SqliteStore {
         Ok(events)
     }
 
+    async fn turns(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: otto_protocol::SessionId,
+    ) -> anyhow::Result<Vec<crate::TurnRecord>> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT t.turn_index, t.goal, t.outcome
+             FROM turns t JOIN sessions s ON s.id = t.session_id
+             WHERE t.session_id = ?1 AND s.owner = ?2
+             ORDER BY t.turn_index ASC",
+        )
+        .bind(session.0.to_string())
+        .bind(owner.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut turns = Vec::with_capacity(rows.len());
+        for (turn_index, goal, outcome) in rows {
+            turns.push(crate::TurnRecord {
+                turn_index: turn_index as u32,
+                goal,
+                outcome: serde_json::from_str(&outcome)?,
+            });
+        }
+        Ok(turns)
+    }
+
     async fn session_status(
         &self,
         owner: &otto_protocol::UserId,
@@ -799,6 +825,75 @@ mod tests {
             .unwrap();
         store.record_turn(id, &turn(0, true)).await.unwrap();
         assert!(store.record_turn(id, &turn(0, false)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn turns_returns_records_in_ascending_turn_index() {
+        let (store, _dir) = temp_store().await;
+        let owner = otto_protocol::UserId::local();
+        let s = store
+            .create_session(&owner, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        for i in [0u32, 1, 2] {
+            store
+                .record_turn(
+                    s,
+                    &TurnRecord {
+                        turn_index: i,
+                        goal: format!("goal {i}"),
+                        outcome: serde_json::json!({ "ok": true }),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let turns = store.turns(&owner, s).await.unwrap();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(
+            turns.iter().map(|t| t.turn_index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(turns[1].goal, "goal 1");
+    }
+
+    #[tokio::test]
+    async fn turns_is_empty_for_an_unknown_session() {
+        let (store, _dir) = temp_store().await;
+        let owner = otto_protocol::UserId::local();
+        assert!(
+            store
+                .turns(&owner, otto_protocol::SessionId::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn turns_is_empty_for_a_session_owned_by_someone_else() {
+        let (store, _dir) = temp_store().await;
+        let mine = otto_protocol::UserId::local();
+        let theirs = otto_protocol::UserId::parse("someone-else").unwrap();
+        let s = store
+            .create_session(&theirs, "g", &serde_json::json!({}))
+            .await
+            .unwrap();
+        store
+            .record_turn(
+                s,
+                &TurnRecord {
+                    turn_index: 0,
+                    goal: "secret".to_string(),
+                    outcome: serde_json::json!({ "ok": true }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Indistinguishable from "no such session" — never an existence oracle.
+        assert!(store.turns(&mine, s).await.unwrap().is_empty());
     }
 
     #[tokio::test]
