@@ -9,14 +9,17 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use otto_engine::{
-    EngineService, EventSink, McpConnection, TurnControls, build_composed_tools,
-    build_default_registry, build_retriever, build_router, preflight_base_urls, session_config,
+    EngineService, EventSink, McpConnection, TurnControls, build_capabilities,
+    build_composed_tools, build_default_registry, build_retriever, build_router,
+    preflight_base_urls, session_config,
 };
+use otto_engine_core::Router;
 use otto_persistence::SqliteStore;
-use otto_protocol::{CapabilitiesManifest, Command, Event, ServerMessage, UserId};
+use otto_protocol::{Command, Event, EventKind, ServerMessage, SessionId, UserId};
 use otto_workspace::LocalWorkspace;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -27,11 +30,23 @@ use crate::transport::ClientTransport;
 /// `Vec` instead; the REPL needs them live, one frame at a time.
 struct ChannelSink {
     tx: UnboundedSender<ServerMessage>,
+    /// Set by `Abort`. The engine has no cooperative cancellation, so an aborted turn keeps
+    /// running to completion; silencing its sink is what stops the client from seeing frames
+    /// after the terminal frame `Abort` already sent it. Persistence is unaffected — the service
+    /// writes each event to the store *before* calling `emit`, so the session log stays complete.
+    silenced: Arc<AtomicBool>,
+    /// The highest seq forwarded to the client so far, so a synthesized frame (the abort's
+    /// terminal `TurnComplete`) can be given a seq that is monotonic on the wire.
+    last_seq: Arc<AtomicU64>,
 }
 
 #[async_trait]
 impl EventSink for ChannelSink {
     async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
+        if self.silenced.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.last_seq.fetch_max(event.seq, Ordering::SeqCst);
         // A closed receiver means the transport was dropped mid-turn; the turn is now pointless
         // but not *wrong*, so this is not an error the engine should fail the turn over.
         let _ = self.tx.send(ServerMessage::Event {
@@ -39,6 +54,22 @@ impl EventSink for ChannelSink {
         });
         Ok(())
     }
+}
+
+/// The transport's handle on the turn it most recently started.
+struct CurrentTurn {
+    /// Which session the turn belongs to, so an `Abort` naming a different session cannot
+    /// silence it.
+    session: SessionId,
+    silenced: Arc<AtomicBool>,
+    /// Deliberately never cancelled — see the `Abort` arm for why `handle.abort()` would be
+    /// actively harmful — so production genuinely never reads this. It is kept because a
+    /// `JoinHandle` is the only way to wait for a turn to become *durable* (the service records
+    /// the turn after emitting `TurnComplete`), which the test helper does. Not underscore-named
+    /// like `_mcp`: dropping this handle detaches the task rather than keeping anything alive, so
+    /// that spelling would claim a guarantee it does not provide.
+    #[cfg_attr(not(test), allow(dead_code))]
+    handle: tokio::task::JoinHandle<()>,
 }
 
 /// The engine, in this process, speaking the wire protocol.
@@ -53,11 +84,12 @@ pub struct EmbeddedTransport {
     /// binding because its whole turn happens inside one function; a transport outlives any
     /// single call, so the guards have to live on the struct.
     _mcp: Vec<McpConnection>,
-    /// The most recently started turn, if any — so `Abort` can actually stop it. The engine
-    /// serializes turns behind its own lock, so a second `SendPrompt` sent before the first
-    /// finishes simply queues; only the latest is tracked here, which is what a REPL (one prompt
-    /// at a time) needs.
-    current: Option<tokio::task::JoinHandle<()>>,
+    /// The most recently started turn, if any — so `Abort` can find it. The engine serializes
+    /// turns behind its own lock, so a second `SendPrompt` sent before the first finishes simply
+    /// queues; only the latest is tracked here, which is what a REPL (one prompt at a time) needs.
+    current: Option<CurrentTurn>,
+    /// Highest seq forwarded to the client, shared with every turn's sink.
+    last_seq: Arc<AtomicU64>,
 }
 
 impl EmbeddedTransport {
@@ -66,15 +98,32 @@ impl EmbeddedTransport {
         Self::new_in(root, dirs::home_dir().unwrap_or_default()).await
     }
 
-    /// [`Self::new`] with the home directory injected, so tests never read the developer's real
-    /// `~/.claude` (the same `_in` convention `otto run --agent`/`--command` already use). All
-    /// the wiring lives here.
-    ///
-    /// The dependency graph is the one `cmd_run` builds — the same router, the same
-    /// `build_composed_tools` composition (permission gate, skills, plugin MCP servers, hooks),
-    /// the same retriever — so the CLI's permission, hook, skill, and plugin behavior cannot
-    /// drift from the rest of the engine.
+    /// [`Self::new`] with the home directory injected, so callers never read the developer's real
+    /// `~/.claude` (the same `_in` convention `otto run --agent`/`--command` already use).
     pub async fn new_in(root: PathBuf, home: PathBuf) -> anyhow::Result<Self> {
+        Self::new_with_router(root, home, None).await
+    }
+
+    /// [`Self::new_in`] with the LLM router injected. `None` — the production path — builds the
+    /// router from the environment via [`build_router`], exactly as `otto run` does; production
+    /// behavior is unchanged by this seam existing.
+    ///
+    /// `Some(router)` exists because [`build_router`] selects a *real remote provider* whenever
+    /// `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/`DEEPSEEK_API_KEY` is exported. A
+    /// test that runs a turn through the ambient router is offline only by accident of the
+    /// machine it runs on: with a key set it would hit the network, cost money, stop being
+    /// deterministic, and let a real Coder apply gated edits. Pinning the router is how a caller
+    /// makes "offline" a property of the code rather than of the environment.
+    ///
+    /// Everything else is the dependency graph `cmd_run` builds — the same
+    /// `build_composed_tools` composition (permission gate, skills, plugin MCP servers, hooks)
+    /// and the same retriever — so the CLI's permission, hook, skill, and plugin behavior cannot
+    /// drift from the rest of the engine.
+    pub async fn new_with_router(
+        root: PathBuf,
+        home: PathBuf,
+        router: Option<Arc<dyn Router>>,
+    ) -> anyhow::Result<Self> {
         // A bad *_BASE_URL degrades the library to the offline canned provider, which still
         // produces a complete-looking turn. In a CLI — where a human set the variable — refuse to
         // start instead, exactly as `otto run` does.
@@ -82,7 +131,7 @@ impl EmbeddedTransport {
 
         // The orchestrator and the tools get separate `LocalWorkspace` handles over the same root,
         // exactly as `cmd_run` does. Each `Arc::new` below is unsized to the corresponding trait
-        // object at the call site, so this module never has to name an `engine-core` seam.
+        // object at the call site, so `Workspace`/`SessionStore` never have to be named here.
         let orch_workspace = Arc::new(LocalWorkspace::new(root.clone()));
         let tools_workspace = Arc::new(LocalWorkspace::new(root.clone()));
 
@@ -101,7 +150,7 @@ impl EmbeddedTransport {
         let service = EngineService::new(
             Arc::new(SqliteStore::open(db).await?),
             Arc::new(build_default_registry()),
-            Arc::from(build_router()),
+            router.unwrap_or_else(|| Arc::from(build_router())),
             orch_workspace,
             Arc::new(tools),
         )
@@ -116,6 +165,7 @@ impl EmbeddedTransport {
             tx,
             _mcp: mcp,
             current: None,
+            last_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -138,12 +188,9 @@ impl EmbeddedTransport {
     /// store the instant it sees `TurnComplete` would race the write. Joining the turn task is
     /// the honest way to ask "and is it durable yet?".
     #[cfg(test)]
-    pub(crate) async fn turn_count(
-        &mut self,
-        session: otto_protocol::SessionId,
-    ) -> anyhow::Result<usize> {
-        if let Some(handle) = self.current.take() {
-            let _ = handle.await;
+    pub(crate) async fn turn_count(&mut self, session: SessionId) -> anyhow::Result<usize> {
+        if let Some(turn) = self.current.take() {
+            let _ = turn.handle.await;
         }
         Ok(self
             .service
@@ -179,10 +226,13 @@ impl ClientTransport for EmbeddedTransport {
                     .await
                 {
                     // `Ready` is the protocol's session-established frame — there is no
-                    // `SessionCreated`. `serve.rs` sends the same frame after its handshake.
+                    // `SessionCreated`. `serve.rs` sends the same frame after its handshake, and
+                    // computes its manifest the same way: `CapabilitiesManifest::default()` would
+                    // report every capability as false, which is not merely uninformative but
+                    // wrong on a machine that has a sandbox or a configured provider.
                     Ok(session) => self.push(ServerMessage::Ready {
                         session,
-                        capabilities: CapabilitiesManifest::default(),
+                        capabilities: build_capabilities(),
                     }),
                     Err(e) => self.push_error(e.to_string()),
                 }
@@ -191,29 +241,70 @@ impl ClientTransport for EmbeddedTransport {
                 let service = Arc::clone(&self.service);
                 let owner = self.owner.clone();
                 let tx = self.tx.clone();
-                self.current = Some(tokio::spawn(async move {
-                    let mut sink = ChannelSink { tx: tx.clone() };
-                    // Approval stays deny-only in this slice: `TurnControls::default()` carries
-                    // `DenyApprover`, so an `Ask` edit is logged and skipped rather than applied.
-                    // Interactive diff review is the next slice.
-                    let controls = TurnControls::default();
-                    if let Err(e) = service
-                        .run_prompt_with_controls(&owner, session, &text, &mut sink, controls)
-                        .await
-                    {
-                        let _ = tx.send(ServerMessage::Error {
-                            message: e.to_string(),
-                        });
+                let silenced = Arc::new(AtomicBool::new(false));
+                let handle = tokio::spawn({
+                    let silenced = Arc::clone(&silenced);
+                    let last_seq = Arc::clone(&self.last_seq);
+                    async move {
+                        let mut sink = ChannelSink {
+                            tx: tx.clone(),
+                            silenced: Arc::clone(&silenced),
+                            last_seq,
+                        };
+                        // Approval stays deny-only in this slice: `TurnControls::default()`
+                        // carries `DenyApprover`, so an `Ask` edit is logged and skipped rather
+                        // than applied. Interactive diff review is the next slice.
+                        let controls = TurnControls::default();
+                        if let Err(e) = service
+                            .run_prompt_with_controls(&owner, session, &text, &mut sink, controls)
+                            .await
+                        {
+                            // An aborted turn already got its terminal frame; do not follow it
+                            // with a stray diagnostic.
+                            if !silenced.load(Ordering::SeqCst) {
+                                let _ = tx.send(ServerMessage::Error {
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
                     }
-                }));
+                });
+                self.current = Some(CurrentTurn {
+                    session,
+                    silenced,
+                    handle,
+                });
             }
             Command::Abort { session } => {
                 if let Err(e) = self.service.abort(&self.owner, session).await {
                     self.push_error(e.to_string());
                 }
-                if let Some(handle) = self.current.take() {
-                    handle.abort();
+                // Silence the in-flight turn for THIS session rather than cancelling its task.
+                //
+                // `EngineService::abort` only writes `SessionStatus::Aborted`; it does not signal
+                // the running turn, and the engine has no cooperative cancellation. Cancelling the
+                // task would drop the `run_prompt_with_controls` future, which (a) detaches the
+                // inner orchestrator task — dropping a tokio `JoinHandle` does not stop it, so it
+                // would keep applying gated `fs.write` edits anyway — and (b) releases the
+                // service's turn lock, letting the next `SendPrompt` start a *second* orchestrator
+                // against the same workspace. Silencing buys the honest half of that (the client
+                // stops hearing from the turn) without the dishonest half.
+                if let Some(turn) = self.current.as_ref().filter(|t| t.session == session) {
+                    turn.silenced.store(true, Ordering::SeqCst);
                 }
+                // Always answer, turn or no turn. The transport owns both ends of the channel, so
+                // `recv()` never yields `None`: without a terminal frame here a client sitting in
+                // `recv()` after an abort waits forever, with no output and no diagnostic.
+                // Synthesized, never persisted — the seq only has to be monotonic on the wire, and
+                // the silenced turn will not emit a competing `TurnComplete`.
+                let seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                self.push(ServerMessage::Event {
+                    event: Event {
+                        seq,
+                        session,
+                        kind: EventKind::TurnComplete { ok: false },
+                    },
+                });
             }
             // Accepted and ignored: the approver denies, so there is nothing to approve yet.
             // Answering with an error would train the REPL to treat approval as unsupported.
@@ -236,10 +327,34 @@ impl ClientTransport for EmbeddedTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use otto_protocol::{Command, EventKind, ServerMessage, SessionId};
 
     use super::EmbeddedTransport;
     use crate::transport::ClientTransport;
+
+    /// A transport whose LLM router is pinned to the offline, deterministic
+    /// `SingleProviderRouter(LocalProvider)` — byte-for-byte what `build_router()` builds when no
+    /// provider key is exported.
+    ///
+    /// Every test uses this rather than `new`/`new_in`. Going through the ambient router would
+    /// make these tests offline only by accident of the machine: with `ANTHROPIC_API_KEY` (or any
+    /// of the other three) exported, the two turn tests would reach the network, cost money, stop
+    /// being deterministic, and hand a real Coder a gated `fs.write`. The home directory is
+    /// injected for the same reason — otherwise `otto_extensions::discover` would pick up the
+    /// developer's real `~/.claude` hooks, skills, permissions, and plugin MCP servers.
+    async fn offline_transport(
+        root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> EmbeddedTransport {
+        let router = Arc::new(otto_router::SingleProviderRouter::new(Arc::new(
+            otto_providers::LocalProvider::new(),
+        )));
+        EmbeddedTransport::new_with_router(root.to_path_buf(), home.to_path_buf(), Some(router))
+            .await
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn embedded_transport_runs_a_turn_and_streams_events() {
@@ -247,9 +362,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
 
-        let mut t = EmbeddedTransport::new_in(dir.path().to_path_buf(), home.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
         t.send(Command::CreateSession).await.unwrap();
         let session = match t.recv().await {
             Some(ServerMessage::Ready { session, .. }) => session,
@@ -288,9 +401,7 @@ mod tests {
     async fn embedded_transport_carries_history_between_turns() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut t = EmbeddedTransport::new_in(dir.path().to_path_buf(), home.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
         t.send(Command::CreateSession).await.unwrap();
         let session = match t.recv().await {
             Some(ServerMessage::Ready { session, .. }) => session,
@@ -316,6 +427,75 @@ mod tests {
         assert_eq!(t.turn_count(session).await.unwrap(), 2);
     }
 
+    /// `Abort` must ALWAYS produce a terminal frame, including when no turn is running.
+    ///
+    /// The transport owns both ends of its channel, so `recv()` never yields `None`. If the
+    /// `Abort` arm pushed nothing, a client sitting in `recv()` — which is exactly what the REPL
+    /// loop does — would wait forever with no output and no diagnostic. This variant is the
+    /// race-free one: with no turn in flight there is nothing else that could have queued a frame,
+    /// so the frame observed here can only have come from the abort itself.
+    #[tokio::test]
+    async fn abort_without_a_turn_still_yields_a_terminal_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
+
+        t.send(Command::CreateSession).await.unwrap();
+        let session = match t.recv().await {
+            Some(ServerMessage::Ready { session, .. }) => session,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        t.send(Command::Abort { session }).await.unwrap();
+
+        match t.recv().await {
+            Some(ServerMessage::Event { event }) => {
+                assert_eq!(event.session, session);
+                assert!(
+                    matches!(event.kind, EventKind::TurnComplete { ok: false }),
+                    "an abort must terminate the turn, and not as a success: {:?}",
+                    event.kind
+                );
+            }
+            other => panic!("expected a terminal TurnComplete frame, got {other:?}"),
+        }
+    }
+
+    /// The same guarantee with a turn actually in flight: the client is never left waiting.
+    /// Race-free because it drains whatever the turn had already emitted and only requires that a
+    /// `TurnComplete` arrives — the abort synthesizes one even if the turn is still running.
+    #[tokio::test]
+    async fn abort_during_a_turn_yields_a_terminal_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
+
+        t.send(Command::CreateSession).await.unwrap();
+        let session = match t.recv().await {
+            Some(ServerMessage::Ready { session, .. }) => session,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+
+        t.send(Command::SendPrompt {
+            session,
+            text: "a long goal".to_string(),
+        })
+        .await
+        .unwrap();
+        t.send(Command::Abort { session }).await.unwrap();
+
+        loop {
+            match t.recv().await {
+                Some(ServerMessage::Event { event }) => {
+                    if matches!(event.kind, EventKind::TurnComplete { .. }) {
+                        break;
+                    }
+                }
+                other => panic!("expected events then a TurnComplete, got {other:?}"),
+            }
+        }
+    }
+
     /// An unsupported command must be answered, not fatal. `RunAgent` stands in for the whole
     /// class (pause/resume, handover, auth): the REPL can send anything, and the transport owes
     /// it a frame back rather than a panic.
@@ -323,9 +503,7 @@ mod tests {
     async fn unsupported_command_yields_an_error_frame_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut t = EmbeddedTransport::new_in(dir.path().to_path_buf(), home.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
 
         t.send(Command::RunAgent {
             session: SessionId::new(),
@@ -349,9 +527,7 @@ mod tests {
     async fn approve_diff_is_accepted_without_a_reply() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let mut t = EmbeddedTransport::new_in(dir.path().to_path_buf(), home.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut t = offline_transport(dir.path(), home.path()).await;
 
         t.send(Command::ApproveDiff {
             session: SessionId::new(),

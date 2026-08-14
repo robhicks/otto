@@ -8,11 +8,13 @@ license.workspace = true
 [dependencies]
 otto-protocol = { path = "../protocol" }
 otto-engine = { path = "../engine" }
-# The three crates below are named by `embedded.rs` alone — the one deliberate exception to this
+# The four crates below are named by `embedded.rs` alone — the one deliberate exception to this
 # crate's protocol-only boundary, because `EmbeddedTransport` IS the adapter between the protocol
 # seam and an in-process engine. `transport.rs`, `render.rs`, and the REPL stay protocol-only.
-# Note there is deliberately no `otto-engine-core` edge: the trait objects are unsized at the
-# call sites, so not one `engine-core` seam is named here.
+# `otto-engine-core` is here for exactly one name, `Router`, in `new_with_router`'s signature —
+# the seam that lets a caller (notably a test) pin the LLM router instead of inheriting whatever
+# the ambient provider API keys select.
+otto-engine-core = { path = "../engine-core" }
 otto-persistence = { path = "../persistence" }
 otto-extensions = { path = "../extensions" }
 otto-workspace = { path = "../workspace" }
@@ -25,3 +27,10 @@ rustyline = "14"
 [dev-dependencies]
 uuid = { workspace = true }
 tempfile = { workspace = true }
+# Dev-only, so the shipped dependency graph is unchanged: the tests pin the offline
+# `SingleProviderRouter(LocalProvider)` — byte-for-byte what `build_router()` builds with no
+# provider keys set — so a turn test is offline by construction, not by luck of the environment.
+# Lateral and inward (both crates sit below `cli`), no cycle; same shape as `remote`'s dev-only
+# edge on `otto-workspace`.
+otto-providers = { path = "../providers" }
+otto-router = { path = "../router" }
