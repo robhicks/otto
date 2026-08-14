@@ -34,7 +34,7 @@ export FLY_API_TOKEN=$(fly auth token)      # provisioning credential
 export OTTO_FLY_ORG=personal
 export OTTO_FLY_REGION=iad
 export OTTO_FLY_IMAGE=registry.fly.io/otto-serve:latest
-export OTTO_TOKEN=<source bearer>           # required by `otto serve`
+export OTTO_PROMOTION_SECRET=<promotion secret>  # required for `otto serve --promote-fly`
 ```
 
 ## 3. Serve with Fly provisioning
@@ -43,7 +43,9 @@ otto serve --promote-fly
 ```
 Promoting a session then creates an app with a unique random suffix (e.g.
 `otto-session-<random>.fly.dev` — the suffix is a random 12-hex string, not the session id),
-runs `otto serve` on it, and the client reconnects. Demote/stop destroys the app immediately.
+runs `otto serve --accept-promotions --promotion-receiver` on it (the machine-to-machine auth
+mode; the promotion secret arrives as `OTTO_PROMOTION_SECRET`, renamed from `OTTO_TOKEN`), and
+the client reconnects. Demote/stop destroys the app immediately.
 The first machine off a freshly-pushed image cold-pulls the whole image (~219 MB) before
 `otto serve` starts, which can exceed the 30 s default boot budget — bump
 `OTTO_FLY_BOOT_TIMEOUT_MS` (e.g. `180000`) when you have just re-pushed the image.
@@ -72,7 +74,7 @@ otherwise defaults to binding `127.0.0.1` for safe local use.
 The image bundles the Dioxus web UI and serves it from the same port as the API
 (`otto serve --ui-dir`, wired through `OTTO_UI_DIR` in the Dockerfile). Once a machine is
 running, open its app URL in a browser — `https://<app>.fly.dev/` — and connect using the
-per-session token the provisioner injected as `OTTO_TOKEN`.
+per-session token the provisioner injected (on the guest as `OTTO_PROMOTION_SECRET`).
 
 The static route is intentionally unauthenticated: a browser has to load `index.html` and the
 wasm before it has a token to present. Only build output is served this way. Every path that

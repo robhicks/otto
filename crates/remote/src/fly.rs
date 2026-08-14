@@ -195,7 +195,7 @@ pub(crate) fn create_machine_body(cfg: &FlyConfig, token: &str) -> serde_json::V
             "image": cfg.image,
             "auto_destroy": true,
             "env": {
-                "OTTO_TOKEN": token,
+                "OTTO_PROMOTION_SECRET": token,
                 "OTTO_PORT": cfg.internal_port.to_string(),
                 "OTTO_ROOT": "/workspace",
             },
@@ -294,7 +294,7 @@ mod tests {
         let body = create_machine_body(&sample_cfg(), "sess-tok");
         assert_eq!(body["config"]["image"], "registry.fly.io/otto-serve:latest");
         assert_eq!(body["config"]["auto_destroy"], true); // machine-level
-        assert_eq!(body["config"]["env"]["OTTO_TOKEN"], "sess-tok");
+        assert_eq!(body["config"]["env"]["OTTO_PROMOTION_SECRET"], "sess-tok");
         assert_eq!(body["config"]["env"]["OTTO_PORT"], "8787");
         assert_eq!(body["config"]["env"]["OTTO_ROOT"], "/workspace");
         assert_eq!(body["config"]["guest"]["cpus"], 1);
