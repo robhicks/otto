@@ -1562,35 +1562,46 @@ async fn handle_handover(
     let (endpoint, tok) = match existing {
         Some((endpoint, tok)) => (endpoint, tok),
         None => {
-            let target: Box<dyn otto_remote::RemoteTarget> =
-                match &cfg.mode {
-                    otto_remote::PromoteMode::Loopback { base_dir } => Box::new(
-                        LoopbackTarget::new(cfg.token.clone(), base_dir.clone(), to_remote),
+            let target: Box<dyn otto_remote::RemoteTarget> = match &cfg.mode {
+                otto_remote::PromoteMode::Loopback { base_dir } => Box::new(
+                    // The provisioned engine inherits `SingleUser` regardless of the source's
+                    // mode (spec §6.5): a loopback provision is in-process, same trust domain,
+                    // and needs no cross-machine credential — `Promoted.token` stays `None`.
+                    LoopbackTarget::new(
+                        AuthConfig {
+                            mode: AuthMode::SingleUser,
+                            authenticator: None,
+                            promotion_secret: None,
+                            handshake_deadline: std::time::Duration::from_secs(10),
+                        },
+                        base_dir.clone(),
+                        to_remote,
                     ),
-                    otto_remote::PromoteMode::Vps { endpoint } => Box::new(
-                        otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
-                    ),
-                    otto_remote::PromoteMode::Microvm { config } => {
-                        #[cfg(feature = "firecracker")]
-                        let provisioner: std::sync::Arc<
-                            dyn otto_remote::Provisioner,
-                        > = std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
-                            config.clone(),
-                            cfg.token.clone(),
-                        ));
-                        #[cfg(not(feature = "firecracker"))]
-                        let provisioner: std::sync::Arc<
-                            dyn otto_remote::Provisioner,
-                        > = {
-                            let _ = config; // unused without the firecracker feature
-                            std::sync::Arc::new(otto_remote::UnsupportedProvisioner)
-                        };
-                        Box::new(otto_remote::MicrovmTarget::new(provisioner))
-                    }
-                    otto_remote::PromoteMode::Fly { config } => {
-                        Box::new(otto_remote::FlyTarget::new(config.clone()))
-                    }
-                };
+                ),
+                otto_remote::PromoteMode::Vps { endpoint } => Box::new(
+                    otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone()),
+                ),
+                otto_remote::PromoteMode::Microvm { config } => {
+                    #[cfg(feature = "firecracker")]
+                    let provisioner: std::sync::Arc<
+                        dyn otto_remote::Provisioner,
+                    > = std::sync::Arc::new(otto_remote::FirecrackerProvisioner::new(
+                        config.clone(),
+                        cfg.token.clone(),
+                    ));
+                    #[cfg(not(feature = "firecracker"))]
+                    let provisioner: std::sync::Arc<
+                        dyn otto_remote::Provisioner,
+                    > = {
+                        let _ = config; // unused without the firecracker feature
+                        std::sync::Arc::new(otto_remote::UnsupportedProvisioner)
+                    };
+                    Box::new(otto_remote::MicrovmTarget::new(provisioner))
+                }
+                otto_remote::PromoteMode::Fly { config } => {
+                    Box::new(otto_remote::FlyTarget::new(config.clone()))
+                }
+            };
             let handle = match promote(
                 state.service.store(),
                 state.service.workspace(),

@@ -10,8 +10,10 @@ use otto_engine::{
     CollectingSink, EngineService, LoopbackTarget, RemoteTarget, build_default_registry,
     build_tool_registry, promote,
 };
+use otto_engine_core::auth::AuthConfig;
 use otto_engine_core::traits::{Workspace, WorkspaceRead};
 use otto_persistence::{SessionStore, SqliteStore};
+use otto_protocol::AuthMode;
 use otto_providers::ScriptedProvider;
 use otto_router::SingleProviderRouter;
 use otto_workspace::{LocalWorkspace, RemoteWorkspace};
@@ -92,8 +94,18 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     );
     let last_seq = src_events.last().unwrap().seq;
 
-    // --- Promote to a loopback remote. ---
-    let target = LoopbackTarget::new(TOKEN, promote_base.path().to_path_buf(), true);
+    // --- Promote to a loopback remote. The provisioned engine inherits SingleUser (spec §6.5):
+    // same trust domain, no cross-machine credential, `Promoted.token` stays `None`. ---
+    let target = LoopbackTarget::new(
+        AuthConfig {
+            mode: AuthMode::SingleUser,
+            authenticator: None,
+            promotion_secret: None,
+            handshake_deadline: std::time::Duration::from_secs(10),
+        },
+        promote_base.path().to_path_buf(),
+        true,
+    );
     let handle = promote(&*store, &*workspace, session, &target)
         .await
         .unwrap();
@@ -106,6 +118,14 @@ async fn promote_resumes_session_and_workspace_on_a_loopback_remote() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("connect to remote");
+
+    let hello = next_json(&mut ws).await.expect("hello frame");
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(
+        hello["auth_mode"].as_str().unwrap(),
+        "single_user",
+        "the loopback provisioned engine inherits SingleUser (spec §6.5)"
+    );
 
     let ready = next_json(&mut ws).await.expect("ready frame");
     assert_eq!(ready["type"], "ready");
