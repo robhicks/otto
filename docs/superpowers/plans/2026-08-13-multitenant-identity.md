@@ -6,7 +6,7 @@
 
 **Architecture:** Five crates in strict inward order (`protocol` → `engine-core` → `auth` → `persistence` (already done) → `engine`), plus the workspace-excluded `ui-dioxus/`. Slice 1a (shipped, #123/#124) already delivered `UserId`, the `sessions.owner` column, owner-scoped `SessionStore` reads, `EngineService::authorize`/`authorize_session`, and `run_goal`'s `UserId::local()` — so this plan builds the identity half on top of a finished ownership foundation. `ServeState` gains an `AuthConfig` (mode + `Arc<dyn Authenticator>` + promotion secret); `handle_socket` resolves one connection-scoped principal and threads it through the command loop; every HTTP route authenticates per its mode. The auth store is a second sqlite database in the OS data dir (`OTTO_AUTH_DB`, per A5), never in the workspace, so the sensitive-path floor is untouched.
 
-**Tech Stack:** Rust (edition 2024, toolchain pinned, `rust-version = "1.85"`), `sqlx` 0.8, `jsonwebtoken` **10.3** (pinned per the issue's verified constraint — 11.x declares `rust-version 1.88` and silently breaks the MSRV), `hmac = "0.12"`, `sha1 = "0.10"`, `sha2` (refresh hashing), `subtle` (constant-time compare), `data-encoding` (base32), `rand` (secrets), `qrcode` (terminal QR), `anyhow`, `async-trait`, `serde`, `tokio`, `tempfile` for tests.
+**Tech Stack:** Rust (edition 2024, toolchain pinned, `rust-version = "1.85"`), `sqlx` 0.8, `jsonwebtoken` **10.3** `default-features = false, features = ["rust_crypto"]` (pinned per the issue's verified MSRV constraint — 11.x declares `rust-version 1.88` and silently breaks the MSRV; the `rust_crypto` backend is mandatory, see Task 4), `hmac = "0.12"`, `sha1 = "0.10"`, `sha2` (refresh hashing), `subtle` (constant-time compare), `data-encoding` (base32), `rand` (secrets), `qrcode` (terminal QR), `anyhow`, `async-trait`, `serde`, `tokio`, `tempfile` for tests.
 
 **Spec:** `docs/superpowers/specs/2026-08-01-multitenant-identity-design.md` — read it first. This plan implements it exactly, including the five resolved open issues (§6.5 `--promotion-receiver` opt-in + zero-principal condition; §7.3 per-mode `/workspace` credential table; §7.2 `Hello` always-first; §6.6 widened `ui-dioxus` table; §6.4 corrected Fly citation).
 
@@ -20,7 +20,7 @@
 - Run `cargo fmt --all` before **every** Rust commit; `cargo clippy --workspace --all-targets` before merge.
 - **Known pre-existing failure:** `otto-mcp-lsp`'s `rust_analyzer_integration::full_round_trip_against_a_real_rust_analyzer` fails on `main` already (verified). It is not a regression from this work.
 - **Security decisions from the spec, non-negotiable:** `Credentials::Debug` redacts the code; `Command`/`ServerMessage` `Debug` redact tokens; failed auth returns one opaque `"authentication failed"` string (A11); TOTP replay rejects `step <= last_step` with a conditional `UPDATE ... WHERE last_step < ?`; JWT verification checks signature → `exp` → denylist in that order; `--single-user` requires a loopback bind; `--promotion-receiver` refuses to start if any principal is enrolled; `otto auth {enroll,list,revoke}` refuse `local`.
-- **Versioned contract:** `jsonwebtoken = "=10.3"` (exact, per the issue's verified MSRV constraint); `hmac = "0.12"`, `sha1 = "0.10"`, `sha2 = "0.10"` reuse the locked `digest 0.10.x` tree.
+- **Versioned contract:** `jsonwebtoken = { version = "=10.3", default-features = false, features = ["rust_crypto"] }` (exact, per the issue's verified MSRV constraint — and the `rust_crypto` backend is mandatory, see Task 4); `hmac = "0.12"`, `sha1 = "0.10"`, `sha2 = "0.10"` reuse the locked `digest 0.10.x` tree.
 
 ## Plan-critique resolutions (round 1, applied to this file)
 
@@ -29,7 +29,7 @@ Two blocking findings from plan review, both resolved here; each was confirmed a
 1. **The seam had no reachable token lifecycle.** The spec's `Authenticator` (`engine-core/src/auth.rs`, §5) exposed only `authenticate`, but `serve.rs` reaches the backend only as `Arc<dyn Authenticator>` and must mint (`Login`), verify (`Attach` + per-command re-check + `/workspace`), rotate (`Refresh`), and revoke (`Logout`) — a concrete `TotpAuthenticator`'s extra methods would be unreachable through the trait object. **Resolution:** widen the seam itself with the four lifecycle methods, all expressed in plain `String`/`u64`/`TokenPair` — so the no-crypto-in-engine-core rule (§1) holds unchanged. The spec's §5 has been updated to match. `FakeAuthenticator` implements the full widened seam, which is what makes Task 6's `login_reaches_ready_and_mints` / `attach_with_a_minted_token` / `logout_invalidates_on_ws_and_workspace` tests implementable.
 2. **`testing` as a default-off feature breaks every harness.** A `#[cfg(feature = "testing")]` gate + engine feature-forwarding would leave `cargo test --workspace` unable to compile the seven harnesses (which reference `otto_auth::testing::FakeAuthenticator` unconditionally) and would also break `cargo test -p otto-auth` (Task 5's own gate). **Resolution:** `FakeAuthenticator` lives in a plain `pub mod testing` with **no feature gate** — following the `ScriptedProvider` precedent (a test double in an impl crate's public API, always compiled, does no I/O). No `testing` feature is added anywhere. The spec's §9.1 has been updated to match.
 
-Advisory findings folded in: Task 1 hand-writes `Debug` for the whole `ServerMessage` enum (Rust has no per-variant `Debug`, and the current derived impl already leaks `Promoted.token` — redacting it closes a pre-existing leak for free); Task 3 reuses `persistence`'s `BUSY_BUDGET` bounded busy-retry for `SqliteAuthStore::open` (`otto auth enroll` and `otto serve` racing on a fresh auth DB is exactly that failure mode); Task 6's auth tests land in a **new** `crates/engine/tests/auth.rs` so the task stays compile-green independent of the still-unmigrated `serve.rs` harnesses (the deliberate red window between Tasks 6 and 9 is stated below, not papered over); Task 6's handshake deadline is injectable via `AuthConfig.handshake_deadline` so the timeout tests do not block 10s each.
+Advisory findings folded in: Task 1 hand-writes `Debug` for the whole `ServerMessage` enum (Rust has no per-variant `Debug`, and the current derived impl already leaks `Promoted.token` — redacting it closes a pre-existing leak for free) **and adds the four new `Command` variants to `serve.rs`'s exhaustive match** (it has no wildcard arm, so Task 1 would otherwise break the library build — the arms reply `Error` until Task 6 wires real auth); Task 3 reuses `persistence`'s `BUSY_BUDGET` bounded busy-retry for `SqliteAuthStore::open` (`otto auth enroll` and `otto serve` racing on a fresh auth DB is exactly that failure mode); Task 4 pins `jsonwebtoken` as `default-features = false, features = ["rust_crypto"]` (10.3.0 has **no** `hmac`/`sha2` features — they are internal deps of the `rust_crypto` feature — and without a crypto backend the crate panics at first sign/verify; HS256-only enforcement comes from the `Validation` config, not the feature set); Task 5's `FakeAuthenticator` gets a `pub fn new(user: UserId)` constructor (its fields are private and both `tests/auth.rs` and the harnesses must construct it, two principals for the cross-tenant tests); Task 6's auth tests land in a **new** `crates/engine/tests/auth.rs` so the task stays compile-green independent of the still-unmigrated `serve.rs` harnesses (the deliberate red window between Tasks 6 and 9 is stated below, not papered over); Task 6's handshake deadline is injectable via `AuthConfig.handshake_deadline` so the timeout tests do not block 10s each; Task 10 updates a **fourth** desktop_boot test (`serve_command_carries_the_given_binary_root_and_token` at `desktop_boot.rs:533`, which asserts the `OTTO_TOKEN` env at `:540`).
 
 ## File Structure
 
@@ -65,9 +65,9 @@ Advisory findings folded in: Task 1 hand-writes `Debug` for the whole `ServerMes
 
 Forced by the inward dependency rule: `protocol` (Task 1) → `engine-core` (Task 2) → `auth` (Tasks 3–5) → `engine` wiring (Tasks 6–9) → `ui-dioxus` + deploy + docs (Tasks 10–12). Each task leaves `cargo build` green for the crates touched so far, and `cargo test` green for those crates' own suites.
 
-**One deliberate exception is stated, not hidden:** between Task 6 (which changes the `serve_app`/`serve::app` signatures and deletes `?token=`) and Task 9 (which migrates the six pre-existing integration harnesses), `cargo test --workspace` is **red** — the pre-existing `tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs` files do not compile against the new signatures. That window is intended: Task 6's auth tests live in a new `tests/auth.rs` precisely so the task can be verified independently, and Task 9 closes the window in one commit. The `--lib` run in Task 6 Step 5 confirms the breakage is confined to integration files, never the library.
+**One deliberate exception is stated, not hidden:** between Task 6 (which changes the `serve_app`/`serve::app` signatures and deletes `?token=`) and Task 9 (which migrates the seven pre-existing integration harnesses), `cargo test --workspace` is **red** — the pre-existing `tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs` files do not compile against the new signatures. That window is intended: Task 6's auth tests live in a new `tests/auth.rs` precisely so the task can be verified independently, and Task 9 closes the window in one commit. The `--lib` run in Task 6 Step 5 confirms the breakage is confined to integration files, never the library.
 
-**Task 1** lands the wire vocabulary. **Task 2** lands the widened seam (no impl). **Tasks 3–5** build `otto-auth` crate-up (store → TOTP/JWT → the `TotpAuthenticator` + `FakeAuthenticator`). **Task 6** rewires `serve.rs` to the three modes, deleting `?token=`; this is the largest task and the one whose integration tests are the spec's success criteria 2–4. **Task 7** adds the CLI (`otto auth`, `--single-user`, `--promotion-receiver`, the rename) and the pure guard functions. **Task 8** threads `AuthConfig` through loopback. **Task 9** migrates the six pre-existing integration harnesses and closes the red window. **Task 10** keeps the desktop app alive. **Tasks 11–12** deploy + docs.
+**Task 1** lands the wire vocabulary. **Task 2** lands the widened seam (no impl). **Tasks 3–5** build `otto-auth` crate-up (store → TOTP/JWT → the `TotpAuthenticator` + `FakeAuthenticator`). **Task 6** rewires `serve.rs` to the three modes, deleting `?token=`; this is the largest task and the one whose integration tests are the spec's success criteria 2–4. **Task 7** adds the CLI (`otto auth`, `--single-user`, `--promotion-receiver`, the rename) and the pure guard functions. **Task 8** threads `AuthConfig` through loopback. **Task 9** migrates the seven pre-existing integration harnesses and closes the red window. **Task 10** keeps the desktop app alive. **Tasks 11–12** deploy + docs.
 
 ---
 
@@ -161,6 +161,8 @@ Add `Credentials` and `AuthMode` near `UserId`'s re-export; add the four `Comman
 
 **Hand-written redacting `Debug` impls.** Rust has no per-variant `Debug`, so replacing `LoggedIn`'s derived impl means hand-writing `Debug` for the **whole** `ServerMessage` enum — the match must cover `Ready`/`Event`/`Error`/`Promoted`/`Demoted` as well as the three new variants, redacting `LoggedIn.access_token`/`refresh_token` and — because the current derived impl already leaks it into any log line or panic that formats a frame — `Promoted.token` too (`protocol/src/lib.rs:168-172`). Same for `Command` (whole enum, redacting `Attach.token`/`Refresh.refresh_token`) and `Credentials` (redacting `code`). `Event`'s inner `EventKind` keeps its derived `Debug` (no secrets there). Redaction writes `<redacted>` in place of the secret field.
 
+**Keep `cargo build --workspace` green.** `serve.rs`'s command loop matches on `Command` **exhaustively with no wildcard arm** (`crates/engine/src/serve.rs:624`, all ten variants at `:625-740`), and `serve.rs` is library code (`mod serve;` at `crates/engine/src/lib.rs:32`), not an integration test. So this task must also add the four new `Command` variants to that match. They are not-applicable until Task 6 wires auth, so each arm replies `Error { "authentication not enabled" }` and closes (or `break`s the loop), mirroring how an unauthenticated command is treated. This is what keeps Step 5's SUCCESS expectation true; without it the workspace build fails with a non-exhaustive-match E0004.
+
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-protocol`
@@ -169,13 +171,13 @@ Expected: PASS — new tests + all pre-existing.
 - [ ] **Step 5: Verify the workspace still builds**
 
 Run: `cargo build --workspace`
-Expected: SUCCESS — nothing outside `protocol` touches the new types yet (`ui-dioxus`'s exhaustive `ServerMessage` match is workspace-excluded; it is fixed in Task 10).
+Expected: SUCCESS — `serve.rs`'s four new `Command` arms (added in Step 3) keep the library compiling; nothing outside `protocol` uses the new types yet (`ui-dioxus`'s exhaustive `ServerMessage` match is workspace-excluded; it is fixed in Task 10).
 
 - [ ] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
-git add crates/protocol/src/lib.rs
+git add crates/protocol/src/lib.rs crates/engine/src/serve.rs
 git commit -m "protocol: add the identity wire vocabulary (Login/Attach/Refresh/Logout, Hello/LoggedIn/LoggedOut)"
 ```
 
@@ -330,7 +332,7 @@ Expected: FAIL to compile — modules/types not found.
 
 - [ ] **Step 3: Implement**
 
-`totp.rs`: HMAC-SHA1 via `hmac` + `sha1`; counter as 8-byte big-endian; RFC 4226 truncation; the verification is a pure function of `(secret, last_step, now)` so the RFC vectors are directly testable against a fixed `Clock`. `jwt.rs`: `jsonwebtoken = "=10.3"` with only the `hmac`/`sha2` features (HS256 sole algorithm — algorithm confusion structurally impossible); `kid` in the header; `sub`/`iat`/`exp`/`jti` claims; no `aud` (reserved, not emitted). Refresh tokens: 32-byte `rand` values, stored SHA-256-hashed.
+`totp.rs`: HMAC-SHA1 via `hmac` + `sha1`; counter as 8-byte big-endian; RFC 4226 truncation; the verification is a pure function of `(secret, last_step, now)` so the RFC vectors are directly testable against a fixed `Clock`. `jwt.rs`: `jsonwebtoken = { version = "=10.3", default-features = false, features = ["rust_crypto"] }`. Note: 10.3.0 has **no** `hmac`/`sha2` features — those are internal deps pulled by the `rust_crypto` feature, and with no crypto backend at all the crate panics on first sign/verify ("make sure exactly one of the 'rust_crypto' and 'aws_lc_rs' features is enabled"). HS256-only enforcement comes from the `Validation` config at the verify call site (`Validation::new(Algorithm::HS256)` — the only algorithm the signer accepts), **not** from the feature set; keep that wording accurate in the commit/docs. `kid` in the header; `sub`/`iat`/`exp`/`jti` claims; no `aud` (reserved, not emitted). Refresh tokens: 32-byte `rand` values, stored SHA-256-hashed.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -361,7 +363,7 @@ git commit -m "auth: add RFC 6238 TOTP and HS256 JWT with refresh rotation and j
 - Consumes: Tasks 2–4 (seam + store + totp + jwt).
 - Produces, used by Tasks 6 and 9:
   - `pub struct TotpAuthenticator { store, jwt }` implementing the full `Authenticator` seam — `authenticate(Credentials::Totp)` → verify code → `Principal`; `mint`/`verify_access`/`rotate_refresh`/`logout` over the `JwtIssuer` + store.
-  - `pub mod testing { pub struct FakeAuthenticator { principal: UserId } }` implementing the full seam with a trivial in-memory token map — `authenticate` accepts any `Credentials` and returns the fixed principal; `mint` issues a numbered fake token; `verify_access` accepts tokens this fake minted; `logout` denylists them. **It is always compiled — no `#[cfg(feature = "testing")]` gate, no `testing` feature** (plan-critique resolution) — following the `ScriptedProvider` precedent: a test double in an impl crate's public API, harmless in the binary because it does no I/O, and required so that both `cargo test --workspace` (the seven harnesses) and `cargo test -p otto-auth` (this task's own gate) reference it with no feature flags.
+  - `pub mod testing { pub struct FakeAuthenticator { principal: UserId } }` implementing the full seam with a trivial in-memory token map — `authenticate` accepts any `Credentials` and returns the fixed principal; `mint` issues a numbered fake token; `verify_access` accepts tokens this fake minted; `logout` denylists them. **It has a `pub fn new(user: UserId) -> Self` constructor** (its field is private, and both `tests/auth.rs` and the Task 9 harnesses must construct it — two distinct principals for the cross-tenant tests). **It is always compiled — no `#[cfg(feature = "testing")]` gate, no `testing` feature** (plan-critique resolution) — following the `ScriptedProvider` precedent: a test double in an impl crate's public API, harmless in the binary because it does no I/O, and required so that both `cargo test --workspace` (the seven harnesses) and `cargo test -p otto-auth` (this task's own gate) reference it with no feature flags.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -442,7 +444,7 @@ Expected: PASS.
 - [ ] **Step 5: Run the library tests to find the fallout**
 
 Run: `cargo test -p otto-engine --lib`
-Expected: PASS — `EngineService`'s signatures are unchanged (slice 1a shipped them), so the library and its own test module are unaffected by this task. The six pre-existing integration files fail to compile against the new `serve_app` signature — **expected**, they are migrated in Task 9. Confirm the failures are confined to the integration tests, not the library.
+Expected: PASS — `EngineService`'s signatures are unchanged (slice 1a shipped them), so the library and its own test module are unaffected by this task. The seven pre-existing integration files fail to compile against the new `serve_app` signature — **expected**, they are migrated in Task 9. Confirm the failures are confined to the integration tests, not the library.
 
 - [ ] **Step 6: Format and commit**
 
@@ -532,7 +534,7 @@ git commit -m "engine: thread AuthConfig through LoopbackTarget and serve::app"
 
 ---
 
-### Task 9: Migrate the six pre-existing integration harnesses
+### Task 9: Migrate the seven pre-existing integration harnesses
 
 **Files:**
 - Modify: `crates/engine/tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs`
@@ -546,7 +548,8 @@ git commit -m "engine: thread AuthConfig through LoopbackTarget and serve::app"
 Each harness that calls `serve_app`/`serve_app_with_base` gains the `AuthConfig` parameter. Choose per harness:
 - `serve.rs` — a `SingleUser`-mode app for the plain command-flow tests (the `?token=` tests, rewritten per Step 2); a `Users`-mode app with `FakeAuthenticator` for any token tests, matching Task 6's `tests/auth.rs`.
 - `cors.rs`, `ui_dir.rs`, `remote_workspace.rs` — `SingleUser` mode (no credential, `/workspace` header ignored), keeping their existing assertions; `remote_workspace.rs`'s wrong-token test becomes a wrong-access-token test against a `Users` app or is rewritten per the per-mode table.
-- `promote.rs`, `vps_promote.rs`, `microvm.rs` — keep `--promote-*` semantics; the receiver side becomes `--promotion-receiver` (`AuthMode::Machine`) with the promotion secret, and `RemoteWorkspace::new(http_base, secret)` against a `Machine` app or a `SingleUser` one.
+- `promote.rs` — **already migrated in Task 8** (its `LoopbackTarget` constructor changed there); here it only needs its `serve_app`/constructor call sites updated to the `AuthConfig` shape. It stays `SingleUser` (loopback promote inherits the source mode per §6.5) — do **not** wire `AuthMode::Machine` into it.
+- `vps_promote.rs`, `microvm.rs` — keep `--promote-*` semantics; the **network receiver** side (`POST /promote` on a real `otto serve`) becomes `--promotion-receiver` (`AuthMode::Machine`) with the promotion secret, and `RemoteWorkspace::new(http_base, secret)` against a `Machine` app or a `SingleUser` one.
 
 - [ ] **Step 2: Rewrite the `?token=` auth tests in `serve.rs`**
 
@@ -578,7 +581,7 @@ git commit -m "engine: migrate the serve integration harnesses to AuthConfig and
 
 - [ ] **Step 1: Write the failing test**
 
-Update `ui-dioxus/src/desktop_boot.rs`'s three argv-assertion tests (`serve_command_passes_both_desktop_capability_flags`, `serve_command_argv_is_the_expected_serve_invocation`, `serve_command_names_exactly_one_promote_mode` at `:483,:498,:517`) to expect `--single-user` and no `OTTO_TOKEN` env. Add a host-side unit test in the net/url tests that `build_ws_url` no longer carries `?token=`.
+Update `ui-dioxus/src/desktop_boot.rs`'s argv/env-assertion tests — `serve_command_passes_both_desktop_capability_flags`, `serve_command_argv_is_the_expected_serve_invocation`, `serve_command_names_exactly_one_promote_mode` (at `:483,:498,:517`), **and `serve_command_carries_the_given_binary_root_and_token` at `:533`** (which asserts the `OTTO_TOKEN` env at `:540` and fails when it is dropped) — to expect `--single-user` and no `OTTO_TOKEN` env. Add a host-side unit test in the net/url tests that `build_ws_url` no longer carries `?token=`.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -623,7 +626,7 @@ Dockerfile: `CMD` gains `--promotion-receiver`; the `OTTO_TOKEN` comment becomes
 
 - [ ] **Step 2: Verify**
 
-The change is text-only in the Dockerfile; the injected-env rename is Task 12's `fly.rs` edit. Confirm the two move together (or the promoted machine will not start).
+The change is text-only in the Dockerfile; the injected-env rename is Task 12's `fly.rs` edit. **The Fly axis is fully wired only after Tasks 7 + 11 + 12 land together:** the guest's `--promotion-receiver` flag (11) needs Task 7's flag + `OTTO_PROMOTION_SECRET` read in `main.rs`, and the injected env name (12) must match the Dockerfile comment (11) or the promoted machine will not start. Note that `deploy/fly/Dockerfile` has **no** `OTTO_TOKEN` `ENV` line (the reference at `:51-54` is a comment); the env injection lives in `create_machine_body`'s map (`crates/remote/src/fly.rs`).
 
 - [ ] **Step 3: Format and commit**
 
