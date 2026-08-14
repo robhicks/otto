@@ -34,12 +34,16 @@ impl std::fmt::Debug for Credentials {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// A pre-shared bearer token guards the whole serve; one principal (`local`) owns every
-    /// session. The pre-identity default.
+    /// Loopback-only serve with **no credential**: every connection is the reserved `local`
+    /// principal, so there is no authentication frame and no session ownership to resolve. The
+    /// desktop sidecar's mode (`otto serve --single-user`). Not the default.
     SingleUser,
-    /// Enrolled users authenticate with TOTP; sessions are owned per-user.
+    /// Enrolled principals authenticate with TOTP; sessions are owned per-user. The default
+    /// `otto serve` posture.
     Users,
-    /// Machine-to-machine: a pre-shared token guards the serve, and sessions belong to `local`.
+    /// A promotion receiver (`otto serve --promotion-receiver`): the promotion secret
+    /// authenticates the connection and it adopts the attached session's owner. No enrolled
+    /// principals.
     Machine,
 }
 

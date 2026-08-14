@@ -197,17 +197,34 @@ fn open_db_path() -> String {
 /// lives outside the workspace so the sensitive-path floor is untouched (the session store's
 /// `otto-sessions.db` default is inside the workspace by contrast). `otto auth` and `otto serve`
 /// share this path.
-fn auth_db_path() -> String {
-    std::env::var("OTTO_AUTH_DB").unwrap_or_else(|_| {
-        dirs::data_dir()
-            .map(|d| {
-                d.join("otto")
-                    .join("auth.db")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| "otto-auth.db".to_string())
-    })
+///
+/// **Fails closed (spec A5)** when neither the variable nor the OS data dir is available: there
+/// is deliberately no CWD fallback. Writing the credentials into an arbitrary directory — e.g. a
+/// workspace root a serve was started inside — would place them where the sensitive-path floor
+/// does not cover them, so `otto auth`/`otto serve` refuse to run instead.
+fn auth_db_path() -> anyhow::Result<String> {
+    auth_db_path_from(std::env::var("OTTO_AUTH_DB").ok(), dirs::data_dir())
+}
+
+/// The pure core of [`auth_db_path`]: an explicit `OTTO_AUTH_DB` wins; otherwise the OS data
+/// dir is required, or the caller fails closed with an actionable error. Tested directly so the
+/// no-CWD-fallback invariant is provable without manipulating process-global env/dirs.
+fn auth_db_path_from(env: Option<String>, data_dir: Option<PathBuf>) -> anyhow::Result<String> {
+    if let Some(path) = env {
+        return Ok(path);
+    }
+    let dir = data_dir.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine the OS data directory for the auth database and OTTO_AUTH_DB is \
+             unset: set OTTO_AUTH_DB to an explicit path outside any workspace, or the auth \
+             state (TOTP secrets, signing key, refresh hashes) cannot be placed safely"
+        )
+    })?;
+    Ok(dir
+        .join("otto")
+        .join("auth.db")
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Parse `host` as an `IpAddr` and require `is_loopback()`. The `--single-user` bind guard (spec
@@ -814,11 +831,11 @@ async fn cmd_auth(args: Vec<String>) -> anyhow::Result<()> {
                 std::process::exit(2);
             };
             let user = refuse_local(&user);
-            let store = otto_auth::SqliteAuthStore::open(auth_db_path()).await?;
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
             enroll_user(&store, &user, force).await
         }
         "list" => {
-            let store = otto_auth::SqliteAuthStore::open(auth_db_path()).await?;
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
             let users = store.list_users().await?;
             if users.is_empty() {
                 println!("no enrolled principals");
@@ -838,7 +855,7 @@ async fn cmd_auth(args: Vec<String>) -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             };
-            let store = otto_auth::SqliteAuthStore::open(auth_db_path()).await?;
+            let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
             store.revoke_user(&user).await?;
             println!("revoked {user}");
             Ok(())
@@ -999,7 +1016,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
             handshake_deadline: std::time::Duration::from_secs(10),
         }
     } else if promotion_receiver {
-        let store = otto_auth::SqliteAuthStore::open(auth_db_path()).await?;
+        let store = otto_auth::SqliteAuthStore::open(auth_db_path()?).await?;
         let enrolled = store.enrolled_count().await?;
         if let Err(e) = promotion_receiver_preconditions(accept_promotions, enrolled) {
             eprintln!("error: {e}");
@@ -1013,7 +1030,7 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
         }
     } else {
         // Users (the default): TOTP-authenticated, ≥1 enrolled principal required (§7.4).
-        let store = Arc::new(otto_auth::SqliteAuthStore::open(auth_db_path()).await?);
+        let store = Arc::new(otto_auth::SqliteAuthStore::open(auth_db_path()?).await?);
         if let Err(e) = users_mode_has_enrolled_principals(store.as_ref()).await {
             eprintln!("error: {e}");
             std::process::exit(2);
@@ -2261,6 +2278,35 @@ mod tests {
 
     // ---- Auth-mode guards (spec §6.5 / §7.4). Pure functions in the `validate_ui_dir` shape so
     // the security-relevant startup refusals ship with unit coverage. ----
+
+    /// Finding 5: the auth DB must never fall back to the CWD. An explicit `OTTO_AUTH_DB` wins;
+    /// the OS data dir is the default; neither available → fail closed with an actionable error
+    /// (spec A5), so `otto serve`/`otto auth` refuse to run rather than write TOTP secrets and
+    /// the signing key somewhere the sensitive-path floor does not cover.
+    #[test]
+    fn auth_db_path_fails_closed_without_a_data_dir() {
+        // OTTO_AUTH_DB wins, even with a data dir present.
+        assert_eq!(
+            auth_db_path_from(Some("x.db".to_string()), Some(PathBuf::from("/data"))).unwrap(),
+            "x.db"
+        );
+        // Absent env → the OS data dir + otto/auth.db (spec A5).
+        assert_eq!(
+            auth_db_path_from(None, Some(PathBuf::from("/data"))).unwrap(),
+            "/data/otto/auth.db"
+        );
+        // Absent env AND no data dir → a hard, actionable error, never "otto-auth.db" in the CWD.
+        let err = auth_db_path_from(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("OTTO_AUTH_DB"),
+            "the error must name the escape hatch: {err}"
+        );
+        assert!(
+            !msg.contains("otto-auth.db"),
+            "the error must not suggest the CWD fallback: {err}"
+        );
+    }
 
     #[test]
     fn loopback_predicate_accepts_loopback_addresses() {

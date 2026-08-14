@@ -1,7 +1,7 @@
 //! WebSocket transport for the engine. Maps WS frames to `Command`/event frames over an
 //! `EngineService`: a `Hello { auth_mode }` greeting on upgrade, then per-mode authentication
-//! (the `Login`/`Attach` handshake under a deadline in `Users`, nothing in `SingleUser`, the
-//! promotion secret in `Machine`), a `Ready { session }` frame once a principal owns a session,
+//! (the `Login`/`Attach` handshake under a deadline in `Users` and `Machine`, nothing in
+//! `SingleUser`), a `Ready { session }` frame once a principal owns a session,
 //! optional `Last-Event-ID` replay (`?last_seq=`), then live streamed events per `SendPrompt`.
 //! Binds loopback (plaintext `ws://` or, with `serve::run` + a `RustlsConfig`, `wss://`); concurrent sessions are out of scope (see the design spec).
 
@@ -791,13 +791,6 @@ struct ConnIdentity {
     access_token: Option<String>,
 }
 
-/// Whether the first-frame wait is bounded. `Users` waits under `AuthConfig.handshake_deadline`;
-/// `Machine` skips the deadline entirely (§7.2).
-enum HandshakeDeadline {
-    Yes,
-    None,
-}
-
 /// Resolve the connection's principal after `Hello`. On failure — a bad credential, a non-auth
 /// command, a malformed frame, or a missed deadline — sends the single opaque
 /// `Error { "authentication failed" }` and returns `None`; the caller closes the socket.
@@ -826,51 +819,49 @@ async fn authenticate_connection(
                     }
                 }
             }
-            handshake_frame(reader, writer, state, HandshakeDeadline::Yes).await
+            handshake_frame(reader, writer, state).await
         }
         AuthMode::Machine => {
             // The promotion secret via the header (constant-time) — or the post-upgrade `Attach`
-            // frame. `Machine` skips the deadline; the owner is the attached session's own, adopted
-            // in `resolve_session` (§6.5 / §7.2).
+            // frame. `Machine` waits under the same handshake deadline as `Users`: a receiver
+            // that sends neither a header nor an `Attach` frame must not hold an idle socket
+            // indefinitely (finding 4). The owner is the attached session's own, adopted in
+            // `resolve_session` (§6.5 / §7.2).
             if authorized(headers, state.auth.promotion_secret.as_deref()) {
                 return Some(ConnIdentity {
                     owner: UserId::local(),
                     access_token: None,
                 });
             }
-            handshake_frame(reader, writer, state, HandshakeDeadline::None).await
+            handshake_frame(reader, writer, state).await
         }
     }
 }
 
-/// Await and verify the first post-upgrade frame. It must be `Login` (identity credentials →
-/// `authenticate` + `mint` → `LoggedIn`) or `Attach` (an access token, or on `Machine` the
-/// promotion secret). Anything else is the same opaque failure. Returns the established identity.
+/// Await and verify the first post-upgrade frame under `AuthConfig.handshake_deadline` (both
+/// `Users` and `Machine` wait; `SingleUser` never reaches this — it expects no frame). It must
+/// be `Login` (identity credentials → `authenticate` + `mint` → `LoggedIn`) or `Attach` (an
+/// access token, or on `Machine` the promotion secret). Anything else is the same opaque
+/// failure. Returns the established identity.
 async fn handshake_frame(
     reader: &mut WsReader,
     writer: &mut WsWriter,
     state: &ServeState,
-    deadline: HandshakeDeadline,
 ) -> Option<ConnIdentity> {
-    let frame = match deadline {
-        HandshakeDeadline::Yes => {
-            match tokio::time::timeout(state.auth.handshake_deadline, reader.next()).await {
-                Err(_) => {
-                    eprintln!("serve: handshake deadline exceeded; closing");
-                    send_msg(
-                        writer,
-                        &ServerMessage::Error {
-                            message: AUTH_FAILED.to_string(),
-                        },
-                    )
-                    .await
-                    .ok();
-                    return None;
-                }
-                Ok(frame) => frame,
-            }
+    let frame = match tokio::time::timeout(state.auth.handshake_deadline, reader.next()).await {
+        Err(_) => {
+            eprintln!("serve: handshake deadline exceeded; closing");
+            send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: AUTH_FAILED.to_string(),
+                },
+            )
+            .await
+            .ok();
+            return None;
         }
-        HandshakeDeadline::None => reader.next().await,
+        Ok(frame) => frame,
     };
     let text = match frame {
         Some(Ok(Message::Text(t))) => t,

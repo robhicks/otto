@@ -756,8 +756,9 @@ principal — a pre-resolved header skips the *deadline*, not the greeting. `han
 2. Await the first frame under a **10-second deadline** (`tokio::time::timeout`). Nothing else is
    read, no session is resolved, and no store call is made until this succeeds — an unauthenticated
    socket costs one task and one timer. (`SingleUser` skips this step — no deadline, no frame, the
-   connection is bound to `UserId::local()` and proceeds straight to `Ready`. `Machine` also skips
-   the deadline; its credential is the header or an `Attach`-with-promotion-secret frame, §6.5.)
+   connection is bound to `UserId::local()` and proceeds straight to `Ready`. `Machine` waits
+   under the same deadline; its credential is the header or an `Attach`-with-promotion-secret
+   frame, §6.5.)
 3. The frame must be `Login` or `Attach`. `Login` runs the `Authenticator` and mints a pair;
    `Attach` verifies an existing access token (or, on a `Machine` server, the promotion secret).
    Success sends `LoggedIn` (for `Login`) and binds the principal to the connection. Failure sends
@@ -886,7 +887,7 @@ code, so both are testable — otherwise two security-relevant guards ship with 
 | `Attach` sent to a `SingleUser` server | Rejected as not-applicable (no tokens exist in the mode). |
 | `Attach` sent to a `Machine` server | **Accepted** — carries the promotion secret (§6.5), the one frame the mode exists to receive. The client was told the mode by `Hello`. |
 | `Attach` without `?session=` on a `Machine` server | Rejected — a receiver creates no sessions, so there is no owner to adopt (§7.2 step 4). |
-| No auth frame within the 10s deadline (`Users` only) | `Error`, close. No session, no store write. (`SingleUser`/`Machine` have no deadline — §7.2.) |
+| No auth frame within the 10s deadline (`Users` and `Machine`) | `Error`, close. No session, no store write. (`SingleUser` expects no frame, so it has no deadline — §7.2.) |
 
 ---
 

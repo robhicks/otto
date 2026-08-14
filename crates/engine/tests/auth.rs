@@ -945,6 +945,33 @@ async fn machine_wrong_secret_is_the_opaque_error() {
     );
 }
 
+/// Finding 4: a `Machine` receiver waits under the same injectable handshake deadline as
+/// `Users`. A connection that sends neither a promotion-secret header nor an `Attach` frame
+/// gets the opaque error and is closed — it cannot hold an idle socket open forever on a
+/// network-reachable receiver.
+#[tokio::test]
+async fn machine_handshake_has_a_deadline() {
+    let (port, dir) = start_machine().await;
+    let mut ws = connect(request(port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "machine");
+
+    // Send nothing: the deadline expires, the opaque Error arrives, the server closes, and no
+    // session is created.
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after the machine handshake deadline"
+    );
+    assert_eq!(
+        session_count(&dir).await,
+        0,
+        "a timed-out machine handshake must create no session"
+    );
+}
+
 /// The promotion secret via the frame `Attach` reaches `Ready` on a `Machine` receiver — the
 /// header-less path (§7.2). The receiver adopts an existing session (it creates none).
 #[tokio::test]
