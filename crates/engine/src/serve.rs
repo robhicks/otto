@@ -1391,10 +1391,34 @@ async fn handle_handover(
     // Vps demote: pull the session's current bundle back off the receiver and restore it into THIS
     // (source) engine, overwriting our own stale copy. Symmetric inverse of the promote push. The
     // client reconnects to us (the session is local again), so we report our own public ws base.
+    // The pull is authorized by the session's per-session secret, which lives in the stored handle
+    // (spec §1.3): the machine-wide pusher token is not a session credential and cannot export.
     if !to_remote {
-        if let otto_remote::PromoteMode::Vps { endpoint } = &cfg.mode {
-            let target = otto_remote::VpsTarget::new(endpoint.clone(), cfg.token.clone());
-            let bundle = match target.export(session).await {
+        if let otto_remote::PromoteMode::Vps { .. } = &cfg.mode {
+            // Source the live endpoint+secret from the handle a prior promote stored under
+            // (session, true). No handle ⟹ nothing to pull from. Take the lock only to clone the
+            // endpoint/secret, releasing it at the `;` before any await.
+            let live = state
+                .remotes
+                .lock()
+                .unwrap()
+                .get(&(session, true))
+                .map(|h| (h.endpoint.clone(), h.token.clone()));
+            let Some((endpoint, secret)) = live else {
+                let _ = send_msg(
+                    writer,
+                    &ServerMessage::Error {
+                        message: "no active vps handover for this session; promote first"
+                            .to_string(),
+                    },
+                )
+                .await;
+                return;
+            };
+
+            // Pull the current bundle off the receiver with the stored session secret. On failure,
+            // leave the remote session in place (a transient pull error must not lose it).
+            let bundle = match otto_remote::export_bundle(&endpoint, &secret, session).await {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = send_msg(
@@ -1419,6 +1443,7 @@ async fn handle_handover(
                 let _ = send_msg(writer, &ServerMessage::Error { message: msg }).await;
                 return;
             }
+            state.remotes.lock().unwrap().remove(&(session, true));
             match &state.public_ws_base {
                 Some(base) => {
                     let _ = send_msg(

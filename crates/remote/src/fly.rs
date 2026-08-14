@@ -30,11 +30,6 @@ pub struct FlyConfig {
     pub public_base_override: Option<String>,
 }
 
-/// A fresh 32-hex per-session bearer token. Blast radius of a leak is one ephemeral session.
-pub(crate) fn mint_token() -> String {
-    Uuid::new_v4().simple().to_string()
-}
-
 /// A globally-unique, DNS-safe Fly app name: `{prefix}-{12 hex}`.
 pub(crate) fn gen_app_name(prefix: &str) -> String {
     let suffix: String = Uuid::new_v4()
@@ -235,7 +230,7 @@ impl crate::RemoteTarget for FlyTarget {
         &self,
         bundle: &crate::PromoteBundle,
     ) -> anyhow::Result<crate::RemoteHandle> {
-        let token = mint_token();
+        let token = crate::mint_session_secret();
         let app = gen_app_name(&self.cfg.app_prefix);
 
         // Everything after create_app must clean up on failure so a half-provisioned app is never
@@ -246,7 +241,10 @@ impl crate::RemoteTarget for FlyTarget {
             self.api.allocate_shared_ip(&app).await?;
             self.api.create_machine(&app, &self.cfg, &token).await?;
             self.api.wait_ready(&app, self.cfg.boot_timeout).await?;
-            crate::push_promote_bundle(&endpoint, &token, bundle).await?;
+            // One session per machine: the machine's own secret IS the session secret (spec A3) —
+            // the minted token is injected as OTTO_PROMOTION_SECRET and rides the same value in the
+            // X-Otto-Session-Secret header.
+            crate::push_promote_bundle(&endpoint, &token, &token, bundle).await?;
             Ok::<(), anyhow::Error>(())
         };
         if let Err(e) = run.await {
@@ -268,7 +266,7 @@ impl crate::RemoteTarget for FlyTarget {
 mod tests {
     use super::*;
     use crate::RemoteTarget;
-    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::matchers::{header, header_exists, header_regex, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_cfg() -> FlyConfig {
@@ -354,14 +352,6 @@ mod tests {
             "{name}"
         );
         assert_ne!(gen_app_name("otto-session"), gen_app_name("otto-session"));
-    }
-
-    #[test]
-    fn mint_token_is_unique_hex() {
-        let t = mint_token();
-        assert_eq!(t.len(), 32, "{t}");
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "{t}");
-        assert_ne!(mint_token(), mint_token());
     }
 
     fn cfg_for(server: &MockServer) -> FlyConfig {
@@ -526,6 +516,11 @@ mod tests {
             .await; // readiness
         Mock::given(method("POST"))
             .and(path("/promote"))
+            // The per-session secret is minted inside `provision`, so presence + 32-hex shape is
+            // all a pre-mounted matcher can assert; equality is covered by the env-injection test
+            // and `handle.token.len() == 32` (env and header share the same mint).
+            .and(header_exists("x-otto-session-secret"))
+            .and(header_regex("x-otto-session-secret", "^[0-9a-f]{32}$"))
             .respond_with(ResponseTemplate::new(200))
             .mount(server)
             .await;

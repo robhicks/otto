@@ -26,6 +26,14 @@ use otto_engine_core::traits::Workspace;
 use otto_engine_core::types::WorkspaceSnapshot;
 use otto_persistence::{SessionState, SessionStore};
 use otto_protocol::SessionId;
+use uuid::Uuid;
+
+/// A fresh 32-hex opaque per-session credential. Blast radius of a leak is one promoted session.
+/// The single mint shared by every `RemoteTarget` (vps/fly/microvm/loopback); delivered to the
+/// receiver over the provisioning channel and reported to the client as `Promoted.token`.
+pub fn mint_session_secret() -> String {
+    Uuid::new_v4().simple().to_string()
+}
 
 /// Enables session handover on a served engine. `token` is the bearer the target requires (reused
 /// from the source, by design); `mode` selects which `RemoteTarget` a handover provisions onto.
@@ -204,7 +212,8 @@ impl RemoteTarget for MicrovmTarget {
         // (in-process serve or microVM) is torn down — never leaked.
         let machine = self.provisioner.provision().await?;
         let handle = RemoteHandle::with_task(machine.endpoint, machine.token, machine.task);
-        push_promote_bundle(&handle.endpoint, &handle.token, bundle).await?;
+        // One session per machine: the machine's own secret IS the session secret (spec A3).
+        push_promote_bundle(&handle.endpoint, &handle.token, &handle.token, bundle).await?;
         Ok(handle)
     }
 
@@ -234,18 +243,22 @@ pub(crate) fn http_base(endpoint: &str) -> String {
     }
 }
 
-/// POST a serialized `PromoteBundle` to `{http_base(endpoint)}/promote` with `Bearer token`. On a
-/// non-2xx, bail with the receiver's status + body (operator diagnostics). Shared by `VpsTarget`
-/// and `MicrovmTarget` so both use the identical gated restore-push.
+/// POST a serialized `PromoteBundle` to `{http_base(endpoint)}/promote` with `Bearer bearer`. The
+/// receiver's machine-wide admission secret is the bearer; the fresh per-session secret rides the
+/// `X-Otto-Session-Secret` header, where the receiver records it for `/export`/WS attach. On a
+/// non-2xx, bail with the receiver's status + body (operator diagnostics). Shared by `VpsTarget`,
+/// `MicrovmTarget`, and `FlyTarget` so all three use the identical gated restore-push.
 pub(crate) async fn push_promote_bundle(
     endpoint: &str,
-    token: &str,
+    bearer: &str,
+    session_secret: &str,
     bundle: &PromoteBundle,
 ) -> anyhow::Result<()> {
     let url = format!("{}/promote", http_base(endpoint));
     let resp = build_promote_client()
         .post(&url)
-        .bearer_auth(token)
+        .bearer_auth(bearer)
+        .header("X-Otto-Session-Secret", session_secret)
         .json(bundle)
         .send()
         .await?;
@@ -259,8 +272,8 @@ pub(crate) async fn push_promote_bundle(
 
 /// POST a session id to `{http_base(endpoint)}/export` with `Bearer token` and deserialize the
 /// returned `PromoteBundle` (the demote pull). On a non-2xx, bail with the receiver's status +
-/// body (operator diagnostics). Shared by `VpsTarget::export` (vps demote) and the microVM demote
-/// pull (whose endpoint comes from the live `RemoteHandle`, not a static config).
+/// body (operator diagnostics). Shared by the vps, microVM, and fly demote pulls, whose endpoint +
+/// secret both come from the live stored `RemoteHandle` (not a static config).
 pub async fn export_bundle(
     endpoint: &str,
     token: &str,
@@ -291,27 +304,24 @@ pub struct VpsTarget {
 }
 
 impl VpsTarget {
-    /// `endpoint` is the receiver's `ws://`/`wss://` base; `token` is its bearer (reused from the
-    /// source, by design — source and receiver share a trust domain in v1).
+    /// `endpoint` is the receiver's `ws://`/`wss://` base; `token` is the machine-wide pusher
+    /// credential (the receiver's admission secret, reused from the source by design — source and
+    /// receiver share a trust domain in v1). The per-session secret a `provision` mints is carried
+    /// in the returned `RemoteHandle`, not here.
     pub fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             token: token.into(),
         }
     }
-
-    /// Pull a session's `PromoteBundle` back from the receiver (the demote primitive). Delegates to
-    /// the shared `export_bundle` so vps and microVM demote use the identical gated pull.
-    pub async fn export(&self, session: SessionId) -> anyhow::Result<PromoteBundle> {
-        export_bundle(&self.endpoint, &self.token, session).await
-    }
 }
 
 #[async_trait]
 impl RemoteTarget for VpsTarget {
     async fn provision(&self, bundle: &PromoteBundle) -> anyhow::Result<RemoteHandle> {
-        push_promote_bundle(&self.endpoint, &self.token, bundle).await?;
-        Ok(RemoteHandle::new(self.endpoint.clone(), self.token.clone()))
+        let secret = mint_session_secret();
+        push_promote_bundle(&self.endpoint, &self.token, &secret, bundle).await?;
+        Ok(RemoteHandle::new(self.endpoint.clone(), secret))
     }
 
     async fn teardown(&self, _handle: RemoteHandle) -> anyhow::Result<()> {
@@ -324,6 +334,14 @@ impl RemoteTarget for VpsTarget {
 mod tests {
     use super::*;
     use otto_persistence::SessionStatus;
+
+    #[test]
+    fn mint_session_secret_is_32_hex_and_unique() {
+        let s = mint_session_secret();
+        assert_eq!(s.len(), 32, "{s}");
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()), "{s}");
+        assert_ne!(mint_session_secret(), mint_session_secret());
+    }
 
     #[tokio::test]
     async fn unsupported_provisioner_refuses() {
