@@ -62,7 +62,8 @@ cargo build --release -p otto-engine
 Runtime requirements: the sandbox behind `otto run` needs `bwrap` on Linux (`sandbox-exec` on
 macOS); `otto serve` defaults to `AuthMode::Users`, so enroll a principal with
 `otto auth enroll <user>` before serving. The `OTTO_PROMOTION_SECRET` promotion secret is needed
-only when a `--promote-*`/`--promotion-receiver` flag is set. See "How it works" below.
+only when a `--promote-*`/`--accept-promotions`/`--promotion-receiver` flag is set. See "How it
+works" below.
 
 ## Quick start
 
