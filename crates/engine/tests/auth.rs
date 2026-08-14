@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use otto_auth::testing::FakeAuthenticator;
 use otto_engine::{
-    EngineService, build_default_registry, build_tool_registry, serve_app, serve_run,
+    EngineService, build_default_registry, build_tool_registry, build_tool_registry_approving,
+    serve_app, serve_run,
 };
 use otto_engine_core::auth::{AuthConfig, AuthError, Authenticator, Principal, TokenPair};
 use otto_engine_core::traits::Workspace;
@@ -50,6 +51,16 @@ fn test_capabilities() -> otto_protocol::CapabilitiesManifest {
 /// An `EngineService` over a fresh tempdir store + workspace. The store lives at the conventional
 /// `s.db` path inside `dir`, which the store-inspection helpers re-open.
 async fn build_service(dir: &tempfile::TempDir) -> EngineService {
+    build_service_inner(dir, false).await
+}
+
+/// An `EngineService` whose `fs.write` is gated `Ask` (interactive approval mode), so a turn
+/// whose Coder proposes edits parks on the approver until an `ApproveDiff` (or disconnect).
+async fn build_service_approving(dir: &tempfile::TempDir) -> EngineService {
+    build_service_inner(dir, true).await
+}
+
+async fn build_service_inner(dir: &tempfile::TempDir, approving: bool) -> EngineService {
     let provider = ScriptedProvider::new("{}")
         .on(
             "edits",
@@ -60,7 +71,14 @@ async fn build_service(dir: &tempfile::TempDir) -> EngineService {
         Arc::new(SingleProviderRouter::new(Arc::new(provider)));
     let workspace: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
     let tools_ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(dir.path()));
-    let tools = Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()));
+    let tools = if approving {
+        Arc::new(build_tool_registry_approving(
+            tools_ws,
+            dir.path().to_path_buf(),
+        ))
+    } else {
+        Arc::new(build_tool_registry(tools_ws, dir.path().to_path_buf()))
+    };
     let store: Arc<dyn otto_persistence::SessionStore> = Arc::new(
         otto_persistence::SqliteStore::open(dir.path().join("s.db"))
             .await
@@ -136,6 +154,23 @@ async fn start_users_with(
     let app = serve_app(service, auth, test_capabilities(), None, false);
     let port = serve(app).await;
     (port, dir)
+}
+
+/// A `Users`-mode server whose tool gate asks for approval on `fs.write` (the interactive
+/// approver parks the turn), so a test can drive in-turn commands while a turn is in flight.
+async fn start_users_approving() -> UsersServer {
+    let dir = tempfile::tempdir().unwrap();
+    let service = build_service_approving(&dir).await;
+    let fake = Arc::new(FakeAuthenticator::new(alice()));
+    let auth = AuthConfig {
+        mode: otto_protocol::AuthMode::Users,
+        authenticator: Some(Arc::clone(&fake) as Arc<dyn otto_engine_core::Authenticator>),
+        promotion_secret: None,
+        handshake_deadline: HANDSHAKE_DEADLINE,
+    };
+    let app = serve_app(service, auth, test_capabilities(), None, false);
+    let port = serve(app).await;
+    UsersServer { port, dir, fake }
 }
 
 async fn start_single_user() -> (u16, tempfile::TempDir) {
@@ -698,5 +733,261 @@ async fn machine_rejects_session_creation() {
         session_count(&dir).await,
         0,
         "a Machine receiver must not create sessions"
+    );
+}
+
+/// §7.2's per-command re-verification: a token revoked after the handshake is rejected on the
+/// next command. The `SendPrompt` gets the opaque error and is NOT dispatched (no session event
+/// frame), and the connection stays open — a subsequent `Refresh` round-trips a fresh pair.
+#[tokio::test]
+async fn per_command_reverification_rejects_a_revoked_token() {
+    let server = start_users().await;
+    let mut ws = connect(request(server.port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let logged_in = login(&mut ws).await;
+    let access_token = logged_in["access_token"].as_str().unwrap().to_string();
+    let refresh_token = logged_in["refresh_token"].as_str().unwrap().to_string();
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = otto_protocol::SessionId(
+        uuid::Uuid::parse_str(ready["session"].as_str().unwrap()).unwrap(),
+    );
+
+    // Revoke the token while the connection is live, then try to run a turn.
+    server.fake.logout(&access_token).await.unwrap();
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::SendPrompt {
+            session,
+            text: "add a greeting".into(),
+        },
+    )
+    .await;
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+
+    // The command is not dispatched, and the socket is NOT closed by the re-verify failure: a
+    // `Refresh` (which rides ahead of the re-verify) rotates to a fresh pair, proving the
+    // connection survived to recover. No event frame may arrive before that `LoggedIn`.
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Refresh {
+            refresh_token: refresh_token.clone(),
+        },
+    )
+    .await;
+    loop {
+        let frame = next_json(&mut ws).await;
+        assert_ne!(
+            frame["type"], "event",
+            "a revoked-token SendPrompt must not be dispatched"
+        );
+        if frame["type"] == "logged_in" {
+            assert_ne!(
+                frame["access_token"].as_str().unwrap(),
+                access_token,
+                "refresh must rotate the access token"
+            );
+            break;
+        }
+    }
+}
+
+/// `Refresh` → `LoggedIn` round-trips on the wire: a fresh pair arrives with DIFFERENT access and
+/// refresh tokens, and the connection is re-bound to the new access token (a subsequent command
+/// is accepted). The fake's `rotate_refresh` consumes the old refresh token but leaves the old
+/// access token verifying, so the rebind is proven by the new token working, not the old one
+/// failing.
+#[tokio::test]
+async fn refresh_rotates_and_rebinds() {
+    let server = start_users().await;
+    let mut ws = connect(request(server.port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let logged_in = login(&mut ws).await;
+    let access_token = logged_in["access_token"].as_str().unwrap().to_string();
+    let refresh_token = logged_in["refresh_token"].as_str().unwrap().to_string();
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = otto_protocol::SessionId(
+        uuid::Uuid::parse_str(ready["session"].as_str().unwrap()).unwrap(),
+    );
+
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Refresh {
+            refresh_token: refresh_token.clone(),
+        },
+    )
+    .await;
+    let refreshed = next_json(&mut ws).await;
+    assert_eq!(refreshed["type"], "logged_in");
+    let new_access = refreshed["access_token"].as_str().unwrap().to_string();
+    let new_refresh = refreshed["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(
+        new_access, access_token,
+        "refresh must rotate the access token"
+    );
+    assert_ne!(
+        new_refresh, refresh_token,
+        "refresh must rotate the refresh token"
+    );
+
+    // The connection is now bound to the rotated token: a SendPrompt on it is accepted and runs
+    // to completion (the re-verify uses the new token, so an accepted turn proves the rebind).
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::SendPrompt {
+            session,
+            text: "add a greeting".into(),
+        },
+    )
+    .await;
+    let mut saw_turn_complete = false;
+    while let Some(frame) = next_json_opt(&mut ws).await {
+        if frame["type"] == "event" && frame["event"]["kind"].get("TurnComplete").is_some() {
+            saw_turn_complete = true;
+            break;
+        }
+        assert_ne!(
+            frame["type"], "error",
+            "a command on the rotated token must be accepted: {frame}"
+        );
+    }
+    assert!(
+        saw_turn_complete,
+        "a SendPrompt on the rotated token must run to TurnComplete"
+    );
+}
+
+/// A wrong promotion secret on a `Machine` receiver is the single opaque error (A11), then the
+/// connection closes — no cause-specific detail leaks.
+#[tokio::test]
+async fn machine_wrong_secret_is_the_opaque_error() {
+    let (port, _dir) = start_machine().await;
+    let mut ws = connect(request(port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "machine");
+
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Attach {
+            token: "wrong-secret".into(),
+        },
+    )
+    .await;
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after a failed machine attach"
+    );
+}
+
+/// The promotion secret via the frame `Attach` reaches `Ready` on a `Machine` receiver — the
+/// header-less path (§7.2). The receiver adopts an existing session (it creates none).
+#[tokio::test]
+async fn machine_attach_with_the_promotion_secret_reaches_ready() {
+    let (port, dir) = start_machine().await;
+    let store = otto_persistence::SqliteStore::open(store_path(&dir))
+        .await
+        .unwrap();
+    let session =
+        otto_persistence::SessionStore::create_session(&store, &alice(), "promoted", &json!({}))
+            .await
+            .unwrap();
+
+    let mut ws = connect(request(port, &format!("?session={}", session.0))).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "machine");
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Attach {
+            token: SECRET.into(),
+        },
+    )
+    .await;
+    // Attach sends no LoggedIn on Machine; the next frame is Ready.
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    assert_eq!(ready["session"].as_str().unwrap(), session.0.to_string());
+    assert_eq!(
+        session_count(&dir).await,
+        1,
+        "a machine attach must not create a session"
+    );
+}
+
+/// §7.2's re-verification covers the frames `run_turn_loop` consumes mid-turn, not just the main
+/// loop's dispatch: a revoked token cannot approve a gated edit. The approval-mode registry
+/// parks the turn on an `fs.write` `Ask`, so the `ApproveDiff` arrives while the turn is
+/// definitively in flight; the re-verify failure aborts the turn and closes the socket.
+#[tokio::test]
+async fn revoked_token_cannot_approve_mid_turn() {
+    let server = start_users_approving().await;
+    let mut ws = connect(request(server.port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let logged_in = login(&mut ws).await;
+    let access_token = logged_in["access_token"].as_str().unwrap().to_string();
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+    let session = otto_protocol::SessionId(
+        uuid::Uuid::parse_str(ready["session"].as_str().unwrap()).unwrap(),
+    );
+
+    // Start a turn whose Coder edit asks for approval; it parks on the gated write. Any event
+    // frame proves the turn started (and the socket reader is consuming in-turn frames).
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::SendPrompt {
+            session,
+            text: "add a greeting".into(),
+        },
+    )
+    .await;
+    loop {
+        let frame = next_json(&mut ws).await;
+        if frame["type"] == "event" {
+            break;
+        }
+    }
+
+    // Revoke the token mid-turn: the next in-turn command must fail closed rather than approving
+    // the parked edit. Pre-approval events may still stream before the ApproveDiff is processed;
+    // the failure then aborts the turn and closes the socket.
+    server.fake.logout(&access_token).await.unwrap();
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::ApproveDiff {
+            session,
+            id: uuid::Uuid::new_v4(),
+            approved: true,
+        },
+    )
+    .await;
+
+    loop {
+        let frame = next_json(&mut ws).await;
+        match frame["type"].as_str() {
+            Some("error") => {
+                assert_eq!(frame["message"], "authentication failed");
+                break;
+            }
+            Some("event") => {
+                assert!(
+                    frame["event"]["kind"].get("FileEdit").is_none(),
+                    "the parked edit must not be applied: {frame}"
+                );
+            }
+            other => panic!("unexpected frame type after mid-turn auth failure: {other:?}"),
+        }
+    }
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "the connection must close after the mid-turn auth failure (aborting the turn)"
     );
 }

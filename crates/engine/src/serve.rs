@@ -511,6 +511,10 @@ enum TurnLoopOutcome {
     /// An explicit `Abort` or a disconnect ended things — the caller must stop reading frames
     /// entirely.
     StopOuterLoop,
+    /// The access token failed its per-command re-verification on an in-turn command (`Users`
+    /// mode; §7.2). The in-flight turn was aborted; the caller sends the opaque `AUTH_FAILED`
+    /// error and must stop reading frames entirely.
+    AuthFailed,
 }
 
 /// Report a turn's `TurnLoopOutcome` on the socket (an error frame, or nothing on success) and
@@ -530,13 +534,48 @@ async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) ->
         }
         TurnLoopOutcome::Finished(None) => false,
         TurnLoopOutcome::StopOuterLoop => true,
+        TurnLoopOutcome::AuthFailed => {
+            let _ = send_msg(
+                writer,
+                &ServerMessage::Error {
+                    message: AUTH_FAILED.to_string(),
+                },
+            )
+            .await;
+            true
+        }
+    }
+}
+
+/// Re-verify the connection's access token for `Users` mode (§7.2): the token is checked on
+/// every command, not only at the handshake. Non-`Users` modes have no per-command token to
+/// check (`SingleUser` holds no credential, `Machine` is secret-authenticated) and always pass.
+/// Returns `false` when re-verification fails — the token is revoked/expired, or a `Users`
+/// server somehow has no authenticator (fail closed).
+async fn re_verify_access_token(state: &ServeState, access_token: Option<&str>) -> bool {
+    if state.auth.mode != AuthMode::Users {
+        return true;
+    }
+    let Some(token) = access_token else {
+        return false;
+    };
+    match state.authenticator() {
+        Some(authenticator) => authenticator.verify_access(token).await.is_ok(),
+        None => false,
     }
 }
 
 /// Drive `turn` to completion while concurrently reading inbound frames for
 /// `ApproveDiff`/`Pause`/`Resume`/`Abort`. Shared by every command that starts a turn
 /// (`SendPrompt`, `RunCommand`) so their concurrency behavior can never drift apart. `owner` is
-/// the connection-scoped principal (A9): the in-flight `Abort` acts for it.
+/// the connection-scoped principal (A9): the in-flight `Abort` acts for it. `access_token` is
+/// the connection's bearer (`None` outside `Users`); it is re-verified on every in-turn command
+/// (§7.2), so a revoked/expired token can neither approve a gated edit nor issue in-turn
+/// controls until the turn ends — a failure aborts the turn and returns `AuthFailed`.
+// The per-command re-verification (Finding I2) pushed this past clippy's 7-argument threshold.
+// Folding `owner`+`access_token` into a struct would split the connection's `ConnIdentity` from
+// the resolved (Machine-adopted) session owner — a worse signature than a long one.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_loop(
     turn: impl std::future::Future<Output = anyhow::Result<TurnOutcome>>,
     reader: &mut WsReader,
@@ -545,6 +584,7 @@ async fn run_turn_loop(
     state: &ServeState,
     session: SessionId,
     owner: &UserId,
+    access_token: Option<&str>,
 ) -> TurnLoopOutcome {
     tokio::pin!(turn);
     loop {
@@ -559,17 +599,31 @@ async fn run_turn_loop(
             }
             inbound = reader.next() => match inbound {
                 Some(Ok(Message::Text(t))) => {
-                    match serde_json::from_str::<Command>(t.as_str()) {
-                        Ok(Command::ApproveDiff { id, approved, .. }) => {
+                    let Ok(command) = serde_json::from_str::<Command>(t.as_str()) else {
+                        // A malformed frame mid-turn is ignored (as before).
+                        continue;
+                    };
+                    // §7.2: the access token is re-verified on every in-turn command, not only
+                    // at the main loop's dispatch — a revoked/expired token must not approve a
+                    // gated edit or issue in-turn controls while a turn is in flight.
+                    if !re_verify_access_token(state, access_token).await {
+                        eprintln!("serve: per-command access-token re-verification failed mid-turn");
+                        let _ = state.service.abort(owner, session).await;
+                        approvals.clear();
+                        pause_state.resume_all();
+                        return TurnLoopOutcome::AuthFailed;
+                    }
+                    match command {
+                        Command::ApproveDiff { id, approved, .. } => {
                             approvals.resolve(id, approved);
                         }
-                        Ok(Command::Pause { .. }) => {
+                        Command::Pause { .. } => {
                             pause_state.pause();
                         }
-                        Ok(Command::Resume { .. }) => {
+                        Command::Resume { .. } => {
                             pause_state.resume_all();
                         }
-                        Ok(Command::Abort { .. }) => {
+                        Command::Abort { .. } => {
                             let _ = state.service.abort(owner, session).await;
                             approvals.clear();
                             pause_state.resume_all();
@@ -941,33 +995,25 @@ async fn handle_socket(
         // A `Users` connection re-verifies its access token on every non-auth command: a
         // long-lived socket must not outlive the token's expiry or its denylisting (§7.2).
         // `Refresh` rides ahead (it needs no access token) and `Logout` revokes the one we hold.
-        if state.auth.mode == AuthMode::Users
-            && let Some(token) = &identity.access_token
-            && !matches!(
-                &command,
-                Command::Login { .. }
-                    | Command::Attach { .. }
-                    | Command::Refresh { .. }
-                    | Command::Logout
-            )
+        if !matches!(
+            &command,
+            Command::Login { .. }
+                | Command::Attach { .. }
+                | Command::Refresh { .. }
+                | Command::Logout
+        ) && !re_verify_access_token(&state, identity.access_token.as_deref()).await
         {
-            let re_ok = match state.authenticator() {
-                Some(authenticator) => authenticator.verify_access(token).await.is_ok(),
-                None => false,
-            };
-            if !re_ok {
-                eprintln!("serve: per-command access-token re-verification failed");
-                let _ = send_msg(
-                    &mut writer,
-                    &ServerMessage::Error {
-                        message: AUTH_FAILED.to_string(),
-                    },
-                )
-                .await;
-                // The connection stays open so the client can `Refresh` (§8); the command is not
-                // dispatched.
-                continue;
-            }
+            eprintln!("serve: per-command access-token re-verification failed");
+            let _ = send_msg(
+                &mut writer,
+                &ServerMessage::Error {
+                    message: AUTH_FAILED.to_string(),
+                },
+            )
+            .await;
+            // The connection stays open so the client can `Refresh` (§8); the command is not
+            // dispatched.
+            continue;
         }
         match command {
             Command::SendPrompt { text, .. } => {
@@ -997,6 +1043,7 @@ async fn handle_socket(
                         &state,
                         session,
                         &owner,
+                        identity.access_token.as_deref(),
                     )
                     .await
                 }; // `sink` dropped here → `writer` is free again
@@ -1058,6 +1105,7 @@ async fn handle_socket(
                         &state,
                         session,
                         &owner,
+                        identity.access_token.as_deref(),
                     )
                     .await
                 }; // `sink` dropped here → `writer` is free again
