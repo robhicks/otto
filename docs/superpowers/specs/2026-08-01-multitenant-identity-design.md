@@ -146,9 +146,12 @@ hole issue #115 opens with.
 - Principal resolution on every `serve.rs` route, including a post-upgrade WS authentication
   handshake that replaces the `?token=` query parameter.
 - `Command::Login`/`Attach`/`Refresh`/`Logout` and `ServerMessage::LoggedIn`/`LoggedOut`.
-- Ownership checks on session **attach** (`resolve_session`'s explicit `?session=` arm), and on
-  `POST /promote` / `POST /export`. Replay, abort, and the WS handover commands already shipped in
-  slice 1a — do not re-implement them.
+- Ownership checks on session **attach** (`resolve_session`'s explicit `?session=` arm). Replay,
+  abort, the WS handover commands, and the `POST /promote` / `POST /export` machine credential all
+  already shipped in slice 1a — do not re-implement them, and do **not** add an owner check to
+  `/promote`/`/export`: those routes are machine-credentialed with no connected principal, and the
+  user-facing ownership check for handover lives on the source's WS command loop where a principal
+  exists (see §7.1's tautology warning and §7.3's per-mode table).
 - `otto auth enroll <user>` — the out-of-band bootstrap that provisions the first principal.
 - `otto serve --single-user` — the loopback-only, unauthenticated single-principal mode the desktop
   sidecar runs in (§6.5), plus the two `ui-dioxus/` line changes that keep the shipped desktop app
@@ -228,14 +231,14 @@ Every choice made without asking, with its rationale.
 > call sites with the same bypass-by-construction shape (attach, `POST /promote`, `POST /export`).
 > **Decision: the full typed `SessionRef` refactor stays out of scope, but the cheap half of the
 > recommendation is taken** — `resolve_session` now returns `(SessionId, UserId)` and `handle_socket`
-> threads one connection-scoped principal through the loop (replacing the seven hard-coded
-> `UserId::local()` constructions at serve.rs:519/576/637/656/680/696/722/1098). That removes the
-> "ambient authority constructed at every call site" failure mode; the residual convention-held
-> invariant is the three new RPCs (`attach`, `POST /promote`, `POST /export`), each a single
-> `authorize_session` call documented the same way the handover arm's is.
+> threads one connection-scoped principal through the loop (replacing the hard-coded
+> `UserId::local()` constructions at serve.rs:519, :576, :637, :656, :680, :696, :722, :1098). That
+> removes the "ambient authority constructed at every call site" failure mode; the residual
+> convention-held invariant is the three new RPCs (`attach`, `POST /promote`, `POST /export`), each a
+> single `authorize_session` call documented the same way the handover arm's is.
 | A10 | ~~`CapabilitiesManifest` gains `auth_required: bool`.~~ **Withdrawn** — replaced by a pre-auth `ServerMessage::Hello { auth_mode }` frame (§3.5). | The manifest rides only on `Ready`, which §7.2 sends *after* authentication, so the flag would have been unreadable at the one moment a client needs it. A dedicated pre-auth frame also gives `SingleUser`/`Machine` clients a defined greeting, which the field could not. |
 | A11 | Failed authentication returns one opaque message (`"authentication failed"`) to the client regardless of cause; the specific reason is logged server-side only. | An error distinguishing "unknown user" from "bad code" from "locked out" is an enumeration oracle. |
-| A12 | A **`--single-user` mode** is added, and the desktop sidecar uses it, rather than accepting a dead UI between slices. | Without it slice 1 ships a broken application: `ui-dioxus/src/desktop_boot.rs:130` mints a secret and `:219` passes it as `OTTO_TOKEN`, `ui-dioxus/src/net/url.rs:19` appends `?token=`, and both stop working here while the login UI is slice 2 — so the client *cannot* be rebuilt in lockstep, which is the precondition Decision 3's "clean break" relies on. Forcing TOTP on a locally-spawned loopback sidecar is also absurd UX. See §6.5 for why this is not the admin bypass Decision 3 rejects. |
+| A12 | A **`--single-user` mode** is added, and the desktop sidecar uses it, rather than accepting a dead UI between slices. | Without it slice 1 ships a broken application: `ui-dioxus/src/desktop_boot.rs:151` mints a secret and `:241` passes it as `OTTO_TOKEN`, `ui-dioxus/src/net/url.rs:19` appends `?token=`, and both stop working here while the login UI is slice 2 — so the client *cannot* be rebuilt in lockstep, which is the precondition Decision 3's "clean break" relies on. Forcing TOTP on a locally-spawned loopback sidecar is also absurd UX. See §6.5 for why this is not the admin bypass Decision 3 rejects. |
 | A13 | `/workspace` accepts a **user access token**, and `RemoteWorkspace` is **source/client-side only** — a promoted machine is never handed a user JWT. | Decision 4: a promoted machine that can verify user JWTs becomes a credential-harvesting oracle against the source. `RemoteWorkspace` has no production construction site today (only `crates/engine/tests/{promote,remote_workspace,vps_promote}.rs`), so this costs nothing now — but it is the constraint slice 3 must honor when it wires promoted machines, and stating it here is what stops the plan encoding the opposite. |
 
 ---
@@ -578,7 +581,7 @@ image's injected env becomes `OTTO_PROMOTION_SECRET` at `crates/remote/src/fly.r
 (`create_machine_body`'s `env` map) — that and the Dockerfile comment at `deploy/fly/Dockerfile:51-52`
 move together, or the promoted machine will not start. The Dockerfile `CMD` at `:57` gains
 `--promotion-receiver`. There is **no** `OTTO_TOKEN` `ENV` line in the Dockerfile to rename (the `ENV`
-at `:53` sets port/root/host/ui-dir) — open issue 5's correction.
+at `:54` sets port/root/host/ui-dir) — open issue 5's correction.
 
 ### 6.5 The three authentication modes
 
@@ -729,8 +732,10 @@ principal — a pre-resolved header skips the *deadline*, not the greeting. `han
 4. Only now is `resolve_session` called. It returns `(SessionId, UserId)` (the connection-scoped
    principal threaded through the loop, per A9's resolution) and is ownership-checked: an explicit
    `?session=` that the principal does not own fails exactly as a nonexistent one does. `None`
-   creates a session owned by the principal. On a `Machine` server the principal is the attached
-   session's own owner (§6.5).
+   creates a session owned by the principal — **except on a `Machine` server**, which rejects
+   session creation outright (a receiver hosts sessions promoted onto it; creation happens on the
+   source). On a `Machine` server the principal is the attached session's own owner (§6.5), so an
+   `Attach` without a `?session=` has no owner to adopt and fails.
 5. `Ready` is sent, `last_seq` replay runs through the owner-scoped `replay_since`, and the command
    loop starts.
 
@@ -843,7 +848,11 @@ code, so both are testable — otherwise two security-relevant guards ship with 
 | `--single-user` with `--accept-promotions` or a non-loopback `--promote-*` | Startup error. `--promote-loopback` is permitted. |
 | `--single-user` server pointed at a store holding another principal's sessions | Those sessions are unreachable — the owner-scoped predicate still runs, bound to `local` (§6.5). |
 | Reconnect to a promoted machine | `AuthMode::Machine`: the promotion secret authenticates and the connection adopts the attached session's owner. The user's JWT never leaves the source (Decision 4). |
-| `Login`/`Attach`/`Refresh`/`Logout` sent to a `SingleUser` or `Machine` server | Rejected as not-applicable; the client was told the mode by the `Hello` frame (§3.5). |
+| `Login`/`Refresh`/`Logout` sent to a `SingleUser` or `Machine` server | Rejected as not-applicable; the client was told the mode by the `Hello` frame (§3.5). |
+| `Attach` sent to a `SingleUser` server | Rejected as not-applicable (no tokens exist in the mode). |
+| `Attach` sent to a `Machine` server | **Accepted** — carries the promotion secret (§6.5), the one frame the mode exists to receive. The client was told the mode by `Hello`. |
+| `Attach` without `?session=` on a `Machine` server | Rejected — a receiver creates no sessions, so there is no owner to adopt (§7.2 step 4). |
+| No auth frame within the 10s deadline (`Users` only) | `Error`, close. No session, no store write. (`SingleUser`/`Machine` have no deadline — §7.2.) |
 
 ---
 
