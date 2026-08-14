@@ -1,6 +1,6 @@
 # Multitenant identity — the `Authenticator` seam, TOTP + JWT, and session ownership
 
-> **Status:** DRAFT — **NOT IMPLEMENTED. Deferred, and deliberately so.**
+> **Status:** DRAFT — being implemented as slice 1b (issue #125); open issues below are resolved.
 > **Implements:** the identity half of the "Suggested first slice" of
 > [#115](https://github.com/robhicks/otto/issues/115).
 > **Depends on:** `docs/superpowers/specs/2026-08-01-session-ownership-design.md` (slice 1a —
@@ -8,78 +8,65 @@
 > this spec's §3.1, §4 and §7.1. It also shipped the ownership check on the WS
 > `PromoteToRemote`/`DemoteToLocal` arm — which the *ownership* spec's §3.4 had assigned here, not
 > the open-issue list below, none of whose five items concerned handover. `POST /promote`,
-> `POST /export`, and attach-time `?session=` ownership all remain open for this slice.
+> `POST /export`, and attach-time `?session=` ownership all land in this slice.
 > **Blocks:** slice 2 (UI slash commands + `otto login`/`logout` CLI).
-> **Entangled with:** slice 3 (handover credentials). See "Why this is deferred" immediately below —
-> the two cannot be designed independently, which is the finding that split this work.
+> **Entangled with:** slice 3 (handover credentials) — resolved for this slice by §6.5's
+> `--promotion-receiver` (explicit opt-in + zero-principal condition), which slice 3 narrows to
+> per-session secrets.
 
-## Why this is deferred
+## Why the machine-to-machine credential is scoped here
 
-Three rounds of design review converged on one structural problem, recorded here so the follow-up
-does not rediscover it:
+Three rounds of design review (recorded in the prior version of this file) found that a **machine-wide
+promote-receiver credential** could not be made safe as a *default*. The resolution, per issue #125's
+open issue 1, is to make the machine mode an **explicit opt-in** and to **condition it on zero
+enrolled principals** (§6.5). This slice ships three explicit modes — `--single-user`, the default
+`Users`, and `--promotion-receiver` — rather than letting `--accept-promotions` silently imply a
+machine-wide root credential. Slice 3 narrows the receiver credential to per-session secrets.
 
-**`AuthMode::Machine` (§6.5) cannot be made safe within this slice, and removing it takes the
-promote-receiver story with it.** The mode exists because §7.4's zero-principal startup guard would
-otherwise brick `deploy/fly/Dockerfile:57`'s `--accept-promotions` guest, and because a client
-reconnecting after a promote needs a credential the remote is permitted to verify (Decision 4
-forbids a remote verifying user JWTs). But as specified it fails on both counts:
+**What slice 1a already shipped** (the ownership foundation this spec's §3.1/§4/§7.1 describe):
+the schema, the choke points, and the `UserId` type — with no behavior change and no credential.
+This slice builds the identity half on top of it.
 
-1. **It re-creates cross-tenant authority.** Decision 4 states that a long-lived
-   `--accept-promotions` receiver "hosts many sessions from potentially many users". A single
-   machine-wide promotion secret, plus a client-supplied `?session=` uuid, plus "the connection
-   adopts the attached session's owner", means the secret-holder can attach to *every* session on
-   that receiver regardless of owner — precisely the root-credential shape Decision 3 removes,
-   rebuilt under a new name.
-2. **It does not actually restore the reconnect.** the `ServerMessage::Promoted` construction in `crates/engine/src/serve.rs`'s `handle_handover`
-   sends `token: None` for loopback/vps/microvm, and making `Promoted.token` always `Some` is
-   explicitly slice 3. So nothing in this slice delivers the secret to a client — and since §6.4
-   deletes `?token=` and a `Machine` server rejects `Attach`, a browser has no channel to present it
-   even if it had it. That matters concretely because the Fly image serves the UI *from* the
-   promoted machine (`--ui-dir`).
+## Open issues — resolutions (issue #125)
 
-The correct scope for the machine-to-machine credential is **slice 3's per-session secret map**, not
-a machine-wide secret bolted onto this one. So the identity work waits for slice 3's credential
-design rather than shipping a coarse version that would have to be un-shipped.
+Each open issue from the third review round, with the resolution this implementation follows:
 
-**What lands instead:** slice 1a, session ownership — the schema, the choke points, and the
-`UserId` type this spec's §3.1/§4/§7.1 describe, with no behavior change and no new credential.
-It is a pure mechanical foundation, which is also why separating it helps: reviewed together, ~35
-mechanical call-site edits would drown every security decision in this document.
+1. **§6.5 / §2 — `Machine` mode → explicit opt-in, zero-principal condition.** `AuthMode::Machine`
+   is selected by a new `--promotion-receiver` flag (requires `--accept-promotions`); it is never
+   implied by `--accept-promotions` alone. A `Machine` server **refuses to start if any principal
+   is enrolled** — a receiver with real users cannot double as a machine-credential host, which
+   closes the "attach to every session regardless of owner" hole at the mode boundary rather than
+   relying on discipline inside it. §2's "Not secured" paragraph now names it explicitly. The Fly
+   guest and VPS/microVM receivers adopt `--promotion-receiver` (§6.4, §6.5); `Promoted.token` keeps
+   its existing shape (`None` for loopback/vps/microvm, `Some` for Fly's fresh per-session mint),
+   and slice 3 generalizes it.
+2. **§7.3 — `/workspace` per-mode credential, stated.** `SingleUser`: **no credential** — the mode
+   is loopback-bound with a single principal and mints nothing, so the route ignores
+   `Authorization` entirely (the desktop sidecar sends an empty header; the server does not consult
+   it). `Users`: a valid access token (JWT), verified exactly like the WS path. `Machine`: the
+   promotion secret, constant-time. This is the per-mode rule §7.3 now states.
+3. **§7.2 — `Hello` is always the first frame, in every mode.** `Hello { auth_mode }` is sent
+   immediately on upgrade regardless of mode and regardless of whether an `Authorization: Bearer`
+   header pre-resolved a principal. A pre-resolved header skips the *deadline*, not the greeting.
+   `SingleUser`/`Machine` then proceed straight to `Ready` (Machine after its `Attach`-with-secret
+   frame, §6.5); `Users` enters the 10-second `Login`/`Attach` deadline. Uniform first-frame ordering
+   is what slice 2's UI depends on.
+4. **§6.6 — `ui-dioxus` table widened to cover the exhaustive match and the empty token.**
+   `app.rs:129-214` matches `ServerMessage` exhaustively, so the three new frames are added there
+   (`Hello` records the mode; `LoggedIn`/`LoggedOut` update an auth signal, wired by slice 2). The
+   `tok.is_empty()` gates at `app.rs:93` (`do_connect`), `:346` (`load_files`), and `:368`
+   (`open_path`) are removed — under `SingleUser` the token is empty by design, and the guards
+   become connection-state-based. Success criterion 7 is widened to exercise `/workspace` (the file
+   tree must load under the desktop sidecar).
+5. **§6.4 — Fly citation corrected.** The rename touches `create_machine_body`'s `env` map at
+   `crates/remote/src/fly.rs:197-201` (`OTTO_TOKEN` → `OTTO_PROMOTION_SECRET`) and the Dockerfile's
+   comment at `:51-52`; the Dockerfile `CMD` at `:57` gains `--promotion-receiver`. There is no
+   `OTTO_TOKEN` `ENV` line to rename.
 
-## Open issues to resolve before implementing this spec
-
-Carried from the third review round; each would otherwise be rediscovered:
-
-1. **§6.5 / §2 — `Machine` mode**, per the two points above. Make it an explicit opt-in rather than
-   implied by `--accept-promotions`, condition it on zero enrolled principals, or replace it with
-   slice 3's per-session secrets. Whatever the answer, §2's "Not secured" paragraph must name it —
-   §2 currently names only the workspace, so a reader takes "attach/replay/abort are
-   ownership-checked" at face value.
-2. **§7.3 — `/workspace` has no defined credential under `SingleUser`.** The mode mints and verifies
-   no token, but §7.3 says the route "requires a valid access token", and the UI calls it
-   unconditionally with `Authorization: Bearer` (`ui-dioxus/src/transport/web.rs:84`,
-   `transport/desktop.rs:95`). State the per-mode rule.
-3. **§7.2 never sends `Hello`, and covers only `Users`.** §3.5 says it is sent immediately on
-   upgrade; §7.2's five steps never emit it, say nothing about the `SingleUser`/`Machine` sequence
-   (no deadline, no frame, straight to `Ready`), and do not say whether it is still sent when an
-   `Authorization: Bearer` header already pre-resolved the principal. This is the ordering slice 2's
-   UI will depend on.
-4. **§6.6's `ui-dioxus` table is incomplete in two ways that break the desktop app**, neither
-   catchable by success criterion 7 as worded: `ui-dioxus/src/app.rs:129-214` matches
-   `ServerMessage` **exhaustively with no wildcard**, so the new frames are a hard compile error
-   there; and removing the minted secret leaves the `token` signal empty (`app.rs:449`), which makes
-   `load_files`/`open_path` (`app.rs:342-372`) early-return on `tok.is_empty()` — the file tree and
-   editor go silently dead while the app still reaches `Ready`. Widen the criterion to exercise
-   `/workspace`.
-5. **§6.4's Fly citation is wrong** in the same way premise correction 5 fixes: `deploy/fly/Dockerfile`
-   has no `OTTO_TOKEN` `ENV` line (it is a comment at `:51-52`; the `ENV` at `:53` sets
-   port/root/host/ui-dir). The injection site is `create_machine_body`'s `env` map at
-   `crates/remote/src/fly.rs:192-197`.
-
-Two smaller corrections: §6.5's loopback predicate must note that an unset `OTTO_HOST` defaults to
-`"127.0.0.1"` (`main.rs:812`) and so must pass the guard; and "the provisioned engine inherits
-`SingleUser`" requires threading an `AuthMode` through `LoopbackTarget::new` (`loopback.rs:31`) and
-`serve::app` (`loopback.rs:84`), both of which take the shared token positionally today.
+Two smaller corrections, adopted: §6.5's loopback predicate runs on the **resolved** bind host
+(unset `OTTO_HOST` defaults to `"127.0.0.1"`, `main.rs:820`, and must pass `is_loopback()`); and
+`AuthMode` is threaded through `LoopbackTarget::new` (`loopback.rs:31`) and `serve::app`
+(`loopback.rs:84`) so a `--single-user` loopback promote provisions a `SingleUser` engine.
 
 otto is single-tenant today: one shared `OTTO_TOKEN` is a root credential for the whole machine,
 nothing in the protocol carries an identity, and `sessions` has no owner. This slice introduces a
@@ -206,10 +193,13 @@ single-user `otto run` path byte-for-byte unchanged.
    accepted and ±2 rejected; and N consecutive failures lock the user out for the cooldown window.
 6. `otto run` with no environment set produces the same event sequence as before this change, and
    `crates/engine/src/lib.rs`'s determinism tests are untouched.
-7. `otto serve --single-user` refuses to bind a non-loopback host (asserted), and the desktop app
-   still launches its sidecar and reaches `Ready` — verified out-of-band via
+7. `otto serve --single-user` refuses to bind a non-loopback host and refuses `--accept-promotions`
+   / non-loopback `--promote-*` (asserted), and the desktop app still launches its sidecar, reaches
+   `Ready`, and **loads the file tree over `/workspace`** — verified out-of-band via
    `cd ui-dioxus && cargo test --features desktop`, since `ui-dioxus/` is workspace-excluded and
-   `cargo test --workspace` structurally cannot catch its breakage.
+   `cargo test --workspace` structurally cannot catch its breakage. The `Hello`/`LoggedIn`/`LoggedOut`
+   arms are exercised by a desktop-suite unit test over the new `ServerMessage` variants, so the
+   exhaustive match in `app.rs` is proven to compile and handle them.
 
 ---
 
@@ -229,14 +219,20 @@ Every choice made without asking, with its rationale.
 | A8 | The WS handshake accepts credentials **after** upgrade (a `Login`/`Attach` frame) and additionally honours an `Authorization: Bearer` header at upgrade time for non-browser clients. `?token=` is deleted. | The issue requires the credential out of the query string. A browser `WebSocket` cannot set headers, so a post-upgrade frame is the only option that serves both clients from one path. |
 | A9 | `EngineService`'s session-bearing methods take an explicit `&UserId` rather than a type-level `AuthorizedSession` token. | Simplest change that is still fail-closed at one choke point. The typed alternative (a `SessionRef` constructible only by `authorize()`) is stronger but a much larger refactor across ~45 existing test call sites; recorded here as the natural follow-up if ownership checks ever get missed. |
 
-> **A9's trigger condition has now fired — re-weigh it before implementing.** A9 defers the typed
+> **A9's trigger condition has now fired — this slice re-weighs it.** A9 defers the typed
 > `SessionRef` alternative as "the natural follow-up **if ownership checks ever get missed**". One
 > was: `serve.rs`'s handover arm reaches `otto_remote::promote` through the `store()` accessor, so it
 > bypassed `EngineService` by construction and shipped unchecked until review caught it (see the
 > ownership spec's §3.4). The fix was a `pub authorize_session` wrapper — i.e. the invariant is held
 > by convention plus a doc comment, not by the type system. This slice adds three more hand-placed
 > call sites with the same bypass-by-construction shape (attach, `POST /promote`, `POST /export`).
-> Decide A9 on that evidence rather than re-deriving the original cost estimate.
+> **Decision: the full typed `SessionRef` refactor stays out of scope, but the cheap half of the
+> recommendation is taken** — `resolve_session` now returns `(SessionId, UserId)` and `handle_socket`
+> threads one connection-scoped principal through the loop (replacing the seven hard-coded
+> `UserId::local()` constructions at serve.rs:519/576/637/656/680/696/722/1098). That removes the
+> "ambient authority constructed at every call site" failure mode; the residual convention-held
+> invariant is the three new RPCs (`attach`, `POST /promote`, `POST /export`), each a single
+> `authorize_session` call documented the same way the handover arm's is.
 | A10 | ~~`CapabilitiesManifest` gains `auth_required: bool`.~~ **Withdrawn** — replaced by a pre-auth `ServerMessage::Hello { auth_mode }` frame (§3.5). | The manifest rides only on `Ready`, which §7.2 sends *after* authentication, so the flag would have been unreadable at the one moment a client needs it. A dedicated pre-auth frame also gives `SingleUser`/`Machine` clients a defined greeting, which the field could not. |
 | A11 | Failed authentication returns one opaque message (`"authentication failed"`) to the client regardless of cause; the specific reason is logged server-side only. | An error distinguishing "unknown user" from "bad code" from "locked out" is an enumeration oracle. |
 | A12 | A **`--single-user` mode** is added, and the desktop sidecar uses it, rather than accepting a dead UI between slices. | Without it slice 1 ships a broken application: `ui-dioxus/src/desktop_boot.rs:130` mints a secret and `:219` passes it as `OTTO_TOKEN`, `ui-dioxus/src/net/url.rs:19` appends `?token=`, and both stop working here while the login UI is slice 2 — so the client *cannot* be rebuilt in lockstep, which is the precondition Decision 3's "clean break" relies on. Forcing TOTP on a locally-spawned loopback sidecar is also absurd UX. See §6.5 for why this is not the admin bypass Decision 3 rejects. |
@@ -283,6 +279,14 @@ reach the first principal's files through `fs.*`, `bash`, and `POST /workspace` 
 check is missing, but because there is only one directory to check against. **`otto serve` remains
 a single-trust-domain deployment until per-owner workspace roots land.** This slice is the identity
 and session-isolation foundation that work requires, not a completed multitenancy story.
+
+**Not secured, named:** the `--promotion-receiver` mode (§6.5). Its promotion secret is authority
+over every session on that receiver — a holder can attach to any session promoted onto it,
+adopting the session's owner. This is bounded (not eliminated) by the zero-principal condition: the
+receiver refuses to start if any principal is enrolled, so the machine credential can never be a
+backdoor into a server that also has real users. Slice 3 narrows the receiver credential to
+per-session secrets, which is the real closure. A reader must not take "attach/replay/abort are
+ownership-checked" as a claim that holds inside a `--promotion-receiver` machine.
 
 ---
 
@@ -569,9 +573,12 @@ consumed_at), `denylist` (jti, expires_at). Located per A5.
 - Slice 3 replaces it with per-session secrets and the receiver's session→secret map; the rename is
   chosen so that change is a narrowing of an already-correctly-named thing.
 
-`README.md`, `CLAUDE.md`, `deploy/fly/Dockerfile`, and `deploy/fly/README.md` are updated, and the
-Fly image's `OTTO_TOKEN` env becomes `OTTO_PROMOTION_SECRET` (`crates/remote/src/fly.rs:198` and
-`deploy/fly/Dockerfile:52` move together, or the promoted machine will not start).
+`README.md`, `CLAUDE.md`, `deploy/fly/Dockerfile`, and `deploy/fly/README.md` are updated. The Fly
+image's injected env becomes `OTTO_PROMOTION_SECRET` at `crates/remote/src/fly.rs:197-201`
+(`create_machine_body`'s `env` map) — that and the Dockerfile comment at `deploy/fly/Dockerfile:51-52`
+move together, or the promoted machine will not start. The Dockerfile `CMD` at `:57` gains
+`--promotion-receiver`. There is **no** `OTTO_TOKEN` `ENV` line in the Dockerfile to rename (the `ENV`
+at `:53` sets port/root/host/ui-dir) — open issue 5's correction.
 
 ### 6.5 The three authentication modes
 
@@ -596,17 +603,19 @@ enum AuthMode {
 - Every connection is bound to `UserId::local()`. No `Authenticator`, no auth database, no token
   minted or verified; `Login`/`Attach`/`Refresh`/`Logout` are rejected as not-applicable.
 - **The bind host must be loopback**, enforced as a startup error rather than a warning. "Loopback"
-  is a predicate, not a string match: parse `OTTO_HOST` as an `IpAddr` and require `is_loopback()`.
-  A value that does not parse as an IP is rejected — so `localhost` is refused (it resolves, but not
-  necessarily to a loopback address), `::1` and `127.0.0.2` are accepted, and `0.0.0.0` is refused.
-  Per §9.1 this is a pure tested function.
+  is a predicate, not a string match: parse the **resolved** `OTTO_HOST` (unset defaults to
+  `"127.0.0.1"`, `main.rs:820`) as an `IpAddr` and require `is_loopback()`. A value that does not
+  parse as an IP is rejected — so `localhost` is refused (it resolves, but not necessarily to a
+  loopback address), `::1` and `127.0.0.2` are accepted, and `0.0.0.0` is refused. Per §9.1 this is a
+  pure tested function.
 - **`--promote-loopback` is allowed; `--promote-vps`/`--promote-microvm`/`--promote-fly` and
-  `--accept-promotions` are startup errors.** Loopback promote provisions a second *in-process*
-  engine on the same machine, inside the same trust domain, so it needs no cross-machine credential
-  — the provisioned engine simply inherits `SingleUser`, and `Promoted.token` stays `None`. This
-  matters concretely: the desktop sidecar's argv is
+  `--accept-promotions`/`--promotion-receiver` are startup errors.** Loopback promote provisions a
+  second *in-process* engine on the same machine, inside the same trust domain, so it needs no
+  cross-machine credential — the provisioned engine simply inherits `SingleUser` (threaded via
+  `AuthMode` through `LoopbackTarget::new`, `loopback.rs:31`, and `serve::app`, `loopback.rs:84`),
+  and `Promoted.token` stays `None`. This matters concretely: the desktop sidecar's argv is
   `serve --port … --root … --approve-edits --promote-loopback` (`ui-dioxus/src/desktop_boot.rs:218`),
-  three tests assert that flag (`desktop_boot.rs:435,459,520`), and the UI has a live promote feature
+  three tests assert that flag (`desktop_boot.rs:483,498,517`), and the UI has a live promote feature
   behind it (`ui-dioxus/src/app.rs:187`). Forbidding it would break exactly what §6.6 exists to keep
   working.
 - **The ownership check still runs**, bound to `UserId::local()`. This is the property that makes
@@ -616,10 +625,18 @@ enum AuthMode {
 
 **`Users`** — the default. §7.2's handshake, §7.4's zero-principal refusal.
 
-**`Machine`** — implied by `--accept-promotions`.
+**`Machine`** — selected by the explicit `--promotion-receiver` flag, which requires
+`--accept-promotions`. Never implied by `--accept-promotions` alone.
 
 - `/ws` and `/workspace` authenticate with the promotion secret (constant-time), and the connection
   **adopts the owner of the session it attaches to**. No enrolled principals are required.
+- **Zero-principal condition:** a `--promotion-receiver` server refuses to start if any principal is
+  enrolled. This is the closure of open issue 1's cross-tenant hole — a receiver with real users
+  cannot double as a machine-credential host, so the machine secret is never a backdoor into a
+  multi-tenant server. §2 names the residual (machine-wide) authority.
+- The WS handshake accepts the promotion secret via the `Authorization` header **or** a post-upgrade
+  `Attach { token }` frame — `Attach` is what gives a browser reconnecting to a promoted machine a
+  channel now that `?token=` is deleted (§7.2).
 - This is issue #115 Decision 4's own reasoning, one slice coarser: *"the remote does not need to
   know who the user is: ownership is checked at the source before promotion, and the machine hosts
   exactly one session. Holding that session's secret is authority for that session and nothing
@@ -629,9 +646,10 @@ enum AuthMode {
 - Without this mode, slice 1 would silently brick two shipped things: `deploy/fly/Dockerfile:57`
   runs `otto serve --accept-promotions --port … --ui-dir …` on a guest with zero enrolled
   principals, and the post-promote reconnect (`ui-dioxus/src/app.rs:187`) would have no credential
-  the remote is permitted to verify. Neither is covered by `cargo test --workspace`, because all
-  seven harnesses in §9.1 build `serve_app` directly instead of going through `cmd_serve` — the
-  same blind spot §9.1 item 2 exists to close.
+  the remote is permitted to verify. The Dockerfile `CMD` gains `--promotion-receiver` (§6.4), and
+  the VPS/microVM test receivers adopt the flag. Neither is covered by `cargo test --workspace`,
+  because all seven harnesses in §9.1 build `serve_app` directly instead of going through
+  `cmd_serve` — the same blind spot §9.1 item 2 exists to close.
 
 **Why none of this is the admin bypass Decision 3 rejects.** That decision refuses to keep
 `OTTO_TOKEN` as "an admin bypass behind a flag" — a *shared secret granting root authority across
@@ -650,9 +668,11 @@ Three touch points, all minimal:
 
 | File | Change |
 |---|---|
-| `ui-dioxus/src/desktop_boot.rs:130,219` | Stop minting a secret and setting `OTTO_TOKEN`; add `--single-user`. **Keep `--promote-loopback`** (`desktop_boot.rs:218`) — §6.5 permits it, and three tests at `desktop_boot.rs:435,459,520` assert it. Net argv: `serve --port … --root … --approve-edits --promote-loopback --single-user`. |
-| `ui-dioxus/src/net/url.rs:19` | Stop appending `?token=…`; the parameter no longer authenticates anything (§6.4). |
+| `ui-dioxus/src/desktop_boot.rs:151,241` | Stop minting a secret and setting `OTTO_TOKEN`; add `--single-user`. **Keep `--promote-loopback`** (`desktop_boot.rs:218`) — §6.5 permits it, and three tests at `desktop_boot.rs:483,498,517` assert it. Net argv: `serve --port … --root … --approve-edits --promote-loopback --single-user`. `LaunchParams.token` becomes empty (`app.rs:449` sets it). |
+| `ui-dioxus/src/net/url.rs:19` | Stop appending `?token=…`; the parameter no longer authenticates anything (§6.4). `build_ws_url` drops the token argument; `LaunchParams.token` stays but is empty on the desktop path. |
 | `ui-dioxus/src/components/connection_form.rs` | The token field and `redact_token` **stay**, unused, for the remote-server path. Slice 2 replaces them with the login flow. A code comment says so, so the next reader does not delete them as dead. |
+| `ui-dioxus/src/app.rs:129-216` | Add the three new `ServerMessage` arms to the **exhaustive** match — a compile error otherwise: `Hello { auth_mode }` records the mode (a signal slice 2's login UI reads), `LoggedIn { access_token, .. }` stores the token (slice 2 wires the rest), `LoggedOut` clears auth state. `redact_token` keeps its seam-wide use via `SeamError`. |
+| `ui-dioxus/src/app.rs:93,346,368` | Drop the `tok.is_empty()` gates in `do_connect`, `load_files`, `open_path` — under `--single-user` the token is empty by design; gate on connection state (`Connected`) instead. Without this the file tree and editor die while the app still reaches `Ready` (open issue 4). |
 
 **The honest limitation:** the *desktop* app keeps working end-to-end (including loopback promote,
 and including the post-promote reconnect, since the provisioned engine inherits `SingleUser`). The
@@ -690,19 +710,27 @@ to check. Its caller authenticates (§7.3).
 ### 7.2 The WS handshake
 
 `ws_handler` no longer authenticates at upgrade — it accepts the socket, optionally pre-resolving a
-principal from an `Authorization: Bearer` header for non-browser clients. `handle_socket` then:
+principal from an `Authorization: Bearer` header for non-browser clients. **`Hello { auth_mode }` is
+always the first frame, in every mode** (open issue 3's resolution): it is sent immediately on
+upgrade, before any credential is presented, and regardless of whether the header pre-resolved a
+principal — a pre-resolved header skips the *deadline*, not the greeting. `handle_socket` then:
 
-1. If a header principal was resolved, skip to step 4.
+1. Send `Hello { auth_mode }`. If a header principal was resolved, skip to step 4.
 2. Await the first frame under a **10-second deadline** (`tokio::time::timeout`). Nothing else is
    read, no session is resolved, and no store call is made until this succeeds — an unauthenticated
-   socket costs one task and one timer.
+   socket costs one task and one timer. (`SingleUser` skips this step — no deadline, no frame, the
+   connection is bound to `UserId::local()` and proceeds straight to `Ready`. `Machine` also skips
+   the deadline; its credential is the header or an `Attach`-with-promotion-secret frame, §6.5.)
 3. The frame must be `Login` or `Attach`. `Login` runs the `Authenticator` and mints a pair;
-   `Attach` verifies an existing access token. Success sends `LoggedIn` (for `Login`) and binds the
-   principal to the connection. Failure sends `Error { "authentication failed" }` and closes. **Any
-   other command before authentication is the same failure** — including `CreateSession`.
-4. Only now is `resolve_session` called, and it is ownership-checked: an explicit `?session=` that
-   the principal does not own fails exactly as a nonexistent one does. `None` creates a session
-   owned by the principal.
+   `Attach` verifies an existing access token (or, on a `Machine` server, the promotion secret).
+   Success sends `LoggedIn` (for `Login`) and binds the principal to the connection. Failure sends
+   `Error { "authentication failed" }` and closes. **Any other command before authentication is the
+   same failure** — including `CreateSession`.
+4. Only now is `resolve_session` called. It returns `(SessionId, UserId)` (the connection-scoped
+   principal threaded through the loop, per A9's resolution) and is ownership-checked: an explicit
+   `?session=` that the principal does not own fails exactly as a nonexistent one does. `None`
+   creates a session owned by the principal. On a `Machine` server the principal is the attached
+   session's own owner (§6.5).
 5. `Ready` is sent, `last_seq` replay runs through the owner-scoped `replay_since`, and the command
    loop starts.
 
@@ -725,17 +753,26 @@ coverage by putting a token check in front of it and break first load. It is nam
 does not happen. Its separate invariant is unchanged: `--ui-dir` is never defaulted, never inferred,
 and never points at a workspace root, because `ServeDir` does not consult the sensitive-path floor.
 
-The three protocol routes:
+The three protocol routes, each with its **per-mode credential** (open issue 2's resolution — the
+rule below replaces the single "requires a valid access token" sentence):
 
-- **`POST /workspace`** — requires a valid access token (`Authorization: Bearer`), verified
-  identically to the WS path. Authenticated, not isolated (§2).
+| Route | `SingleUser` | `Users` | `Machine` |
+|---|---|---|---|
+| `/ws` | No credential; every connection is `UserId::local()` | Access token (header, or `Login`/`Attach` post-upgrade); the `Hello`/deadline handshake of §7.2 | Promotion secret (header or `Attach`), constant-time; adopts the attached session's owner |
+| `POST /workspace` | **No credential** — header ignored entirely; the route is loopback-bound, single-principal, and mints nothing | Valid access token (`Authorization: Bearer`), verified exactly like the WS path | Promotion secret, constant-time |
+| `POST /promote` / `POST /export` | Startup error (`--accept-promotions`/`--promotion-receiver` refused under `--single-user`, §6.5) | Promotion secret (machine-to-machine; the flag gate is `--accept-promotions` / `--promotion-receiver`) | Promotion secret, same |
+
+- **`POST /workspace`** — authenticated per the table; *not* isolated (§2). The UI calls it
+  unconditionally with `Authorization: Bearer` (`ui-dioxus/src/transport/web.rs:84`,
+  `transport/desktop.rs:95`); under `SingleUser` the server simply does not consult the header.
 - **`POST /promote` / `POST /export`** — keep the machine credential (§6.4), constant-time compared,
-  behind the existing `--accept-promotions` gate. Ownership travels in the bundle. The user-facing
-  ownership check for handover is on the **source**, in the WS command loop, where a real principal
-  exists: `PromoteToRemote`/`DemoteToLocal` verify the connection's principal owns the session
-  before any bundle is built. **That check shipped in slice 1a**
-  (`EngineService::authorize_session`) — described here for completeness, not as outstanding work.
-  What remains for this slice is the two endpoints themselves, which are bearer-only today.
+  behind the `--accept-promotions` / `--promotion-receiver` gate. Ownership travels in the bundle.
+  The user-facing ownership check for handover is on the **source**, in the WS command loop, where a
+  real principal exists: `PromoteToRemote`/`DemoteToLocal` verify the connection's principal owns
+  the session before any bundle is built. **That check shipped in slice 1a**
+  (`EngineService::authorize_session`). What this slice adds is attach-time `?session=` ownership
+  (§7.2 step 4) on the WS path; `/promote`/`/export` stay bearer-only because their machine
+  credential and the source-side check are the boundary (A9's resolution documents the convention).
 
 **Which credential `/workspace` accepts, and from whom** (A13 — this is the direction the plan will
 encode, so it is stated rather than implied):
@@ -836,28 +873,28 @@ code, so both are testable — otherwise two security-relevant guards ship with 
 
 ### 9.1 The integration-test migration is wider than `serve.rs`
 
-`create_session(owner, …)`, the owner-scoped reads, and the `/workspace` auth change reach **seven**
-integration test files, each of which builds `serve_app`/`ServeState` directly rather than going
-through `cmd_serve`, so each needs updating:
+**Slice 1a already shipped the `create_session(owner, …)` signature, the owner-scoped reads, and
+`run_goal`'s `UserId::local()`** — so the owner-parameter churn this section originally budgeted for
+is largely done. What this slice adds at the integration level is the **auth surface**: the serve
+constructors gain an `AuthMode`/authenticator parameter, `?token=` stops authenticating, and the WS
+handshake grows `Hello` + `Login`/`Attach`. That reaches the same **seven** integration test files,
+each of which builds `serve_app`/`ServeState` directly rather than going through `cmd_serve`:
 `crates/engine/tests/{serve,cors,ui_dir,promote,remote_workspace,vps_promote,microvm}.rs`.
 
-Larger than all seven combined, and easy to overlook because it is not an integration test: the
-**~25 `create_session` call sites inside `crates/engine/src/service.rs`'s own `#[cfg(test)]`
-module**, plus `crates/engine/src/lib.rs:570` (`run_goal`), which must pass `UserId::local()` per A2.
-Budget for this — it is the single biggest mechanical change in the slice.
-
-Two further consequences the plan must budget for rather than discover:
+Two consequences the plan must budget for rather than discover:
 
 1. **Those harnesses need an `Authenticator`.** They get a `FakeAuthenticator` — a test double in
-   `otto-auth` behind `#[cfg(feature = "testing")]` (or a `dev-dependencies`-only module) that
-   accepts a fixed credential and returns a fixed `Principal`. Not `SqliteAuthStore`: the suite must
-   stay hermetic and fast, and — critically — **A5's `OTTO_AUTH_DB` default must never be consulted
-   by a test.** Every constructor takes an explicit path or an explicit authenticator, so a
-   developer's real auth database can never be opened, written, or depended on by `cargo test`.
-2. **§7.4's zero-principal startup refusal and §6.5's loopback enforcement live in `cmd_serve`,
-   which no test exercises.** Both must therefore be extracted as pure, unit-testable functions
-   (in the shape of the existing `validate_ui_dir` at `crates/engine/src/main.rs:141`) rather than
-   written inline — otherwise two security-relevant guards ship untested.
+   `otto-auth` behind `#[cfg(feature = "testing")]` (forwarded as `otto-engine`'s own `testing`
+   feature, the `firecracker`-forwarding precedent) that accepts a fixed credential and returns a
+   fixed `Principal`. Not `SqliteAuthStore`: the suite must stay hermetic and fast, and — critically
+   — **A5's `OTTO_AUTH_DB` default must never be consulted by a test.** Every constructor takes an
+   explicit path or an explicit authenticator, so a developer's real auth database can never be
+   opened, written, or depended on by `cargo test`.
+2. **§7.4's zero-principal startup refusal, §6.5's loopback/`--promotion-receiver` enforcement, and
+   the `--single-user` mode resolution live in `cmd_serve`, which no test exercises.** They must
+   therefore be extracted as pure, unit-testable functions (in the shape of the existing
+   `validate_ui_dir` at `crates/engine/src/main.rs:141`) rather than written inline — otherwise
+   these security-relevant guards ship untested.
 
 ---
 
