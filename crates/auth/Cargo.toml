@@ -18,6 +18,18 @@ sha2 = "0.10"
 # apps expect — and signing keys / hashes round-trip through hex.
 data-encoding = "2"
 uuid = { workspace = true }
+# RFC 6238 TOTP: HMAC-SHA1 via the RustCrypto tree (digest 0.10.x, already locked).
+hmac = "0.12"
+sha1 = "0.10"
+# HS256 JWT. Exact pin: 10.3 is the newest line that builds on this workspace's MSRV
+# (11.x declares rust-version 1.88). The `rust_crypto` backend is mandatory — with no crypto
+# backend at all the crate panics on first sign/verify — and HS256-only enforcement is the
+# `Validation` config at the verify call site, not the feature set.
+jsonwebtoken = { version = "=10.3", default-features = false, features = ["rust_crypto"] }
+# Constant-time comparison for TOTP digits (and, in later slices, the promotion secret).
+subtle = "2"
+# 32-byte secrets: the HS256 signing key and the refresh tokens.
+rand = "0.8"
 # Only `time`, for the bounded open-retry backoff in `SqliteAuthStore::open`.
 tokio = { workspace = true, features = ["time"] }
 
