@@ -161,7 +161,7 @@ Expected: FAIL to compile — `mint_session_secret` not found, `push_promote_bun
 - Update the `/promote` wiremock mocks per Step 1.
 
 `crates/engine/src/serve.rs` — the vps demote arm (`:1394-1445`):
-- Replace the `VpsTarget::new(endpoint, cfg.token) + target.export(session)` construction with the stored-handle pattern the microvm/fly arms use: look up `state.remotes[(session, true)]` → `(endpoint, secret)`; on `None`, reply `Error { "no active vps handover for this session; promote first" }`; else `otto_remote::export_bundle(&endpoint, &secret, session)` → `accept_demotion` → remove the handle → report `Demoted` (spec §1.6). The `PromoteMode::Vps { endpoint }` destructure still supplies the endpoint for the *promote* direction — keep the arm's structure, only swap the pull path.
+- Replace the `VpsTarget::new(endpoint, cfg.token) + target.export(session)` construction with the stored-handle pattern the microvm/fly arms use: look up `state.remotes[(session, true)]` → `(endpoint, secret)`; on `None`, reply `Error { "no active vps handover for this session; promote first" }`; else `otto_remote::export_bundle(&endpoint, &secret, session)` → `accept_demotion` → remove the handle → report `Demoted` (spec §1.6). The arm's `PromoteMode::Vps { .. }` match becomes a `Vps { .. }` (the cfg-derived `endpoint` binding is now unused once the pull reads the stored handle — leave it unbound or `clippy -D warnings` fails on the unused variable).
 
 `crates/remote/Cargo.toml`: `version = "0.1.0"` → `"0.2.0"`.
 
@@ -204,7 +204,7 @@ git commit -m "remote: mint per-session secrets and push them over X-Otto-Sessio
 - `promote_handler` (`:315-345`):
   1. `403`/`401` unchanged (machine secret, constant-time).
   2. Deserialize with the **pre-ownership special-case**: on serde failure, parse the raw body as `serde_json::Value`; if `session` is a present object missing `owner`, return `400` with the §3.2 message (assert byte-for-byte in a test); else the existing `bad request: {e}`.
-  3. Read `X-Otto-Session-Secret`; absent → `400`.
+  3. Read `X-Otto-Session-Secret`; absent **or empty** → `400` (A2: an empty value would be recorded as the session secret, weakening the fail-closed intent — every in-repo pusher sends a 32-hex mint).
   4. `accept_promotion` as today; on `Ok(session)`, `record_session_secret(session, header_secret)`.
 - `export_handler` (`:351-379`):
   1. `403` unless `--accept-promotions` (unchanged).
@@ -472,7 +472,7 @@ SocketEvent::Message(Ok(ServerMessage::Promoted { endpoint, token, .. })) => {
     reconnect_to.set(Some(endpoint));
 }
 ```
-The `..` already covers the other fields; add the `token` binding and the `token.set(token)` line.
+The current arm is a **combined or-pattern** `Promoted { endpoint, .. } | Demoted { endpoint, .. }` — it must be **split** into two arms so the `token` field can bind in the `Promoted` arm (the compiler will force this once `token` is destructured; the `Demoted` arm keeps `{ endpoint, .. }`).
 
 - [ ] **Step 3: Verify the desktop suite and the wasm compile**
 
@@ -501,7 +501,7 @@ git commit -m "ui-dioxus: adopt the Promoted frame's session token for the recon
 
 - [ ] **Step 1: Update `CLAUDE.md`**
 
-In the `engine` crate-table row and the serve command block: note that `Promoted.token` is always `Some` (a fresh per-session secret minted by the target), that `--promotion-receiver` receivers keep a session→secret map consulted by `/export`/`/workspace`/the `Machine` WS handshake, and that the per-session secret rides `X-Otto-Session-Secret` on the `/promote` push. Keep the `OTTO_PROMOTION_SECRET` description accurate (it is now the *admission* credential for `/promote`, no longer a session credential).
+In the `engine` crate-table row and the serve command block: note that `Promoted.token` is always `Some` (a fresh per-session secret minted by the target), that `--promotion-receiver` receivers keep a session→secret map consulted by `/export`/`/workspace`/the `Machine` WS handshake, and that the per-session secret rides `X-Otto-Session-Secret` on the `/promote` push. Keep the `OTTO_PROMOTION_SECRET` description accurate (it is now the *admission* credential for `/promote`, no longer a session credential). **Also update the `remote` crate-table row**, which currently describes `VpsTarget` as having an `export` that "pulls a bundle back for demote" — that method is removed by Task 2; the row should say the demote pull uses the shared `export_bundle` with the stored handle's session secret.
 
 - [ ] **Step 2: Update `README.md`**
 
@@ -527,3 +527,4 @@ git commit -m "docs: describe per-session handover secrets and always-Some Promo
 - **wasm bundle** — `cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web` (compile check; `./scripts/build-web.sh` if a release bundle is desired).
 - **Feature-gated builds** — the `firecracker` feature's `FirecrackerProvisioner` construction changed (Task 3's mint at the serve.rs arm): verify `cargo build --workspace --features firecracker` compiles. The `candle` feature is untouched by this slice but is exercised by the same command.
 - **Wire breaks** — `protocol` 0.2.0 and `remote` 0.2.0 are consumed by path-deps across the workspace; `cargo test --workspace` resolving cleanly confirms no stale version string.
+- **`deploy/fly` container image** — **no change needed, and none expected:** the image builds `otto serve` from the same commit as the pushers, so pusher/receiver lockstep (the required `X-Otto-Session-Secret` header and the per-session `Machine` handshake) holds by construction. Verify the `deploy/fly` directory is untouched in the PR diff.
