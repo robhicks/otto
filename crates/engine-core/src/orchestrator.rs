@@ -2,6 +2,7 @@
 //! It owns control flow and event emission; capabilities live in the agents.
 
 use otto_protocol::{EventKind, Role, SessionId};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::registry::AgentRegistry;
@@ -23,9 +24,20 @@ impl<F: Fn(EventKind) + Send + Sync> Emitter for F {
 }
 
 /// The result of running a single turn.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialized whole into `TurnRecord.outcome` (an opaque JSON column), which is what lets
+/// conversation history be rebuilt from turn records alone — no event-log join, no schema
+/// migration. Every field added after `ok` is `#[serde(default)]` so turn rows written before
+/// this shape existed still deserialize.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnOutcome {
     pub ok: bool,
+    #[serde(default)]
+    pub milestones: Vec<String>,
+    #[serde(default)]
+    pub files_edited: Vec<std::path::PathBuf>,
+    #[serde(default)]
+    pub verify: Option<crate::types::VerifySummary>,
 }
 
 pub struct Orchestrator<'a> {
@@ -109,6 +121,8 @@ impl<'a> Orchestrator<'a> {
         let AgentOutput::Plan { milestones } = plan else {
             anyhow::bail!("planner returned unexpected output");
         };
+        let milestone_texts: Vec<String> =
+            milestones.iter().map(|m| m.description.clone()).collect();
         emit.emit(EventKind::Log {
             message: format!("planned {} milestone(s)", milestones.len()),
         });
@@ -146,6 +160,8 @@ impl<'a> Orchestrator<'a> {
         const MAX_REPAIRS: u32 = 2;
         let mut prior_failures: u32 = 0;
         let mut feedback: Option<String> = None;
+        let mut files_edited: Vec<std::path::PathBuf> = Vec::new();
+        let mut verify_summary: Option<crate::types::VerifySummary>;
 
         let ok = loop {
             // Coder
@@ -216,6 +232,7 @@ impl<'a> Orchestrator<'a> {
                     path: edit.path.clone(),
                     bytes_written,
                 });
+                files_edited.push(edit.path.clone());
             }
             emit.emit(EventKind::AgentFinished { role: Role::Coder });
             self.emit_meter(emit);
@@ -234,6 +251,10 @@ impl<'a> Orchestrator<'a> {
                 anyhow::bail!("verifier returned unexpected output");
             };
             emit.emit(EventKind::VerifyResult {
+                ok,
+                detail: detail.clone(),
+            });
+            verify_summary = Some(crate::types::VerifySummary {
                 ok,
                 detail: detail.clone(),
             });
@@ -257,7 +278,12 @@ impl<'a> Orchestrator<'a> {
 
         // --- Done ---
         emit.emit(EventKind::TurnComplete { ok });
-        Ok(TurnOutcome { ok })
+        Ok(TurnOutcome {
+            ok,
+            milestones: milestone_texts.clone(),
+            files_edited: files_edited.clone(),
+            verify: verify_summary.clone(),
+        })
     }
 }
 
@@ -463,7 +489,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![PathBuf::from("out.txt")],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         assert_eq!(workspace.edits.lock().unwrap().len(), 1);
 
         let recorded = events.lock().unwrap().clone();
@@ -502,6 +539,48 @@ mod tests {
             EventKind::TurnComplete { ok: true },
         ];
         assert_eq!(recorded, expected);
+    }
+
+    #[tokio::test]
+    async fn run_turn_outcome_carries_the_turn_summary() {
+        // Same harness as run_turn_drives_full_spine_and_emits_ordered_events:
+        // FixedPlanner -> milestone "m"; OneEditCoder -> edit to "out.txt"; OkVerifier -> ok/"ok".
+        let reg = registry();
+        let router = FakeRouter;
+        let workspace = RecordingWorkspace::default();
+        let tools = empty_tools();
+        let meter = TokenMeter::default();
+        let orch = Orchestrator {
+            registry: &reg,
+            router: &router,
+            workspace: &workspace,
+            tools: &tools,
+            retriever: None,
+            approver: &DenyApprover,
+            next_id: &test_id,
+            meter: &meter,
+            pauser: &NeverPause,
+        };
+
+        let outcome = orch
+            .run_turn(SessionId::new(), "do the thing", &(|_k: EventKind| {}))
+            .await
+            .unwrap();
+
+        assert!(outcome.ok);
+        assert_eq!(
+            outcome.milestones,
+            vec!["m".to_string()],
+            "the planner's milestone text must survive into the outcome"
+        );
+        assert_eq!(outcome.files_edited, vec![PathBuf::from("out.txt")]);
+        assert_eq!(
+            outcome.verify,
+            Some(crate::types::VerifySummary {
+                ok: true,
+                detail: "ok".to_string()
+            })
+        );
     }
 
     #[tokio::test]
@@ -558,7 +637,18 @@ mod tests {
 
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
 
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         assert_eq!(workspace.edits.lock().unwrap().len(), 0);
 
         let recorded = events.lock().unwrap().clone();
@@ -597,7 +687,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         // An Ask verdict (not Allow) must NOT apply the edit — fail-closed.
         assert_eq!(workspace.edits.lock().unwrap().len(), 0);
     }
@@ -673,7 +774,18 @@ mod tests {
         };
 
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![PathBuf::from("out.txt"), PathBuf::from("out.txt")],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
 
         let recorded = events.lock().unwrap().clone();
         let coder_starts = recorded
@@ -719,7 +831,22 @@ mod tests {
         };
 
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
-        assert_eq!(outcome, TurnOutcome { ok: false });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: false,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![
+                    PathBuf::from("out.txt"),
+                    PathBuf::from("out.txt"),
+                    PathBuf::from("out.txt")
+                ],
+                verify: Some(crate::types::VerifySummary {
+                    ok: false,
+                    detail: "still broken".to_string()
+                })
+            }
+        );
 
         let recorded = events.lock().unwrap().clone();
         let coder_starts = recorded
@@ -788,7 +915,18 @@ mod tests {
         };
 
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![PathBuf::from("out.txt")],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         // Approved → edit applied.
         assert_eq!(workspace.edits.lock().unwrap().len(), 1);
 
@@ -838,7 +976,18 @@ mod tests {
         };
 
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         // Rejected → no edit applied.
         assert_eq!(workspace.edits.lock().unwrap().len(), 0);
         let recorded = events.lock().unwrap().clone();
@@ -964,7 +1113,18 @@ mod tests {
             move |kind: EventKind| events.lock().unwrap().push(kind)
         };
         let outcome = orch.run_turn(SessionId::new(), "x", &sink).await.unwrap();
-        assert_eq!(outcome, TurnOutcome { ok: true });
+        assert_eq!(
+            outcome,
+            TurnOutcome {
+                ok: true,
+                milestones: vec!["m".to_string()],
+                files_edited: vec![PathBuf::from("out.txt")],
+                verify: Some(crate::types::VerifySummary {
+                    ok: true,
+                    detail: "ok".to_string()
+                })
+            }
+        );
         let recorded = events.lock().unwrap().clone();
         assert!(
             recorded

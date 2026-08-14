@@ -59,6 +59,14 @@ pub struct Milestone {
     pub description: String,
 }
 
+/// The verifier's result for a turn, retained on `TurnOutcome` so conversation history can
+/// report it without re-scanning the event log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerifySummary {
+    pub ok: bool,
+    pub detail: String,
+}
+
 /// The uniform request passed to any atomic agent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentRequest {

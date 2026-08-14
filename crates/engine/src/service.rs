@@ -571,7 +571,12 @@ impl EngineService {
         self.emit_and_persist(session, counter, sink, EventKind::TurnComplete { ok })
             .await?;
 
-        Ok(TurnOutcome { ok })
+        Ok(TurnOutcome {
+            ok,
+            milestones: Vec::new(),
+            files_edited: Vec::new(),
+            verify: None,
+        })
     }
 
     /// Assign the next seq, persist the event (fail-closed), then stream it to `sink`. Shared by
