@@ -84,7 +84,7 @@ Forced by the inward dependency rule: `protocol` (Task 1) → `engine-core` (Tas
   - `Command::{Login { credentials: Credentials }, Attach { token: String }, Refresh { refresh_token: String }, Logout}` — hand `Debug` redacting `Attach.token`/`Refresh.refresh_token` (externally tagged, matching the enum).
   - `ServerMessage::{Hello { auth_mode: AuthMode }, LoggedIn { user, access_token, expires_at: u64, refresh_token }, LoggedOut}` — internally tagged `#[serde(tag = "type", rename_all = "snake_case")]`; `LoggedIn`'s `Debug` redacts both tokens.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `#[cfg(test)]` module in `crates/protocol/src/lib.rs`:
 
@@ -150,12 +150,12 @@ fn hello_frame_carries_the_mode_snake_cased() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-protocol`
 Expected: FAIL to compile — `Credentials`/`AuthMode`/new variants not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add `Credentials` and `AuthMode` near `UserId`'s re-export; add the four `Command` variants and three `ServerMessage` variants. Follow the existing serde conventions (external for `Command`, `tag = "type"` for `ServerMessage`).
 
@@ -163,17 +163,17 @@ Add `Credentials` and `AuthMode` near `UserId`'s re-export; add the four `Comman
 
 **Keep `cargo build --workspace` green.** `serve.rs`'s command loop matches on `Command` **exhaustively with no wildcard arm** (`crates/engine/src/serve.rs:624`, all ten variants at `:625-740`), and `serve.rs` is library code (`mod serve;` at `crates/engine/src/lib.rs:32`), not an integration test. So this task must also add the four new `Command` variants to that match. They are not-applicable until Task 6 wires auth, so each arm replies `Error { "authentication not enabled" }` and closes (or `break`s the loop), mirroring how an unauthenticated command is treated. This is what keeps Step 5's SUCCESS expectation true; without it the workspace build fails with a non-exhaustive-match E0004.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-protocol`
 Expected: PASS — new tests + all pre-existing.
 
-- [ ] **Step 5: Verify the workspace still builds**
+- [x] **Step 5: Verify the workspace still builds**
 
 Run: `cargo build --workspace`
 Expected: SUCCESS — `serve.rs`'s four new `Command` arms (added in Step 3) keep the library compiling; nothing outside `protocol` uses the new types yet (`ui-dioxus`'s exhaustive `ServerMessage` match is workspace-excluded; it is fixed in Task 10).
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -203,7 +203,7 @@ git commit -m "protocol: add the identity wire vocabulary (Login/Attach/Refresh/
     - `async fn rotate_refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError>` — Refresh; single-use.
     - `async fn logout(&self, access_token: &str) -> Result<(), AuthError>` — Logout; denylist `jti` + revoke refresh.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/engine-core/src/auth.rs` with the test module only:
 
@@ -243,21 +243,21 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p otto-engine-core auth::`
 Expected: FAIL to compile — `Authenticator` not found. (`#[tokio::test]` needs `tokio` in dev-deps with `macros`+`rt`; add it to `crates/engine-core/Cargo.toml` if absent.)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `engine-core/src/auth.rs` — module doc noting (per A9's resolution and the spec's §5) that this is the one seam that must stay crypto-free; the trait; `Principal`; `AuthError`; `TokenPair`; `AuthConfig`. Wire `pub mod auth;` + `pub use auth::{Authenticator, AuthError, Principal, TokenPair, AuthConfig};` into `lib.rs`.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p otto-engine-core`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -280,25 +280,25 @@ git commit -m "engine-core: add the Authenticator seam with the token lifecycle 
   - `SqliteAuthStore::open(path)` with a `PRAGMA user_version` guard: fresh DB → create tables + stamp; version match → ok; version newer → refuse. **No legacy arm** (this DB is new in this slice).
   - `open` reuses `persistence`'s bounded busy-retry shape (`crates/persistence/src/sqlite.rs:58-76`): `otto auth enroll` and `otto serve` can race to create the same fresh DB, and on a fresh file both `connect_with`'s WAL transition and `init_schema`'s `BEGIN IMMEDIATE` can report `SQLITE_BUSY` despite `busy_timeout`. Wrap the whole open in the same `tokio::time::timeout(BUSY_BUDGET, ...)` loop.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create the crate skeleton with `store.rs`'s test module covering: enroll then read the secret; the conditional `last_step` update (concurrent same-step writes: exactly one wins); failure-count/window bookkeeping; refresh insert/consume/revoke-all; denylist insert/check/prune; `enrolled_count`; a version-mismatch open error; two concurrent `open`s of the same fresh path both succeed. Use `tempfile` for the db path — **never** the `OTTO_AUTH_DB` default.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-auth store::`
 Expected: FAIL to compile — crate/types not found. (Add the workspace member to `Cargo.toml` first so the package resolves.)
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `SqliteAuthStore` in the same `init_schema`/`user_version` style as `persistence`'s `sqlite.rs`, but with only the create-and-stamp and forward-version arms, plus the busy-retry. Four tables: `users (id PK, totp_secret, last_step, failure_count, failure_window)`, `signing_keys (kid PK, key, created_at)`, `refresh_tokens (hash PK, user, expires_at, consumed_at)`, `denylist (jti PK, expires_at)`. Store TOTP secrets base32-encoded (RFC 4648, unpadded) and refresh tokens as SHA-256 hashes (a stolen DB yields no usable refresh token).
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-auth`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -321,30 +321,30 @@ git commit -m "auth: add the sqlite auth store (users, signing keys, refresh has
   - `TotpVerifier` (or functions taking `now`) implementing: compute candidate steps `T-1..T+1`; **any step `<= last_step` rejected before comparison**; on success `UPDATE ... WHERE last_step < step` (exactly one concurrent winner); 5 failures within 15 min → `RateLimited` without computing.
   - `JwtIssuer` over `AuthStore`: 32-byte key generated on first use, stored keyed by `kid`; `mint(user) -> (access, refresh, expires_at)`; `verify_access(token) -> Result<Principal, _>` checking signature → `exp` → denylist in that order; `rotate_refresh(refresh) -> (access, refresh, expires_at)` single-use in a transaction, reused token revokes the user's whole refresh set; `logout(access)` inserts `jti` + `exp`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `totp.rs` tests: **RFC 6238's published test vectors**. The RFC's Appendix B values are **8-digit** (RFC 4226) — `94287082` etc. — so they cannot be asserted against the production 6-digit formatter. Assert them against a raw truncation function exposed for the test (e.g. `fn truncate(secret: &[u8], step: u64) -> u32`, the RFC 4226 31-bit dynamic truncation, formatted `{:08}`), and assert the 6-digit zero-padded production formatting separately against a fixed step: secret `12345678901234567890`, steps `59`, `1111111109`, `1111111111`, `1234567890`, `2000000000`, `20000000000` → `94287082`, `07081804`, `14050431`, `89005924`, `69279037`, `65353130`. Then: ±1 accepted, ±2 rejected; replay (`<= last_step`) rejected; two concurrent same-step logins → exactly one succeeds; lockout after N failures. `jwt.rs` tests: mint/verify round trip; expired rejected; denylisted rejected; denylist row pruned past `exp`; refresh rotation consumes the old token and issues a new pair; a reused (already-consumed) refresh token is rejected and revokes the user's outstanding set.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-auth totp:: jwt::`
 Expected: FAIL to compile — modules/types not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `totp.rs`: HMAC-SHA1 via `hmac` + `sha1`; counter as 8-byte big-endian; RFC 4226 truncation; the verification is a pure function of `(secret, last_step, now)` so the RFC vectors are directly testable against a fixed `Clock`. `jwt.rs`: `jsonwebtoken = { version = "=10.3", default-features = false, features = ["rust_crypto"] }`. Note: 10.3.0 has **no** `hmac`/`sha2` features — those are internal deps pulled by the `rust_crypto` feature, and with no crypto backend at all the crate panics on first sign/verify ("make sure exactly one of the 'rust_crypto' and 'aws_lc_rs' features is enabled"). HS256-only enforcement comes from the `Validation` config at the verify call site (`Validation::new(Algorithm::HS256)` — the only algorithm the signer accepts), **not** from the feature set; keep that wording accurate in the commit/docs. `kid` in the header; `sub`/`iat`/`exp`/`jti` claims; no `aud` (reserved, not emitted). Refresh tokens: 32-byte `rand` values, stored SHA-256-hashed.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-auth`
 Expected: PASS.
 
-- [ ] **Step 5: Verify the workspace still builds**
+- [x] **Step 5: Verify the workspace still builds**
 
 Run: `cargo build --workspace`
 Expected: SUCCESS — `otto-auth` is a member but nothing depends on it yet.
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -365,25 +365,25 @@ git commit -m "auth: add RFC 6238 TOTP and HS256 JWT with refresh rotation and j
   - `pub struct TotpAuthenticator { store, jwt }` implementing the full `Authenticator` seam — `authenticate(Credentials::Totp)` → verify code → `Principal`; `mint`/`verify_access`/`rotate_refresh`/`logout` over the `JwtIssuer` + store.
   - `pub mod testing { pub struct FakeAuthenticator { principal: UserId } }` implementing the full seam with a trivial in-memory token map — `authenticate` accepts any `Credentials` and returns the fixed principal; `mint` issues a numbered fake token; `verify_access` accepts tokens this fake minted; `logout` denylists them. **It has a `pub fn new(user: UserId) -> Self` constructor** (its field is private, and both `tests/auth.rs` and the Task 9 harnesses must construct it — two distinct principals for the cross-tenant tests). **It is always compiled — no `#[cfg(feature = "testing")]` gate, no `testing` feature** (plan-critique resolution) — following the `ScriptedProvider` precedent: a test double in an impl crate's public API, harmless in the binary because it does no I/O, and required so that both `cargo test --workspace` (the seven harnesses) and `cargo test -p otto-auth` (this task's own gate) reference it with no feature flags.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `authenticate` with a wrong code → `InvalidCredentials` (never `Backend`); with a correct code → `Principal`; with the store locked → `RateLimited`. `verify_access` on a minted token → the principal; on a logged-out token → `InvalidCredentials`; `rotate_refresh` consumes the old token and mints a new pair. The `FakeAuthenticator` returns its fixed principal for any input and verifies only its own minted tokens.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-auth`
 Expected: FAIL to compile — `TotpAuthenticator`/`testing` not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `TotpAuthenticator` glues totp + jwt + store behind the seam. `FakeAuthenticator` in a plain `pub mod testing` (no feature gate) implementing the full seam with an in-memory `Mutex<HashMap<String, UserId>>`.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-auth`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -415,7 +415,7 @@ git commit -m "auth: add the TotpAuthenticator behind the seam and a FakeAuthent
 - `/workspace`: per-mode table (§7.3) — `SingleUser` ignores the header; `Users` requires a valid access token (`authenticator.verify_access`); `Machine` requires the promotion secret. `/promote`/`/export`: keep the promotion secret constant-time.
 - Thread the connection-scoped `owner` through `handle_socket`/`run_turn_loop`/the command arms, replacing the hard-coded `UserId::local()` calls (A9's resolution).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/engine/tests/auth.rs` — a NEW integration file with its own harnesses, so this task does not depend on `tests/serve.rs`'s still-unmigrated constructors (plan-critique resolution: landing here keeps the task compile-green independently). The harness builds `serve_app` with a `FakeAuthenticator` + `AuthMode::Users` (short `handshake_deadline`), plus a `SingleUser` and a `Machine` app. New tests, each mapping to a success criterion:
 - `no_auth_frame_times_out`: connect to a `Users` app with no header, send nothing; assert an `Error` frame then close, and the store has **no** new session.
@@ -427,26 +427,26 @@ Create `crates/engine/tests/auth.rs` — a NEW integration file with its own har
 - `logout_invalidates_on_ws_and_workspace`: `Login` → `Logout` → a re-`Attach` and a `/workspace` call with the old token both fail.
 - `cross_tenant_replay_is_refused`: after `Login`, attach to another principal's session and `SendPrompt`; assert the shared not-found error and no replayed events (closes spec §9's serve-level replay criterion).
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-engine --test auth`
 Expected: FAIL to compile — `serve_app` has no auth parameters yet, `Hello`/`Login` don't exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Rework `serve.rs` per the design points above. Add `otto-auth` and `subtle` to `crates/engine/Cargo.toml`. Keep `handle_handover`'s `Promoted.token` logic unchanged (`None` for loopback/vps/microvm, `Some` for Fly).
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-engine --test auth`
 Expected: PASS.
 
-- [ ] **Step 5: Run the library tests to find the fallout**
+- [x] **Step 5: Run the library tests to find the fallout**
 
 Run: `cargo test -p otto-engine --lib`
 Expected: PASS — `EngineService`'s signatures are unchanged (slice 1a shipped them), so the library and its own test module are unaffected by this task. The seven pre-existing integration files fail to compile against the new `serve_app` signature — **expected**, they are migrated in Task 9. Confirm the failures are confined to the integration tests, not the library.
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -469,25 +469,25 @@ git commit -m "engine: resolve a principal on every serve route — Hello/Login/
   - `OTTO_TOKEN` → `OTTO_PROMOTION_SECRET`, required **only** when a `--promote-*` or `--promotion-receiver` flag is set; `otto serve` with neither requires no shared secret.
   - Pure, unit-tested guard functions (the `validate_ui_dir` shape): `resolve_bind_host_is_loopback` (parses the resolved `OTTO_HOST` default `"127.0.0.1"` as `IpAddr` and requires `is_loopback()`), `single_user_promote_modes_ok` (only `--promote-loopback`), `users_mode_has_enrolled_principals` (zero-principal refusal naming `otto auth enroll`), `promotion_receiver_preconditions`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add a `#[cfg(test)]` module (or extend the existing one) in `main.rs` covering the pure guards: loopback predicate accepts `::1`/`127.0.0.2`, rejects `0.0.0.0`/`localhost`/garbage; the zero-principal guard errors when the auth store reports zero enrolled and passes otherwise; the promotion-receiver precondition requires `--accept-promotions` and zero enrolled principals.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p otto-engine --bin otto`
 Expected: FAIL to compile — guard functions don't exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Wire the `auth` subcommand dispatcher (the hand-rolled `match` pattern `main.rs:31-58`), `cmd_auth` (enroll/list/revoke against the `OTTO_AUTH_DB` store), the two new serve flags in `cmd_serve`'s flag loop, the env rename + conditional requirement, and the guard functions called before any server setup.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-engine --bin otto`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -506,25 +506,25 @@ git commit -m "engine: add otto auth enroll/list/revoke, --single-user and --pro
 - Consumes: Task 6's `serve::app` signature.
 - Produces: a `--single-user` loopback promote that provisions a `SingleUser` engine (spec's §6.5 + the two smaller corrections).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Extend `crates/engine/tests/promote.rs`: a loopback promote from a `SingleUser` source provisions an engine whose `serve::app` is built with `AuthConfig { mode: SingleUser, .. }` (assert via the provisioned engine's `Hello` frame or the serve constructor's mode). At minimum, the existing promote round-trip test must pass with the new constructor signature.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p otto-engine --test promote`
 Expected: FAIL to compile — `LoopbackTarget::new` / `serve::app` signature drift.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `LoopbackTarget::new(auth: AuthConfig, base_dir, engine_remote)`; `serve::app(service, auth: AuthConfig, capabilities, promote, accept_promotions, …)`. Thread the same mode the source uses.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p otto-engine --test promote`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -543,7 +543,7 @@ git commit -m "engine: thread AuthConfig through LoopbackTarget and serve::app"
 - Consumes: the new serve constructors + `FakeAuthenticator`.
 - Produces: a workspace-green tree (closes the Task 6–9 red window).
 
-- [ ] **Step 1: Migrate the harness constructors**
+- [x] **Step 1: Migrate the harness constructors**
 
 Each harness that calls `serve_app`/`serve_app_with_base` gains the `AuthConfig` parameter. Choose per harness:
 - `serve.rs` — a `SingleUser`-mode app for the plain command-flow tests (the `?token=` tests, rewritten per Step 2); a `Users`-mode app with `FakeAuthenticator` for any token tests, matching Task 6's `tests/auth.rs`.
@@ -551,16 +551,16 @@ Each harness that calls `serve_app`/`serve_app_with_base` gains the `AuthConfig`
 - `promote.rs` — **already migrated in Task 8** (its `LoopbackTarget` constructor changed there); here it only needs its `serve_app`/constructor call sites updated to the `AuthConfig` shape. It stays `SingleUser` (loopback promote inherits the source mode per §6.5) — do **not** wire `AuthMode::Machine` into it.
 - `vps_promote.rs`, `microvm.rs` — keep `--promote-*` semantics; the **network receiver** side (`POST /promote` on a real `otto serve`) becomes `--promotion-receiver` (`AuthMode::Machine`) with the promotion secret, and `RemoteWorkspace::new(http_base, secret)` against a `Machine` app or a `SingleUser` one.
 
-- [ ] **Step 2: Rewrite the `?token=` auth tests in `serve.rs`**
+- [x] **Step 2: Rewrite the `?token=` auth tests in `serve.rs`**
 
 The five tests (`rejects_missing_token`, `rejects_wrong_token`, `authorizes_via_query_token`, `rejects_wrong_query_token`, `rejects_empty_query_token`) are rewritten, **not deleted** (spec §9): `?token=` must be proven inert. Against a `Users` app, a socket presenting only `?token=` (no header, no auth frame) hits the handshake deadline/`Error`; against a `SingleUser` app, the query parameter is ignored and `Ready` arrives.
 
-- [ ] **Step 3: Run the workspace suite**
+- [x] **Step 3: Run the workspace suite**
 
 Run: `cargo test --workspace`
 Expected: PASS except the known `mcp-lsp` rust-analyzer test. This is the commit that closes the Task 6–9 red window.
 
-- [ ] **Step 4: Format and commit**
+- [x] **Step 4: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -579,33 +579,33 @@ git commit -m "engine: migrate the serve integration harnesses to AuthConfig and
 - Consumes: the new `ServerMessage` variants (Task 1) — `app.rs`'s exhaustive match is a hard compile error until fixed.
 - Produces: the desktop app still boots its sidecar with `--single-user`, reaches `Ready`, and loads the file tree over `/workspace` (spec success criterion 7).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Update `ui-dioxus/src/desktop_boot.rs`'s argv/env-assertion tests — `serve_command_passes_both_desktop_capability_flags`, `serve_command_argv_is_the_expected_serve_invocation`, `serve_command_names_exactly_one_promote_mode` (at `:483,:498,:517`), **and `serve_command_carries_the_given_binary_root_and_token` at `:533`** (which asserts the `OTTO_TOKEN` env at `:540` and fails when it is dropped) — to expect `--single-user` and no `OTTO_TOKEN` env. Add a host-side unit test in the net/url tests that `build_ws_url` no longer carries `?token=`.
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cd ui-dioxus && cargo test --features desktop`
 Expected: FAIL — argv mismatch; `build_ws_url` still emits `?token=`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - `desktop_boot.rs`: stop minting the secret and setting `OTTO_TOKEN`; argv becomes `serve --port … --root … --approve-edits --promote-loopback --single-user`.
 - `net/url.rs`: `build_ws_url(base, session, last_seq)` drops the token; `LaunchParams.token` stays (empty on desktop). Keep `redact_token` (still used by `SeamError::new`).
 - `app.rs`: add `Hello { auth_mode }` (records the mode — a signal slice 2's login UI reads), `LoggedIn { access_token, .. }` (stores the token), `LoggedOut` (clears auth state) to the exhaustive match; drop the `tok.is_empty()` early-returns in `do_connect`/`load_files`/`open_path` — gate on connection state instead.
 - `connection_form.rs`: add the comment that the token field stays, unused, for the remote-server path until slice 2.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `cd ui-dioxus && cargo test --features desktop`
 Expected: PASS.
 
-- [ ] **Step 5: Verify the web target still compiles**
+- [x] **Step 5: Verify the web target still compiles**
 
 Run: `cd ui-dioxus && cargo build --target wasm32-unknown-unknown --features web`
 Expected: SUCCESS.
 
-- [ ] **Step 6: Format and commit**
+- [x] **Step 6: Format and commit**
 
 ```bash
 cargo fmt --all
@@ -620,15 +620,15 @@ git commit -m "ui-dioxus: run the desktop sidecar in --single-user and handle th
 **Files:**
 - Modify: `deploy/fly/Dockerfile`, `deploy/fly/README.md`
 
-- [ ] **Step 1: Make the change**
+- [x] **Step 1: Make the change**
 
 Dockerfile: `CMD` gains `--promotion-receiver`; the `OTTO_TOKEN` comment becomes `OTTO_PROMOTION_SECRET`. README: document the rename and the flag. (The actual injected env rename is in `crates/remote/src/fly.rs` — see Task 12.)
 
-- [ ] **Step 2: Verify**
+- [x] **Step 2: Verify**
 
 The change is text-only in the Dockerfile; the injected-env rename is Task 12's `fly.rs` edit. **The Fly axis is fully wired only after Tasks 7 + 11 + 12 land together:** the guest's `--promotion-receiver` flag (11) needs Task 7's flag + `OTTO_PROMOTION_SECRET` read in `main.rs`, and the injected env name (12) must match the Dockerfile comment (11) or the promoted machine will not start. Note that `deploy/fly/Dockerfile` has **no** `OTTO_TOKEN` `ENV` line (the reference at `:51-54` is a comment); the env injection lives in `create_machine_body`'s map (`crates/remote/src/fly.rs`).
 
-- [ ] **Step 3: Format and commit**
+- [x] **Step 3: Format and commit**
 
 ```bash
 git add deploy/fly
@@ -642,15 +642,15 @@ git commit -m "deploy: run the Fly guest in --promotion-receiver mode"
 **Files:**
 - Modify: `crates/remote/src/fly.rs` (env map in `create_machine_body`), `CLAUDE.md`, `README.md`
 
-- [ ] **Step 1: Make the change**
+- [x] **Step 1: Make the change**
 
 `create_machine_body`'s `env` map injects `OTTO_PROMOTION_SECRET` (not `OTTO_TOKEN`). Update `CLAUDE.md` (the `engine` crate-table row, the serve command block, and a multitenancy note) and `README.md` for the rename and the two new modes.
 
-- [ ] **Step 2: Verify**
+- [x] **Step 2: Verify**
 
 Run: `cargo test -p otto-remote` → PASS (wiremock tests unaffected by the env name). Confirm the docs no longer tell an operator to set `OTTO_TOKEN`.
 
-- [ ] **Step 3: Format and commit**
+- [x] **Step 3: Format and commit**
 
 ```bash
 cargo fmt --all
