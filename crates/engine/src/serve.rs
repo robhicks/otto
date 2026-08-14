@@ -113,6 +113,10 @@ impl ServeState {
             return false;
         };
         let secrets = self.session_secrets.lock().unwrap();
+        // `.any()` short-circuits on the first match, leaking the matching position through
+        // timing — acceptable: the map holds at most one entry per live promoted session (tiny),
+        // every value is the same 32-hex shape, and the position reveals nothing about the secret
+        // to a caller who already holds some credential (the failure is a single opaque error).
         secrets
             .values()
             .any(|s| bool::from(s.as_bytes().ct_eq(provided.as_bytes())))
@@ -401,7 +405,7 @@ async fn promote_handler(
     // The per-session secret the pusher minted for this session (A2): required — a session
     // restored without a recorded secret would be unreachable yet exist.
     let header_secret = match headers
-        .get("x-otto-session-secret")
+        .get(otto_remote::SESSION_SECRET_HEADER)
         .and_then(|v| v.to_str().ok())
     {
         Some(s) if !s.is_empty() => s.to_string(),

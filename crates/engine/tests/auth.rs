@@ -1037,7 +1037,7 @@ async fn machine_handshake_has_a_deadline() {
     assert_eq!(
         session_count(&dir).await,
         1,
-        "a timed-out machine handshake must not create a session"
+        "a timed-out machine handshake must not create an additional session"
     );
 }
 

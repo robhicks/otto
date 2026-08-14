@@ -710,9 +710,9 @@ impl EngineService {
         // `restore_over` overwrites the row INCLUDING its owner, so the id binding alone is not
         // enough: a tampered bundle carrying the right id but a different owner would reassign
         // the local row's ownership. Refuse it. `owner_of` is a reverse-existence oracle, so a
-        // demotion for an unknown local row fails closed here too — and its error is a genuine
-        // store-side failure (`Failed`), never leaked to a client, with the Refused text
-        // re-deriving both ids from the known-good `expected`.
+        // demotion for an unknown local row fails closed here too — its error is a genuine
+        // store-side failure (`Failed`), surfaced (as store text) only to the already-authorized
+        // WS caller, with the Refused text re-deriving both ids from the known-good `expected`.
         let current_owner = self
             .store
             .owner_of(expected)

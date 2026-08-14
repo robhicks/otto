@@ -35,6 +35,12 @@ pub fn mint_session_secret() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// The HTTP header carrying a session's per-session secret on the `/promote` push, recorded by the
+/// receiver and consulted by `/export`/`/workspace`/the `Machine` WS handshake. Shared by the
+/// pusher (`push_promote_bundle`) and the receiver (`otto serve`'s `promote_handler`) so the name
+/// cannot drift. HTTP header names are case-insensitive, but one canonical spelling avoids noise.
+pub const SESSION_SECRET_HEADER: &str = "X-Otto-Session-Secret";
+
 /// Enables session handover on a served engine. `token` is the bearer the target requires (reused
 /// from the source, by design); `mode` selects which `RemoteTarget` a handover provisions onto.
 /// `ServeState` holds this as `Option`: `Some` ⟺ `--promote-loopback` or `--promote-vps`.
@@ -258,7 +264,7 @@ pub(crate) async fn push_promote_bundle(
     let resp = build_promote_client()
         .post(&url)
         .bearer_auth(bearer)
-        .header("X-Otto-Session-Secret", session_secret)
+        .header(SESSION_SECRET_HEADER, session_secret)
         .json(bundle)
         .send()
         .await?;
