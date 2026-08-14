@@ -22,7 +22,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::SinkExt;
 use futures_util::stream::{SplitSink, SplitStream, StreamExt};
 use otto_engine_core::TurnOutcome;
-use otto_engine_core::auth::{AuthConfig, Authenticator};
+use otto_engine_core::auth::{AuthConfig, Authenticator, TokenPair};
 use otto_engine_core::tool::Approver;
 use otto_engine_core::tool::PauseController;
 use otto_protocol::{
@@ -550,12 +550,36 @@ async fn report_turn_outcome(outcome: TurnLoopOutcome, writer: &mut WsWriter) ->
     }
 }
 
+/// Assert a freshly-rotated pair's principal matches the connection's bound owner (finding 3).
+/// The `Authenticator` seam's `rotate_refresh` mints for whoever presented the refresh token
+/// but returns only the pair, so the minted access token is re-verified to recover the
+/// principal. A mismatch — alice's connection presenting bob's refresh token — fails closed:
+/// the token is already consumed, and the connection must not keep alice's session authorized
+/// against a pair minted for bob.
+async fn rotated_pair_owned_by(
+    authenticator: &dyn Authenticator,
+    pair: &TokenPair,
+    owner: &UserId,
+) -> bool {
+    match authenticator.verify_access(&pair.access_token).await {
+        Ok(principal) => principal.user == *owner,
+        Err(_) => false,
+    }
+}
+
 /// Re-verify the connection's access token for `Users` mode (§7.2): the token is checked on
 /// every command, not only at the handshake. Non-`Users` modes have no per-command token to
 /// check (`SingleUser` holds no credential, `Machine` is secret-authenticated) and always pass.
-/// Returns `false` when re-verification fails — the token is revoked/expired, or a `Users`
-/// server somehow has no authenticator (fail closed).
-async fn re_verify_access_token(state: &ServeState, access_token: Option<&str>) -> bool {
+/// The principal the token resolves to must also be the connection's bound owner — a
+/// connection authenticated as alice must not be able to present a DIFFERENT user's valid
+/// access token and stay authorized to alice's session (finding 3, defense-in-depth).
+/// Returns `false` when re-verification fails — the token is revoked/expired, resolves to a
+/// different owner, or a `Users` server somehow has no authenticator (fail closed).
+async fn re_verify_access_token(
+    state: &ServeState,
+    access_token: Option<&str>,
+    owner: &UserId,
+) -> bool {
     if state.auth.mode != AuthMode::Users {
         return true;
     }
@@ -563,7 +587,10 @@ async fn re_verify_access_token(state: &ServeState, access_token: Option<&str>) 
         return false;
     };
     match state.authenticator() {
-        Some(authenticator) => authenticator.verify_access(token).await.is_ok(),
+        Some(authenticator) => match authenticator.verify_access(token).await {
+            Ok(principal) => principal.user == *owner,
+            Err(_) => false,
+        },
         None => false,
     }
 }
@@ -624,7 +651,7 @@ async fn run_turn_loop(
                             | Command::Attach { .. }
                             | Command::Refresh { .. }
                             | Command::Logout
-                    ) && !re_verify_access_token(state, access_token.as_deref()).await
+                    ) && !re_verify_access_token(state, access_token.as_deref(), owner).await
                     {
                         eprintln!("serve: per-command access-token re-verification failed mid-turn");
                         let _ = state.service.abort(owner, session).await;
@@ -656,6 +683,35 @@ async fn run_turn_loop(
                             };
                             match authenticator.rotate_refresh(&refresh_token).await {
                                 Ok(pair) => {
+                                    // The rotated pair belongs to whoever presented the
+                                    // refresh token; it must be this connection's owner, or
+                                    // the pair is rejected and the connection closed (finding
+                                    // 3). A `LoggedIn` for a different user would keep the
+                                    // socket authorized to the owner's session.
+                                    if !rotated_pair_owned_by(
+                                        authenticator.as_ref(),
+                                        &pair,
+                                        owner,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "serve: mid-turn refresh rotated a pair for a \
+                                             principal other than the connection owner"
+                                        );
+                                        let mut guard = writer.lock().await;
+                                        let _ = send_msg(
+                                            &mut guard,
+                                            &ServerMessage::Error {
+                                                message: AUTH_FAILED.to_string(),
+                                            },
+                                        )
+                                        .await;
+                                        drop(guard);
+                                        approvals.clear();
+                                        pause_state.resume_all();
+                                        return TurnLoopOutcome::StopOuterLoop;
+                                    }
                                     let logged_in = ServerMessage::LoggedIn {
                                         user: owner.clone(),
                                         access_token: pair.access_token.clone(),
@@ -1082,7 +1138,8 @@ async fn handle_socket(
                 | Command::Attach { .. }
                 | Command::Refresh { .. }
                 | Command::Logout
-        ) && !re_verify_access_token(&state, identity.access_token.as_deref()).await
+        ) && !re_verify_access_token(&state, identity.access_token.as_deref(), &identity.owner)
+            .await
         {
             eprintln!("serve: per-command access-token re-verification failed");
             let _ = send_msg(
@@ -1252,6 +1309,26 @@ async fn handle_socket(
                 };
                 match authenticator.rotate_refresh(&refresh_token).await {
                     Ok(pair) => {
+                        // The rotated pair belongs to whoever presented the refresh token;
+                        // it must be this connection's owner, or the connection closes with
+                        // the opaque error (finding 3) — a different user's refresh token
+                        // must not keep the socket authorized to the owner's session.
+                        if !rotated_pair_owned_by(authenticator.as_ref(), &pair, &identity.owner)
+                            .await
+                        {
+                            eprintln!(
+                                "serve: refresh rotated a pair for a principal other than the \
+                                 connection owner"
+                            );
+                            let _ = send_msg(
+                                &mut writer,
+                                &ServerMessage::Error {
+                                    message: AUTH_FAILED.to_string(),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
                         let logged_in = ServerMessage::LoggedIn {
                             user: identity.owner.clone(),
                             access_token: pair.access_token.clone(),

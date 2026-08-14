@@ -865,6 +865,61 @@ async fn refresh_rotates_and_rebinds() {
     );
 }
 
+/// Finding 3: a connection authenticated as alice must not be able to `Refresh` with a
+/// DIFFERENT principal's refresh token. The rotation itself succeeds (the presented token is
+/// consumed and a pair minted for bob), but the pair does not belong to the connection's
+/// owner, so the connection closes with the single opaque error — bob's refresh token cannot
+/// keep the socket authorized to alice's session.
+#[tokio::test]
+async fn refresh_with_another_users_token_is_rejected_and_closes() {
+    let server = start_users().await;
+    let mut ws = connect(request(server.port, "")).await;
+    let hello = hello(&mut ws).await;
+    assert_eq!(hello["auth_mode"], "users");
+    let logged_in = login(&mut ws).await;
+    let _alice_access = logged_in["access_token"].as_str().unwrap().to_string();
+    let ready = next_json(&mut ws).await;
+    assert_eq!(ready["type"], "ready");
+
+    // A pair minted for bob (the fake can mint for any principal), presented on alice's
+    // connection.
+    let bob_pair = server.fake.mint(&Principal { user: bob() }).await.unwrap();
+    send_cmd(
+        &mut ws,
+        &otto_protocol::Command::Refresh {
+            refresh_token: bob_pair.refresh_token.clone(),
+        },
+    )
+    .await;
+
+    let frame = next_json(&mut ws).await;
+    assert_eq!(frame["type"], "error");
+    assert_eq!(frame["message"], "authentication failed");
+    assert!(
+        next_json_opt(&mut ws).await.is_none(),
+        "connection must close after a cross-user refresh"
+    );
+
+    // Fail-closed is real, not just close-then-reconnect: the cross-user rotation consumed
+    // bob's refresh token (single-use), so it is dead even though the rotated pair was
+    // rejected — the attacker gains nothing. Bob's ORIGINAL access token is untouched
+    // (rotation mints a fresh pair, it does not revoke the old one — same as the real
+    // issuer); it simply can never be bound to alice's connection, which is closed.
+    assert_eq!(
+        server
+            .fake
+            .verify_access(&bob_pair.access_token)
+            .await
+            .unwrap()
+            .user,
+        bob()
+    );
+    assert!(matches!(
+        server.fake.rotate_refresh(&bob_pair.refresh_token).await,
+        Err(AuthError::InvalidCredentials)
+    ));
+}
+
 /// A wrong promotion secret on a `Machine` receiver is the single opaque error (A11), then the
 /// connection closes — no cause-specific detail leaks.
 #[tokio::test]
