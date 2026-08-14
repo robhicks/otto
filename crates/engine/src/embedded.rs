@@ -1,29 +1,39 @@
 //! `EmbeddedTransport` — the engine running in this process, behind the protocol seam.
 //!
-//! This is the one module in the crate that names engine types: it *is* the adapter between the
-//! `ClientTransport` seam and an in-process `EngineService`, so it necessarily reaches inward.
-//! Everything else in `otto-cli` (`transport.rs`, `render.rs`, the REPL) stays protocol-only, and
-//! that boundary is what keeps the REPL honest — it cannot tell an embedded engine from a remote
-//! one. No socket, no port, no auth, no sidecar process: this is what makes `cd repo && otto`
-//! work with zero configuration.
+//! This is the one module that bridges `otto-cli`'s `ClientTransport` seam to a concrete
+//! `EngineService`: it necessarily reaches into this crate's own wiring (`EngineService`,
+//! `build_composed_tools`, `build_router`, …). Everything else `otto-cli` exposes
+//! (`transport.rs`, `render.rs`) stays protocol-only with no engine dependency at all — and that
+//! boundary is what keeps the REPL (`repl.rs`) honest: it is written against `ClientTransport`
+//! alone and cannot tell an embedded engine from a remote one. No socket, no port, no auth, no
+//! sidecar process: this is what makes `cd repo && otto` work with zero configuration.
+//!
+//! Lives in `otto-engine` rather than `otto-cli` itself, unlike Task 9's original placement: an
+//! `otto-cli` that depends on `otto-engine` while `otto-engine`'s own `otto` binary depends on
+//! `otto-cli` is a genuine Cargo cyclic-package error (`cyclic package dependency: package
+//! otto-cli ... depends on itself`), not a style choice — Cargo's cycle check is package-granular
+//! and does not care that the two edges come from different targets (lib vs. bin) within the same
+//! package. Moving this adapter (and `repl.rs`) here, while `otto-cli` stays a pure protocol-only
+//! client kit, is what breaks the cycle: `otto-engine` depends on the now engine-free `otto-cli`,
+//! and nothing depends back.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use otto_engine::{
-    EngineService, EventSink, McpConnection, TurnControls, build_capabilities,
-    build_composed_tools, build_default_registry, build_retriever, build_router,
-    preflight_base_urls, session_config,
-};
+use otto_cli::ClientTransport;
 use otto_engine_core::Router;
 use otto_persistence::SqliteStore;
 use otto_protocol::{Command, Event, EventKind, ServerMessage, SessionId, UserId};
 use otto_workspace::LocalWorkspace;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::transport::ClientTransport;
+use crate::{
+    EngineService, EventSink, McpConnection, TurnControls, build_capabilities,
+    build_composed_tools, build_default_registry, build_retriever, build_router,
+    preflight_base_urls, session_config,
+};
 
 /// An `EventSink` that forwards each persisted event straight onto the transport's outbound
 /// queue. The engine-side counterpart of `otto_engine::CollectingSink`, which gathers into a
@@ -351,7 +361,7 @@ mod tests {
     use otto_protocol::{Command, EventKind, ServerMessage, SessionId};
 
     use super::EmbeddedTransport;
-    use crate::transport::ClientTransport;
+    use otto_cli::ClientTransport;
 
     /// A transport whose LLM router is pinned to the offline, deterministic
     /// `SingleProviderRouter(LocalProvider)` — byte-for-byte what `build_router()` builds when no

@@ -54,13 +54,17 @@ otto-remote = { path = "../remote" }
 otto-retrieval = { path = "../retrieval" }
 otto-extensions = { path = "../extensions" }
 otto-auth = { path = "../auth" }
+# The wire-protocol client kit `embedded.rs`/`repl.rs` adapt to a concrete in-process engine.
+# `otto-cli` has no dependency back on `otto-engine` (see `embedded.rs`'s module doc for why that
+# matters — the reverse edge is a Cargo package cycle), so this direction is acyclic.
+otto-cli = { path = "../cli" }
 dirs = "5"
 # Constant-time comparison of the promotion secret on `/ws`, `/workspace`, `/promote`, `/export`.
 subtle = "2"
 rmcp = { version = "1.7", features = ["client", "transport-child-process"] }
 anyhow.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "net", "time", "sync", "signal"] }
 async-trait.workspace = true
 serde = { workspace = true }
 axum = { version = "0.8", features = ["ws"] }
@@ -73,6 +77,8 @@ inquire = "0.7"
 rand = "0.8"
 data-encoding = "2"
 qrcode = "0.14"
+# The interactive REPL's line editor (`repl.rs`).
+rustyline = "14"
 
 [dev-dependencies]
 escargot = "0.5"

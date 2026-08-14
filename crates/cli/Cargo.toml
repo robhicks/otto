@@ -5,32 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# Deliberately engine-free: `otto-engine`'s `otto` binary is what constructs a concrete
+# `ClientTransport` (`EmbeddedTransport`, in `crates/engine/src/embedded.rs`) and drives the REPL
+# (`crates/engine/src/repl.rs`) — both live there rather than here because `otto-cli` depending on
+# `otto-engine` while `otto-engine`'s binary depends on `otto-cli` is a genuine Cargo cyclic-package
+# error (verified: "cyclic package dependency ... depends on itself"), not merely a style
+# preference. This crate stays exactly what its own doc comment promises: the wire protocol
+# (`Command`/`ServerMessage`) plus a transport seam and pure rendering, reusable by any future
+# client without ever pulling in the engine.
 [dependencies]
 otto-protocol = { path = "../protocol" }
-otto-engine = { path = "../engine" }
-# The four crates below are named by `embedded.rs` alone — the one deliberate exception to this
-# crate's protocol-only boundary, because `EmbeddedTransport` IS the adapter between the protocol
-# seam and an in-process engine. `transport.rs`, `render.rs`, and the REPL stay protocol-only.
-# `otto-engine-core` is here for exactly one name, `Router`, in `new_with_router`'s signature —
-# the seam that lets a caller (notably a test) pin the LLM router instead of inheriting whatever
-# the ambient provider API keys select.
-otto-engine-core = { path = "../engine-core" }
-otto-persistence = { path = "../persistence" }
-otto-extensions = { path = "../extensions" }
-otto-workspace = { path = "../workspace" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-dirs = "5"
-rustyline = "14"
 
 [dev-dependencies]
 uuid = { workspace = true }
-tempfile = { workspace = true }
-# Dev-only, so the shipped dependency graph is unchanged: the tests pin the offline
-# `SingleProviderRouter(LocalProvider)` — byte-for-byte what `build_router()` builds with no
-# provider keys set — so a turn test is offline by construction, not by luck of the environment.
-# Lateral and inward (both crates sit below `cli`), no cycle; same shape as `remote`'s dev-only
-# edge on `otto-workspace`.
-otto-providers = { path = "../providers" }
-otto-router = { path = "../router" }

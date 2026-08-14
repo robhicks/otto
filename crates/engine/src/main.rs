@@ -27,6 +27,7 @@ mod plugin_tui;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage:
+  otto                                         interactive session in the current directory
   otto run \"<goal>\" [--root <path>] [--agent <name>]
   otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--single-user | --promotion-receiver] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
   otto auth enroll <user> [--force]
@@ -56,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())
+        }
+        // A bare `otto` (no subcommand) starts the interactive REPL — `cd repo && otto` with no
+        // configuration. An actually-unknown subcommand still falls through to the `_` arm below.
+        "" => {
+            let (root, _) = parse_root(&rest);
+            otto_engine::repl(root).await
         }
         _ => {
             eprintln!(

@@ -25,10 +25,16 @@ use otto_tools::{
 mod approval;
 /// otto's terminal mark. Public so any tty frontend — and the `bake-art` example — can reach it.
 pub mod banner;
+/// `EmbeddedTransport` — the `otto_cli::ClientTransport` seam over an in-process `EngineService`.
+/// Lives here (not in `otto-cli`) to avoid a Cargo package cycle — see the module doc.
+pub mod embedded;
 mod hooks;
 mod loopback;
 mod mcp;
 mod policy_gate;
+/// The interactive REPL (`otto` with no subcommand). Lives here for the same reason as
+/// `embedded` — see that module's doc.
+mod repl;
 mod serve;
 mod service;
 
@@ -46,6 +52,7 @@ pub use otto_remote::{
     export_bundle, mint_session_secret, promote,
 };
 pub use policy_gate::PolicyGate;
+pub use repl::repl;
 pub use serve::{
     app as serve_app, app_with_base as serve_app_with_base, resolve_tls_paths, run as serve_run,
     with_ui_dir as serve_with_ui_dir,
