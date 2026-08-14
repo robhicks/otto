@@ -203,9 +203,9 @@ pub fn App() -> Element {
                             })) => {
                                 // The promoted remote requires this per-session bearer for its
                                 // `/workspace` RPCs (load_files/open_path). Switch the credential
-                                // BEFORE the reconnect, exactly as the `LoggedIn` arm stores an
-                                // access token — the drain task reads the signal when it calls
-                                // `connect`, so ordering here is load-bearing.
+                                // BEFORE the reconnect effect fires `do_connect`, exactly as the
+                                // `LoggedIn` arm stores an access token — the /workspace RPCs read
+                                // the signal once `Connected`, so ordering here is load-bearing.
                                 token.set(handover_token);
                                 reconnect_to.set(Some(endpoint));
                             }
