@@ -466,20 +466,30 @@ impl AuthStore for SqliteAuthStore {
 
     async fn consume_refresh(&self, token: &str, now: i64) -> anyhow::Result<ConsumeRefresh> {
         let hash = hash_refresh(token);
-        // The atomic single-use consume: at most one caller observes `rows_affected() == 1`.
-        let result = sqlx::query(
-            "UPDATE refresh_tokens SET consumed_at = ?1 WHERE hash = ?2 AND consumed_at IS NULL",
+        // The atomic single-use consume AND the user lookup happen in one statement:
+        // `UPDATE ... WHERE consumed_at IS NULL RETURNING user` yields the user's row only if
+        // THIS call won the single-use race (sqlite 3.35+ RETURNING, supported by sqlx 0.8).
+        // There is no window between the claim and the read, so a concurrent
+        // `revoke_user_refresh`/`revoke_user` deleting the just-claimed row can no longer make
+        // a follow-up lookup come up empty — the old two-statement version panicked there.
+        let user: Option<(String,)> = sqlx::query_as(
+            "UPDATE refresh_tokens SET consumed_at = ?1
+             WHERE hash = ?2 AND consumed_at IS NULL
+             RETURNING user",
         )
         .bind(now)
         .bind(&hash)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        if result.rows_affected() == 1 {
-            let user = self.refresh_user(&hash).await?.expect("row just consumed");
+        if let Some((user,)) = user {
+            let user = UserId::parse(&user)
+                .map_err(|e| anyhow::anyhow!("refresh_tokens: stored user is invalid: {e}"))?;
             return Ok(ConsumeRefresh::Consumed { user });
         }
         // The row is absent (never issued) or already consumed — tell them apart so a reuse
-        // can revoke the user's whole set.
+        // can revoke the user's whole set. The lookup tolerates the row having vanished since
+        // the losing UPDATE (a concurrent revoke deleting it wholesale), reporting `Unknown`
+        // rather than panicking.
         match self.refresh_user(&hash).await? {
             None => Ok(ConsumeRefresh::Unknown),
             Some(user) => Ok(ConsumeRefresh::Reused { user }),
@@ -853,6 +863,79 @@ mod tests {
             store.consume_refresh("bob-1", NOW).await.unwrap(),
             ConsumeRefresh::Consumed { user: bob() }
         );
+    }
+
+    /// The deterministic half of the consume+revoke race: consume a token, revoke the whole
+    /// set (which deletes the just-consumed row), then present the token again. The old
+    /// two-statement implementation would panic here only if the row vanished between the
+    /// winning UPDATE and its follow-up lookup; this sequence guarantees the row is gone by
+    /// the time of any re-presentation, and the method must answer `Unknown` — never panic.
+    #[tokio::test]
+    async fn consuming_a_token_after_its_set_is_revoked_is_unknown() {
+        let (store, _dir) = temp_store().await;
+        store.enroll_user(&alice(), &secret()).await.unwrap();
+        store
+            .insert_refresh("alice-1", &alice(), NOW + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.consume_refresh("alice-1", NOW).await.unwrap(),
+            ConsumeRefresh::Consumed { user: alice() }
+        );
+        store.revoke_user_refresh(&alice()).await.unwrap();
+        assert_eq!(
+            store.consume_refresh("alice-1", NOW).await.unwrap(),
+            ConsumeRefresh::Unknown
+        );
+    }
+
+    /// The nondeterministic half: consumers and a whole-set revoker race, so a consume can
+    /// land between the revoker's DELETE and... nothing — the atomic `RETURNING` consume and
+    /// the revoke are both single statements. Whatever interleaving happens, `consume_refresh`
+    /// must return a variant (never panic, never error).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_consume_and_revoke_never_panics() {
+        let (store, _dir) = temp_store().await;
+        store.enroll_user(&alice(), &secret()).await.unwrap();
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let token = format!("rt-{i}");
+                    store
+                        .insert_refresh(&token, &alice(), NOW + 3600)
+                        .await
+                        .unwrap();
+                    let consumer = {
+                        let store = store.clone();
+                        let token = token.clone();
+                        tokio::spawn(async move { store.consume_refresh(&token, NOW).await })
+                    };
+                    let revoker = {
+                        let store = store.clone();
+                        tokio::spawn(async move { store.revoke_user_refresh(&alice()).await })
+                    };
+                    let (consumed, revoked) = (consumer.await, revoker.await);
+                    // A panicked task (the old `.expect`) fails here via the JoinError.
+                    let consumed = consumed
+                        .expect("consume task panicked")
+                        .expect("consume_refresh errored");
+                    revoked
+                        .expect("revoke task panicked")
+                        .expect("revoke errored");
+                    match consumed {
+                        ConsumeRefresh::Consumed { .. }
+                        | ConsumeRefresh::Reused { .. }
+                        | ConsumeRefresh::Unknown => {}
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.expect("task panicked");
+        }
     }
 
     #[tokio::test]
