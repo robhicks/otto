@@ -1,0 +1,23 @@
+[package]
+name = "otto-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately engine-free: `otto-engine`'s `otto` binary is what constructs a concrete
+# `ClientTransport` (`EmbeddedTransport`, in `crates/engine/src/embedded.rs`) and drives the REPL
+# (`crates/engine/src/repl.rs`) — both live there rather than here because `otto-cli` depending on
+# `otto-engine` while `otto-engine`'s binary depends on `otto-cli` is a genuine Cargo cyclic-package
+# error (verified: "cyclic package dependency ... depends on itself"), not merely a style
+# preference. This crate stays exactly what its own doc comment promises: the wire protocol
+# (`Command`/`ServerMessage`) plus a transport seam and pure rendering, reusable by any future
+# client without ever pulling in the engine.
+[dependencies]
+otto-protocol = { path = "../protocol" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

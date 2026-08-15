@@ -40,8 +40,13 @@ otto-next/
 │   ├── remote           # RemoteTarget + Provisioner seam; vps + microvm (firecracker, feat-gated) + fly (on-demand Fly.io). LoopbackTarget stays in engine.
 │   ├── extensions       # Loads .claude/ agents, commands, skills, hooks, permissions, plugins.
 │   │                    #   Slice 1 shipped: custom agents; slices 2-3 shipped: commands, skills.
-│   ├── engine           # Binary + library: wires the above; `embedded` and `serve` modes.
-│   └── cli              # `otto` binary: `otto engine serve`, headless one-shot runs.
+│   ├── engine           # Binary + library: wires the above; `embedded` (in-process ClientTransport,
+│   │                    #   embedded.rs) and `serve` modes; repl.rs drives the interactive REPL.
+│   └── cli              # Protocol-only client kit behind the REPL: the ClientTransport seam
+│                        #   (send/recv over Command/ServerMessage) + FakeTransport, and pure
+│                        #   EventKind -> terminal-line rendering. No dependency on otto-engine —
+│                        #   otto-engine depends on this crate, not the reverse (the other
+│                        #   direction is a genuine Cargo package cycle).
 └── ui-dioxus/           # Dioxus CSR frontend: WASM (browser) + native (desktop). Replaced the original Leptos+Tauri stack.
 ```
 
@@ -54,6 +59,12 @@ otto-next/
 - MCP tool crates are standalone binaries; the engine talks to them over stdio JSON-RPC,
   never by linking.
 - `ui-dioxus` depends only on `protocol` (compiled to WASM). It must never link `engine-core`.
+- `cli` depends only on `protocol`; `engine` depends on `cli`, never the reverse — the reverse
+  edge is a genuine Cargo cyclic-package error (`otto-engine`'s own binary already depends on
+  `otto-cli`), not merely a layering preference. The concrete `ClientTransport` impl
+  (`EmbeddedTransport`) and the REPL loop that drive `cli`'s traits live in `engine`
+  (`embedded.rs`/`repl.rs`) rather than in `cli` itself, which is what keeps `cli`'s
+  protocol-only boundary enforced by the dependency graph instead of by review discipline.
 
 ## Key trait interfaces
 
@@ -177,7 +188,11 @@ MCP-shaped (`fn name()`, `async fn call(Value) -> Result<Value>`), so an MCP-std
 Every call passes a deterministic `PermissionGate` (otto's guardrail) before dispatch:
 `DefaultPermissionGate` denies sensitive paths (`.env`, `.ssh/`, `.git/`, `.aws/`, ssh keys) as
 an inviolable, case-insensitive floor. An `Ask` verdict is resolved by an `AskResolver` —
-`DenyAsk` in headless mode; the interactive UI supplies a prompting resolver later.
+`DenyAsk` in headless mode; the interactive UI supplies a prompting resolver later. The `cli`
+crate's REPL (see the crate layout above) does not close this gap either: its
+`TurnControls::default()` carries `DenyApprover`, so an `Ask` edit is logged and skipped rather
+than applied — interactive diff review is deferred to a later slice, not shipped alongside the
+REPL itself.
 
 The `bash` tool (`BashTool`) runs shell commands confined by a `SandboxPolicy`: on Linux,
 `bwrap` mounts the whole filesystem read-only, re-binds only the workspace root writable, and

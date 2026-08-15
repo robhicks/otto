@@ -4,10 +4,12 @@
 use async_trait::async_trait;
 use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
-use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, Milestone};
+use otto_engine_core::types::{
+    AgentOutput, AgentRequest, CompleteRequest, Milestone, SessionHistory,
+};
 use serde::Deserialize;
 
-use crate::parse::extract_json;
+use crate::parse::{extract_json, history_block};
 
 pub struct Planner;
 
@@ -21,12 +23,13 @@ struct MilestoneDto {
     description: String,
 }
 
-fn plan_prompt(goal: &str) -> String {
+fn plan_prompt(goal: &str, history: &SessionHistory) -> String {
     format!(
         "You are otto's planner. Decompose the goal into an ordered list of concrete milestones.\n\
-         Goal: {goal}\n\
+         Goal: {goal}{history}\n\
          Respond ONLY with valid JSON matching this schema:\n\
-         milestones: array of objects, each with a string field named description."
+         milestones: array of objects, each with a string field named description.",
+        history = history_block(history)
     )
 }
 
@@ -40,7 +43,7 @@ impl Agent for Planner {
             .router()
             .complete(
                 CompleteRequest {
-                    prompt: plan_prompt(&goal),
+                    prompt: plan_prompt(&goal, ctx.history()),
                 },
                 RouteHints {
                     task_kind: TaskKind::Architecture,
@@ -68,10 +71,12 @@ impl Agent for Planner {
 mod tests {
     use super::*;
     use otto_engine_core::tool::{DenyAsk, ToolRegistry};
+    use otto_engine_core::types::{SessionHistory, TurnSummary, VerifySummary};
     use otto_providers::{LocalProvider, ScriptedProvider};
     use otto_router::SingleProviderRouter;
     use otto_tools::DefaultPermissionGate;
     use otto_workspace::LocalWorkspace;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     async fn run_planner(router: &SingleProviderRouter, goal: &str) -> Vec<Milestone> {
@@ -105,6 +110,51 @@ mod tests {
         assert_eq!(milestones.len(), 2);
         assert_eq!(milestones[0].description, "step one");
         assert_eq!(milestones[1].description, "step two");
+    }
+
+    /// The single source of truth for the pinned no-history prompt string.
+    fn plan_prompt_pinned_expectation() -> String {
+        "You are otto's planner. Decompose the goal into an ordered list of concrete milestones.\n\
+         Goal: add a hello function\n\
+         Respond ONLY with valid JSON matching this schema:\n\
+         milestones: array of objects, each with a string field named description."
+            .to_string()
+    }
+
+    #[test]
+    fn plan_prompt_with_empty_history_is_unchanged() {
+        // Regression rail for threading conversation history into the Planner: with no prior
+        // turns the prompt must stay byte-identical to the pre-history one, because the offline
+        // suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
+        // "helpfully" update this string when a history change makes it fail — that means the
+        // no-history path changed, which the history work is required to leave alone.
+        assert_eq!(
+            plan_prompt("add a hello function", &SessionHistory::empty()),
+            plan_prompt_pinned_expectation()
+        );
+    }
+
+    #[test]
+    fn plan_prompt_with_history_names_prior_goals_and_files() {
+        let history = SessionHistory::new(vec![TurnSummary {
+            turn_index: 0,
+            goal: "add a hello function".to_string(),
+            milestones: vec!["create hello.rs".to_string()],
+            files_edited: vec![PathBuf::from("hello.rs")],
+            verify: Some(VerifySummary {
+                ok: true,
+                detail: "passed".to_string(),
+            }),
+            ok: true,
+        }]);
+
+        let p = plan_prompt("now add tests for that", &history);
+        assert!(p.contains("add a hello function"), "prior goal must appear");
+        assert!(p.contains("hello.rs"), "prior edited file must appear");
+        assert!(
+            p.contains("now add tests for that"),
+            "current goal must still appear"
+        );
     }
 
     #[tokio::test]

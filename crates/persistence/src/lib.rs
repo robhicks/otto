@@ -17,7 +17,7 @@ pub use types::{SessionState, SessionStatus, TurnRecord};
 ///
 /// # Which methods are owner-scoped, and why not all of them
 ///
-/// `create_session`, `replay_since`, `session_status`, and `snapshot` take a principal
+/// `create_session`, `replay_since`, `session_status`, `snapshot`, and `turns` take a principal
 /// (`owner_of` does **not** — it is unscoped by design; see its own doc): they are the methods a client can reach with a session id it does not own, and the
 /// ones that would return another tenant's data. Their ownership predicate lives inside the SQL
 /// statement, so no caller can forget it.
@@ -85,6 +85,17 @@ pub trait SessionStore: Send + Sync {
         owner: &otto_protocol::UserId,
         session: SessionId,
     ) -> anyhow::Result<SessionStatus>;
+
+    /// The session's completed turn records, ascending by `turn_index`.
+    ///
+    /// Scoped by owner exactly like `replay_since`: an unknown session and a session `owner`
+    /// does not own both return an empty Vec, so this can never become an existence oracle for
+    /// another principal's sessions.
+    async fn turns(
+        &self,
+        owner: &otto_protocol::UserId,
+        session: SessionId,
+    ) -> anyhow::Result<Vec<TurnRecord>>;
 
     /// The next event seq for `session` (`MAX(seq) + 1`, or 0 if none). Lets a long-lived
     /// or reconnected writer continue the seq sequence without holding an in-memory counter.

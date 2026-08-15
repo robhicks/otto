@@ -9,11 +9,13 @@ use std::sync::Arc;
 use rand::RngCore;
 
 use otto_engine::{
-    McpConnection, build_router, build_tool_registry, mcp_connect_bash, mcp_connect_fs,
-    mcp_connect_git, mcp_connect_grep, mcp_connect_lsp, mcp_connect_plugin_server,
-    resolve_tls_paths, run_goal, serve_app_with_base, serve_run,
+    build_composed_tools, build_router, resolve_tls_paths, run_goal, serve_app_with_base, serve_run,
 };
-use otto_engine_core::tool::ToolRegistry;
+// The composition helpers now live in the library (so the `cli` crate can reach them); this
+// binary drives them only through `build_composed_tools`, but its test module exercises them
+// directly, so the names must be in scope for `super::` there.
+#[cfg(test)]
+use otto_engine::{register_hooks, register_skills};
 use otto_engine_core::traits::Workspace;
 use otto_workspace::LocalWorkspace;
 
@@ -25,6 +27,7 @@ mod plugin_tui;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage:
+  otto [--root <path>]                         interactive session in the current directory
   otto run \"<goal>\" [--root <path>] [--agent <name>]
   otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--single-user | --promotion-receiver] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
   otto auth enroll <user> [--force]
@@ -55,14 +58,38 @@ async fn main() -> anyhow::Result<()> {
             println!("{USAGE}");
             Ok(())
         }
-        _ => {
-            eprintln!(
-                "{}\n",
-                otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
-            );
-            eprintln!("{USAGE}");
-            std::process::exit(2);
-        }
+        // A bare `otto` (no subcommand) starts the interactive REPL — `cd repo && otto` with no
+        // configuration — as does `otto --root <path>`. An actually-unknown subcommand still
+        // falls through to the usage error.
+        _ => match repl_root(&command, &rest) {
+            Some(root) => otto_engine::repl(root).await,
+            None => {
+                eprintln!(
+                    "{}\n",
+                    otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
+                );
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
+/// The workspace root for an interactive-REPL invocation, or `None` when this is not one.
+///
+/// `otto` alone is the REPL in the current directory. `otto --root <path>` is the REPL rooted
+/// there: the flag is read here rather than by `parse_root` because the first argv word is the
+/// subcommand, so a leading `--root` would otherwise be parsed *as* the subcommand and exit 2 —
+/// which it did, while the usage string, `CLAUDE.md`, and the design spec all advertised the flag.
+///
+/// Deliberately narrow: a leading `--root <path>` and nothing else. Anything further along is an
+/// unknown subcommand or a flag the REPL does not take, and must still reach the usage error
+/// rather than being silently ignored.
+fn repl_root(command: &str, rest: &[String]) -> Option<PathBuf> {
+    match (command, rest) {
+        ("", []) => Some(PathBuf::from(".")),
+        ("--root", [path]) => Some(PathBuf::from(path)),
+        _ => None,
     }
 }
 
@@ -342,194 +369,6 @@ fn fly_config_from_env() -> otto_engine::FlyConfig {
             .unwrap_or_else(|_| "https://api.fly.io/graphql".to_string()),
         public_base_override: std::env::var("OTTO_FLY_PUBLIC_BASE").ok(),
     }
-}
-
-fn mcp_fs_bin() -> String {
-    std::env::var("OTTO_MCP_FS_BIN").unwrap_or_else(|_| "mcp-fs".to_string())
-}
-
-fn mcp_grep_bin() -> String {
-    std::env::var("OTTO_MCP_GREP_BIN").unwrap_or_else(|_| "mcp-grep".to_string())
-}
-
-fn mcp_git_bin() -> String {
-    std::env::var("OTTO_MCP_GIT_BIN").unwrap_or_else(|_| "mcp-git".to_string())
-}
-
-fn mcp_bash_bin() -> String {
-    std::env::var("OTTO_MCP_BASH_BIN").unwrap_or_else(|_| "mcp-bash".to_string())
-}
-
-fn mcp_lsp_bin() -> String {
-    std::env::var("OTTO_MCP_LSP_BIN").unwrap_or_else(|_| "mcp-lsp".to_string())
-}
-
-/// Build the tool registry, preferring mcp-fs for fs tools and falling back to in-process.
-/// Also registers the grep tool from mcp-grep (additive; absent if mcp-grep can't be spawned).
-/// Returns the registry and the live MCP connections to keep alive for the process lifetime.
-async fn build_tools_preferring_mcp(
-    tools_workspace: Arc<dyn Workspace>,
-    root: PathBuf,
-    approve_edits: bool,
-    permissions: &otto_extensions::PermissionRules,
-) -> (ToolRegistry, Vec<McpConnection>) {
-    let mut registry = if !permissions.is_empty() {
-        // Permission rules override the default gate with a PolicyGate, composed with approval
-        // mode when the caller requests it (e.g. `otto serve --approve-edits`).
-        otto_engine::build_tool_registry_with_permissions(
-            tools_workspace,
-            root.clone(),
-            permissions,
-            approve_edits,
-        )
-    } else if approve_edits {
-        otto_engine::build_tool_registry_approving(tools_workspace, root.clone())
-    } else {
-        build_tool_registry(tools_workspace, root.clone())
-    };
-    let mut conns = Vec::new();
-
-    // fs: prefer mcp-fs, fall back to the in-process fs tools already in the registry.
-    match mcp_connect_fs(&mcp_fs_bin(), &root).await {
-        Ok((conn, mcp_tools)) => {
-            for t in mcp_tools {
-                registry.register(t);
-            }
-            conns.push(conn);
-        }
-        Err(e) => eprintln!("mcp-fs unavailable ({e}); using in-process fs tools"),
-    }
-
-    // grep: additive new capability — absent (logged) if mcp-grep can't be spawned.
-    match mcp_connect_grep(&mcp_grep_bin(), &root).await {
-        Ok((conn, mcp_tools)) => {
-            for t in mcp_tools {
-                registry.register(t);
-            }
-            conns.push(conn);
-        }
-        Err(e) => eprintln!("mcp-grep unavailable ({e}); search disabled"),
-    }
-
-    // git: additive — absent (logged) if mcp-git can't be spawned.
-    match mcp_connect_git(&mcp_git_bin(), &root).await {
-        Ok((conn, mcp_tools)) => {
-            for t in mcp_tools {
-                registry.register(t);
-            }
-            conns.push(conn);
-        }
-        Err(e) => eprintln!("mcp-git unavailable ({e}); git tools disabled"),
-    }
-
-    // lsp: additive — absent (logged) if mcp-lsp can't start (its PATH gate finds no supported
-    // language server: rust-analyzer / typescript-language-server / pyright-langserver / gopls).
-    // No in-process fallback exists (there's no in-process LSP client), same category as grep/git.
-    match mcp_connect_lsp(&mcp_lsp_bin(), &root).await {
-        Ok((conn, mcp_tools)) => {
-            for t in mcp_tools {
-                registry.register(t);
-            }
-            conns.push(conn);
-        }
-        Err(e) => eprintln!("mcp-lsp unavailable ({e}); LSP tools disabled"),
-    }
-
-    // bash: only when a sandbox backend exists (same rule build_tool_registry uses for the
-    // in-process BashTool). Prefer mcp-bash, falling back to the in-process sandboxed BashTool
-    // already in the registry. mcp-bash itself hardcodes Os, so it is always sandboxed.
-    if otto_tools::os_sandbox_available() {
-        match mcp_connect_bash(&mcp_bash_bin(), &root).await {
-            Ok((conn, mcp_tools)) => {
-                for t in mcp_tools {
-                    registry.register(t);
-                }
-                conns.push(conn);
-            }
-            Err(e) => eprintln!("mcp-bash unavailable ({e}); using in-process sandboxed bash"),
-        }
-    }
-
-    (registry, conns)
-}
-
-/// The tool-registry composition every entrypoint shares (`otto run`, `otto run --command`,
-/// `otto run --agent`, `otto serve`): the permission/approval gate from
-/// `build_tools_preferring_mcp`, then skill registration via `register_skills`, then bundled plugin
-/// MCP servers via `mcp_connect_plugin_server`, then hook-wrapping over all of them via
-/// `register_hooks` (so hooks fire on plugin tools too). `approve_edits` is true only for
-/// `otto serve --approve-edits`.
-async fn build_composed_tools(
-    ext: &otto_extensions::Extensions,
-    tools_workspace: Arc<dyn Workspace>,
-    root: PathBuf,
-    approve_edits: bool,
-) -> (ToolRegistry, Vec<McpConnection>) {
-    let (mut tools, mut conns) = build_tools_preferring_mcp(
-        tools_workspace,
-        root.clone(),
-        approve_edits,
-        &ext.permissions,
-    )
-    .await;
-    register_skills(&mut tools, &ext.skills);
-    // Bundled plugin MCP servers register BEFORE register_hooks so hook-wrapping covers them too:
-    // a `PreToolUse`/`PostToolUse` hook (matched via an `mcp__…` matcher or `*`) fires on plugin
-    // tool calls. A server that won't spawn is logged and skipped — additive, never fatal.
-    for spec in &ext.mcp_servers {
-        match mcp_connect_plugin_server(spec).await {
-            Ok((conn, mcp_tools)) => {
-                for t in mcp_tools {
-                    tools.register(t);
-                }
-                conns.push(conn);
-            }
-            Err(e) => eprintln!(
-                "plugin mcp server {}:{} unavailable ({e}); skipping",
-                spec.namespace, spec.server_key
-            ),
-        }
-    }
-    register_hooks(&mut tools, &ext.hooks, &root);
-    (tools, conns)
-}
-
-/// Register the built-in `skill` tool when any skills were discovered. No-op otherwise, so a
-/// workspace with no `.claude/skills/` leaves the spine's tool set byte-for-byte unchanged.
-fn register_skills(
-    registry: &mut otto_engine_core::tool::ToolRegistry,
-    skills: &[otto_extensions::CustomSkillDef],
-) {
-    if !skills.is_empty() {
-        registry.register(Arc::new(otto_extensions::SkillTool::new(skills)));
-    }
-}
-
-/// Wrap every registered tool with hook decorators. With no hooks configured, nothing happens.
-/// If hooks ARE configured but no OS sandbox backend is available, the hooks are skipped (their
-/// commands are never run unsandboxed) and a loud warning is printed: a configured blocking
-/// `PreToolUse` hook will NOT fire, so it cannot protect the call — unlike `bash`, the guarded
-/// tools still run. Only when hooks exist AND a sandbox backend is present is every tool wrapped.
-fn register_hooks(
-    registry: &mut otto_engine_core::tool::ToolRegistry,
-    hooks: &otto_extensions::HookSet,
-    root: &std::path::Path,
-) {
-    if hooks.is_empty() {
-        return;
-    }
-    if !otto_tools::os_sandbox_available() {
-        eprintln!(
-            "warning: {} hook(s) are configured in settings.json but no OS sandbox backend \
-             (bwrap/sandbox-exec) is available — hooks will NOT run, so tool calls are NOT \
-             guarded by them. Install bwrap (Linux) or sandbox-exec (macOS) to enable hooks.",
-            hooks.pre_tool_use.len() + hooks.post_tool_use.len()
-        );
-        return;
-    }
-    let exec: Arc<dyn otto_extensions::HookExecutor> =
-        Arc::new(otto_engine::SandboxedHookExecutor::new(root.to_path_buf()));
-    registry.wrap_each(|t| otto_extensions::HookedTool::wrap(t, hooks, exec.clone()));
 }
 
 async fn cmd_run(args: Vec<String>) -> anyhow::Result<()> {
@@ -1158,6 +997,34 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `otto --root <path>` must start the REPL rooted there. The bare-`otto` arm is reachable
+    /// only with an empty argv, so a leading `--root` used to be parsed as the *subcommand* and
+    /// exit 2 — while the usage string, `CLAUDE.md`, and the design spec all advertised the flag.
+    #[test]
+    fn repl_root_accepts_a_bare_invocation_and_a_leading_root_flag() {
+        assert_eq!(repl_root("", &[]), Some(PathBuf::from(".")));
+        assert_eq!(
+            repl_root("--root", &["/tmp/somewhere".to_string()]),
+            Some(PathBuf::from("/tmp/somewhere"))
+        );
+    }
+
+    /// ...and nothing else. An unknown subcommand, a `--root` with no path, and trailing junk all
+    /// have to reach the usage error rather than quietly starting a REPL somewhere.
+    #[test]
+    fn repl_root_rejects_everything_else() {
+        assert_eq!(repl_root("bogus", &[]), None);
+        assert_eq!(repl_root("--root", &[]), None);
+        assert_eq!(
+            repl_root(
+                "--root",
+                &["/tmp/somewhere".to_string(), "extra".to_string()]
+            ),
+            None
+        );
+        assert_eq!(repl_root("--rooted", &["/tmp/somewhere".to_string()]), None);
+    }
 
     #[test]
     fn parse_agent_flag_extracts_name() {
@@ -1888,391 +1755,6 @@ mod tests {
         assert_eq!(
             reg.check("fs.write", &json!({"path": "dist/x.txt"})),
             Decision::Deny
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_wraps_hooks_around_permission_and_approval_gate() {
-        use otto_workspace::LocalWorkspace;
-
-        if !otto_tools::os_sandbox_available() {
-            eprintln!("skipping serve hooks composition test: no OS sandbox backend");
-            return;
-        }
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-        let claude = proj.path().join(".claude");
-        std::fs::create_dir_all(&claude).unwrap();
-        std::fs::write(
-            claude.join("settings.json"),
-            r#"{
-                "permissions": { "deny": ["Write(dist/**)"] },
-                "hooks": { "PreToolUse": [
-                    {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
-                ] }
-            }"#,
-        )
-        .unwrap();
-
-        let ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(!ext.permissions.is_empty());
-        assert!(!ext.hooks.is_empty());
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), true).await;
-
-        // The hook fires even though fs.read is otherwise allowed by the permission/approval gate.
-        let err = tools
-            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("blocked by PreToolUse hook"),
-            "got: {err}"
-        );
-        // The permission-gate deny still wins for an unrelated tool call (composition intact).
-        assert_eq!(
-            tools.check("fs.write", &serde_json::json!({"path": "dist/x.txt"})),
-            otto_engine_core::tool::Decision::Deny
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_enforces_hooks_on_the_plain_gate_branch() {
-        use otto_workspace::LocalWorkspace;
-
-        if !otto_tools::os_sandbox_available() {
-            eprintln!("skipping serve hooks plain-branch test: no OS sandbox backend");
-            return;
-        }
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-        let claude = proj.path().join(".claude");
-        std::fs::create_dir_all(&claude).unwrap();
-        std::fs::write(
-            claude.join("settings.json"),
-            r#"{"hooks": { "PreToolUse": [
-                {"matcher": "fs.read", "hooks": [{"type": "command", "command": "exit 2"}]}
-            ] }}"#,
-        )
-        .unwrap();
-
-        let ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(ext.permissions.is_empty());
-        assert!(!ext.hooks.is_empty());
-
-        // No permission rules and approve_edits=false: build_tools_preferring_mcp takes its
-        // plain build_tool_registry branch, not PolicyGate/ApprovalModeGate.
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        let err = tools
-            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("blocked by PreToolUse hook"),
-            "got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_matches_direct_call_when_nothing_is_configured() {
-        use otto_workspace::LocalWorkspace;
-
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-
-        let ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(ext.permissions.is_empty());
-        assert!(ext.hooks.is_empty());
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        // With no settings.json at all, build_composed_tools must behave exactly like calling
-        // build_tools_preferring_mcp directly — register_hooks is a no-op with no hooks.
-        let out = tools
-            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
-            .await
-            .unwrap();
-        assert!(
-            out.to_string().contains("hi"),
-            "expected fs.read to return content, got: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_registers_skill_tool_when_present() {
-        use otto_workspace::LocalWorkspace;
-
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let skill_dir = proj.path().join(".claude").join("skills").join("greeter");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: greeter\ndescription: greets\n---\nSay hi.\n",
-        )
-        .unwrap();
-
-        let ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(!ext.skills.is_empty());
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        assert!(
-            tools.tool_names().iter().any(|n| n == "skill"),
-            "expected the `skill` tool to be registered, got: {:?}",
-            tools.tool_names()
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_connects_and_registers_a_plugin_mcp_server() {
-        use otto_extensions::{Extensions, PluginMcpServer};
-        use otto_workspace::LocalWorkspace;
-
-        // Use the real, already-built mcp-fs binary as a stand-in "plugin" MCP server — a real
-        // stdio server, so this proves the actual connect-and-register path, not a mock.
-        let bin = escargot::CargoBuild::new()
-            .package("otto-mcp-fs")
-            .bin("mcp-fs")
-            .run()
-            .expect("build mcp-fs")
-            .path()
-            .to_path_buf();
-
-        let proj = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-
-        let mut ext = Extensions::default();
-        ext.mcp_servers.push(PluginMcpServer {
-            namespace: "testplugin".to_string(),
-            server_key: "fs".to_string(),
-            command: bin.to_string_lossy().into_owned(),
-            args: vec![proj.path().to_string_lossy().into_owned()],
-            env: Default::default(),
-            cwd: None,
-        });
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        assert!(
-            tools
-                .tool_names()
-                .iter()
-                .any(|n| n == "plugin__testplugin__fs__fs.read"),
-            "expected the namespaced plugin tool to be registered, got: {:?}",
-            tools.tool_names()
-        );
-        // The connection must be retained in the returned Vec — otherwise the caller would drop
-        // it and kill the child process the instant build_composed_tools returns.
-        assert!(!conns.is_empty());
-
-        // Registered-by-name isn't enough on its own — prove the tool actually round-trips
-        // through the spawned server (catches a namespacing/routing bug that a name-only
-        // assertion would miss, e.g. the request reaching the server under the wrong tool name).
-        let out = tools
-            .call(
-                "plugin__testplugin__fs__fs.read",
-                serde_json::json!({ "path": "target.txt" }),
-            )
-            .await
-            .unwrap();
-        assert!(
-            out.to_string().contains("hi"),
-            "expected the plugin tool call to return the file content, got: {out}"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_skips_an_unreachable_plugin_mcp_server() {
-        use otto_extensions::{Extensions, PluginMcpServer};
-        use otto_workspace::LocalWorkspace;
-
-        let proj = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-
-        let mut ext = Extensions::default();
-        ext.mcp_servers.push(PluginMcpServer {
-            namespace: "testplugin".to_string(),
-            server_key: "bogus".to_string(),
-            command: "definitely-not-a-real-binary-xyz".to_string(),
-            args: vec![],
-            env: Default::default(),
-            cwd: None,
-        });
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        // An unreachable plugin server is logged and skipped, never fatal — matches cmd_run.
-        assert!(
-            !tools.tool_names().iter().any(|n| n.starts_with("plugin__")),
-            "expected no plugin tools to be registered, got: {:?}",
-            tools.tool_names()
-        );
-        assert!(conns.is_empty());
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_hook_wraps_plugin_mcp_tools() {
-        use otto_extensions::PluginMcpServer;
-        use otto_workspace::LocalWorkspace;
-
-        if !otto_tools::os_sandbox_available() {
-            eprintln!(
-                "skipping plugin-hook-ordering test: no OS sandbox backend, hooks would be skipped"
-            );
-            return;
-        }
-
-        let bin = escargot::CargoBuild::new()
-            .package("otto-mcp-fs")
-            .bin("mcp-fs")
-            .run()
-            .expect("build mcp-fs")
-            .path()
-            .to_path_buf();
-
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-        let claude = proj.path().join(".claude");
-        std::fs::create_dir_all(&claude).unwrap();
-        std::fs::write(
-            claude.join("settings.json"),
-            r#"{"hooks": { "PreToolUse": [
-                {"matcher": "*", "hooks": [{"type": "command", "command": "exit 2"}]}
-            ] }}"#,
-        )
-        .unwrap();
-
-        // A "*" PreToolUse hook blocks every tool in the registry when register_hooks wraps it.
-        // Both fs.read and the plugin tool register before the wrap now, so both must be blocked.
-        let mut ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(!ext.hooks.is_empty());
-        ext.mcp_servers.push(PluginMcpServer {
-            namespace: "testplugin".to_string(),
-            server_key: "fs".to_string(),
-            command: bin.to_string_lossy().into_owned(),
-            args: vec![proj.path().to_string_lossy().into_owned()],
-            env: Default::default(),
-            cwd: None,
-        });
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        // fs.read was registered before the hook wrap — the "*" hook blocks it.
-        let blocked = tools
-            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
-            .await
-            .unwrap_err();
-        assert!(
-            blocked.to_string().contains("blocked by PreToolUse hook"),
-            "got: {blocked}"
-        );
-
-        // The plugin tool now registers BEFORE the hook wrap — the same "*" hook must block it too.
-        let plugin_blocked = tools
-            .call(
-                "plugin__testplugin__fs__fs.read",
-                serde_json::json!({ "path": "target.txt" }),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            plugin_blocked
-                .to_string()
-                .contains("blocked by PreToolUse hook"),
-            "expected the wrapped plugin tool to be blocked, got: {plugin_blocked}"
-        );
-    }
-
-    #[tokio::test]
-    async fn build_composed_tools_mcp_matcher_hook_fires_on_plugin_tool_only() {
-        use otto_extensions::PluginMcpServer;
-        use otto_workspace::LocalWorkspace;
-
-        if !otto_tools::os_sandbox_available() {
-            eprintln!(
-                "skipping mcp-matcher hook test: no OS sandbox backend, hooks would be skipped"
-            );
-            return;
-        }
-
-        let bin = escargot::CargoBuild::new()
-            .package("otto-mcp-fs")
-            .bin("mcp-fs")
-            .run()
-            .expect("build mcp-fs")
-            .path()
-            .to_path_buf();
-
-        let proj = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(proj.path().join("target.txt"), "hi").unwrap();
-        let claude = proj.path().join(".claude");
-        std::fs::create_dir_all(&claude).unwrap();
-        // Matcher targets ONLY this plugin's MCP tools — fs.read must be untouched.
-        std::fs::write(
-            claude.join("settings.json"),
-            r#"{"hooks": { "PreToolUse": [
-                {"matcher": "mcp__testplugin", "hooks": [{"type": "command", "command": "exit 2"}]}
-            ] }}"#,
-        )
-        .unwrap();
-
-        let mut ext = otto_extensions::discover(proj.path(), home.path());
-        assert!(!ext.hooks.is_empty());
-        ext.mcp_servers.push(PluginMcpServer {
-            namespace: "testplugin".to_string(),
-            server_key: "fs".to_string(),
-            command: bin.to_string_lossy().into_owned(),
-            args: vec![proj.path().to_string_lossy().into_owned()],
-            env: Default::default(),
-            cwd: None,
-        });
-
-        let ws: Arc<dyn Workspace> = Arc::new(LocalWorkspace::new(proj.path().to_path_buf()));
-        let (tools, _conns) =
-            super::build_composed_tools(&ext, ws, proj.path().to_path_buf(), false).await;
-
-        // fs.read is NOT selected by the mcp__testplugin matcher → it runs.
-        let ok = tools
-            .call("fs.read", serde_json::json!({ "path": "target.txt" }))
-            .await
-            .unwrap();
-        assert!(
-            ok.to_string().contains("hi"),
-            "fs.read should not be blocked, got: {ok}"
-        );
-
-        // The plugin tool IS selected → blocked.
-        let blocked = tools
-            .call(
-                "plugin__testplugin__fs__fs.read",
-                serde_json::json!({ "path": "target.txt" }),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            blocked.to_string().contains("blocked by PreToolUse hook"),
-            "expected the plugin tool to be blocked by the mcp__ matcher, got: {blocked}"
         );
     }
 

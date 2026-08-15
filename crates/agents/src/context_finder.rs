@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use otto_engine_core::router::{RouteHints, TaskKind};
 use otto_engine_core::traits::{Agent, AgentCtx};
-use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest};
+use otto_engine_core::types::{AgentOutput, AgentRequest, CompleteRequest, SessionHistory};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::parse::extract_json;
+use crate::parse::{extract_json, history_block};
 
 /// Candidate files kept after lexical scoring, before LLM selection.
 const CANDIDATE_LIMIT: usize = 20;
@@ -104,6 +104,7 @@ fn select_prompt(
     goal: &str,
     candidates: &[(String, u64)],
     symbols_by_path: &std::collections::HashMap<String, Vec<String>>,
+    history: &SessionHistory,
 ) -> String {
     let listed = candidates
         .iter()
@@ -118,12 +119,13 @@ fn select_prompt(
     format!(
         "You are otto's context finder. From the candidate files below, choose up to {SELECT_LIMIT} \
          files most relevant to the goal, most relevant first.\n\
-         Goal: {goal}\n\
+         Goal: {goal}{history}\n\
          Candidates:\n{listed}\n\
          Each candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; \
          the path is only the part before ` (score`.\n\
          Respond ONLY with valid JSON: an object with a string-array field named files, each the \
-         exact path (without the score or symbols) copied from a candidate line."
+         exact path (without the score or symbols) copied from a candidate line.",
+        history = history_block(history)
     )
 }
 
@@ -237,7 +239,7 @@ impl Agent for ContextFinder {
             .router()
             .complete(
                 CompleteRequest {
-                    prompt: select_prompt(&goal, &scored, &symbols_by_path),
+                    prompt: select_prompt(&goal, &scored, &symbols_by_path, ctx.history()),
                 },
                 RouteHints {
                     task_kind: TaskKind::Architecture,
@@ -274,7 +276,7 @@ mod tests {
     use super::*;
     use otto_engine_core::tool::{DenyAsk, Tool, ToolRegistry};
     use otto_engine_core::traits::{Workspace, WorkspaceRead};
-    use otto_engine_core::types::Edit;
+    use otto_engine_core::types::{Edit, TurnSummary, VerifySummary};
     use otto_engine_core::{Candidate, Retriever};
     use otto_providers::{LocalProvider, ScriptedProvider};
     use otto_router::SingleProviderRouter;
@@ -529,6 +531,61 @@ mod tests {
         );
     }
 
+    /// The single source of truth for the pinned no-history prompt string.
+    fn select_prompt_pinned_expectation() -> String {
+        "You are otto's context finder. From the candidate files below, choose up to 8 files most relevant to the goal, most relevant first.\nGoal: add a hello function\nCandidates:\n- src/login.rs (score 10) [symbols: login]\n- README.md (score 3)\nEach candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; the path is only the part before ` (score`.\nRespond ONLY with valid JSON: an object with a string-array field named files, each the exact path (without the score or symbols) copied from a candidate line.".to_string()
+    }
+
+    #[test]
+    fn select_prompt_with_empty_history_is_unchanged() {
+        // Regression rail for threading conversation history into the ContextFinder: with no
+        // prior turns the prompt must stay byte-identical to the pre-history one, because the
+        // offline suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
+        // "helpfully" update this string when a history change makes it fail — that means the
+        // no-history path changed, which the history work is required to leave alone. The
+        // candidate list is fixed/deterministic so the pinned string is reproducible.
+        let cands = vec![
+            ("src/login.rs".to_string(), 10u64),
+            ("README.md".to_string(), 3u64),
+        ];
+        let mut syms = std::collections::HashMap::new();
+        syms.insert("src/login.rs".to_string(), vec!["login".to_string()]);
+        assert_eq!(
+            select_prompt(
+                "add a hello function",
+                &cands,
+                &syms,
+                &SessionHistory::empty()
+            ),
+            select_prompt_pinned_expectation()
+        );
+    }
+
+    #[test]
+    fn select_prompt_with_history_names_prior_goals_and_files() {
+        let cands = vec![("src/login.rs".to_string(), 10u64)];
+        let syms = std::collections::HashMap::new();
+        let history = SessionHistory::new(vec![TurnSummary {
+            turn_index: 0,
+            goal: "add a hello function".to_string(),
+            milestones: vec!["create hello.rs".to_string()],
+            files_edited: vec![PathBuf::from("hello.rs")],
+            verify: Some(VerifySummary {
+                ok: true,
+                detail: "passed".to_string(),
+            }),
+            ok: true,
+        }]);
+
+        let p = select_prompt("now add tests for that", &cands, &syms, &history);
+        assert!(p.contains("add a hello function"), "prior goal must appear");
+        assert!(p.contains("hello.rs"), "prior edited file must appear");
+        assert!(
+            p.contains("now add tests for that"),
+            "current goal must still appear"
+        );
+    }
+
     #[test]
     fn select_prompt_lists_symbols_only_when_present() {
         let cands = vec![("a.rs".to_string(), 10u64), ("b.rs".to_string(), 5u64)];
@@ -537,7 +594,7 @@ mod tests {
             "a.rs".to_string(),
             vec!["login".to_string(), "logout".to_string()],
         );
-        let p = select_prompt("goal", &cands, &syms);
+        let p = select_prompt("goal", &cands, &syms, &SessionHistory::empty());
         assert!(
             p.contains("- a.rs (score 10) [symbols: login, logout]"),
             "{p}"
