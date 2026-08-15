@@ -531,39 +531,19 @@ mod tests {
         );
     }
 
-    /// The single source of truth for the pinned no-history prompt string. Both the pinning
-    /// test and the empty-history regression test assert against this literal.
+    /// The single source of truth for the pinned no-history prompt string.
     fn select_prompt_pinned_expectation() -> String {
         "You are otto's context finder. From the candidate files below, choose up to 8 files most relevant to the goal, most relevant first.\nGoal: add a hello function\nCandidates:\n- src/login.rs (score 10) [symbols: login]\n- README.md (score 3)\nEach candidate line is `- <path> (score <n>)` optionally followed by `[symbols: ...]`; the path is only the part before ` (score`.\nRespond ONLY with valid JSON: an object with a string-array field named files, each the exact path (without the score or symbols) copied from a candidate line.".to_string()
     }
 
     #[test]
-    fn select_prompt_is_pinned_for_the_no_history_case() {
-        // Regression rail for threading conversation history into the ContextFinder: the
-        // offline suite asserts on LocalProvider output, which echoes this exact prompt. Do
-        // NOT "helpfully" update this string when the history change makes it fail — that
-        // means the no-history path changed, which the history task is required to leave
-        // alone. Candidate list is fixed/deterministic so the pinned string is reproducible.
-        let cands = vec![
-            ("src/login.rs".to_string(), 10u64),
-            ("README.md".to_string(), 3u64),
-        ];
-        let mut syms = std::collections::HashMap::new();
-        syms.insert("src/login.rs".to_string(), vec!["login".to_string()]);
-        assert_eq!(
-            select_prompt(
-                "add a hello function",
-                &cands,
-                &syms,
-                &SessionHistory::empty()
-            ),
-            select_prompt_pinned_expectation()
-        );
-    }
-
-    #[test]
     fn select_prompt_with_empty_history_is_unchanged() {
-        // The rail: the no-history prompt must equal the pinned string from Task 5.
+        // Regression rail for threading conversation history into the ContextFinder: with no
+        // prior turns the prompt must stay byte-identical to the pre-history one, because the
+        // offline suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
+        // "helpfully" update this string when a history change makes it fail — that means the
+        // no-history path changed, which the history work is required to leave alone. The
+        // candidate list is fixed/deterministic so the pinned string is reproducible.
         let cands = vec![
             ("src/login.rs".to_string(), 10u64),
             ("README.md".to_string(), 3u64),

@@ -112,8 +112,7 @@ mod tests {
         assert_eq!(milestones[1].description, "step two");
     }
 
-    /// The single source of truth for the pinned no-history prompt string. Both the pinning
-    /// test and the empty-history regression test assert against this literal.
+    /// The single source of truth for the pinned no-history prompt string.
     fn plan_prompt_pinned_expectation() -> String {
         "You are otto's planner. Decompose the goal into an ordered list of concrete milestones.\n\
          Goal: add a hello function\n\
@@ -123,20 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_prompt_is_pinned_for_the_no_history_case() {
-        // Regression rail for threading conversation history into the Planner: the offline
-        // suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
-        // "helpfully" update this string when the history change makes it fail — that means
-        // the no-history path changed, which the history task is required to leave alone.
-        assert_eq!(
-            plan_prompt("add a hello function", &SessionHistory::empty()),
-            plan_prompt_pinned_expectation()
-        );
-    }
-
-    #[test]
     fn plan_prompt_with_empty_history_is_unchanged() {
-        // The rail: the no-history prompt must equal the pinned string from Task 5.
+        // Regression rail for threading conversation history into the Planner: with no prior
+        // turns the prompt must stay byte-identical to the pre-history one, because the offline
+        // suite asserts on LocalProvider output, which echoes this exact prompt. Do NOT
+        // "helpfully" update this string when a history change makes it fail — that means the
+        // no-history path changed, which the history work is required to leave alone.
         assert_eq!(
             plan_prompt("add a hello function", &SessionHistory::empty()),
             plan_prompt_pinned_expectation()
