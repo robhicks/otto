@@ -86,6 +86,18 @@ pub struct EngineService {
     retriever: Option<Arc<dyn Retriever>>,
     extensions: Option<Arc<Extensions>>,
     turn_lock: tokio::sync::Mutex<()>,
+    /// Sessions whose abort has not yet been accounted for by a turn's terminal status write.
+    ///
+    /// An abort claims exactly one terminal write — the turn it was aimed at — and is consumed by
+    /// it. That is what keeps `Aborted` from being sticky: without the claim, `set_terminal_status`
+    /// can only ask the store "is this session aborted?", which stays true forever and silences
+    /// every later turn's `Done`/`Failed` (a REPL aborts turn 1 and runs twenty more).
+    ///
+    /// In memory on purpose. The ordering it fixes is entirely intra-process — an `abort()` racing
+    /// a turn that is still running in this process — and no other process can observe it. A
+    /// restart correctly forgets it: there is no in-flight turn left to protect. A session aborted
+    /// and never run again leaves its id behind, which is bounded by aborts-per-process.
+    pending_aborts: tokio::sync::Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl EngineService {
@@ -105,6 +117,7 @@ impl EngineService {
             retriever: None,
             extensions: None,
             turn_lock: tokio::sync::Mutex::new(()),
+            pending_aborts: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -187,7 +200,22 @@ impl EngineService {
         session: SessionId,
     ) -> anyhow::Result<()> {
         self.authorize(owner, session).await?;
-        self.store.set_status(session, SessionStatus::Aborted).await
+        // Claim the next terminal status write BEFORE the store write, not after: a turn finishing
+        // in the window between the two would otherwise read a not-yet-aborted status and write
+        // `Done` straight over the abort. On a failed write there is nothing to protect, so the
+        // claim is released again.
+        self.pending_aborts.lock().await.insert(session);
+        let result = self.store.set_status(session, SessionStatus::Aborted).await;
+        if result.is_err() {
+            self.pending_aborts.lock().await.remove(&session);
+        }
+        result
+    }
+
+    /// Whether an abort is waiting to be accounted for by this session's next terminal write.
+    /// Does not consume the claim — only `set_terminal_status` does.
+    async fn abort_is_pending(&self, session: SessionId) -> bool {
+        self.pending_aborts.lock().await.contains(&session)
     }
 
     /// Run one turn with the headless defaults (deny approvals, never pause). (≙ `SendPrompt`.)
@@ -223,6 +251,26 @@ impl EngineService {
         self.authorize(owner, session).await?;
 
         let _guard = self.turn_lock.lock().await;
+
+        // A starting turn means the session is live again, so the status stops reading `Aborted`
+        // (or the previous turn's `Done`/`Failed`) for as long as this one runs. Without it,
+        // `set_terminal_status`'s "is the session aborted?" store read would stay true forever
+        // after a single abort and silence every later turn's terminal write.
+        //
+        // Skipped while an abort is still unclaimed, because such an abort belongs to *this* turn:
+        // a Ctrl-C typed a beat after the prompt lands here before the turn has even taken the
+        // lock, and writing `Active` over it would erase the abort the user just asked for. The
+        // claim is consumed by this turn's own terminal write instead.
+        //
+        // Ordering is safe by construction for the un-stick: this write and the guarded terminal
+        // read both happen under `_guard`, held until this function returns, so a previous
+        // (possibly silenced) turn has already made its skipped terminal write — and released its
+        // claim — before the next turn can take the lock and land this `Active`.
+        if !self.abort_is_pending(session).await {
+            self.store
+                .set_status(session, SessionStatus::Active)
+                .await?;
+        }
 
         let start_seq = self.store.next_seq(session).await?;
         let turn_index = self.store.next_turn(session).await?;
@@ -346,9 +394,18 @@ impl EngineService {
     /// abort this way, which is why the guard lives here, at the offending write, instead of at
     /// any one abort site — a new caller cannot reintroduce the bug.
     ///
-    /// No locking, because both interleavings are already correct: an `Abort` landing before this
-    /// read is seen and skipped, and one landing after is simply the last writer, so `Aborted`
-    /// wins either way.
+    /// **The skip is scoped to the aborted turn, not to the session.** An abort claims exactly one
+    /// terminal write (`pending_aborts`), consumed here. The store read alone cannot express that:
+    /// `Aborted` stays in the store, so a status-only guard would silence every later turn for the
+    /// life of the session — which is precisely the REPL's shape (Ctrl-C on turn 1, then twenty
+    /// more turns). The turn-start `Active` write in `run_prompt_with_controls` un-sticks the store
+    /// read; the claim covers the window before it.
+    ///
+    /// The claim also closes the opposite direction, which a status-only guard gets wrong: a
+    /// Ctrl-C typed immediately after a prompt reaches `abort` before the turn has taken the turn
+    /// lock, so `Aborted` lands in the store *first* — and the turn's own `Active` write would then
+    /// erase it and record `Done`, losing the abort the user just asked for. The claim removes that
+    /// race instead of leaving it to whichever of two store writes happens to land last.
     ///
     /// A failed status read falls through to the write. That is the pre-existing behavior, and it
     /// is the safer default: leaving a finished session stuck in `Running` because a read
@@ -359,10 +416,14 @@ impl EngineService {
         session: SessionId,
         status: SessionStatus,
     ) -> anyhow::Result<()> {
-        if matches!(
-            self.store.session_status(owner, session).await,
-            Ok(SessionStatus::Aborted)
-        ) {
+        // Always consume: an abort claims one terminal write, and this is it.
+        let claimed = self.pending_aborts.lock().await.remove(&session);
+        if claimed
+            || matches!(
+                self.store.session_status(owner, session).await,
+                Ok(SessionStatus::Aborted)
+            )
+        {
             return Ok(());
         }
         self.store.set_status(session, status).await
@@ -531,6 +592,12 @@ impl EngineService {
             .run_agent_dispatch(session, &counter, name, prompt, &task, sink)
             .await;
 
+        // Consume any abort claim aimed at THIS turn. The status writes below stay unguarded — a
+        // one-shot dispatch keeps its existing behavior — but the claim must not outlive the turn
+        // it was aimed at, or the next `run_prompt` turn would silently inherit it and skip its
+        // own terminal write.
+        self.pending_aborts.lock().await.remove(&session);
+
         match &outcome {
             Ok(turn_outcome) => {
                 self.store
@@ -539,7 +606,11 @@ impl EngineService {
                         &TurnRecord {
                             turn_index,
                             goal: prompt.to_string(),
-                            outcome: serde_json::json!({ "ok": turn_outcome.ok }),
+                            // Serialize the whole outcome, same as `run_prompt_with_controls`:
+                            // the "a new `TurnOutcome` field reaches the store without anyone
+                            // widening a literal" invariant is stated globally, so it has to hold
+                            // at every construction site, not just the one that motivated it.
+                            outcome: serde_json::to_value(turn_outcome)?,
                         },
                     )
                     .await?;
@@ -1080,16 +1151,45 @@ mod tests {
         );
     }
 
-    /// An aborted session must still read back as `Aborted` after the turn finishes.
+    /// An `EventSink` that aborts the session from inside the turn, on the first event it sees.
+    ///
+    /// This is how a mid-turn abort is made deterministic without a sleep: the drain loop in
+    /// `run_prompt_with_controls` awaits `emit` while the orchestrator task is still running, so
+    /// the `Aborted` write provably lands after the turn's `Active` write and before its terminal
+    /// write — exactly the interleaving a Ctrl-C produces, with no timing.
+    struct AbortOnFirstEventSink<'a> {
+        service: &'a EngineService,
+        owner: otto_protocol::UserId,
+        session: SessionId,
+        aborted: bool,
+        events: Vec<Event>,
+    }
+
+    #[async_trait]
+    impl EventSink for AbortOnFirstEventSink<'_> {
+        async fn emit(&mut self, event: &Event) -> anyhow::Result<()> {
+            if !self.aborted {
+                self.aborted = true;
+                self.service.abort(&self.owner, self.session).await?;
+            }
+            self.events.push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// The abort guard is scoped to the aborted *turn*, not to the session.
     ///
     /// A turn is not cancellable: `abort` records `Aborted` but the orchestrator runs on and
-    /// reaches `run_prompt_with_controls`'s terminal `set_status`, which used to overwrite it with
-    /// `Done`/`Failed`. Aborting *before* the turn is the deterministic way to put `Aborted` in the
-    /// store while that write happens — no timing, no sleep — and it exercises exactly the guard
-    /// that the mid-turn case relies on. Both the embedded transport and `otto serve` abort this
-    /// way, so this covers both.
+    /// reaches `run_prompt_with_controls`'s terminal `set_status`, which must not overwrite the
+    /// abort. But `Aborted` must not be sticky either — the REPL's shape is Ctrl-C on turn 1 and
+    /// then twenty more turns, and every one of those has to record its own status. Both halves
+    /// are asserted here, in sequence, because they are one behavior: the turn-start `Active`
+    /// write is what makes the guard turn-scoped.
+    ///
+    /// Both the embedded transport and `otto serve` abort through `EngineService::abort`, so this
+    /// covers both.
     #[tokio::test]
-    async fn a_turns_terminal_status_does_not_clobber_an_abort() {
+    async fn an_abort_survives_its_own_turn_but_does_not_stick_to_the_next() {
         let (service, _tmp) = build_service_for_test().await;
         let owner = otto_protocol::UserId::local();
         let session = service
@@ -1097,15 +1197,21 @@ mod tests {
             .await
             .unwrap();
 
-        service.abort(&owner, session).await.unwrap();
-
-        let mut sink = CollectingSink::default();
+        // Turn 1: aborted from inside the turn, then allowed to run to completion.
+        let mut sink = AbortOnFirstEventSink {
+            service: &service,
+            owner: owner.clone(),
+            session,
+            aborted: false,
+            events: Vec::new(),
+        };
         service
             .run_prompt(&owner, session, "go", &mut sink)
             .await
             .unwrap();
 
-        // The turn ran to completion — this is the terminal write that used to clobber.
+        assert!(sink.aborted, "the sink must actually have aborted the turn");
+        // The turn ran to completion — this is the terminal write that would clobber.
         assert!(
             sink.events
                 .iter()
@@ -1115,7 +1221,19 @@ mod tests {
         assert_eq!(
             service.store.session_status(&owner, session).await.unwrap(),
             SessionStatus::Aborted,
-            "a completing turn must not overwrite an abort"
+            "a completing turn must not overwrite its own abort"
+        );
+
+        // Turn 2: a new turn means the session is live again, and records its own status.
+        let mut sink = CollectingSink::default();
+        service
+            .run_prompt(&owner, session, "go again", &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.store.session_status(&owner, session).await.unwrap(),
+            SessionStatus::Done,
+            "an earlier turn's abort must not silence every later turn's status"
         );
     }
 
