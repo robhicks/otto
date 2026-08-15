@@ -154,6 +154,16 @@ jobs:
   # workflows (GitHub's loop prevention), so a required check would never run on it and it would
   # sit unmergeable.
   #
+  # That direct push needs a credential of its own, which is what OTTO_HOMEBREW_TOKEN is. The
+  # `main` ruleset requires a pull request and the "fmt + clippy + test" check, and grants bypass
+  # only to the Repository admin role. GITHUB_TOKEN runs as github-actions[bot], which holds no
+  # role, so with it this job pushes into `remote: error: GH013` and the release fails after every
+  # artifact has already been built and uploaded — v0.5.0 did exactly that. Granting the bypass to
+  # the GitHub Actions integration instead is not possible here: a bypass actor must be an app
+  # installed on the repository, and the API refuses the first-party integration with "Actor GitHub
+  # Actions integration must be part of the ruleset source or owner organization". So the push runs
+  # as a maintainer PAT, which carries the admin role and therefore the bypass.
+  #
   # `needs: upload-assets` waits for every matrix leg, so all four sidecars exist before we read
   # them. The rewrite lives in deploy/update-homebrew-formula.py rather than inline here so it can
   # be exercised locally; it fails without writing unless every substitution lands, because a
@@ -162,9 +172,25 @@ jobs:
     needs: upload-assets
     runs-on: ubuntu-latest
     steps:
+      # Fail here rather than 30 seconds later at the push. Without the secret, checkout silently
+      # falls back to GITHUB_TOKEN and the job dies on an opaque GH013 rule violation that reads
+      # like a branch-protection misconfiguration rather than a missing credential.
+      - name: Require the Homebrew push token
+        env:
+          TOKEN: ${{ secrets.OTTO_HOMEBREW_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::secret OTTO_HOMEBREW_TOKEN is not set. It must be a PAT belonging to a" \
+                 "repository admin with Contents: write, so the push to main clears the ruleset." \
+                 "Create it, then: gh secret set OTTO_HOMEBREW_TOKEN"
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           ref: main
+          # Persisted into the local git credential store, so the `git push` below authenticates as
+          # the PAT's owner (an admin, hence past the ruleset) rather than as github-actions[bot].
+          token: ${{ secrets.OTTO_HOMEBREW_TOKEN }}
       # `github.ref_name` reaches the shell through `env:` rather than `${{ }}` interpolation
       # throughout this job: a tag name is attacker-shaped input under the usual workflow-injection
       # rules, and a tag containing shell metacharacters would otherwise execute here.
