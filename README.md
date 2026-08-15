@@ -83,8 +83,17 @@ Start an interactive session in a repo:
 cd /path/to/repo && otto
 ```
 
-Each prompt runs a full turn (Plan → find context → code → verify) and the session remembers
-prior turns. Ctrl-C cancels a running turn; Ctrl-D exits.
+`otto --root /path/to/repo` does the same from anywhere. Each prompt runs a full turn (Plan →
+find context → code → verify) and the session remembers prior turns. Ctrl-D exits.
+
+**Ctrl-C does not cancel a running turn yet.** It stops the turn's output and hands you back the
+prompt, but the turn itself runs to completion — still applying its gated `fs.write` edits — and
+keeps holding the engine's turn lock, so the next prompt you type waits silently until the
+abandoned turn finishes. Real cancellation is a later slice.
+
+Until you configure a provider key, every turn is answered by the canned offline `LocalProvider`
+and produces a complete-looking stream that changes nothing real — set one of the variables in the
+table below before using the REPL for actual work.
 
 Run a single turn against a directory:
 

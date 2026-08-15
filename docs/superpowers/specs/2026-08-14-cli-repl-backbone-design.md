@@ -92,6 +92,13 @@ Each assumption that did not survive contact with the repository, corrected here
 3. Event output is human-readable prose, not `{:?}`.
 4. Ctrl-C during a turn cancels it and returns to the prompt; Ctrl-C at an idle prompt, or
    Ctrl-D, exits cleanly.
+
+   **Correction (post-implementation):** the first clause overclaims — §3's own body text ("sends
+   `Command::Abort` and returns to the prompt") is the accurate statement. There is no cooperative
+   cancellation in the engine: `abort` records `SessionStatus::Aborted` and the transport silences
+   the sink, but the turn runs to completion, still applying its gated `fs.write` edits, and keeps
+   holding the service's turn lock — so the next prompt queues silently behind the abandoned turn.
+   Ctrl-C returns the prompt; it does not stop the work. Real cancellation is a later slice.
 5. The REPL loop compiles against `Command`/`ServerMessage` only — it must not name
    `EngineService`, `Orchestrator`, or `ToolRegistry` in any signature.
 6. **The existing offline suite passes unchanged**, with no test edited to accommodate a changed
@@ -147,6 +154,16 @@ on `otto-engine` (it must, to construct `EmbeddedTransport`), so the compiler ca
 REPL module from reaching further. The `repl` module's function signatures are the reviewable
 surface.
 
+**Correction (post-implementation):** the dependency was inverted, and the boundary came out
+*stronger* than this paragraph claims. `cli` does **not** depend on `otto-engine` — the reverse
+edge (`cli` → `engine`, with `engine`'s `otto` binary → `cli`) is a genuine Cargo cyclic-package
+error, so `EmbeddedTransport` and the REPL loop live in `crates/engine` instead
+(`embedded.rs`/`repl.rs`) and `cli` is protocol-only. Its boundary is therefore compiler-
+guaranteed, not convention-enforced: the crate cannot name `EngineService`, `Orchestrator`, or
+`ToolRegistry` because it cannot see them. What remains conventional is `repl.rs`'s own
+discipline — it lives in `crates/engine`, where those types *are* in scope, so its signatures stay
+the reviewable surface.
+
 ### 1.2 `EmbeddedTransport`
 
 Owns an `EngineService` built exactly as `cmd_run` builds its dependencies today
@@ -162,6 +179,14 @@ permissions, hooks, skills, and plugin MCP servers compose identically to `otto 
   `InteractiveApprover` (`crates/engine/src/serve.rs:521`): it emits `ApprovalRequest` outward
   and awaits a matching `ApproveDiff`. In this slice the REPL replies `approved: false`
   immediately, preserving the current headless posture until slice 2.
+
+  **Correction (post-implementation):** the round-trip is not wired. The implementation passes
+  `TurnControls::default()` — a `DenyApprover` — and `Command::ApproveDiff` is a documented no-op
+  on the transport (`crates/engine/src/embedded.rs`), accepted silently so the REPL is not trained
+  to treat approval as unsupported. Observable behavior matches this bullet (the orchestrator still
+  emits `ApprovalRequest`, and the CLI renders the auto-denied skip note), but there is no
+  channel-backed approver and no `ApproveDiff` routing: slice 2 **builds** that, it does not merely
+  enable it.
 - No socket, no port, no bind address, no `AuthMode`, no promotion secret. The owner is
   `UserId::local()`, matching every other single-machine path.
 
@@ -340,10 +365,14 @@ All offline: no network, no API keys, no TTY, no PTY.
 |---|---|
 | Rendering | Pure unit tests over every `EventKind` variant; `NO_COLOR` on and off |
 | `EmbeddedTransport` | Driven with `ScriptedProvider`; assert `Command` in → `ServerMessage` out, including the approval round-trip |
-| History construction | Fixture store with N `TurnRecord`s + event log → expected `SessionHistory`; the bounding cap |
+| History construction | Fixture store with N `TurnRecord`s → expected `SessionHistory`; the bounding cap |
 | Prompt invariant | Empty history yields the byte-identical prompt string to today (§2.4.1) |
 | REPL loop | Fake `ClientTransport` + scripted input; asserts turn dispatch, abort, and clean exit |
 | Regression | The full existing `cargo test --workspace` suite, unedited |
+
+**Correction (post-implementation):** the history row said "N `TurnRecord`s **+ event log**". There
+is no event-log join anywhere in the implementation and there was never meant to be — §2.1 already
+corrects the design to derive history from `TurnRecord` alone. The row above is fixed to match.
 
 ---
 
