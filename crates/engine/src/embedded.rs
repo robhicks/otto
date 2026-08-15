@@ -151,11 +151,7 @@ impl EmbeddedTransport {
         let (tools, mcp) = build_composed_tools(&ext, tools_workspace, root.clone(), false).await;
 
         let db = session_db_path(&root);
-        if let Some(parent) = db.parent() {
-            // sqlite will not create intermediate directories; `.otto/` normally does not exist
-            // yet on a repo's first `otto` run.
-            std::fs::create_dir_all(parent)?;
-        }
+        ensure_session_db_dir(&db, &root)?;
         let retriever = build_retriever(&root).await;
         let service = EngineService::new(
             Arc::new(SqliteStore::open(db).await?),
@@ -242,6 +238,43 @@ fn session_db_path(root: &std::path::Path) -> PathBuf {
         return PathBuf::from(explicit);
     }
     root.join(".otto").join("sessions.db")
+}
+
+/// Create the session database's parent directory, and — only for the default `<root>/.otto`
+/// location — seed it with a `.gitignore` that ignores everything.
+///
+/// sqlite will not create intermediate directories, and `.otto/` normally does not exist yet on a
+/// repo's first `otto` run. The ignore file is the other half of that first run: otto's own
+/// `.gitignore` does not travel to a user's repository, so without it `cd repo && otto` leaves
+/// `.otto/sessions.db{,-wal,-shm}` sitting untracked in the user's `git status` — where otto's own
+/// `git.status`/`git.add` tools then see it too.
+///
+/// Never overwritten: once the file exists it is the user's. And never written for an explicit
+/// `OTTO_DB`, which can name any directory — dropping an ignore-everything file into an operator's
+/// chosen data directory would be a surprise, not a courtesy.
+fn ensure_session_db_dir(db: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
+    let Some(parent) = db.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    if parent != root.join(".otto") {
+        return Ok(());
+    }
+    // `create_new` rather than an `exists()` check: same "do not overwrite" guarantee, without the
+    // window between the two.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(parent.join(".gitignore"))
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(b"*\n")?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[async_trait]
@@ -607,6 +640,33 @@ mod tests {
         assert!(
             matches!(t.recv().await, Some(ServerMessage::Ready { .. })),
             "ApproveDiff must not have queued a frame ahead of the next command's reply"
+        );
+    }
+
+    /// A first run in someone's repository must not dirty their `git status`.
+    ///
+    /// otto's own `.gitignore` covers `.otto/` in *this* repository only; a user's checkout has
+    /// never heard of it, so the store directory has to ignore itself — and must leave the file
+    /// alone once it exists, since by then it is the user's.
+    #[tokio::test]
+    async fn the_session_store_directory_ignores_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _t = offline_transport(dir.path(), home.path()).await;
+
+        let ignore = dir.path().join(".otto").join(".gitignore");
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "*\n",
+            "the session store directory must ignore its own contents"
+        );
+
+        std::fs::write(&ignore, "# mine\n").unwrap();
+        let _t2 = offline_transport(dir.path(), home.path()).await;
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "# mine\n",
+            "a later run must not overwrite an existing .gitignore"
         );
     }
 }

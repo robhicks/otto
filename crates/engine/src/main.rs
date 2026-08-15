@@ -27,7 +27,7 @@ mod plugin_tui;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage:
-  otto                                         interactive session in the current directory
+  otto [--root <path>]                         interactive session in the current directory
   otto run \"<goal>\" [--root <path>] [--agent <name>]
   otto serve [--root <path>] [--port <p>] [--ui-dir <path>] [--approve-edits] [--single-user | --promotion-receiver] [--promote-loopback | --promote-vps <ws-endpoint> | --promote-microvm | --promote-fly] [--accept-promotions]
   otto auth enroll <user> [--force]
@@ -59,19 +59,37 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         // A bare `otto` (no subcommand) starts the interactive REPL — `cd repo && otto` with no
-        // configuration. An actually-unknown subcommand still falls through to the `_` arm below.
-        "" => {
-            let (root, _) = parse_root(&rest);
-            otto_engine::repl(root).await
-        }
-        _ => {
-            eprintln!(
-                "{}\n",
-                otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
-            );
-            eprintln!("{USAGE}");
-            std::process::exit(2);
-        }
+        // configuration — as does `otto --root <path>`. An actually-unknown subcommand still
+        // falls through to the usage error.
+        _ => match repl_root(&command, &rest) {
+            Some(root) => otto_engine::repl(root).await,
+            None => {
+                eprintln!(
+                    "{}\n",
+                    otto_engine::banner::banner(otto_engine::banner::ColorMode::detect())
+                );
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
+/// The workspace root for an interactive-REPL invocation, or `None` when this is not one.
+///
+/// `otto` alone is the REPL in the current directory. `otto --root <path>` is the REPL rooted
+/// there: the flag is read here rather than by `parse_root` because the first argv word is the
+/// subcommand, so a leading `--root` would otherwise be parsed *as* the subcommand and exit 2 —
+/// which it did, while the usage string, `CLAUDE.md`, and the design spec all advertised the flag.
+///
+/// Deliberately narrow: a leading `--root <path>` and nothing else. Anything further along is an
+/// unknown subcommand or a flag the REPL does not take, and must still reach the usage error
+/// rather than being silently ignored.
+fn repl_root(command: &str, rest: &[String]) -> Option<PathBuf> {
+    match (command, rest) {
+        ("", []) => Some(PathBuf::from(".")),
+        ("--root", [path]) => Some(PathBuf::from(path)),
+        _ => None,
     }
 }
 
@@ -979,6 +997,34 @@ async fn cmd_serve(args: Vec<String>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `otto --root <path>` must start the REPL rooted there. The bare-`otto` arm is reachable
+    /// only with an empty argv, so a leading `--root` used to be parsed as the *subcommand* and
+    /// exit 2 — while the usage string, `CLAUDE.md`, and the design spec all advertised the flag.
+    #[test]
+    fn repl_root_accepts_a_bare_invocation_and_a_leading_root_flag() {
+        assert_eq!(repl_root("", &[]), Some(PathBuf::from(".")));
+        assert_eq!(
+            repl_root("--root", &["/tmp/somewhere".to_string()]),
+            Some(PathBuf::from("/tmp/somewhere"))
+        );
+    }
+
+    /// ...and nothing else. An unknown subcommand, a `--root` with no path, and trailing junk all
+    /// have to reach the usage error rather than quietly starting a REPL somewhere.
+    #[test]
+    fn repl_root_rejects_everything_else() {
+        assert_eq!(repl_root("bogus", &[]), None);
+        assert_eq!(repl_root("--root", &[]), None);
+        assert_eq!(
+            repl_root(
+                "--root",
+                &["/tmp/somewhere".to_string(), "extra".to_string()]
+            ),
+            None
+        );
+        assert_eq!(repl_root("--rooted", &["/tmp/somewhere".to_string()]), None);
+    }
 
     #[test]
     fn parse_agent_flag_extracts_name() {
