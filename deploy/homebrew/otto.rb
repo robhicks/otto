@@ -15,28 +15,28 @@
 class Otto < Formula
   desc "Agentic coding engine: a deterministic orchestrator drives a spine of atomic agents"
   homepage "https://github.com/robhicks/otto"
-  version "0.4.0"
+  version "0.5.0"
   license "MIT OR Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-aarch64-apple-darwin.tar.gz"
-      sha256 "2b6b9a7e4f43fef11d769cba7f45923b24db565fc4c9309bfc11f0a14e15e815"
+      url "https://github.com/robhicks/otto/releases/download/v0.5.0/otto-aarch64-apple-darwin.tar.gz"
+      sha256 "326e84b1ced6d9b15af5cdc400c03bfd20f71740697adbbc167dd9508c7dd9d2"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-x86_64-apple-darwin.tar.gz"
-      sha256 "112f4c4375231095ec95686ffde9a9db805c0fd75c1c2a7a4496918d526a201b"
+      url "https://github.com/robhicks/otto/releases/download/v0.5.0/otto-x86_64-apple-darwin.tar.gz"
+      sha256 "53c7d442153f46e38f1d04f1ed67c49448de37ba3adaff6efa9f2fc0d22b8eeb"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "e18d170f37b131bd1e6200b30803160d223c93ca85459ae2fc18152eb7c47926"
+      url "https://github.com/robhicks/otto/releases/download/v0.5.0/otto-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "2619570f1127f507bd93f050b1def05de6cf302427175ed52c576927f5a0e566"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "2d3cae6a269657d1d354b63da0f97e4c67d17e28e05a5d66f9a1998876795462"
+      url "https://github.com/robhicks/otto/releases/download/v0.5.0/otto-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "2e35e476899ed1e7320831dade9fe8ea1c24c58f019715eae1b004c88f2971c6"
     end
   end
 
