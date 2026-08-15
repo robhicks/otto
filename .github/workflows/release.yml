@@ -13,6 +13,11 @@
 # `[package.metadata.generate-rpm]` in crates/engine/Cargo.toml. Publish the draft once the
 # checksums look right. The same archive layout is what `deploy/install.sh` and
 # `deploy/homebrew/otto.rb` expect — keep the three in sync.
+#
+# The Homebrew formula is no longer hand-edited: the `bump-homebrew` job below regenerates it from
+# this release's own `.sha256` sidecars and commits it to `main`. `deploy/install.sh` resolves the
+# tag at runtime and needs no per-release edit, so the archive layout is the only thing left to
+# keep in sync by hand.
 
 name: release
 
@@ -107,3 +112,67 @@ jobs:
         run: |
           rpm=$(find target/rpms -name '*.rpm')
           gh release upload "${{ github.ref_name }}" "$rpm" --clobber
+
+  # Point the Homebrew formula at the release we just built, using that release's own `.sha256`
+  # sidecars. This was hand-transcription before — four checksums copied by eye, at the one step
+  # where a typo silently breaks `brew install` for everyone.
+  #
+  # The formula is committed to `main`, not to the tag: the documented install command fetches it
+  # from raw.githubusercontent.com/robhicks/otto/main/deploy/homebrew/otto.rb, so a formula
+  # updated only on the tag would never reach a user.
+  #
+  # It commits directly rather than opening a PR, deliberately. The formula is a generated file
+  # whose content is derived deterministically from published artifacts, so there is nothing for a
+  # reviewer or for the Rust CI gate to judge — and a PR opened with GITHUB_TOKEN cannot trigger
+  # workflows (GitHub's loop prevention), so a required check would never run on it and it would
+  # sit unmergeable.
+  #
+  # `needs: upload-assets` waits for every matrix leg, so all four sidecars exist before we read
+  # them. The rewrite lives in deploy/update-homebrew-formula.py rather than inline here so it can
+  # be exercised locally; it fails without writing unless every substitution lands, because a
+  # formula pairing new URLs with stale checksums is worse than one that is a release behind.
+  bump-homebrew:
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      # `github.ref_name` reaches the shell through `env:` rather than `${{ }}` interpolation
+      # throughout this job: a tag name is attacker-shaped input under the usual workflow-injection
+      # rules, and a tag containing shell metacharacters would otherwise execute here.
+      - name: Download this release's checksum sidecars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p /tmp/otto-shas
+          # Only the four Homebrew targets. The two musl archives are published for Alpine and
+          # older-glibc users but are not served by the formula.
+          for target in aarch64-apple-darwin x86_64-apple-darwin \
+                        aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            gh release download "$TAG" \
+              --repo "$REPO" \
+              --pattern "otto-${target}.sha256" \
+              --dir /tmp/otto-shas
+          done
+      - name: Rewrite the formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 deploy/update-homebrew-formula.py "$TAG" /tmp/otto-shas
+      - name: Commit to main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet -- deploy/homebrew/otto.rb; then
+            echo "formula already describes $TAG; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/homebrew/otto.rb
+          git commit -m "release: point the Homebrew formula at $TAG"
+          # main may have moved while the six targets built; rebase rather than fail the release.
+          git pull --rebase origin main
+          git push origin HEAD:main
