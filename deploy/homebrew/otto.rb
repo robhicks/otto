@@ -6,34 +6,37 @@
 #
 #     brew install --formula https://raw.githubusercontent.com/robhicks/otto/main/deploy/homebrew/otto.rb
 #
-# NOTE: when cutting a new release, bump `version`/the tag in each `url` and replace every sha256
-# with the value from that release's `otto-<target>.sha256` sidecar.
+# NOTE: this file is generated. The release workflow's `bump-homebrew` job rewrites `version`, the
+# four `url`s, and the four sha256s from each release's `otto-<target>.sha256` sidecars and commits
+# the result to `main` (see .github/workflows/release.yml and deploy/update-homebrew-formula.py).
+# Hand-edits to those fields will be overwritten by the next release; everything else here is
+# hand-maintained and is left alone.
 
 class Otto < Formula
   desc "Agentic coding engine: a deterministic orchestrator drives a spine of atomic agents"
   homepage "https://github.com/robhicks/otto"
-  version "0.3.0"
+  version "0.4.0"
   license "MIT OR Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-aarch64-apple-darwin.tar.gz"
-      sha256 "6fffd5eccb9e1c66194ba4e12de995fe3eef9ef68f3ca255f016ab1edede937e"
+      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-aarch64-apple-darwin.tar.gz"
+      sha256 "2b6b9a7e4f43fef11d769cba7f45923b24db565fc4c9309bfc11f0a14e15e815"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-x86_64-apple-darwin.tar.gz"
-      sha256 "0c1694a19cba898107a3bfd7fa112bc3a452dcfe7130ed1c5fa7da950f4a874e"
+      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-x86_64-apple-darwin.tar.gz"
+      sha256 "112f4c4375231095ec95686ffde9a9db805c0fd75c1c2a7a4496918d526a201b"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "35d314e44e7ec98ca3c7521cfacc4675ac7b421794ca360217496993234082ad"
+      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "e18d170f37b131bd1e6200b30803160d223c93ca85459ae2fc18152eb7c47926"
     end
     on_intel do
-      url "https://github.com/robhicks/otto/releases/download/v0.3.0/otto-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0f56236ecf9e6fbe8fa89a65459059bc3ed77bd7799d27517128c0104f512887"
+      url "https://github.com/robhicks/otto/releases/download/v0.4.0/otto-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "2d3cae6a269657d1d354b63da0f97e4c67d17e28e05a5d66f9a1998876795462"
     end
   end
 
